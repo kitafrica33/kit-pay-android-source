@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "coordinate": "io.github.webrtc-sdk:android-prefixed:144.7559.09",
+  "evidence_status": "exact_artifact_source_and_licence_evidence_verified",
+  "licence_layers": [
+    {
+      "scope": "android packaging and publication wrapper",
+      "licence": "MIT",
+      "file": "WEBRTC_ANDROID_WRAPPER_MIT_LICENSE.txt",
+      "sha256": "e6b282fe6c0fb353928923470457f31b44cbab203effd60c0cde4a5bb96c8aec",
+      "repository": "https://github.com/webrtc-sdk/android",
+      "tag": "v144.7559.09",
+      "commit": "a46e9a7f63ce2b531252313f4e81754998e78f9a"
+    },
+    {
+      "scope": "Google WebRTC baseline",
+      "licence": "BSD-3-Clause",
+      "file": "WEBRTC_FORK_BSD-3-Clause.txt",
+      "sha256": "ab00a482b6a3902e40211b43c5d0441962ea99b6cc7c25c0f243fa270b78d482",
+      "repository": "https://github.com/webrtc-sdk/webrtc",
+      "commit": "b1800a61db8320af5c14456c13622d8b85b1ed39"
+    },
+    {
+      "scope": "Shiguredo and LiveKit WebRTC fork modifications",
+      "licence": "Apache-2.0",
+      "notice_file": "WEBRTC_FORK_APACHE_NOTICE.txt",
+      "notice_sha256": "e00ec4edd5966821115deb6c73e0e158524b310250fbda3a50e8d542b2a501c2",
+      "licence_file": "APACHE-2.0.txt",
+      "licence_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "repository": "https://github.com/webrtc-sdk/webrtc",
+      "commit": "b1800a61db8320af5c14456c13622d8b85b1ed39"
+    },
+    {
+      "scope": "linked WebRTC and native third-party payload",
+      "licence": "multiple permissive and notice-bearing terms",
+      "notice_file": "WEBRTC_NATIVE_THIRD_PARTY_NOTICES.md",
+      "notice_sha256": "bb8a8a3c8c9898f79fa537d71273a10d700ba6f1205d81d3c9c525dfcd3ec93e",
+      "notice_size": 214439
+    }
+  ],
+  "source": {
+    "android_wrapper_repository": "https://github.com/webrtc-sdk/android",
+    "android_wrapper_tag": "v144.7559.09",
+    "android_wrapper_commit": "a46e9a7f63ce2b531252313f4e81754998e78f9a",
+    "webrtc_repository": "https://github.com/webrtc-sdk/webrtc",
+    "webrtc_commit": "b1800a61db8320af5c14456c13622d8b85b1ed39",
+    "build_repository": "https://github.com/webrtc-sdk/webrtc-build",
+    "build_tag": "m144.7559.09",
+    "build_commit": "6097d61fb396e7c990cf12094ac3147853377d2d"
+  },
+  "github_actions_artifact": {
+    "repository": "webrtc-sdk/webrtc-build",
+    "workflow_run_id": 27323447647,
+    "artifact_id": 7555285078,
+    "name": "webrtc.android_prefixed.tar.gz",
+    "head_branch": "m144.7559.09",
+    "head_sha": "6097d61fb396e7c990cf12094ac3147853377d2d",
+    "created_at": "2026-06-11T05:08:34Z",
+    "expires_at": "2026-09-09T04:16:51Z",
+    "size": 281442563,
+    "sha256": "579ca3c4ea28272388103a2db059193dd914ef80f9d2154e76ddcf9150bb3106"
+  },
+  "build_package": {
+    "webrtc_tar_gz_size": 283105643,
+    "webrtc_tar_gz_sha256": "c907edb85c3b650253dfa7781a801596469ca75831ac02cbd24485da290fa76d",
+    "versions_file": "WEBRTC_BUILD_VERSIONS.txt",
+    "versions_sha256": "6ec948599720d5b6f41ceb5c6914a9418cbd34dc1fabd601fa4d5fbb18248df5",
+    "github_release_aar_name": "libwebrtc_prefixed.aar",
+    "github_release_aar_size": 48665204,
+    "github_release_aar_sha256": "33ac1fa52b8d3582d557d4ed57bd9617a91edbfa52abdb87eb6886183befc262"
+  },
+  "maven_central": {
+    "repository_url": "https://repo.maven.apache.org/maven2/io/github/webrtc-sdk/android-prefixed/144.7559.09/",
+    "aar_size": 22600113,
+    "aar_sha256": "d2542864ce012f188d0b2d5da21f5cc48bacc6d46523d25f7515809d424780c6",
+    "pom_sha256": "7a217afedde02d097ba4ed5c7f2ab41e606165175d92b1e2136a529ca0e7334f",
+    "gradle_module_sha256": "ce2b795f78bd48110a0f3c6a648f3c3ef0fea2a76912516db8db4077eddfa3e4",
+    "sources_jar_sha256": "18dc05a4d201cdf4c7580d59ded2ae92f44926f45a8eb55ae2574209100acf6a",
+    "sources_jar_contents": "README: Not available.",
+    "aar_signature_sha256": "89e4e6d9077145c04cecec7130a71144dff324a82bfb81f9d6d9e781857368f2",
+    "openpgp_signature_key_id": "3CCBD94F6FC0F446",
+    "openpgp_signature_created": "2026-06-11"
+  },
+  "publication_transformation": {
+    "upstream_script": "https://github.com/webrtc-sdk/android/blob/a46e9a7f63ce2b531252313f4e81754998e78f9a/downloadAar_prefixed.sh",
+    "source_classes_jar_size": 1050663,
+    "source_classes_jar_sha256": "72b37e97b24298edead08a226c920d2e5c2aa0c87bd0bd74a72bf812ed8045c7",
+    "maven_shadow_jar_size": 537029,
+    "maven_shadow_jar_sha256": "bab74386f412036a8dfb7965ed755ef7dc0b74c9628b662dfbdb8ff0bcad866a",
+    "source_class_count": 426,
+    "maven_class_count": 426,
+    "class_name_mapping": "org/... -> livekit/org/...",
+    "all_class_names_map_exactly": true,
+    "native_libraries": [
+      {
+        "abi": "arm64-v8a",
+        "source_name": "libjingle_peerconnection_so.so",
+        "maven_name": "liblkjingle_peerconnection_so.so",
+        "size": 12095976,
+        "sha256": "2269811a76fd46c2b61def310bebf8be316af068a97bc062b512a0550787c259"
+      },
+      {
+        "abi": "armeabi-v7a",
+        "source_name": "libjingle_peerconnection_so.so",
+        "maven_name": "liblkjingle_peerconnection_so.so",
+        "size": 6831924,
+        "sha256": "e57114d7d9ce80c62a0beea8639efb732f476972c1d34b182e51af5357c6b262"
+      },
+      {
+        "abi": "x86",
+        "source_name": "libjingle_peerconnection_so.so",
+        "maven_name": "liblkjingle_peerconnection_so.so",
+        "size": 12617280,
+        "sha256": "3672098e37b2030cfeb4d061a4bcba909ac65c605c68398fbe69d4a2da5b8397"
+      },
+      {
+        "abi": "x86_64",
+        "source_name": "libjingle_peerconnection_so.so",
+        "maven_name": "liblkjingle_peerconnection_so.so",
+        "size": 16067856,
+        "sha256": "0f51e7eeeaef38e3c21c500e7ca8dc688a6c894ca28daeaf09939d1981709592"
+      }
+    ]
+  }
+}

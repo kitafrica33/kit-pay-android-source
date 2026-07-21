@@ -1,0 +1,22 @@
+{
+  "project_info": {
+    "project_number": "1098889103581",
+    "project_id": "kit-pay-africa"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1098889103581:android:035e9b15e90e4e397f7334",
+        "android_client_info": {
+          "package_name": "com.kit.wallet"
+        }
+      },
+      "api_key": [
+        {
+          "current_key": "AIzaSyDr9KnLKvTJNXl8T6YIgEZ4NwrFmsMpwvw"
+        }
+      ]
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "component": {
+    "coordinate": "africa.kit.livekit:livekit-android:2.27.0-kitpay.1",
+    "group": "africa.kit.livekit",
+    "module": "livekit-android",
+    "version": "2.27.0-kitpay.1",
+    "licence": "Apache-2.0"
+  },
+  "fork": {
+    "commit": "fe82899113a2f6468be4cb8b0e757052cb539903",
+    "tree": "5bee13a3935f4d398c3b3f0be66705c88d70ced2",
+    "commit_epoch": 1784578001,
+    "source_repository": "https://github.com/kitafrica33/kit-pay-android-source",
+    "upstream_repository": "https://github.com/livekit/client-sdk-android",
+    "upstream_tag": "v2.27.0",
+    "upstream_commit": "5011da6fc302fefcdc869faecae2e07055f1c8c5",
+    "upstream_tree": "c7537f3ae7418b56a17006737eaee49ce1e1cb44",
+    "protocol_repository": "https://github.com/livekit/protocol",
+    "protocol_commit": "8381f2180c45ab926b3ebf19df0608f1dadcac1e",
+    "protocol_tree": "4d9270438c2d086de8e556abc09afaa96d77bd89"
+  },
+  "publication": {
+    "gradle_version": "8.9",
+    "repository_path": "third_party/livekit/maven",
+    "remote_publication_required": false,
+    "command": "./gradlew --no-daemon --no-parallel -PRELEASE_SIGNING_ENABLED=false :livekit-android-sdk:publishReleasePublicationToKitPayLocalRepository"
+  },
+  "artifacts": {
+    "maven/africa/kit/livekit/livekit-android/2.27.0-kitpay.1/livekit-android-2.27.0-kitpay.1.aar": {
+      "size": 2582447,
+      "sha256": "875ca7e0a1b9768f414440d2889504d5192800840a385fbe94cd407096724a9b"
+    },
+    "maven/africa/kit/livekit/livekit-android/2.27.0-kitpay.1/livekit-android-2.27.0-kitpay.1-sources.jar": {
+      "size": 583909,
+      "sha256": "dc6d6095c0db6e3941c10a1f443671528b19afe0ba4541292ac82f0f9689d961"
+    },
+    "maven/africa/kit/livekit/livekit-android/2.27.0-kitpay.1/livekit-android-2.27.0-kitpay.1-javadoc.jar": {
+      "size": 3854748,
+      "sha256": "f9a8c9cf67b54168337cba58e939480915feb13db34f366ba2ac1a69e1fd0acf"
+    },
+    "maven/africa/kit/livekit/livekit-android/2.27.0-kitpay.1/livekit-android-2.27.0-kitpay.1.module": {
+      "size": 6424,
+      "sha256": "ff46f588e4a9589e11b8d85021c1577553096911f85a1bd144f8c68aae4d8894"
+    },
+    "maven/africa/kit/livekit/livekit-android/2.27.0-kitpay.1/livekit-android-2.27.0-kitpay.1.pom": {
+      "size": 3929,
+      "sha256": "07e3d790483968801ad1ee3b591917d8edc42a64fc3c66eced7bdb752a1f95fc"
+    },
+    "source/livekit-android-2.27.0-kitpay.1-source.tar.gz": {
+      "size": 1698290,
+      "sha256": "8cae9d2cfa17d1c0b4687c160118b1781f511e09fe653fda18812a1c8518011b"
+    },
+    "livekit-android-2.27.0-kitpay.1.patch": {
+      "size": 54133,
+      "sha256": "4a774f9d4a923eb50a0b7f60c4e1ee8e5be0ac0a36f3a6dcaac1c6811ee9f134"
+    },
+    "LICENSE": {
+      "size": 11357,
+      "sha256": "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd"
+    },
+    "NOTICE": {
+      "size": 5305,
+      "sha256": "dae3375b7a34fa5e154f989e88942fda5919eabba5d6f6e70ae88854cd3ae984"
+    },
+    "KIT_PAY_FORK.md": {
+      "size": 2058,
+      "sha256": "0dbf484cab879a7130c233cf2a9082471477f7a89bcd2be45bf6622cdb2f69a7"
+    }
+  },
+  "jain_sip": {
+    "dependency_removed": "javax.sip:android-jain-sip-ri:1.3.0-91",
+    "replacement_source": "livekit-android-sdk/src/main/java/io/livekit/android/webrtc/SdpUtils.kt",
+    "legacy_source_removed": "livekit-android-sdk/src/main/java/io/livekit/android/webrtc/JainSdpUtils.kt",
+    "focused_unit_tests_passed": 15
+  }
+}

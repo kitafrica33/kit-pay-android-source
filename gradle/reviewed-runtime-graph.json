@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "configuration": "releaseRuntimeClasspath",
+  "reviewed_runtime_inventory_sha256": "4f63a48022e82f037a9c3e8de80d847f2a54b5948ce6f51be8a8863bd83ca330",
+  "gradle_resolution": {
+    "component_count": 188,
+    "direct_component_count": 32,
+    "dependency_edge_count": 910,
+    "graph_sha256": "24b9522cf76d4c129361aca60fbdb2da10e26be46fdbe69e916b8f1e6e24f305"
+  },
+  "aab_dependencies_metadata": {
+    "component_count": 188,
+    "direct_component_count": 32,
+    "dependency_edge_count": 910,
+    "graph_sha256": "24b9522cf76d4c129361aca60fbdb2da10e26be46fdbe69e916b8f1e6e24f305"
+  },
+  "cyclonedx": {
+    "component_count": 188,
+    "direct_component_count": 32,
+    "dependency_edge_count": 602,
+    "graph_sha256": "2c76bb782bcf03ac1d8dbc364e2313385eb69b4ec99fa53f8920e8f0f5e33042"
+  }
+}

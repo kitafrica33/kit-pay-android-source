@@ -1,0 +1,1304 @@
+diff --git a/KIT_PAY_FORK.md b/KIT_PAY_FORK.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..da0330323dce746036050fd205cc9d248a462520
+--- /dev/null
++++ b/KIT_PAY_FORK.md
+@@ -0,0 +1,61 @@
++# Kit Pay LiveKit Android fork
++
++This fork is based exactly on LiveKit Android SDK tag `v2.27.0`, commit
++`5011da6fc302fefcdc869faecae2e07055f1c8c5`, with the `protocol` submodule
++pinned by that commit to `8381f2180c45ab926b3ebf19df0608f1dadcac1e`.
++
++The fork removes `javax.sip:android-jain-sip-ri` and replaces the small SDP
++surface used by `PeerConnectionTransport` with a lossless internal line model.
++The model preserves original lines, ordering, duplicates, unknown fields,
++media-section boundaries, line-ending style, and trailing-newline state. It
++only mutates the targeted `fmtp` value or inserts the required dependency
++descriptor `extmap` attribute.
++
++## Verify the focused behavior
++
++```bash
++git submodule update --init --recursive
++JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
++  ./gradlew --no-daemon --no-parallel \
++  :livekit-android-test:testDebugUnitTest \
++  --tests io.livekit.android.webrtc.SdpUtilsTest \
++  --tests io.livekit.android.room.SdpMungingTest
++```
++
++## Publish the reviewed local repository
++
++Publish into this checkout's deterministic `build/kit-pay-maven` repository without
++invoking the upstream signing or remote repository configuration:
++
++```bash
++JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
++  ./gradlew --no-daemon --no-parallel \
++  -PRELEASE_SIGNING_ENABLED=false \
++  :livekit-android-sdk:publishReleasePublicationToKitPayLocalRepository
++```
++
++The pinned fork coordinate is:
++
++```text
++africa.kit.livekit:livekit-android:2.27.0-kitpay.1
++```
++
++Kit Pay vendors the exact output, hashes it, and declares that repository before Maven
++Central. Consumer builds must use the exact version (never a dynamic version):
++
++```kotlin
++dependencyResolutionManagement {
++    repositories {
++        maven { url = uri("third_party/livekit/maven") }
++        google()
++        mavenCentral()
++    }
++}
++
++dependencies {
++    implementation("africa.kit.livekit:livekit-android:2.27.0-kitpay.1")
++}
++```
++
++The SDK remains Apache-2.0. `SdpUtils.kt` retains both the upstream Apache-2.0
++notice and the MIT notice for the portions derived from `ggarber/sdpparser`.
+diff --git a/build.gradle b/build.gradle
+index ba01fff6e442e90e95e2c0d2d182b3b0bf984483..161b52d0b3a9dd3dc564c0b62d1f6e3570b93a09 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -67,7 +67,7 @@ subprojects {
+                 "src/*/java/**/ReentrantMutex.kt", // Different license
+                 "src/*/java/**/TextureViewRenderer.kt", // Different license
+                 "src/*/java/**/FlowDelegate.kt", // Different license
+-                "src/*/java/**/JainSdpUtils.kt", // Different license
++                "src/*/java/**/SdpUtils.kt", // Includes MIT-licensed portions
+             )
+             ktlint("0.50.0")
+                 .setEditorConfigPath("$rootDir/.editorconfig")
+diff --git a/gradle.properties b/gradle.properties
+index 31667e7d3b9fe8321558d368a833f85c94f52cd8..a71788d86a294d59c546ce7fcafb8fbd83a04497 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -32,22 +32,22 @@ kapt.use.worker.api=true
+ 
+ ###############################################################
+ 
+-GROUP=io.livekit
+-VERSION_NAME=2.27.0
++GROUP=africa.kit.livekit
++VERSION_NAME=2.27.0-kitpay.1
+ 
+-POM_DESCRIPTION=LiveKit Android SDK, WebRTC Rooms
++POM_DESCRIPTION=Kit Pay JAIN-free fork of LiveKit Android SDK 2.27.0
+ 
+-POM_URL=https://github.com/livekit/client-sdk-android
+-POM_SCM_URL=https://github.com/livekit/client-sdk-android
+-POM_SCM_CONNECTION=scm:git:git://github.com/livekit/client-sdk-android.git
+-POM_SCM_DEV_CONNECTION=scm:git:ssh://git@github.com/livekit/client-sdk-android.git
++POM_URL=https://github.com/kitafrica33/kit-pay-android-source
++POM_SCM_URL=https://github.com/kitafrica33/kit-pay-android-source
++POM_SCM_CONNECTION=scm:git:https://github.com/kitafrica33/kit-pay-android-source.git
++POM_SCM_DEV_CONNECTION=scm:git:ssh://git@github.com/kitafrica33/kit-pay-android-source.git
+ 
+ POM_LICENCE_NAME=The Apache Software License, Version 2.0
+ POM_LICENCE_URL=http://www.apache.org/licenses/LICENSE-2.0.txt
+ POM_LICENCE_DIST=repo
+ 
+-POM_DEVELOPER_ID=livekit
+-POM_DEVELOPER_NAME=LiveKit
++POM_DEVELOPER_ID=kit-pay
++POM_DEVELOPER_NAME=KIT POS UGANDA LIMITED
+ 
+ RELEASE_REPOSITORY_URL=https://ossrh-staging-api.central.sonatype.com/service/local/
+ SNAPSHOT_REPOSITORY_URL=https://central.sonatype.com/repository/maven-snapshots/
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 6c3caf7b0d423da036b98827274110dfe0088807..6c0a43ae147ade6708458697d0faf2aed4542dbb 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -1,7 +1,6 @@
+ [versions]
+ webrtc = "144.7559.09"
+ 
+-androidJainSipRi = "1.3.0-91"
+ androidx-activity = "1.9.0"
+ androidx-camera = "1.4.2"
+ androidx-core = "1.13.1"
+@@ -34,7 +33,6 @@ agp = "8.7.2"
+ kotlin = "1.9.25"
+ 
+ [libraries]
+-android-jain-sip-ri = { module = "javax.sip:android-jain-sip-ri", version.ref = "androidJainSipRi" }
+ androidx-activity-ktx = { module = "androidx.activity:activity-ktx", version.ref = "androidx-activity" }
+ androidx-camera-core = { module = "androidx.camera:camera-core", version.ref = "androidx-camera" }
+ androidx-camera-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "androidx-camera" }
+@@ -119,4 +117,3 @@ detekt-test = { module = "io.gitlab.arturbosch.detekt:detekt-test", version.ref
+ detekt = { id = "io.gitlab.arturbosch.detekt", version.ref = "detekt" }
+ android-library = { id = "com.android.library", version.ref = "agp" }
+ kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+-
+diff --git a/livekit-android-sdk/build.gradle b/livekit-android-sdk/build.gradle
+index dbc69f7368cb4dfaa9f277d2731cfde84ca38e0a..bd0f2cee6c7898626056c6cdddc6b610d76a518d 100644
+--- a/livekit-android-sdk/build.gradle
++++ b/livekit-android-sdk/build.gradle
+@@ -128,8 +128,6 @@ dependencies {
+     implementation libs.androidx.core
+     implementation libs.protobuf.javalite
+ 
+-    implementation libs.android.jain.sip.ri
+-
+     implementation libs.dagger.lib
+     kapt libs.dagger.compiler
+ 
+@@ -154,6 +152,12 @@ apply from: rootProject.file('gradle/dokka-kotlin-dep-fix.gradle')
+ 
+ afterEvaluate {
+     publishing {
++        repositories {
++            maven {
++                name = "kitPayLocal"
++                url = rootProject.layout.buildDirectory.dir("kit-pay-maven")
++            }
++        }
+         publications {
+             // Creates a Maven publication called "release".
+             release(MavenPublication) {
+diff --git a/livekit-android-sdk/consumer-rules.pro b/livekit-android-sdk/consumer-rules.pro
+index 20469df10fbe4fa5b8ce99f2e79aeeb6dd986395..b0a2f324f29046ac5f873b19e6d4731177ccbca0 100644
+--- a/livekit-android-sdk/consumer-rules.pro
++++ b/livekit-android-sdk/consumer-rules.pro
+@@ -33,13 +33,6 @@
+     @livekit.**.CalledByNativeUnchecked <methods>;
+ }
+ 
+-# NIST sdp parser
+-#########################################
+-# Preserve reflection used for Parser registrations
+--keep class android.gov.nist.javax.sdp.parser.*Parser { *; }
+--keep class android.gov.nist.javax.sdp.parser.ParserFactory { *; }
+--keep class android.gov.nist.javax.sdp.parser.SDPParser { *; }
+-
+ # Protobuf
+ #########################################
+ -keepclassmembers class livekit.** extends com.google.protobuf.GeneratedMessageLite {
+diff --git a/livekit-android-sdk/detekt-baseline-release.xml b/livekit-android-sdk/detekt-baseline-release.xml
+index 54ebf273db7ad56dd0f71529fcd2b72c57fdf643..3fafe4eb6ba39f38d3aaf17a972c3a871b991824 100644
+--- a/livekit-android-sdk/detekt-baseline-release.xml
++++ b/livekit-android-sdk/detekt-baseline-release.xml
+@@ -51,7 +51,6 @@
+     <ID>LongParameterList:LocalVideoTrack.kt$LocalVideoTrack.Companion$( peerConnectionFactory: PeerConnectionFactory, context: Context, name: String, options: LocalVideoTrackOptions, rootEglBase: EglBase, trackFactory: Factory, videoProcessor: VideoProcessor? = null, )</ID>
+     <ID>LongParameterList:LocalVideoTrack.kt$LocalVideoTrack.Factory$( capturer: VideoCapturer, source: VideoSource, name: String, options: LocalVideoTrackOptions, rtcTrack: livekit.org.webrtc.VideoTrack, dispatchObserver: CaptureDispatchObserver?, )</ID>
+     <ID>LongParameterList:MixerAudioBufferCallback.kt$MixerAudioBufferCallback$(originalBuffer: ByteBuffer, audioFormat: Int, channelCount: Int, sampleRate: Int, bytesRead: Int, captureTimeNs: Long)</ID>
+-    <ID>LongParameterList:PeerConnectionTransport.kt$PeerConnectionTransport$( @Assisted config: RTCConfiguration, @Assisted pcObserver: PeerConnection.Observer, @Assisted private val listener: Listener?, @Named(InjectionNames.DISPATCHER_IO) private val ioDispatcher: CoroutineDispatcher, connectionFactory: PeerConnectionFactory, private val sdpFactory: SdpFactory, private val rtcThreadToken: RTCThreadToken, )</ID>
+     <ID>LongParameterList:RTCMetricsManager.kt$( label: MetricLabel, strings: MutableList&lt;String>, samples: List&lt;MetricSample>, identity: Participant.Identity? = null, trackSid: String? = null, rid: String? = null, )</ID>
+     <ID>LongParameterList:RTCModule.kt$RTCModule$( @Named(InjectionNames.OVERRIDE_AUDIO_DEVICE_MODULE) audioDeviceModuleOverride: AudioDeviceModule?, @Named(InjectionNames.OVERRIDE_JAVA_AUDIO_DEVICE_MODULE_CUSTOMIZER) moduleCustomizer: ((builder: JavaAudioDeviceModule.Builder) -> Unit)?, audioOutputAttributes: AudioAttributes, appContext: Context, closeableManager: CloseableManager, communicationWorkaround: CommunicationWorkaround, @Named(InjectionNames.LOCAL_AUDIO_RECORD_SAMPLES_DISPATCHER) audioRecordSamplesDispatcher: AudioRecordSamplesDispatcher, @Named(InjectionNames.LOCAL_AUDIO_BUFFER_CALLBACK_DISPATCHER) audioBufferCallbackDispatcher: AudioBufferCallbackDispatcher, )</ID>
+     <ID>LongParameterList:RTCModule.kt$RTCModule$( @Suppress("UNUSED_PARAMETER") @Named(InjectionNames.LIB_WEBRTC_INITIALIZATION) webrtcInitialization: LibWebrtcInitialization, audioDeviceModule: AudioDeviceModule, videoEncoderFactory: VideoEncoderFactory, videoDecoderFactory: VideoDecoderFactory, @Named(InjectionNames.OVERRIDE_PEER_CONNECTION_FACTORY_OPTIONS) peerConnectionFactoryOptions: PeerConnectionFactory.Options?, memoryManager: CloseableManager, audioProcessingFactory: AudioProcessingFactory, )</ID>
+diff --git a/livekit-android-sdk/src/main/java/io/livekit/android/dagger/RTCModule.kt b/livekit-android-sdk/src/main/java/io/livekit/android/dagger/RTCModule.kt
+index e8d78fa436c8f9275be1c6fe8ddefe85152f6b66..d571d96eee77115120cd738cb498095bc1b11ff2 100644
+--- a/livekit-android-sdk/src/main/java/io/livekit/android/dagger/RTCModule.kt
++++ b/livekit-android-sdk/src/main/java/io/livekit/android/dagger/RTCModule.kt
+@@ -17,7 +17,6 @@
+ package io.livekit.android.dagger
+ 
+ import android.content.Context
+-import android.javax.sdp.SdpFactory
+ import android.media.AudioAttributes
+ import android.media.MediaRecorder
+ import android.os.Build
+@@ -411,9 +410,6 @@ internal object RTCModule {
+     @Provides
+     @Named(InjectionNames.OPTIONS_VIDEO_HW_ACCEL)
+     fun videoHwAccel() = true
+-
+-    @Provides
+-    fun sdpFactory(): SdpFactory = SdpFactory.getInstance()
+ }
+ 
+ /**
+diff --git a/livekit-android-sdk/src/main/java/io/livekit/android/room/PeerConnectionTransport.kt b/livekit-android-sdk/src/main/java/io/livekit/android/room/PeerConnectionTransport.kt
+index efae279a40cf864ceed4254b2d862306a4151956..48dd4c12596a14bae6a32d02e6f47a73b29b45fd 100644
+--- a/livekit-android-sdk/src/main/java/io/livekit/android/room/PeerConnectionTransport.kt
++++ b/livekit-android-sdk/src/main/java/io/livekit/android/room/PeerConnectionTransport.kt
+@@ -16,8 +16,6 @@
+ 
+ package io.livekit.android.room
+ 
+-import android.javax.sdp.MediaDescription
+-import android.javax.sdp.SdpFactory
+ import androidx.annotation.VisibleForTesting
+ import dagger.assisted.Assisted
+ import dagger.assisted.AssistedFactory
+@@ -33,6 +31,8 @@ import io.livekit.android.util.LKLog
+ import io.livekit.android.util.debounce
+ import io.livekit.android.webrtc.SdpExt
+ import io.livekit.android.webrtc.SdpFmtp
++import io.livekit.android.webrtc.SdpMediaDescription
++import io.livekit.android.webrtc.SdpSessionDescription
+ import io.livekit.android.webrtc.getExts
+ import io.livekit.android.webrtc.getFmtps
+ import io.livekit.android.webrtc.getMsid
+@@ -76,7 +76,6 @@ constructor(
+     @Named(InjectionNames.DISPATCHER_IO)
+     private val ioDispatcher: CoroutineDispatcher,
+     connectionFactory: PeerConnectionFactory,
+-    private val sdpFactory: SdpFactory,
+     private val rtcThreadToken: RTCThreadToken,
+ ) {
+     private val coroutineScope = CoroutineScope(ioDispatcher + SupervisorJob())
+@@ -203,16 +202,12 @@ constructor(
+                     return@launchRTCIfNotClosed
+                 }
+                 // munge sdp
+-                val sdpDescription = sdpFactory.createSessionDescription(sdpOffer.description)
++                val sdpDescription = SdpSessionDescription.parse(sdpOffer.description)
+ 
+-                val mediaDescs = sdpDescription.getMediaDescriptions(true)
+-                for (mediaDesc in mediaDescs) {
+-                    if (mediaDesc !is MediaDescription) {
+-                        continue
+-                    }
+-                    if (mediaDesc.media.mediaType == "audio") {
++                for (mediaDesc in sdpDescription.mediaDescriptions) {
++                    if (mediaDesc.mediaType == "audio") {
+                         // TODO
+-                    } else if (mediaDesc.media.mediaType == "video") {
++                    } else if (mediaDesc.mediaType == "video") {
+                         ensureVideoDDExtensionForSVC(mediaDesc)
+                         ensureCodecBitrates(mediaDesc, trackBitrates = trackBitrates)
+                     }
+@@ -402,7 +397,7 @@ private const val DD_EXTENSION_URI = "https://aomediacodec.github.io/av1-rtp-spe
+  * @suppress
+  */
+ @VisibleForTesting
+-fun ensureVideoDDExtensionForSVC(mediaDesc: MediaDescription) {
++internal fun ensureVideoDDExtensionForSVC(mediaDesc: SdpMediaDescription) {
+     val codec = mediaDesc.getRtps()
+         .firstOrNull()
+         ?.second
+@@ -432,7 +427,7 @@ fun ensureVideoDDExtensionForSVC(mediaDesc: MediaDescription) {
+                 config = null,
+                 direction = null,
+                 encryptUri = null,
+-            ).toAttributeField(),
++            ).toAttribute(),
+         )
+     }
+ }
+@@ -449,8 +444,8 @@ private const val startBitrateForSVC = 0.7
+  * @suppress
+  */
+ @VisibleForTesting
+-fun ensureCodecBitrates(
+-    media: MediaDescription,
++internal fun ensureCodecBitrates(
++    media: SdpMediaDescription,
+     trackBitrates: Map<TrackBitrateInfoKey, TrackBitrateInfo>,
+ ) {
+     val msid = media.getMsid()?.value ?: return
+@@ -475,11 +470,13 @@ fun ensureCodecBitrates(
+             if (fmtp.payload == codecPayload) {
+                 fmtpFound = true
+                 var newFmtpConfig = fmtp.config
+-                if (!fmtp.config.contains("x-google-start-bitrate")) {
+-                    newFmtpConfig = "$newFmtpConfig;x-google-start-bitrate=${(trackBr.maxBitrate * startBitrateForSVC).roundToLong()}"
++                if (!fmtp.config.hasParameter("x-google-start-bitrate")) {
++                    newFmtpConfig = newFmtpConfig.appendParameter(
++                        "x-google-start-bitrate=${(trackBr.maxBitrate * startBitrateForSVC).roundToLong()}",
++                    )
+                 }
+-                if (!fmtp.config.contains("x-google-max-bitrate")) {
+-                    newFmtpConfig = "$newFmtpConfig;x-google-max-bitrate=${trackBr.maxBitrate}"
++                if (!fmtp.config.hasParameter("x-google-max-bitrate")) {
++                    newFmtpConfig = newFmtpConfig.appendParameter("x-google-max-bitrate=${trackBr.maxBitrate}")
+                 }
+                 if (fmtp.config != newFmtpConfig) {
+                     attribute.value = "${fmtp.payload} $newFmtpConfig"
+@@ -494,12 +491,22 @@ fun ensureCodecBitrates(
+                     payload = codecPayload,
+                     config = "x-google-start-bitrate=${trackBr.maxBitrate * startBitrateForSVC};" +
+                         "x-google-max-bitrate=${trackBr.maxBitrate}",
+-                ).toAttributeField(),
++                ).toAttribute(),
+             )
+         }
+     }
+ }
+ 
++private fun String.hasParameter(name: String): Boolean = split(';').any { parameter ->
++    parameter.substringBefore('=').trim() == name
++}
++
++private fun String.appendParameter(parameter: String): String = when {
++    isEmpty() -> parameter
++    endsWith(';') -> this + parameter
++    else -> "$this;$parameter"
++}
++
+ internal fun isSVCCodec(codec: String?): Boolean {
+     return codec != null &&
+         ("av1".equals(codec, ignoreCase = true) ||
+diff --git a/livekit-android-sdk/src/main/java/io/livekit/android/webrtc/JainSdpUtils.kt b/livekit-android-sdk/src/main/java/io/livekit/android/webrtc/JainSdpUtils.kt
+deleted file mode 100644
+index 897d46d384f18eb676852bcbb287d6f4f85e741b..0000000000000000000000000000000000000000
+--- a/livekit-android-sdk/src/main/java/io/livekit/android/webrtc/JainSdpUtils.kt
++++ /dev/null
+@@ -1,177 +0,0 @@
+-/*
+- * Copyright 2023-2024 LiveKit, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- *
+- * Parts of this source code comes from https://github.com/ggarber/sdpparser
+- *
+- * MIT License
+- *
+- * Copyright (c) 2023 Gustavo Garcia
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a copy
+- * of this software and associated documentation files (the "Software"), to deal
+- * in the Software without restriction, including without limitation the rights
+- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+- * copies of the Software, and to permit persons to whom the Software is
+- * furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice shall be included in all
+- * copies or substantial portions of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+- * SOFTWARE.
+- */
+-
+-package io.livekit.android.webrtc
+-
+-import android.gov.nist.javax.sdp.fields.AttributeField
+-import android.javax.sdp.MediaDescription
+-import io.livekit.android.util.LKLog
+-
+-/**
+- * @suppress
+- */
+-data class SdpRtp(val payload: Long, val codec: String, val rate: Long?, val encoding: String?)
+-
+-/**
+- * @suppress
+- */
+-fun MediaDescription.getRtps(): List<Pair<AttributeField, SdpRtp>> {
+-    return getAttributes(true)
+-        .filterIsInstance<AttributeField>()
+-        .filter { it.attribute.name == "rtpmap" }
+-        .mapNotNull {
+-            val rtp = tryParseRtp(it.value)
+-            if (rtp == null) {
+-                LKLog.w { "could not parse rtpmap: ${it.encode()}" }
+-                return@mapNotNull null
+-            }
+-            it to rtp
+-        }
+-}
+-
+-private val RTP = """(\d*) ([\w\-.]*)(?:\s*/(\d*)(?:\s*/(\S*))?)?""".toRegex()
+-internal fun tryParseRtp(string: String): SdpRtp? {
+-    val match = RTP.matchEntire(string) ?: return null
+-    val (payload, codec, rate, encoding) = match.destructured
+-    return SdpRtp(payload.toLong(), codec, toOptionalLong(rate), toOptionalString(encoding))
+-}
+-
+-/**
+- * @suppress
+- */
+-data class SdpMsid(
+-    /** holds the msid-id (and msid-appdata if available) */
+-    val value: String,
+-)
+-
+-/**
+- * @suppress
+- */
+-fun MediaDescription.getMsid(): SdpMsid? {
+-    val attribute = getAttribute("msid") ?: return null
+-    return SdpMsid(attribute)
+-}
+-
+-/**
+- * @suppress
+- */
+-data class SdpFmtp(val payload: Long, val config: String) {
+-    fun toAttributeField(): AttributeField {
+-        return AttributeField().apply {
+-            name = "fmtp"
+-            value = "$payload $config"
+-        }
+-    }
+-}
+-
+-/**
+- * @suppress
+- */
+-fun MediaDescription.getFmtps(): List<Pair<AttributeField, SdpFmtp>> {
+-    return getAttributes(true)
+-        .filterIsInstance<AttributeField>()
+-        .filter { it.attribute.name == "fmtp" }
+-        .mapNotNull {
+-            val fmtp = tryParseFmtp(it.value)
+-            if (fmtp == null) {
+-                LKLog.w { "could not parse fmtp: ${it.encode()}" }
+-                return@mapNotNull null
+-            }
+-            it to fmtp
+-        }
+-}
+-
+-private val FMTP = """(\d*) ([\S| ]*)""".toRegex()
+-internal fun tryParseFmtp(string: String): SdpFmtp? {
+-    val match = FMTP.matchEntire(string) ?: return null
+-    val (payload, config) = match.destructured
+-    return SdpFmtp(payload.toLong(), config)
+-}
+-
+-/**
+- * @suppress
+- */
+-data class SdpExt(val value: Long, val direction: String?, val encryptUri: String?, val uri: String, val config: String?) {
+-    fun toAttributeField(): AttributeField {
+-        return AttributeField().apply {
+-            name = "extmap"
+-            value = buildString {
+-                append(this@SdpExt.value)
+-                if (direction != null) {
+-                    append(" $direction")
+-                }
+-                if (encryptUri != null) {
+-                    append(" $encryptUri")
+-                }
+-                append(" $uri")
+-                if (config != null) {
+-                    append(" $config")
+-                }
+-            }
+-        }
+-    }
+-}
+-
+-/**
+- * @suppress
+- */
+-fun MediaDescription.getExts(): List<Pair<AttributeField, SdpExt>> {
+-    return getAttributes(true)
+-        .filterIsInstance<AttributeField>()
+-        .filter { it.attribute.name == "extmap" }
+-        .mapNotNull {
+-            val ext = tryParseExt(it.value)
+-            if (ext == null) {
+-                LKLog.w { "could not parse extmap: ${it.encode()}" }
+-                return@mapNotNull null
+-            }
+-            it to ext
+-        }
+-}
+-
+-private val EXT = """(\d+)(?:/(\w+))?(?: (urn:ietf:params:rtp-hdrext:encrypt))? (\S*)(?: (\S*))?""".toRegex()
+-internal fun tryParseExt(string: String): SdpExt? {
+-    val match = EXT.matchEntire(string) ?: return null
+-    val (value, direction, encryptUri, uri, config) = match.destructured
+-    return SdpExt(value.toLong(), toOptionalString(direction), toOptionalString(encryptUri), uri, toOptionalString(config))
+-}
+-
+-internal fun toOptionalLong(str: String): Long? = if (str.isEmpty()) null else str.toLong()
+-internal fun toOptionalString(str: String): String? = str.ifEmpty { null }
+diff --git a/livekit-android-sdk/src/main/java/io/livekit/android/webrtc/SdpUtils.kt b/livekit-android-sdk/src/main/java/io/livekit/android/webrtc/SdpUtils.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..51d32d536d2f0207c04f43fcd1f6dda2a4e05351
+--- /dev/null
++++ b/livekit-android-sdk/src/main/java/io/livekit/android/webrtc/SdpUtils.kt
+@@ -0,0 +1,349 @@
++/*
++ * Copyright 2023-2026 LiveKit, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Parts of this source code come from https://github.com/ggarber/sdpparser
++ *
++ * MIT License
++ *
++ * Copyright (c) 2023 Gustavo Garcia
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++package io.livekit.android.webrtc
++
++import io.livekit.android.util.LKLog
++
++/**
++ * A deliberately small, lossless SDP document model.
++ *
++ * WebRTC creates the SDP, so this class does not try to validate or normalise
++ * the complete grammar. It keeps every input line and line ending verbatim and
++ * exposes only the media attributes that LiveKit needs to munge.
++ *
++ * @suppress
++ */
++internal class SdpSessionDescription private constructor(
++    private val lines: MutableList<SdpLine>,
++) {
++    val mediaDescriptions: List<SdpMediaDescription>
++        get() = lines
++            .filter { it.text.startsWith(MEDIA_PREFIX) }
++            .map { SdpMediaDescription(this, it) }
++
++    override fun toString(): String = buildString {
++        lines.forEach { line ->
++            append(line.text)
++            append(line.ending)
++        }
++    }
++
++    internal fun linesFor(mediaLine: SdpLine): List<SdpLine> {
++        val start = lines.indexOfIdentity(mediaLine)
++        if (start < 0) {
++            return emptyList()
++        }
++        val end = lines.indexOfFirstAfter(start) { it.text.startsWith(MEDIA_PREFIX) }
++            .takeUnless { it < 0 }
++            ?: lines.size
++        return lines.subList(start + 1, end)
++    }
++
++    internal fun addAttribute(mediaLine: SdpLine, attribute: SdpAttribute) {
++        val start = lines.indexOfIdentity(mediaLine)
++        require(start >= 0) { "media section is not part of this SDP document" }
++
++        val end = lines.indexOfFirstAfter(start) { it.text.startsWith(MEDIA_PREFIX) }
++            .takeUnless { it < 0 }
++            ?: lines.size
++        val ending = preferredEnding(start, end)
++        val newLine = attribute.line
++
++        if (end == lines.size) {
++            val previous = lines.lastOrNull()
++            if (previous == null) {
++                newLine.ending = ""
++            } else if (previous.ending.isEmpty()) {
++                // Preserve whether the source had a trailing newline after appending.
++                previous.ending = ending
++                newLine.ending = ""
++            } else {
++                newLine.ending = ending
++            }
++        } else {
++            newLine.ending = ending
++        }
++        lines.add(end, newLine)
++    }
++
++    private fun preferredEnding(start: Int, end: Int): String {
++        for (index in start until end) {
++            if (lines[index].ending.isNotEmpty()) {
++                return lines[index].ending
++            }
++        }
++        return lines.firstOrNull { it.ending.isNotEmpty() }?.ending ?: CRLF
++    }
++
++    companion object {
++        private const val MEDIA_PREFIX = "m="
++        private const val CRLF = "\r\n"
++
++        fun parse(description: String): SdpSessionDescription {
++            val lines = mutableListOf<SdpLine>()
++            var lineStart = 0
++            var index = 0
++            while (index < description.length) {
++                val ending = when (description[index]) {
++                    '\r' -> if (index + 1 < description.length && description[index + 1] == '\n') CRLF else "\r"
++                    '\n' -> "\n"
++                    else -> {
++                        index++
++                        continue
++                    }
++                }
++                lines += SdpLine(description.substring(lineStart, index), ending)
++                index += ending.length
++                lineStart = index
++            }
++            if (lineStart < description.length) {
++                lines += SdpLine(description.substring(lineStart), "")
++            }
++            return SdpSessionDescription(lines)
++        }
++    }
++}
++
++/** @suppress */
++internal class SdpMediaDescription internal constructor(
++    private val document: SdpSessionDescription,
++    private val mediaLine: SdpLine,
++) {
++    val mediaType: String?
++        get() {
++            if (!mediaLine.text.startsWith("m=")) {
++                return null
++            }
++            return mediaLine.text
++                .substring(2)
++                .trimStart()
++                .takeWhile { !it.isWhitespace() }
++                .ifEmpty { null }
++        }
++
++    internal fun getAttributes(name: String): List<SdpAttribute> = document
++        .linesFor(mediaLine)
++        .mapNotNull(SdpAttribute::from)
++        .filter { it.name == name }
++
++    internal fun addAttribute(attribute: SdpAttribute) {
++        document.addAttribute(mediaLine, attribute)
++    }
++}
++
++/** @suppress */
++internal class SdpAttribute private constructor(
++    internal val line: SdpLine,
++) {
++    val name: String
++        get() = parseAttribute(line.text)?.first.orEmpty()
++
++    var value: String
++        get() = parseAttribute(line.text)?.second.orEmpty()
++        set(value) {
++            val currentName = name
++            require(currentName.isNotEmpty()) { "cannot mutate a malformed SDP attribute" }
++            line.text = "a=$currentName:$value"
++        }
++
++    internal fun encode(): String = line.text
++
++    companion object {
++        fun create(name: String, value: String? = null): SdpAttribute {
++            require(name.isNotEmpty() && ':' !in name) { "invalid SDP attribute name" }
++            val text = if (value == null) "a=$name" else "a=$name:$value"
++            return SdpAttribute(SdpLine(text, ""))
++        }
++
++        fun from(line: SdpLine): SdpAttribute? = if (parseAttribute(line.text) == null) null else SdpAttribute(line)
++
++        private fun parseAttribute(text: String): Pair<String, String?>? {
++            if (!text.startsWith("a=")) {
++                return null
++            }
++            val body = text.substring(2)
++            val separator = body.indexOf(':')
++            val name = if (separator < 0) body else body.substring(0, separator)
++            if (name.isEmpty() || name.any(Char::isWhitespace)) {
++                return null
++            }
++            return name to if (separator < 0) null else body.substring(separator + 1)
++        }
++    }
++}
++
++internal class SdpLine(
++    var text: String,
++    var ending: String,
++)
++
++/** @suppress */
++data class SdpRtp(val payload: Long, val codec: String, val rate: Long?, val encoding: String?)
++
++/** @suppress */
++internal fun SdpMediaDescription.getRtps(): List<Pair<SdpAttribute, SdpRtp>> = getAttributes("rtpmap")
++    .mapNotNull { attribute ->
++        val rtp = tryParseRtp(attribute.value)
++        if (rtp == null) {
++            LKLog.w { "could not parse rtpmap: ${attribute.encode()}" }
++            null
++        } else {
++            attribute to rtp
++        }
++    }
++
++private val RTP = """^(\d+)\s+([^\s/]+)(?:\s*/\s*(\d+)(?:\s*/\s*(\S+))?)?\s*$""".toRegex()
++
++internal fun tryParseRtp(string: String): SdpRtp? {
++    val match = RTP.matchEntire(string) ?: return null
++    val (payload, codec, rate, encoding) = match.destructured
++    return SdpRtp(
++        payload = payload.toLongOrNull() ?: return null,
++        codec = codec,
++        rate = rate.toLongOrNull(),
++        encoding = encoding.ifEmpty { null },
++    )
++}
++
++/** @suppress */
++data class SdpMsid(
++    /** holds the msid-id (and msid-appdata if available) */
++    val value: String,
++)
++
++/** @suppress */
++internal fun SdpMediaDescription.getMsid(): SdpMsid? = getAttributes("msid")
++    .firstOrNull()
++    ?.let { SdpMsid(it.value) }
++
++/** @suppress */
++data class SdpFmtp(val payload: Long, val config: String) {
++    internal fun toAttribute(): SdpAttribute = SdpAttribute.create("fmtp", "$payload $config")
++}
++
++/** @suppress */
++internal fun SdpMediaDescription.getFmtps(): List<Pair<SdpAttribute, SdpFmtp>> = getAttributes("fmtp")
++    .mapNotNull { attribute ->
++        val fmtp = tryParseFmtp(attribute.value)
++        if (fmtp == null) {
++            LKLog.w { "could not parse fmtp: ${attribute.encode()}" }
++            null
++        } else {
++            attribute to fmtp
++        }
++    }
++
++private val FMTP = """^(\d+)(?:[ \t]+(.*))?$""".toRegex()
++
++internal fun tryParseFmtp(string: String): SdpFmtp? {
++    val match = FMTP.matchEntire(string) ?: return null
++    val (payload, config) = match.destructured
++    return SdpFmtp(payload.toLongOrNull() ?: return null, config)
++}
++
++/** @suppress */
++data class SdpExt(
++    val value: Long,
++    val direction: String?,
++    val encryptUri: String?,
++    val uri: String,
++    val config: String?,
++) {
++    internal fun toAttribute(): SdpAttribute = SdpAttribute.create(
++        "extmap",
++        buildString {
++            append(value)
++            if (direction != null) {
++                append('/')
++                append(direction)
++            }
++            append(' ')
++            if (encryptUri != null) {
++                append(encryptUri)
++                append(' ')
++            }
++            append(uri)
++            if (config != null) {
++                append(' ')
++                append(config)
++            }
++        },
++    )
++}
++
++/** @suppress */
++internal fun SdpMediaDescription.getExts(): List<Pair<SdpAttribute, SdpExt>> = getAttributes("extmap")
++    .mapNotNull { attribute ->
++        val ext = tryParseExt(attribute.value)
++        if (ext == null) {
++            LKLog.w { "could not parse extmap: ${attribute.encode()}" }
++            null
++        } else {
++            attribute to ext
++        }
++    }
++
++private val EXT =
++    """^(\d+)(?:/(sendonly|recvonly|sendrecv|inactive))?[ \t]+(?:(urn:ietf:params:rtp-hdrext:encrypt)[ \t]+)?(\S+)(?:[ \t]+(.*))?$"""
++        .toRegex()
++
++internal fun tryParseExt(string: String): SdpExt? {
++    val match = EXT.matchEntire(string) ?: return null
++    val (value, direction, encryptUri, uri, config) = match.destructured
++    return SdpExt(
++        value = value.toLongOrNull() ?: return null,
++        direction = direction.ifEmpty { null },
++        encryptUri = encryptUri.ifEmpty { null },
++        uri = uri,
++        config = config.ifEmpty { null },
++    )
++}
++
++private fun MutableList<SdpLine>.indexOfIdentity(target: SdpLine): Int = indexOfFirst { it === target }
++
++private inline fun MutableList<SdpLine>.indexOfFirstAfter(start: Int, predicate: (SdpLine) -> Boolean): Int {
++    for (index in start + 1 until size) {
++        if (predicate(this[index])) {
++            return index
++        }
++    }
++    return -1
++}
+diff --git a/livekit-android-test/build.gradle b/livekit-android-test/build.gradle
+index 1629569f0fda165b1cef43fe3fb9dccecef167bc..906d66ed62a6121efecb8331d5cdfcc3b4c777ba 100644
+--- a/livekit-android-test/build.gradle
++++ b/livekit-android-test/build.gradle
+@@ -114,7 +114,6 @@ dependencies {
+     api libs.audioswitch
+     implementation libs.androidx.annotation
+     api libs.protobuf.javalite
+-    implementation libs.android.jain.sip.ri
+     implementation libs.junit
+     implementation libs.robolectric
+     implementation libs.mockito.core
+diff --git a/livekit-android-test/src/main/java/io/livekit/android/test/mock/dagger/TestRTCModule.kt b/livekit-android-test/src/main/java/io/livekit/android/test/mock/dagger/TestRTCModule.kt
+index 0ed771c7e327a271106935d6681f3c551ddce4f5..e242985d4ba4962a0eb2a12caaa574a358519a78 100644
+--- a/livekit-android-test/src/main/java/io/livekit/android/test/mock/dagger/TestRTCModule.kt
++++ b/livekit-android-test/src/main/java/io/livekit/android/test/mock/dagger/TestRTCModule.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2023-2025 LiveKit, Inc.
++ * Copyright 2023-2026 LiveKit, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -17,7 +17,6 @@
+ package io.livekit.android.test.mock.dagger
+ 
+ import android.content.Context
+-import android.javax.sdp.SdpFactory
+ import dagger.Module
+ import dagger.Provides
+ import dagger.Reusable
+@@ -129,9 +128,6 @@ object TestRTCModule {
+     @Named(InjectionNames.OPTIONS_VIDEO_HW_ACCEL)
+     fun videoHwAccel() = true
+ 
+-    @Provides
+-    fun sdpFactory() = SdpFactory.getInstance()
+-
+     @Provides
+     fun dataPacketCryptorManagerFactory(): DataPacketCryptorManager.Factory = object : DataPacketCryptorManager.Factory {
+         override fun create(keyProvider: KeyProvider): DataPacketCryptorManager {
+diff --git a/livekit-android-test/src/test/java/io/livekit/android/room/SdpMungingTest.kt b/livekit-android-test/src/test/java/io/livekit/android/room/SdpMungingTest.kt
+index bfecd6012b2ca9ec24abd748bf67715aab556421..fc96a2b1158471f87630dd411cc536cd645ebe64 100644
+--- a/livekit-android-test/src/test/java/io/livekit/android/room/SdpMungingTest.kt
++++ b/livekit-android-test/src/test/java/io/livekit/android/room/SdpMungingTest.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2023-2024 LiveKit, Inc.
++ * Copyright 2023-2026 LiveKit, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -16,9 +16,8 @@
+ 
+ package io.livekit.android.room
+ 
+-import android.javax.sdp.MediaDescription
+-import android.javax.sdp.SdpFactory
+-import io.livekit.android.webrtc.JainSdpUtilsTest
++import io.livekit.android.webrtc.SdpSessionDescription
++import io.livekit.android.webrtc.SdpUtilsTest
+ import io.livekit.android.webrtc.getExts
+ import io.livekit.android.webrtc.getFmtps
+ import org.junit.Assert.assertEquals
+@@ -29,9 +28,9 @@ import org.junit.Test
+ class SdpMungingTest {
+ 
+     @Test
+-    fun ensureVideoDDExtensionForSVCTest() {
+-        val sdp = SdpFactory.getInstance().createSessionDescription(NO_DD_DESCRIPTION)
+-        val mediaDescription = sdp.getMediaDescriptions(true).filterIsInstance<MediaDescription>()[1]
++    fun ensureVideoDDExtensionForVP9IsLosslessAndIdempotent() {
++        val sdp = SdpSessionDescription.parse(NO_DD_DESCRIPTION)
++        val mediaDescription = sdp.mediaDescriptions[1]
+ 
+         ensureVideoDDExtensionForSVC(mediaDescription)
+ 
+@@ -49,12 +48,40 @@ class SdpMungingTest {
+         assertNull(ext.encryptUri)
+         assertEquals("https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension", ext.uri)
+         assertNull(ext.config)
++
++        val once = sdp.toString()
++        assertEquals(
++            NO_DD_DESCRIPTION +
++                "\na=extmap:12 https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension",
++            once,
++        )
++        ensureVideoDDExtensionForSVC(mediaDescription)
++        assertEquals(once, sdp.toString())
++    }
++
++    @Test
++    fun ensureVideoDDExtensionForAV1PreservesCrLfAndTrailingNewline() {
++        val description = "v=0\r\n" +
++            "x=unknown-session-line\r\n" +
++            "m=video 9 UDP/TLS/RTP/SAVPF 39\r\n" +
++            "a=rtpmap:39 AV1/90000\r\n" +
++            "a=extmap:4 urn:example:existing\r\n" +
++            "a=x-unknown:keep-me\r\n"
++        val expected = description +
++            "a=extmap:5 https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension\r\n"
++        val sdp = SdpSessionDescription.parse(description)
++        val mediaDescription = sdp.mediaDescriptions.single()
++
++        ensureVideoDDExtensionForSVC(mediaDescription)
++        assertEquals(expected, sdp.toString())
++        ensureVideoDDExtensionForSVC(mediaDescription)
++        assertEquals(expected, sdp.toString())
+     }
+ 
+     @Test
+     fun ensureCodecBitratesTest() {
+-        val sdp = SdpFactory.getInstance().createSessionDescription(JainSdpUtilsTest.DESCRIPTION)
+-        val mediaDescription = sdp.getMediaDescriptions(true).filterIsInstance<MediaDescription>()[1]
++        val sdp = SdpSessionDescription.parse(SdpUtilsTest.DESCRIPTION)
++        val mediaDescription = sdp.mediaDescriptions[1]
+ 
+         ensureCodecBitrates(
+             mediaDescription,
+@@ -72,6 +99,156 @@ class SdpMungingTest {
+             .first()
+ 
+         assertEquals("profile-id=0;x-google-start-bitrate=700000;x-google-max-bitrate=1000000", vp9fmtp.config)
++        val expected = SdpUtilsTest.DESCRIPTION.replace(
++            "a=fmtp:98 profile-id=0",
++            "a=fmtp:98 profile-id=0;x-google-start-bitrate=700000;x-google-max-bitrate=1000000",
++        )
++        assertEquals(expected, sdp.toString())
++
++        ensureCodecBitrates(
++            mediaDescription,
++            mapOf(
++                TrackBitrateInfoKey.Cid("PA_Qwqk4y9fcD3G") to TrackBitrateInfo("VP9", 1000000L),
++            ),
++        )
++        assertEquals(expected, sdp.toString())
++    }
++
++    @Test
++    fun ensureCodecBitratesAddsMissingFmtpWithoutChangingOtherSections() {
++        val description = "v=0\n" +
++            "m=audio 9 UDP/TLS/RTP/SAVPF 111\n" +
++            "a=msid:audio-cid audio-track\n" +
++            "a=rtpmap:111 opus/48000/2\n" +
++            "a=x-duplicate:one\n" +
++            "a=x-duplicate:two\n" +
++            "m=video 9 UDP/TLS/RTP/SAVPF 98\n" +
++            "a=msid:video-cid video-track\n" +
++            "a=rtpmap:98 VP9/90000\n" +
++            "a=x-unknown:keep"
++        val expected = description +
++            "\na=fmtp:98 x-google-start-bitrate=700000.0;x-google-max-bitrate=1000000"
++        val sdp = SdpSessionDescription.parse(description)
++        val video = sdp.mediaDescriptions[1]
++
++        ensureCodecBitrates(
++            video,
++            mapOf(TrackBitrateInfoKey.Cid("video-cid") to TrackBitrateInfo("VP9", 1000000L)),
++        )
++
++        assertEquals(expected, sdp.toString())
++        assertEquals(1, video.getFmtps().size)
++    }
++
++    @Test
++    fun ensureCodecBitratesUsesFirstMsidAndIgnoresMalformedLines() {
++        val description = "v=0\r\n" +
++            "m=video 9 UDP/TLS/RTP/SAVPF 98\r\n" +
++            "a=msid:first-cid first-track\r\n" +
++            "a=msid:second-cid second-track\r\n" +
++            "a=rtpmap:malformed\r\n" +
++            "a=rtpmap:98 VP9/90000\r\n" +
++            "a=fmtp:not-a-payload keep-this\r\n" +
++            "a=fmtp:98 profile-id=0\r\n"
++        val sdp = SdpSessionDescription.parse(description)
++        val media = sdp.mediaDescriptions.single()
++
++        ensureCodecBitrates(
++            media,
++            mapOf(TrackBitrateInfoKey.Cid("second-cid") to TrackBitrateInfo("VP9", 1000000L)),
++        )
++        assertEquals(description, sdp.toString())
++
++        ensureCodecBitrates(
++            media,
++            mapOf(TrackBitrateInfoKey.Cid("first-cid") to TrackBitrateInfo("VP9", 1000000L)),
++        )
++        assertEquals(
++            description.replace(
++                "a=fmtp:98 profile-id=0",
++                "a=fmtp:98 profile-id=0;x-google-start-bitrate=700000;x-google-max-bitrate=1000000",
++            ),
++            sdp.toString(),
++        )
++    }
++
++    @Test
++    fun realWorldOfferMutationPreservesEveryUntouchedLineExactly() {
++        val description = "v=0\r\n" +
++            "o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n" +
++            "s=-\r\n" +
++            "t=0 0\r\n" +
++            "a=group:BUNDLE 0 1 2\r\n" +
++            "a=extmap-allow-mixed\r\n" +
++            "a=x-session-unknown:first\r\n" +
++            "a=x-session-unknown:second\r\n" +
++            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" +
++            "c=IN IP4 0.0.0.0\r\n" +
++            "a=candidate:1 1 udp 2122260223 192.0.2.10 50000 typ host generation 0\r\n" +
++            "a=candidate:2 1 tcp 1518280447 192.0.2.10 9 typ host tcptype active\r\n" +
++            "a=ice-ufrag:dataUfrag\r\n" +
++            "a=ice-pwd:dataPassword123456789012\r\n" +
++            "a=fingerprint:sha-256 AA:BB:CC:DD\r\n" +
++            "a=setup:actpass\r\n" +
++            "a=mid:0\r\n" +
++            "a=sctp-port:5000\r\n" +
++            "a=max-message-size:262144\r\n" +
++            "a=x-data-unknown:preserve me exactly\r\n" +
++            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" +
++            "c=IN IP4 0.0.0.0\r\n" +
++            "a=ice-ufrag:audioUfrag\r\n" +
++            "a=ice-pwd:audioPassword12345678901\r\n" +
++            "a=fingerprint:sha-256 AA:BB:CC:DD\r\n" +
++            "a=setup:actpass\r\n" +
++            "a=mid:1\r\n" +
++            "a=rtpmap:111 opus/48000/2\r\n" +
++            "a=msid:audio-cid audio-track\r\n" +
++            "a=ssrc-group:FID 1111 2222\r\n" +
++            "a=ssrc:1111 cname:audio-cname\r\n" +
++            "a=ssrc:2222 cname:audio-cname\r\n" +
++            "a=x-audio-duplicate:same\r\n" +
++            "a=x-audio-duplicate:same\r\n" +
++            "m=video 9 UDP/TLS/RTP/SAVPF 98\r\n" +
++            "c=IN IP4 0.0.0.0\r\n" +
++            "a=candidate:3 1 udp 1686052607 198.51.100.20 40000 typ srflx raddr 192.0.2.10 rport 50000\r\n" +
++            "a=ice-ufrag:videoUfrag\r\n" +
++            "a=ice-pwd:videoPassword12345678901\r\n" +
++            "a=fingerprint:sha-256 AA:BB:CC:DD\r\n" +
++            "a=setup:actpass\r\n" +
++            "a=mid:2\r\n" +
++            "a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid\r\n" +
++            "a=rtpmap:98 VP9/90000\r\n" +
++            "a=fmtp:98 profile-id=0\r\n" +
++            "a=msid:video-cid video-track\r\n" +
++            "a=ssrc-group:SIM 3333 4444 5555\r\n" +
++            "a=ssrc:3333 cname:video-cname\r\n" +
++            "a=ssrc:4444 cname:video-cname\r\n" +
++            "a=ssrc:5555 cname:video-cname\r\n" +
++            "a=rid:h send\r\n" +
++            "a=rid:q send\r\n" +
++            "a=simulcast:send h;q\r\n" +
++            "a=x-video-unknown:first value\r\n" +
++            "a=x-video-unknown:second value\r\n"
++        val expected = description.replace(
++            "a=fmtp:98 profile-id=0",
++            "a=fmtp:98 profile-id=0;x-google-start-bitrate=700000;x-google-max-bitrate=1000000",
++        ) + "a=extmap:5 https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension\r\n"
++        val sdp = SdpSessionDescription.parse(description)
++        val video = sdp.mediaDescriptions.single { it.mediaType == "video" }
++
++        ensureVideoDDExtensionForSVC(video)
++        ensureCodecBitrates(
++            video,
++            mapOf(TrackBitrateInfoKey.Cid("video-cid") to TrackBitrateInfo("VP9", 1000000L)),
++        )
++
++        assertEquals(expected, sdp.toString())
++        ensureVideoDDExtensionForSVC(video)
++        ensureCodecBitrates(
++            video,
++            mapOf(TrackBitrateInfoKey.Cid("video-cid") to TrackBitrateInfo("VP9", 1000000L)),
++        )
++        assertEquals(expected, sdp.toString())
+     }
+ 
+     companion object {
+diff --git a/livekit-android-test/src/test/java/io/livekit/android/webrtc/JainSdpUtilsTest.kt b/livekit-android-test/src/test/java/io/livekit/android/webrtc/SdpUtilsTest.kt
+similarity index 70%
+rename from livekit-android-test/src/test/java/io/livekit/android/webrtc/JainSdpUtilsTest.kt
+rename to livekit-android-test/src/test/java/io/livekit/android/webrtc/SdpUtilsTest.kt
+index 18870afbb84f49827940753c654b7efae2037c9d..f6fd1e29617914c16d9c540d7d423173e8d50b60 100644
+--- a/livekit-android-test/src/test/java/io/livekit/android/webrtc/JainSdpUtilsTest.kt
++++ b/livekit-android-test/src/test/java/io/livekit/android/webrtc/SdpUtilsTest.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2023-2024 LiveKit, Inc.
++ * Copyright 2023-2026 LiveKit, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -16,26 +16,21 @@
+ 
+ package io.livekit.android.webrtc
+ 
+-import android.javax.sdp.MediaDescription
+-import android.javax.sdp.SdpFactory
+-import android.javax.sdp.SessionDescription
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertNotNull
+ import org.junit.Assert.assertNull
+ import org.junit.Test
+ 
+-class JainSdpUtilsTest {
++class SdpUtilsTest {
+ 
+-    private val sdpFactory = SdpFactory.getInstance()
+-    private fun createSessionDescription(): SessionDescription {
+-        return sdpFactory.createSessionDescription(DESCRIPTION)
++    private fun createSessionDescription(): SdpSessionDescription {
++        return SdpSessionDescription.parse(DESCRIPTION)
+     }
+ 
+     @Test
+     fun getRtpAttributes() {
+         val sdp = createSessionDescription()
+-        val mediaDescriptions = sdp.getMediaDescriptions(true)
+-            .filterIsInstance<MediaDescription>()
++        val mediaDescriptions = sdp.mediaDescriptions
+         val mediaDesc = mediaDescriptions[1]
+         val rtps = mediaDesc.getRtps()
+         assertEquals(13, rtps.size)
+@@ -51,8 +46,7 @@ class JainSdpUtilsTest {
+     @Test
+     fun getExtmapAttributes() {
+         val sdp = createSessionDescription()
+-        val mediaDescriptions = sdp.getMediaDescriptions(true)
+-            .filterIsInstance<MediaDescription>()
++        val mediaDescriptions = sdp.mediaDescriptions
+         val mediaDesc = mediaDescriptions[1]
+         val exts = mediaDesc.getExts()
+ 
+@@ -69,8 +63,7 @@ class JainSdpUtilsTest {
+     @Test
+     fun getMsid() {
+         val sdp = createSessionDescription()
+-        val mediaDescriptions = sdp.getMediaDescriptions(true)
+-            .filterIsInstance<MediaDescription>()
++        val mediaDescriptions = sdp.mediaDescriptions
+         val mediaDesc = mediaDescriptions[1]
+ 
+         val msid = mediaDesc.getMsid()
+@@ -81,8 +74,7 @@ class JainSdpUtilsTest {
+     @Test
+     fun getFmtps() {
+         val sdp = createSessionDescription()
+-        val mediaDescriptions = sdp.getMediaDescriptions(true)
+-            .filterIsInstance<MediaDescription>()
++        val mediaDescriptions = sdp.mediaDescriptions
+         val mediaDesc = mediaDescriptions[1]
+ 
+         val fmtps = mediaDesc.getFmtps()
+@@ -93,6 +85,72 @@ class JainSdpUtilsTest {
+         assertEquals("apt=96", fmtp.config)
+     }
+ 
++    @Test
++    fun roundTripsLfWithoutTrailingNewlineExactly() {
++        val description = "v=0\no=- 1 1 IN IP4 127.0.0.1\nm=video 9 UDP/TLS/RTP/SAVPF 98\na=rtpmap:98 VP9/90000"
++
++        assertEquals(description, SdpSessionDescription.parse(description).toString())
++    }
++
++    @Test
++    fun roundTripsCrLfWithTrailingNewlineExactly() {
++        val description = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\nm=video 9 UDP/TLS/RTP/SAVPF 39\r\na=rtpmap:39 AV1/90000\r\n"
++
++        assertEquals(description, SdpSessionDescription.parse(description).toString())
++    }
++
++    @Test
++    fun preservesUnknownLinesDuplicateAttributesAndMixedEndings() {
++        val description = "v=0\r\nx=opaque one\n" +
++            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" +
++            "a=msid:first-stream first-track\r\n" +
++            "a=msid:second-stream second-track\n" +
++            "z=opaque two\r" +
++            "m=video 9 UDP/TLS/RTP/SAVPF 98\r\n" +
++            "a=x-unknown:keep:all:colons\r\n" +
++            "a=x-unknown:duplicate\r\n"
++        val sdp = SdpSessionDescription.parse(description)
++
++        assertEquals(2, sdp.mediaDescriptions.size)
++        assertEquals("first-stream first-track", sdp.mediaDescriptions[0].getMsid()?.value)
++        assertEquals(2, sdp.mediaDescriptions[1].getAttributes("x-unknown").size)
++        assertEquals(description, sdp.toString())
++    }
++
++    @Test
++    fun toleratesMalformedAttributesAndMultipleMediaSections() {
++        val description = "v=0\n" +
++            "m=\n" +
++            "a=rtpmap:not-a-payload VP9/90000\n" +
++            "a=fmtp:\n" +
++            "m=audio 9 UDP/TLS/RTP/SAVPF 111\n" +
++            "a=rtpmap:111 opus/48000/2\n" +
++            "m=video 9 UDP/TLS/RTP/SAVPF 98\n" +
++            "a=rtpmap:broken\n" +
++            "a=rtpmap:98 VP9/90000\n"
++        val sdp = SdpSessionDescription.parse(description)
++
++        assertEquals(listOf(null, "audio", "video"), sdp.mediaDescriptions.map { it.mediaType })
++        assertEquals(0, sdp.mediaDescriptions[0].getRtps().size)
++        assertEquals("opus", sdp.mediaDescriptions[1].getRtps().single().second.codec)
++        assertEquals("VP9", sdp.mediaDescriptions[2].getRtps().single().second.codec)
++        assertEquals(description, sdp.toString())
++    }
++
++    @Test
++    fun parsesAndSerializesDirectedEncryptedExtmap() {
++        val value = "7/sendonly urn:ietf:params:rtp-hdrext:encrypt urn:example:extension config words"
++        val ext = tryParseExt(value)
++
++        assertNotNull(ext)
++        assertEquals(7L, ext!!.value)
++        assertEquals("sendonly", ext.direction)
++        assertEquals("urn:ietf:params:rtp-hdrext:encrypt", ext.encryptUri)
++        assertEquals("urn:example:extension", ext.uri)
++        assertEquals("config words", ext.config)
++        assertEquals("a=extmap:$value", ext.toAttribute().encode())
++    }
++
+     companion object {
+         const val DESCRIPTION = "v=0\n" +
+             "o=- 3682890773448528616 3 IN IP4 127.0.0.1\n" +

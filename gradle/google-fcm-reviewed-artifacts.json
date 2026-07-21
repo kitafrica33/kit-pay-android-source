@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "review_scope": "GOOGLE_ANDROID_SDK_AGPL_COMPATIBILITY",
+  "artifacts": [
+    {
+      "coordinate": "com.google.android.gms:play-services-base:18.1.0",
+      "aar_sha256": "4eca56ceecd4325a376cd843af56377e2376ce284d0c6f05a5d0a82f4c1bf8cd",
+      "pom_sha256": "30df78ba3ead133c2b36784b425a9eeee7f02531907e8aaee4e8922354f732a7"
+    },
+    {
+      "coordinate": "com.google.android.gms:play-services-basement:18.3.0",
+      "aar_sha256": "6c11ae3eb2dd7f17373f919c4c557a70e4cf891bc0c9b66926a0a6445d654352",
+      "pom_sha256": "9cef5dc9a6950ff09a85ff522b476f855eb7ef2373aa4c17339cb114ac5397e2"
+    },
+    {
+      "coordinate": "com.google.android.gms:play-services-cloud-messaging:17.2.0",
+      "aar_sha256": "27255e7fe9706483816b158db25cf319f6a26a0566feff41597ce8807a350e37",
+      "pom_sha256": "65f5833e621368dfb0eb203dcafcf070c5cece5a60ca18842ce7081d440e0419"
+    },
+    {
+      "coordinate": "com.google.android.gms:play-services-stats:17.0.2",
+      "aar_sha256": "dd4314a53f49a378ec146103d36232b96c75454d29526336ccbdf132941764d3",
+      "pom_sha256": "68bb2bc131c0939858e3166f777c63903b990c7fcae3c1dea70a312937f6a73f"
+    },
+    {
+      "coordinate": "com.google.android.gms:play-services-tasks:18.1.0",
+      "aar_sha256": "d60575eae39350e6234858bc9d7d775375707ae82a684e6caf7f3e41a12e25a2",
+      "pom_sha256": "cf29ed846108d7a8f2c17d8ef5b63399735757c5a09bb663d7e784e02ad84bcd"
+    },
+    {
+      "coordinate": "com.google.firebase:firebase-iid-interop:17.1.0",
+      "aar_sha256": "0b7c3721c84b62e70415307239ed4a7f998989084bf2833f90b9f5bea3095a05",
+      "pom_sha256": "53f269f5e127ac21eba2d80a985abc8d2c8f24cdca9be0284448ee9ea343e34b"
+    }
+  ]
+}

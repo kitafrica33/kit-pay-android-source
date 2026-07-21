@@ -1,0 +1,189 @@
+Kit Pay for Android
+
+Copyright (C) 2026 KIT POS UGANDA LIMITED
+
+Licence
+-------
+
+Kit Pay for Android is free software: you may redistribute it and/or modify it
+under the GNU Affero General Public License, version 3 only (AGPL-3.0-only).
+It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+PURPOSE. See LICENSE in the source distribution and the bundled AGPL-3.0-only
+text for the complete terms. Copyright notices and licence terms for third-party
+components remain with their owners.
+
+Corresponding source
+====================
+
+The corresponding-source repository for Kit Pay for Android is:
+
+    https://github.com/kitafrica33/kit-pay-android-source
+
+Every distributed APK or Android App Bundle must have a public, annotated
+`v<versionName>-code<versionCode>` tag in that repository matching the binary.
+The tag and its release archives must contain the exact source used for the
+binary, including build scripts, interface definitions, installation
+information and Kit's modifications. A binary must not be distributed while
+its corresponding tag or required source archives are inaccessible.
+
+Release legal status
+====================
+
+This notice preserves evidence; it does not itself decide licence
+compatibility. Internal distribution clearance
+`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-001` covers the exact six reviewed
+Android-SDK-licensed components in the Firebase Cloud Messaging path, the
+recorded Google terms, the official libsignal 0.97.4 pair and the reviewed
+application boundary. Release gates verify their hashes and the complete
+runtime inventory. Any recorded dependency, terms, architecture, libsignal
+licence or distribution-model trigger requires re-review before another
+binary is conveyed.
+
+libsignal
+=========
+
+This distribution incorporates these unmodified official artifacts:
+
+    org.signal:libsignal-android:0.97.4
+    SHA-256 95830032dcf066979a55d451a91a549a7d5d216f07b6d2cde955c85f7658084f
+
+    org.signal:libsignal-client:0.97.4
+    SHA-256 ce8f6b76c5b7fa3a8031ebe0e4abaf499f28e76b4eb9f6457d8a8d706d94b971
+
+libsignal is Copyright Signal Messenger, LLC and contributors and is licensed
+under AGPL-3.0-only. Its exact upstream source is tagged at:
+
+    https://github.com/signalapp/libsignal/tree/v0.97.4
+
+The reviewed tag resolves to commit:
+
+    b5121d07c72f9e631f178d907ca892587f64f9e2
+
+The mirrored GitHub source archive for that commit has SHA-256:
+
+    d0772dafdddb48e9c22a027140bfc7214c327cc51228c653da5f890f3c145f96
+
+Release publication must include or mirror the complete v0.97.4 libsignal source
+archive alongside Kit's corresponding source so recipients do not depend on a
+third party to keep it available. Kit Pay is not affiliated with or endorsed by
+Signal, and Signal does not support Kit's use of libsignal.
+
+Runtime inventory and bundled texts
+===================================
+
+The reviewed release graph identifies 188 Maven runtime components. The exact
+coordinate/licence matrix is distributed as THIRD_PARTY_LICENSES.md. Android's
+separate core-library desugaring input is recorded there as well.
+
+Complete or upstream-exact texts are bundled under assets/legal/:
+
+    AGPL-3.0-only.txt
+    APACHE-2.0.txt
+    LIVEKIT_NOTICE.txt
+    AUTH0_JWTDECODE_LICENSE.txt
+    SEMVER4J_LICENSE.txt
+    PROTOBUF_BSD-3-Clause.txt
+    WEBRTC_ANDROID_WRAPPER_MIT_LICENSE.txt
+    WEBRTC_FORK_BSD-3-Clause.txt
+    WEBRTC_FORK_APACHE_NOTICE.txt
+    WEBRTC_NATIVE_THIRD_PARTY_NOTICES.md
+    WEBRTC_BUILD_VERSIONS.txt
+    WEBRTC_PROVENANCE.json
+    MPL-2.0.txt
+    DESUGAR_JDK_LIBS_GPL-2.0.txt
+    DESUGAR_JDK_LIBS_ASSEMBLY_EXCEPTION.txt
+    DESUGAR_JDK_LIBS_ADDITIONAL_LICENSE_INFO.txt
+
+The build also retains licence/notice resources supplied inside resolved AARs
+and JARs. It generates GOOGLE_BUNDLED_THIRD_PARTY_NOTICES.txt from the Google
+AARs, preserving all 20 unique embedded blocks byte-for-byte, with their 27
+project labels, source-archive labels and content hashes.
+
+Apache-2.0 components
+=====================
+
+The runtime matrix identifies 175 Apache-2.0 components. The complete Apache
+License 2.0 is in APACHE-2.0.txt. Dependency-supplied notices are retained.
+
+The checked-in `africa.kit.livekit:livekit-android:2.27.0-kitpay.1` fork is
+Copyright 2021 LiveKit, Inc. and remains Apache-2.0. Fork commit
+0387bfe237332e049dfdeba55f44c905628c5e3e is based on upstream 2.27.0 commit
+5011da6fc302fefcdc869faecae2e07055f1c8c5 and removes the JAIN-SIP dependency.
+The exact AAR SHA-256 is:
+
+    875ca7e0a1b9768f414440d2889504d5192800840a385fbe94cd407096724a9b
+
+The checked-in full source archive SHA-256 is:
+
+    9f497ee396db5d1d18c1753155bc055beb35b3818e13b3b36c9829084c0e96e6
+
+Its Maven publication, full source/protocol archive, exact patch, provenance,
+licence and NOTICE are under third_party/livekit/. LIVEKIT_NOTICE.txt contains
+the required Shiguredo, sdpparser, WebRTC and Timber attributions.
+
+AudioSwitch at commit 039a35aefab7747c557242fa216c9ea11743b604 is
+Copyright 2020 Twilio Inc. and is licensed under Apache-2.0.
+
+MIT, BSD and WebRTC components
+===============================
+
+Auth0 JWTDecode 2.0.2 is Copyright 2016 Auth0 and is licensed under the MIT
+License. Its complete notice is in AUTH0_JWTDECODE_LICENSE.txt.
+
+semver4j 3.1.0 is Copyright 2015-present Vincent DURMONT and is licensed under
+the MIT License. Its complete notice is in SEMVER4J_LICENSE.txt.
+
+protobuf-javalite 3.22.0 and AndroidX's repackaged preferences external
+protobuf code use the BSD-3-Clause terms, Copyright 2008 Google Inc. The
+complete notice is in PROTOBUF_BSD-3-Clause.txt.
+
+io.github.webrtc-sdk:android-prefixed:144.7559.09 is a layered distribution,
+not a BSD/MIT contradiction. The Android packaging wrapper is MIT; the payload
+is the BSD-3-Clause WebRTC baseline with Apache-2.0 Shiguredo/LiveKit fork
+modifications and generated third-party terms. The reviewed evidence is:
+
+    Composite: BSD-3-Clause (WebRTC baseline) + Apache-2.0 (fork modifications) + generated third-party terms; MIT packaging wrapper
+
+The wrapper tag v144.7559.09 resolves to
+a46e9a7f63ce2b531252313f4e81754998e78f9a. Build tag m144.7559.09 resolves to
+6097d61fb396e7c990cf12094ac3147853377d2d and pins exact fork source commit
+b1800a61db8320af5c14456c13622d8b85b1ed39. WEBRTC_PROVENANCE.json records the
+GitHub Actions, release AAR, Maven AAR, POM, signature-key, class-relocation and
+four-ABI native byte-match evidence.
+
+The exact 214,439-byte M144 native/transitive notice set is in
+WEBRTC_NATIVE_THIRD_PARTY_NOTICES.md, SHA-256:
+
+    bb8a8a3c8c9898f79fa537d71273a10d700ba6f1205d81d3c9c525dfcd3ec93e
+
+The wrapper MIT licence, fork BSD-3-Clause licence, fork Apache-2.0 notice,
+complete Apache-2.0 text and exact build VERSIONS file are bundled separately
+under the filenames listed above.
+
+Mozilla Public License component
+================================
+
+OkHttp 4.12.0 includes data from the Public Suffix List. The embedded OkHttp
+notice identifies that data as Mozilla Public License 2.0 and remains packaged.
+The complete MPL-2.0 text is in MPL-2.0.txt.
+
+Core-library desugaring
+=======================
+
+com.android.tools:desugar_jdk_libs:2.1.5 is licensed under GPL-2.0 with the
+Classpath/assembly exceptions. The complete upstream GPL text, assembly
+exception and additional licensing information are bundled in the three
+DESUGAR_JDK_LIBS files listed above.
+
+Google SDK terms
+================
+
+Six resolved Google Play services and Firebase components in the Firebase
+Cloud Messaging dependency path declare the Android Software Development Kit
+License:
+
+    https://developer.android.com/studio/terms.html
+
+The exact coordinates appear in THIRD_PARTY_LICENSES.md. Their AAR-embedded
+third-party notices are preserved in GOOGLE_BUNDLED_THIRD_PARTY_NOTICES.txt.

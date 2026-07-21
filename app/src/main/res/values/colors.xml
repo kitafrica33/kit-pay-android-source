@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Kit brand palette. Single source of truth for XML resources;
+         Compose tokens live in ui/theme/Color.kt and must stay in sync. -->
+    <color name="kit_navy">#122D46</color>
+    <color name="kit_green">#34B98B</color>
+    <color name="kit_surface_light">#F6F8FA</color>
+    <color name="kit_surface_dark">#0B1D2E</color>
+</resources>
