@@ -32,7 +32,7 @@ Release legal status
 
 This notice preserves evidence; it does not itself decide licence
 compatibility. Internal distribution clearance
-`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-001` covers the exact six reviewed
+`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-002` covers the exact six reviewed
 Android-SDK-licensed components in the Firebase Cloud Messaging path, the
 recorded Google terms, the official libsignal 0.97.4 pair and the reviewed
 application boundary. Release gates verify their hashes and the complete

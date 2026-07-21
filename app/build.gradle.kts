@@ -392,7 +392,7 @@ android {
         applicationId = kitPayApplicationId
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
+        versionCode = 12
         versionName = "0.2.0"
 
         if (kitPaySideloadAbi != null) {

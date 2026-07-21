@@ -1,11 +1,11 @@
-# Kit Pay Android distribution clearance decision record
+# Kit Pay Android distribution clearance decision record — code 12
 
 - Document type: Third-Party License Compatibility Review
 - Decision classification: Internal Distribution Clearance Approval
-- Approval reference: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-001`
+- Approval reference: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-002`
 - Application: `com.kit.wallet`
 - Product: Kit Pay
-- Candidate version: `0.2.0` (`versionCode` 11)
+- Candidate version: `0.2.0` (`versionCode` 12)
 - Review date: 2026-07-21
 - Decision status: **CLEARED**
 
@@ -20,9 +20,22 @@ and Signal libsignal dependencies, subject to continued compliance with the cond
 documented in this decision record.
 
 This approval applies only to the exact dependency versions, hashes, application
-boundary, and licensing assumptions reviewed in this document.
+boundary, licensing assumptions, candidate identity, and release scope recorded in
+this document.
 
-## 2. Reviewed Google components
+## 2. Code-12 scope and reaffirmation
+
+Code 12 differs from the reviewed code-11 candidate only in public-source
+normalization, release validation, and version/release metadata. The reviewer
+reaffirms the reviewer metadata, reviewed artifacts, Google terms, rationale,
+conditions, and re-review triggers from decision
+`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-001` for this exact code-12 candidate.
+
+The historical code-11 decision remains preserved as its own candidate-bound record;
+this decision does not move, recreate, or authorize reuse of the code-11 release
+identity or tags.
+
+## 3. Reviewed Google components
 
 | Maven coordinate | AAR SHA-256 | POM SHA-256 |
 | --- | --- | --- |
@@ -33,12 +46,12 @@ boundary, and licensing assumptions reviewed in this document.
 | `com.google.android.gms:play-services-tasks:18.1.0` | `d60575eae39350e6234858bc9d7d775375707ae82a684e6caf7f3e41a12e25a2` | `cf29ed846108d7a8f2c17d8ef5b63399735757c5a09bb663d7e784e02ad84bcd` |
 | `com.google.firebase:firebase-iid-interop:17.1.0` | `0b7c3721c84b62e70415307239ed4a7f998989084bf2833f90b9f5bea3095a05` | `53f269f5e127ac21eba2d80a985abc8d2c8f24cdca9be0284448ee9ea343e34b` |
 
-## 3. Additional reviewed dependency
+## 4. Additional reviewed dependency
 
 The application links `org.signal:libsignal-android:0.97.4` and
 `org.signal:libsignal-client:0.97.4` under `AGPL-3.0-only`.
 
-## 4. Google terms reviewed
+## 5. Google terms reviewed
 
 - Terms: Android Software Development Kit License Agreement
 - URL: `https://developer.android.com/studio/terms`
@@ -47,7 +60,7 @@ The application links `org.signal:libsignal-android:0.97.4` and
 - Retrieved HTML SHA-256:
   `8bd88dc1144a7d12818687d680d6a9f9e8a2f1ee62c43a8e21f5c6a75f6977cd`
 
-## 5. Technical architecture review
+## 6. Technical architecture review
 
 The reviewed implementation:
 
@@ -61,7 +74,7 @@ The reviewed implementation:
 The application maintains a provider-neutral notification abstraction to allow future
 transport replacement without application-wide changes.
 
-## 6. AGPL compatibility determination
+## 7. AGPL compatibility determination
 
 The review considered AGPL-3.0 sections 5, 7, 10 and 12; combined-work,
 separate-work and System Library considerations; third-party licensing restrictions;
@@ -73,7 +86,7 @@ distributed under their applicable Google terms, while Kit Pay source obligation
 remain governed by the applicable AGPL requirements. No additional Signal permission
 is required for the reviewed libsignal usage.
 
-## 7. Distribution conditions
+## 8. Distribution conditions
 
 1. The exact reviewed dependency versions must remain unchanged.
 2. Any Google SDK or Firebase dependency change requires re-review.
@@ -83,7 +96,7 @@ is required for the reviewed libsignal usage.
 6. Any application-architecture change affecting third-party linking boundaries
    requires review.
 
-## 8. Re-review triggers
+## 9. Re-review triggers
 
 This approval expires or requires reassessment upon:
 
@@ -94,7 +107,7 @@ This approval expires or requires reassessment upon:
 - changes to the distribution model; or
 - introduction of additional proprietary SDKs.
 
-## 9. Final dependency verification required before release
+## 10. Final dependency verification required before release
 
 - [ ] Final minified AAB dependency inventory verified
 - [ ] Hashes matched against reviewed artifacts
@@ -105,13 +118,13 @@ This approval expires or requires reassessment upon:
 These release checks are performed by the release pipeline and do not mutate this
 decision record.
 
-## 10. Approval
+## 11. Approval
 
 - Reviewer name: Namisi Arnold Paul
 - Organization: Kit Pos Uganda Limited
 - Qualification: Chief Executive Officer (CEO) and Product Owner
 - Jurisdiction: Uganda
-- Approval reference identifier: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-001`
+- Approval reference identifier: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-002`
 - Review date: 2026-07-21
 - Final decision: **CLEARED**
 - Reviewer signature: Namisi Arnold Paul

@@ -3,4 +3,4 @@ useDefault = true
 
 [[allowlists]]
 description = "The release Firebase file is a schema-validated public Android client identifier, not a server credential."
-paths = ['''^config/firebase/google-services[.]json$''']
+paths = ['''(^|/)config/firebase/google-services[.]json$''']

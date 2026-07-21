@@ -3,13 +3,13 @@
 Audit snapshot: 2026-07-21  
 Application ID: `com.kit.wallet`  
 Version name: `0.2.0`  
-Version code: `11`  
+Version code: `12`  
 Distribution clearance: `true`  
 Distribution review disposition: `CLEARED`  
 Distribution review record type: `INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL`  
 Distribution review recorded date: `2026-07-21`  
 Distribution review date: `2026-07-21`  
-Distribution review reference: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-001`  
+Distribution review reference: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-002`  
 Distribution review issue IDs: `GOOGLE_ANDROID_SDK_AGPL_COMPATIBILITY`  
 Distribution reviewer name: `Namisi Arnold Paul`  
 Distribution reviewer organization: `Kit Pos Uganda Limited`  
@@ -21,8 +21,8 @@ Applicable terms effective date: `2026-04-28`
 Applicable terms retrieval date: `2026-07-20`  
 Applicable terms URL: `https://developer.android.com/studio/terms`  
 Applicable terms SHA-256: `8bd88dc1144a7d12818687d680d6a9f9e8a2f1ee62c43a8e21f5c6a75f6977cd`  
-Decision document: `docs/google-fcm-agpl-clearance-decision.md`  
-Decision document SHA-256: `572cdfc96a7fbd9e9f2bf9c9416abc0d6677fbe82f5a10e8f5804c9e985db963`  
+Decision document: `docs/google-fcm-agpl-clearance-decision-code12.md`  
+Decision document SHA-256: `699c8cc8671235bf2de907c8b0d2f679ffd25c1c9a0d51fa970ddaec80963b18`  
 Reviewed runtime inventory SHA-256: `4f63a48022e82f037a9c3e8de80d847f2a54b5948ce6f51be8a8863bd83ca330`  
 Reviewed runtime graph manifest SHA-256: `1602aeac63688c2dd85062b6b951aa58e7df1715b7da125b1f487efcf385a5a9`  
 Distribution conditions recorded: `6`  
@@ -50,7 +50,7 @@ The separate desugaring input is GPL-2.0 with the Classpath/assembly exceptions.
 ## Distribution clearance and continuing conditions
 
 The internal distribution clearance decision
-`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-001` records `CLEARED` for the
+`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-002` records `CLEARED` for the
 exact reviewed runtime. It is signed by Namisi Arnold Paul for Kit Pos Uganda Limited
 in the stated capacity of Chief Executive Officer (CEO) and Product Owner. The record
 is classified as an internal distribution clearance approval; it is not described as

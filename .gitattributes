@@ -1,5 +1,7 @@
 * text=auto eol=lf
 
+gradlew.bat text eol=lf
+
 *.gif binary
 *.aar binary
 *.gz binary

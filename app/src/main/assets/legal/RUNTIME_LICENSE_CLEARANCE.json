@@ -2,7 +2,7 @@
   "schema_version": 3,
   "application_id": "com.kit.wallet",
   "version_name": "0.2.0",
-  "version_code": 11,
+  "version_code": 12,
   "audit_date": "2026-07-21",
   "distribution_clearance": true,
   "unresolved_issue_ids": [],
@@ -11,7 +11,7 @@
     "record_type": "INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL",
     "recorded_date": "2026-07-21",
     "review_date": "2026-07-21",
-    "reference": "KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-001",
+    "reference": "KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-002",
     "issue_ids": [
       "GOOGLE_ANDROID_SDK_AGPL_COMPATIBILITY"
     ],
@@ -46,8 +46,8 @@
       "Introduction of additional proprietary SDKs."
     ],
     "rationale": "Based on the reviewed architecture and dependency usage, the distribution is approved. The Google client libraries are treated as independent third-party components distributed under their applicable Google terms, while Kit Pay source obligations remain governed by the applicable AGPL requirements. No additional Signal permission is required for the reviewed libsignal usage.",
-    "decision_document": "docs/google-fcm-agpl-clearance-decision.md",
-    "decision_document_sha256": "572cdfc96a7fbd9e9f2bf9c9416abc0d6677fbe82f5a10e8f5804c9e985db963",
+    "decision_document": "docs/google-fcm-agpl-clearance-decision-code12.md",
+    "decision_document_sha256": "699c8cc8671235bf2de907c8b0d2f679ffd25c1c9a0d51fa970ddaec80963b18",
     "reviewed_runtime_inventory_sha256": "4f63a48022e82f037a9c3e8de80d847f2a54b5948ce6f51be8a8863bd83ca330",
     "reviewed_runtime_graph_manifest_sha256": "1602aeac63688c2dd85062b6b951aa58e7df1715b7da125b1f487efcf385a5a9",
     "reviewed_artifacts": [
