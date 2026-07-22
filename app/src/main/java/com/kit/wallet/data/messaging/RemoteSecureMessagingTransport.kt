@@ -15,6 +15,7 @@ import com.kit.wallet.data.remote.MarkMessagingConversationReadRequest
 import com.kit.wallet.data.remote.MessagingConversationListDto
 import com.kit.wallet.data.remote.MessagingKeyStatusDto
 import com.kit.wallet.data.remote.MessagingReadReceiptDto
+import com.kit.wallet.data.remote.StoreMessagingHistoryEnvelopeRequest
 import com.kit.wallet.data.remote.SECURE_MESSAGING_ROSTER_REVISION
 import com.kit.wallet.data.remote.SECURE_MESSAGING_PROTOCOL_VERSION
 import com.kit.wallet.data.remote.SecureMessagingWireApi
@@ -24,6 +25,9 @@ import com.kit.wallet.data.remote.SecureMessagingWireValidator
 import com.kit.wallet.data.remote.ValidatedDirectConversation
 import com.kit.wallet.data.remote.ValidatedMessageDeliveryAcknowledgement
 import com.kit.wallet.data.remote.ValidatedMessagingDeviceRoster
+import com.kit.wallet.data.remote.ValidatedMessagingHistoryBackfillPage
+import com.kit.wallet.data.remote.ValidatedMessagingHistoryCandidate
+import com.kit.wallet.data.remote.ValidatedMessagingHistoryEnvelopeResult
 import com.kit.wallet.data.remote.ValidatedMessagingReadReceipt
 import com.kit.wallet.data.remote.ValidatedMessagingSyncEvent
 import com.kit.wallet.data.remote.ValidatedMessagingSyncPage
@@ -111,9 +115,15 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val clientMessageId: String,
             val senderUserId: String,
             val senderDeviceId: String,
+            val senderEnrollmentEpoch: Long?,
+            val senderSignalDeviceId: Int,
             val sentAt: Instant,
             val replyToMessageId: String?,
             val rosterRevision: String = "",
+            val isHistoryBackfill: Boolean = false,
+            val transferClientMessageId: String? = null,
+            val transferRosterRevision: String = rosterRevision,
+            val recipientEnrollmentEpoch: Long? = null,
             internal val kind: String,
             attachments: List<EncryptedAttachmentRequest>,
         ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt) {
@@ -162,6 +172,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val eventType: String,
             val affectedUserId: String,
             val affectedDeviceId: String?,
+            val affectedEnrollmentEpoch: Long?,
             val affectedSignalDeviceId: Int?,
             val affectedRegistrationId: Int?,
             val previousRegistrationId: Int?,
@@ -232,6 +243,49 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val sentAt: Instant,
         )
 
+        /** Opaque server-authorized original message that may receive one target-only envelope. */
+        class HistoryBackfillCandidate internal constructor(
+            private val owner: Session,
+            internal val issuanceIdentity: Any,
+            val messageId: String,
+            val clientMessageId: String,
+            val conversationId: String,
+            val senderUserId: String,
+            val senderDeviceId: String,
+            val senderEnrollmentEpoch: Long,
+            val senderSignalDeviceId: Int,
+            val rosterRevision: String,
+            val kind: String,
+            val replyToMessageId: String?,
+            val sentAt: Instant,
+        )
+
+        class HistoryBackfillPage internal constructor(
+            private val owner: Session,
+            internal val issuanceIdentity: Any,
+            val targetDeviceId: String,
+            val targetEnrollmentEpoch: Long,
+            val rosterRevision: String,
+            val nextAfter: String?,
+            val hasMore: Boolean,
+            candidates: List<HistoryBackfillCandidate>,
+        ) {
+            private val immutableCandidates = candidates.toList()
+
+            fun candidates(): List<HistoryBackfillCandidate> =
+                owner.snapshotHistoryCandidates(this, immutableCandidates)
+        }
+
+        class HistoryEnvelopeReceipt internal constructor(
+            private val owner: Session,
+            internal val issuanceIdentity: Any,
+            val messageId: String,
+            val targetDeviceId: String,
+            val targetEnrollmentEpoch: Long,
+            val transferClientMessageId: String,
+            val created: Boolean,
+        )
+
         class DeliveryAcknowledgement internal constructor(
             private val owner: Session,
             internal val issuanceIdentity: Any,
@@ -263,6 +317,20 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val rosterIdentity: Any,
             val conversationIdentity: Any,
             val outboundAllowed: Boolean,
+        )
+
+        private data class IssuedHistoryPage(
+            val identity: Any,
+            val conversationIdentity: Any,
+            val rosterIdentity: Any,
+            val validated: ValidatedMessagingHistoryBackfillPage,
+            val candidateIdentities: Set<Any>,
+        )
+
+        private data class IssuedHistoryCandidate(
+            val identity: Any,
+            val pageIdentity: Any,
+            val validated: ValidatedMessagingHistoryCandidate,
         )
 
         private enum class RosterUse { CURRENT_OUTBOUND, HISTORICAL_INBOUND }
@@ -318,6 +386,9 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         private val issuedConversations = WeakHashMap<DirectConversation, IssuedConversation>()
         private val issuedRosters = WeakHashMap<AuthoritativeRoster, IssuedRoster>()
         private val issuedPlans = WeakHashMap<SecureMessagingEncryptionPlan, IssuedPlan>()
+        private val issuedHistoryPages = WeakHashMap<HistoryBackfillPage, IssuedHistoryPage>()
+        private val issuedHistoryCandidates =
+            WeakHashMap<HistoryBackfillCandidate, IssuedHistoryCandidate>()
         private val issuedCheckpoints = WeakHashMap<SyncCheckpoint, IssuedCheckpoint>()
         private val issuedBatches = WeakHashMap<SyncBatch, IssuedBatch>()
         private val issuedEvents = WeakHashMap<SyncEvent, IssuedEvent>()
@@ -414,6 +485,9 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                     "Secure-messaging enrollment was not reconciled before lifecycle validation"
                 }
             }
+
+        private fun reconciledEnrollmentEpochOrNull(): Long? =
+            synchronized(issuanceLock) { reconciledKeyIdentity?.enrollmentEpoch }
 
         /** Withdraws an established handle, while initial sync revalidates before first publish. */
         internal fun beginReconciledKeyIdentityRevalidation():
@@ -673,6 +747,164 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             return issuePlan(conversation, roster, validatedConversation, issuedRoster, true)
         }
 
+        suspend fun historyBackfillCandidates(
+            conversation: DirectConversation,
+            roster: AuthoritativeRoster,
+            targetDeviceId: String,
+            targetEnrollmentEpoch: Long,
+            after: String? = null,
+            limit: Int = HISTORY_PAGE_SIZE,
+        ): HistoryBackfillPage {
+            val validatedConversation = requireConversation(conversation)
+            val issuedRoster = requireRoster(roster, conversation)
+            check(issuedRoster.use == RosterUse.CURRENT_OUTBOUND) {
+                "Historical rosters cannot authorize history transfer"
+            }
+            requireUuid(targetDeviceId, "history target device ID")
+            require(targetDeviceId != context.currentDeviceId) {
+                "History target cannot be the current device"
+            }
+            require(targetEnrollmentEpoch > 0) { "Invalid history target enrollment epoch" }
+            require(limit in 1..HISTORY_PAGE_SIZE) { "Invalid history candidate page limit" }
+            val currentEnrollmentEpoch = reconciledKeyIdentityResetTarget().enrollmentEpoch
+            val response = owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                messagingHistoryBackfillCandidates(
+                    conversationId = validatedConversation.conversationId,
+                    targetDeviceId = targetDeviceId,
+                    targetEnrollmentEpoch = targetEnrollmentEpoch,
+                    cursor = after,
+                    limit = limit,
+                )
+            }
+            val validated = SecureMessagingTransportValidator.validateHistoryBackfillCandidates(
+                response = response,
+                authoritativeRoster = issuedRoster.validated,
+                expectedConversationId = validatedConversation.conversationId,
+                expectedCurrentUserId = context.currentUserId,
+                expectedCurrentDeviceId = context.currentDeviceId,
+                expectedCurrentEnrollmentEpoch = currentEnrollmentEpoch,
+                expectedTargetDeviceId = targetDeviceId,
+                expectedTargetEnrollmentEpoch = targetEnrollmentEpoch,
+                requestedAfter = after,
+                requestedLimit = limit,
+            )
+            return issueHistoryPage(conversation, roster, validated)
+        }
+
+        fun historyBackfillEncryptionPlan(
+            conversation: DirectConversation,
+            roster: AuthoritativeRoster,
+            page: HistoryBackfillPage,
+        ): SecureMessagingEncryptionPlan {
+            val validatedConversation = requireConversation(conversation)
+            val issuedRoster = requireRoster(roster, conversation)
+            check(issuedRoster.use == RosterUse.CURRENT_OUTBOUND) {
+                "Historical rosters cannot authorize history transfer"
+            }
+            val issuedPage = requireHistoryPage(page, conversation, roster)
+            check(issuedPage.validated.conversationId == validatedConversation.conversationId) {
+                "History page belongs to another conversation"
+            }
+            check(issuedPage.validated.rosterRevision == issuedRoster.validated.rosterRevision) {
+                "History page belongs to another roster revision"
+            }
+            val plan = SecureMessagingCryptoWireMapper.historyBackfillEncryptionPlan(
+                roster = issuedRoster.validated,
+                targetDeviceId = issuedPage.validated.target.deviceId,
+                activation = activation,
+            )
+            synchronized(issuanceLock) {
+                issuedPlans[plan] = IssuedPlan(
+                    rosterIdentity = roster.issuanceIdentity,
+                    conversationIdentity = conversation.issuanceIdentity,
+                    outboundAllowed = true,
+                )
+            }
+            return plan
+        }
+
+        suspend fun storeHistoryEnvelope(
+            conversation: DirectConversation,
+            roster: AuthoritativeRoster,
+            page: HistoryBackfillPage,
+            candidate: HistoryBackfillCandidate,
+            encryptedSend: SecureMessagingEncryptedSend,
+        ): HistoryEnvelopeReceipt {
+            val validatedConversation = requireConversation(conversation)
+            val issuedRoster = requireRoster(roster, conversation)
+            val issuedPage = requireHistoryPage(page, conversation, roster)
+            val issuedCandidate = requireHistoryCandidate(candidate, issuedPage)
+            val send = SecureMessagingCryptoWireMapper.requireEncryptedSend(encryptedSend)
+            val current = SecureMessagingActivationProvenance.requireCurrent(
+                activation,
+                readyRequired = true,
+            )
+            check(current.isSameActivation(send.provenance)) {
+                "History ciphertext belongs to another authentication activation"
+            }
+            check(send.conversationId == validatedConversation.conversationId) {
+                "History ciphertext belongs to another conversation"
+            }
+            val wire = send.request()
+            check(wire.rosterRevision == issuedRoster.validated.rosterRevision) {
+                "History ciphertext belongs to another roster revision"
+            }
+            check(wire.replyToMessageId == null && wire.attachments.isEmpty()) {
+                "History wrapper cannot contain server-visible reply or attachment metadata"
+            }
+            val envelope = wire.envelopes.singleOrNull()
+                ?: error("History transfer requires exactly one target envelope")
+            check(envelope.recipientDeviceId == issuedPage.validated.target.deviceId) {
+                "History ciphertext targets another device"
+            }
+            val request = StoreMessagingHistoryEnvelopeRequest(
+                targetDeviceId = issuedPage.validated.target.deviceId,
+                targetEnrollmentEpoch = issuedPage.validated.target.enrollmentEpoch,
+                transferClientMessageId = wire.clientMessageId,
+                rosterRevision = wire.rosterRevision,
+                envelopeType = envelope.envelopeType,
+                ciphertext = envelope.ciphertext,
+            )
+            val expectedTransferId = SecureMessagingHistoryBackfillCodec.deterministicTransferId(
+                messageId = issuedCandidate.validated.messageId,
+                targetDeviceId = issuedPage.validated.target.deviceId,
+                targetEnrollmentEpoch = issuedPage.validated.target.enrollmentEpoch,
+                donorDeviceId = context.currentDeviceId,
+                donorEnrollmentEpoch = reconciledKeyIdentityResetTarget().enrollmentEpoch,
+                transferRosterRevision = issuedPage.validated.rosterRevision,
+            )
+            check(request.transferClientMessageId == expectedTransferId) {
+                "History ciphertext transfer identity is not deterministic for this enrollment"
+            }
+            val response = owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                storeMessagingHistoryEnvelope(
+                    conversationId = validatedConversation.conversationId,
+                    messageId = issuedCandidate.validated.messageId,
+                    request = request,
+                )
+            }
+            val validated = SecureMessagingTransportValidator.validateHistoryEnvelopeResult(
+                response = response,
+                expectedMessageId = issuedCandidate.validated.messageId,
+                expectedTargetDeviceId = issuedPage.validated.target.deviceId,
+                expectedTargetEnrollmentEpoch = issuedPage.validated.target.enrollmentEpoch,
+                expectedTransferClientMessageId = wire.clientMessageId,
+            )
+            return issueHistoryEnvelopeReceipt(validated)
+        }
+
         /** Issues a receive-only plan; historical rosters can never authorize an outbound send. */
         fun decryptionPlan(
             conversation: DirectConversation,
@@ -754,7 +986,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             check(incoming.conversationId == issuedRoster.validated.conversationId) {
                 "Incoming envelope belongs to another authoritative roster"
             }
-            check(incoming.message.rosterRevision == issuedRoster.validated.rosterRevision) {
+            check(incoming.message.transferRosterRevision == issuedRoster.validated.rosterRevision) {
                 "Incoming envelope belongs to another roster revision"
             }
             val request = SecureMessagingCryptoWireMapper.decryptionRequest(
@@ -831,6 +1063,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                     expectedClientMessageId = request.clientMessageId,
                     expectedCurrentUserId = context.currentUserId,
                     expectedCurrentDeviceId = context.currentDeviceId,
+                    expectedCurrentEnrollmentEpoch = reconciledEnrollmentEpochOrNull(),
                     expectedRosterRevision = request.rosterRevision,
                 ),
             )
@@ -987,6 +1220,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                     requestedCursor = request.cursor,
                     requestedLimit = limit,
                     previousEventId = request.previousEventId,
+                    currentEnrollmentEpoch = reconciledEnrollmentEpochOrNull(),
                 )
                 assertSyncAllowed()
                 issueSyncBatch(checkpoint, validated)
@@ -1077,11 +1311,13 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             }
             val committed = requireDurablyCommittedDecryption(decrypted)
             val expectedSender = SecureMessagingCryptoAddress(
-                userId = incoming.message.senderUserId,
-                serverDeviceId = incoming.message.senderDeviceId,
-                signalDeviceId = incoming.message.senderSignalDeviceId,
+                userId = incoming.message.cryptoSenderUserId,
+                serverDeviceId = incoming.message.cryptoSenderDeviceId,
+                signalDeviceId = incoming.message.cryptoSenderSignalDeviceId,
             )
-            check(committed.messageId == incoming.message.messageId) {
+            val expectedCryptoMessageId = incoming.message.transferClientMessageId
+                ?: incoming.message.messageId
+            check(committed.messageId == expectedCryptoMessageId) {
                 "Durably decrypted result belongs to another incoming message"
             }
             check(committed.conversationId == incoming.message.conversationId) {
@@ -1105,20 +1341,35 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val incoming = requireIncomingEnvelope(envelope)
             val durable = requireDurableLibSignalCompanionRecord(durableRecord)
             val expectedSender = SecureMessagingCryptoAddress(
-                userId = incoming.message.senderUserId,
-                serverDeviceId = incoming.message.senderDeviceId,
-                signalDeviceId = incoming.message.senderSignalDeviceId,
+                userId = incoming.message.cryptoSenderUserId,
+                serverDeviceId = incoming.message.cryptoSenderDeviceId,
+                signalDeviceId = incoming.message.cryptoSenderSignalDeviceId,
             )
+            val expectedCryptoMessageId = incoming.message.transferClientMessageId
+                ?: incoming.message.messageId
+            val expectedCryptoClientMessageId = incoming.message.transferClientMessageId
+                ?: incoming.message.clientMessageId
             check(durable.direction == LibSignalCompanionDirection.INBOUND) {
                 "Durable projection is not an incoming secure message"
             }
             check(
-                durable.messageId == incoming.message.messageId &&
-                    durable.clientMessageId == incoming.message.clientMessageId &&
+                durable.recordNamespace == if (incoming.message.isHistoryBackfill) {
+                    SecureMessagingProjectionStore.HISTORY_COMPANION_NAMESPACE
+                } else {
+                    SecureMessagingProjectionStore.COMPANION_NAMESPACE
+                },
+            ) { "Durable incoming projection belongs to another message-state namespace" }
+            check(
+                durable.messageId == expectedCryptoMessageId &&
+                    durable.clientMessageId == expectedCryptoClientMessageId &&
                     durable.conversationId == incoming.message.conversationId &&
-                    durable.rosterRevision == incoming.message.rosterRevision &&
+                    durable.rosterRevision == incoming.message.transferRosterRevision &&
                     durable.sender == expectedSender &&
-                    durable.replyToMessageId == incoming.message.replyToMessageId &&
+                    durable.replyToMessageId == if (incoming.message.isHistoryBackfill) {
+                        null
+                    } else {
+                        incoming.message.replyToMessageId
+                    } &&
                     durable.ciphertextFanout().isEmpty(),
             ) { "Durable incoming projection does not match the authenticated envelope" }
             return issueDeliveryToken(envelope, incoming)
@@ -1204,6 +1455,107 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 issued.validated
             }
         }
+
+        private fun issueHistoryPage(
+            conversation: DirectConversation,
+            roster: AuthoritativeRoster,
+            validated: ValidatedMessagingHistoryBackfillPage,
+        ): HistoryBackfillPage {
+            val pageIdentity = Any()
+            val candidatePairs = validated.messages.map { item ->
+                val identity = Any()
+                HistoryBackfillCandidate(
+                    owner = this,
+                    issuanceIdentity = identity,
+                    messageId = item.messageId,
+                    clientMessageId = item.clientMessageId,
+                    conversationId = item.conversationId,
+                    senderUserId = item.senderUserId,
+                    senderDeviceId = item.senderDeviceId,
+                    senderEnrollmentEpoch = item.senderEnrollmentEpoch,
+                    senderSignalDeviceId = item.senderSignalDeviceId,
+                    rosterRevision = item.rosterRevision,
+                    kind = item.kind,
+                    replyToMessageId = item.replyToMessageId,
+                    sentAt = item.sentAt,
+                ) to IssuedHistoryCandidate(identity, pageIdentity, item)
+            }
+            val page = HistoryBackfillPage(
+                owner = this,
+                issuanceIdentity = pageIdentity,
+                targetDeviceId = validated.target.deviceId,
+                targetEnrollmentEpoch = validated.target.enrollmentEpoch,
+                rosterRevision = validated.rosterRevision,
+                nextAfter = validated.nextCursor,
+                hasMore = validated.hasMore,
+                candidates = candidatePairs.map { it.first },
+            )
+            synchronized(issuanceLock) {
+                requireConversation(conversation)
+                requireRoster(roster, conversation)
+                candidatePairs.forEach { (handle, issued) ->
+                    issuedHistoryCandidates[handle] = issued
+                }
+                issuedHistoryPages[page] = IssuedHistoryPage(
+                    identity = pageIdentity,
+                    conversationIdentity = conversation.issuanceIdentity,
+                    rosterIdentity = roster.issuanceIdentity,
+                    validated = validated,
+                    candidateIdentities = candidatePairs.mapTo(mutableSetOf()) {
+                        it.second.identity
+                    },
+                )
+            }
+            return page
+        }
+
+        private fun requireHistoryPage(
+            page: HistoryBackfillPage,
+            conversation: DirectConversation,
+            roster: AuthoritativeRoster,
+        ): IssuedHistoryPage {
+            lifecycle.assertCurrent(activation)
+            return synchronized(issuanceLock) {
+                val issued = issuedHistoryPages[page]
+                    ?: error("History page was not issued by this secure-messaging session")
+                check(issued.identity === page.issuanceIdentity) {
+                    "History page was not issued by this secure-messaging session"
+                }
+                check(issued.conversationIdentity === conversation.issuanceIdentity) {
+                    "History page belongs to another conversation handle"
+                }
+                check(issued.rosterIdentity === roster.issuanceIdentity) {
+                    "History page belongs to another authoritative roster"
+                }
+                issued
+            }
+        }
+
+        private fun requireHistoryCandidate(
+            candidate: HistoryBackfillCandidate,
+            page: IssuedHistoryPage,
+        ): IssuedHistoryCandidate = synchronized(issuanceLock) {
+            val issued = issuedHistoryCandidates[candidate]
+                ?: error("History candidate was not issued by this secure-messaging session")
+            check(
+                issued.identity === candidate.issuanceIdentity &&
+                    issued.pageIdentity === page.identity &&
+                    issued.identity in page.candidateIdentities,
+            ) { "History candidate belongs to another candidate page" }
+            issued
+        }
+
+        private fun issueHistoryEnvelopeReceipt(
+            validated: ValidatedMessagingHistoryEnvelopeResult,
+        ): HistoryEnvelopeReceipt = HistoryEnvelopeReceipt(
+            owner = this,
+            issuanceIdentity = Any(),
+            messageId = validated.messageId,
+            targetDeviceId = validated.targetDeviceId,
+            targetEnrollmentEpoch = validated.targetEnrollmentEpoch,
+            transferClientMessageId = validated.transferClientMessageId,
+            created = validated.created,
+        )
 
         private fun issueRoster(
             conversation: DirectConversation,
@@ -1438,8 +1790,14 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 clientMessageId = validated.message.clientMessageId,
                 senderUserId = validated.message.senderUserId,
                 senderDeviceId = validated.message.senderDeviceId,
+                senderEnrollmentEpoch = validated.message.senderEnrollmentEpoch,
+                senderSignalDeviceId = validated.message.senderSignalDeviceId,
                 sentAt = validated.message.sentAt,
                 rosterRevision = validated.message.rosterRevision,
+                isHistoryBackfill = validated.message.isHistoryBackfill,
+                transferClientMessageId = validated.message.transferClientMessageId,
+                transferRosterRevision = validated.message.transferRosterRevision,
+                recipientEnrollmentEpoch = validated.message.recipientEnrollmentEpoch,
                 replyToMessageId = validated.message.replyToMessageId,
                 kind = validated.message.kind,
                 attachments = validated.message.attachments(),
@@ -1483,6 +1841,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 eventType = validated.refresh.eventType,
                 affectedUserId = validated.refresh.userId,
                 affectedDeviceId = validated.refresh.deviceId,
+                affectedEnrollmentEpoch = validated.refresh.enrollmentEpoch,
                 affectedSignalDeviceId = validated.refresh.signalDeviceId,
                 affectedRegistrationId = validated.refresh.registrationId,
                 previousRegistrationId = validated.refresh.previousRegistrationId,
@@ -1512,6 +1871,30 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 "Sync batch was not issued by this secure-messaging session"
             }
             return issued
+        }
+
+        private fun snapshotHistoryCandidates(
+            page: HistoryBackfillPage,
+            candidates: List<HistoryBackfillCandidate>,
+        ): List<HistoryBackfillCandidate> {
+            lifecycle.assertCurrent(activation)
+            synchronized(issuanceLock) {
+                val issuedPage = issuedHistoryPages[page]
+                    ?: error("History page was not issued by this secure-messaging session")
+                check(issuedPage.identity === page.issuanceIdentity) {
+                    "History page was not issued by this secure-messaging session"
+                }
+                check(
+                    issuedPage.candidateIdentities.size == candidates.size &&
+                        candidates.all { candidate ->
+                            val issued = issuedHistoryCandidates[candidate] ?: return@all false
+                            issued.identity === candidate.issuanceIdentity &&
+                                issued.pageIdentity === issuedPage.identity &&
+                                issued.identity in issuedPage.candidateIdentities
+                        },
+                ) { "History candidate snapshot changed" }
+            }
+            return candidates.toList()
         }
 
         private fun snapshotEvents(
@@ -1623,6 +2006,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         private companion object {
             const val MAX_RECIPIENT_DEVICES = 99
             const val MAX_DELIVERY_ACK_BATCH = 100
+            const val HISTORY_PAGE_SIZE = 50
         }
     }
 

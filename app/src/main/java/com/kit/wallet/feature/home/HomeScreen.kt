@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -31,11 +32,15 @@ import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -44,6 +49,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -60,6 +66,7 @@ import com.kit.wallet.ui.model.Transaction
 import com.kit.wallet.ui.model.UserProfile
 import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
+import kotlinx.coroutines.launch
 
 @Composable
 fun HomeScreen(
@@ -81,13 +88,15 @@ fun HomeScreen(
     val balanceMinor by viewModel.balanceMinor.collectAsStateWithLifecycle()
     val recent by viewModel.recentTransactions.collectAsStateWithLifecycle()
     val favorites by viewModel.favorites.collectAsStateWithLifecycle()
+    val snackbarHostState = remember { SnackbarHostState() }
 
-    HomeContent(
+    HomeDashboard(
         profile = profile,
         balanceMinor = balanceMinor,
         capabilities = capabilities,
         favorites = favorites,
         recent = recent,
+        snackbarHostState = snackbarHostState,
         onSend = onSend,
         onReceive = onReceive,
         onScan = onScan,
@@ -100,6 +109,73 @@ fun HomeScreen(
         onAllTransactions = onAllTransactions,
         onTransaction = onTransaction,
     )
+}
+
+@Composable
+internal fun HomeDashboard(
+    profile: UserProfile,
+    balanceMinor: Long,
+    capabilities: AppCapabilities,
+    favorites: List<Contact>,
+    recent: List<Transaction>,
+    snackbarHostState: SnackbarHostState,
+    onSend: () -> Unit,
+    onReceive: () -> Unit,
+    onScan: () -> Unit,
+    onBills: () -> Unit,
+    onAirtime: () -> Unit,
+    onBank: () -> Unit,
+    onMobileMoney: () -> Unit,
+    onRequest: () -> Unit,
+    onKyc: () -> Unit,
+    onAllTransactions: () -> Unit,
+    onTransaction: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val dispatch: (HomeAction, () -> Unit) -> Unit = { action, onAvailable ->
+        val access = capabilities.homeActionAccess(action)
+        if (access.available) {
+            onAvailable()
+        } else {
+            scope.launch {
+                snackbarHostState.currentSnackbarData?.dismiss()
+                snackbarHostState.showSnackbar(access.unavailableMessage)
+            }
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        HomeContent(
+            profile = profile,
+            balanceMinor = balanceMinor,
+            capabilities = capabilities,
+            favorites = favorites,
+            recent = recent,
+            onSend = { dispatch(HomeAction.SEND_MONEY, onSend) },
+            onReceive = { dispatch(HomeAction.RECEIVE_MONEY, onReceive) },
+            onScan = { dispatch(HomeAction.SCAN_QR, onScan) },
+            onBills = { dispatch(HomeAction.PAY_BILLS, onBills) },
+            onAirtime = { dispatch(HomeAction.BUY_AIRTIME, onAirtime) },
+            onBank = { dispatch(HomeAction.BANK, onBank) },
+            onMobileMoney = { dispatch(HomeAction.MOBILE_MONEY, onMobileMoney) },
+            onRequest = { dispatch(HomeAction.REQUEST_MONEY, onRequest) },
+            onKyc = { dispatch(HomeAction.VERIFY_IDENTITY, onKyc) },
+            onFavorite = { dispatch(HomeAction.FAVORITE_SEND, onSend) },
+            onAllTransactions = {
+                dispatch(HomeAction.ALL_TRANSACTIONS, onAllTransactions)
+            },
+            onTransaction = { id ->
+                dispatch(HomeAction.TRANSACTION_DETAIL) { onTransaction(id) }
+            },
+        )
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(16.dp),
+        )
+    }
 }
 
 @Composable
@@ -118,6 +194,7 @@ private fun HomeContent(
     onMobileMoney: () -> Unit,
     onRequest: () -> Unit,
     onKyc: () -> Unit,
+    onFavorite: () -> Unit,
     onAllTransactions: () -> Unit,
     onTransaction: (String) -> Unit,
 ) {
@@ -149,10 +226,11 @@ private fun HomeContent(
                             style = MaterialTheme.typography.titleMedium,
                         )
                     }
-                    if (capabilities.qrPaymentsUsable) {
-                        IconButton(onClick = onScan) {
-                            Icon(Icons.Rounded.QrCodeScanner, contentDescription = "Scan QR")
-                        }
+                    IconButton(
+                        onClick = onScan,
+                        modifier = Modifier.testTag(HomeAction.SCAN_QR.testTag),
+                    ) {
+                        Icon(Icons.Rounded.QrCodeScanner, contentDescription = "Scan QR")
                     }
                 }
             }
@@ -161,15 +239,6 @@ private fun HomeContent(
                 if (walletEnabled) {
                     BalanceCard(
                         balanceMinor = balanceMinor,
-                        sendAvailable = capabilities.allEnabled(
-                            KitFeature.WALLETS,
-                            KitFeature.INTERNAL_TRANSFERS,
-                        ),
-                        receiveAvailable = capabilities.receiveQrUsable,
-                        requestAvailable = capabilities.allEnabled(
-                            KitFeature.WALLETS,
-                            KitFeature.PAYMENT_REQUESTS,
-                        ),
                         onSend = onSend,
                         onReceive = onReceive,
                         onRequest = onRequest,
@@ -203,6 +272,7 @@ private fun HomeContent(
                         modifier = Modifier
                             .padding(horizontal = 20.dp, vertical = 12.dp)
                             .fillMaxWidth()
+                            .testTag(HomeAction.VERIFY_IDENTITY.testTag)
                             .clickable(onClick = onKyc),
                     ) {
                         Row(
@@ -231,39 +301,37 @@ private fun HomeContent(
                 }
             }
 
-            if (listOf(
-                    KitFeature.BILLS,
-                    KitFeature.AIRTIME,
-                    KitFeature.BANK_TRANSFERS,
-                    KitFeature.MOBILE_MONEY,
-                )
-                    .any(capabilities::enabled)
-            ) {
-                item {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 20.dp, vertical = 20.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        if (capabilities.enabled(KitFeature.BILLS)) {
-                            QuickAction(Icons.Rounded.Receipt, "Pay bills", onBills, Modifier.weight(1f))
-                        }
-                        if (capabilities.enabled(KitFeature.AIRTIME)) {
-                            QuickAction(Icons.Rounded.SimCard, "Airtime", onAirtime, Modifier.weight(1f))
-                        }
-                        if (capabilities.enabled(KitFeature.BANK_TRANSFERS)) {
-                            QuickAction(Icons.Rounded.AccountBalance, "Bank", onBank, Modifier.weight(1f))
-                        }
-                        if (capabilities.enabled(KitFeature.MOBILE_MONEY)) {
-                            QuickAction(
-                                Icons.Rounded.PhoneAndroid,
-                                "Mobile money",
-                                onMobileMoney,
-                                Modifier.weight(1f),
-                            )
-                        }
-                    }
+            item {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 20.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    QuickAction(
+                        Icons.Rounded.Receipt,
+                        "Pay bills",
+                        onBills,
+                        Modifier.weight(1f).testTag(HomeAction.PAY_BILLS.testTag),
+                    )
+                    QuickAction(
+                        Icons.Rounded.SimCard,
+                        "Airtime",
+                        onAirtime,
+                        Modifier.weight(1f).testTag(HomeAction.BUY_AIRTIME.testTag),
+                    )
+                    QuickAction(
+                        Icons.Rounded.AccountBalance,
+                        "Bank",
+                        onBank,
+                        Modifier.weight(1f).testTag(HomeAction.BANK.testTag),
+                    )
+                    QuickAction(
+                        Icons.Rounded.PhoneAndroid,
+                        "Mobile money",
+                        onMobileMoney,
+                        Modifier.weight(1f).testTag(HomeAction.MOBILE_MONEY.testTag),
+                    )
                 }
             }
 
@@ -279,7 +347,8 @@ private fun HomeContent(
                                 horizontalAlignment = Alignment.CenterHorizontally,
                                 modifier = Modifier
                                     .clip(MaterialTheme.shapes.medium)
-                                    .clickable(onClick = onSend)
+                                    .testTag("${HomeAction.FAVORITE_SEND.testTag}-${contact.id}")
+                                    .clickable(onClick = onFavorite)
                                     .padding(6.dp),
                             ) {
                                 KitAvatar(contact.name, size = 52.dp)
@@ -305,7 +374,13 @@ private fun HomeContent(
                 }
 
                 items(recent.size) { i ->
-                    TransactionRow(tx = recent[i], onClick = { onTransaction(recent[i].id) })
+                    TransactionRow(
+                        tx = recent[i],
+                        onClick = { onTransaction(recent[i].id) },
+                        modifier = Modifier.testTag(
+                            "${HomeAction.TRANSACTION_DETAIL.testTag}-${recent[i].id}",
+                        ),
+                    )
                 }
             }
 
@@ -323,9 +398,6 @@ internal fun shouldPromptForIdentityVerification(
 @Composable
 private fun BalanceCard(
     balanceMinor: Long,
-    sendAvailable: Boolean,
-    receiveAvailable: Boolean,
-    requestAvailable: Boolean,
     onSend: () -> Unit,
     onReceive: () -> Unit,
     onRequest: () -> Unit,
@@ -368,34 +440,26 @@ private fun BalanceCard(
             }
         }
         Spacer(Modifier.height(18.dp))
-        if (sendAvailable || receiveAvailable || requestAvailable) {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (sendAvailable) {
-                    BalanceAction(
-                        Icons.AutoMirrored.Rounded.CallMade,
-                        "Send",
-                        onSend,
-                        Modifier.weight(1f),
-                        prominent = true,
-                    )
-                }
-                if (receiveAvailable) {
-                    BalanceAction(
-                        Icons.AutoMirrored.Rounded.CallReceived,
-                        "Receive",
-                        onReceive,
-                        Modifier.weight(1f),
-                    )
-                }
-                if (requestAvailable) {
-                    BalanceAction(
-                        Icons.Rounded.RequestPage,
-                        "Request",
-                        onRequest,
-                        Modifier.weight(1f),
-                    )
-                }
-            }
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            BalanceAction(
+                Icons.AutoMirrored.Rounded.CallMade,
+                "Send",
+                onSend,
+                Modifier.weight(1f).testTag(HomeAction.SEND_MONEY.testTag),
+                prominent = true,
+            )
+            BalanceAction(
+                Icons.AutoMirrored.Rounded.CallReceived,
+                "Receive",
+                onReceive,
+                Modifier.weight(1f).testTag(HomeAction.RECEIVE_MONEY.testTag),
+            )
+            BalanceAction(
+                Icons.Rounded.RequestPage,
+                "Request",
+                onRequest,
+                Modifier.weight(1f).testTag(HomeAction.REQUEST_MONEY.testTag),
+            )
         }
     }
 }
@@ -462,7 +526,7 @@ private fun QuickAction(
 @Composable
 private fun HomePreview() {
     KitWalletTheme {
-        HomeContent(
+        HomeDashboard(
             profile = UserProfile(DemoData.USER_NAME, DemoData.USER_PHONE, "@amina", "KYC verified • Level 2"),
             balanceMinor = DemoData.WALLET_BALANCE_MINOR,
             capabilities = AppCapabilities(
@@ -484,6 +548,7 @@ private fun HomePreview() {
             ),
             favorites = DemoData.contacts.filter { it.favorite },
             recent = DemoData.transactions.take(5),
+            snackbarHostState = remember { SnackbarHostState() },
             onSend = {}, onReceive = {}, onScan = {}, onBills = {}, onAirtime = {},
             onBank = {}, onRequest = {}, onAllTransactions = {}, onTransaction = {},
             onMobileMoney = {}, onKyc = {},

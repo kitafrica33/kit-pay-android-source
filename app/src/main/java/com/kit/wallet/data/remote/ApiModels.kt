@@ -131,6 +131,7 @@ data class TwoFactorVerifyRequest(
 @JsonClass(generateAdapter = false)
 data class RefreshSessionRequest(
     @Json(name = "refresh_token") val refreshToken: String,
+    @Json(name = "refresh_replay_nonce") val refreshReplayNonce: String,
 )
 
 @JsonClass(generateAdapter = false)
@@ -486,6 +487,11 @@ data class StartCallRequest(
     @Json(name = "recipient_user_ids") val recipientUserIds: List<String>,
     val type: String,
     @Json(name = "conversation_id") val conversationId: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class InviteCallRequest(
+    @Json(name = "recipient_user_ids") val recipientUserIds: List<String>,
 )
 
 @JsonClass(generateAdapter = false)

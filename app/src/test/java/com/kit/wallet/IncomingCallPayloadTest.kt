@@ -19,6 +19,7 @@ class IncomingCallPayloadTest {
                 "call_type" to "video",
                 "video" to "true",
                 "initiator_name" to "  Grace & Amina  ",
+                "initiator_user_id" to "86d5c9b8-4c19-4f14-91a7-28c2500049d1",
                 "ring_expires_at" to "2026-07-17T18:00:00Z",
             ),
         )
@@ -26,6 +27,7 @@ class IncomingCallPayloadTest {
         requireNotNull(payload)
         assertEquals(callId, payload.callId)
         assertEquals("Grace & Amina", payload.callerName)
+        assertEquals("86d5c9b8-4c19-4f14-91a7-28c2500049d1", payload.callerUserId)
         assertTrue(payload.video)
         assertEquals("2026-07-17T18:00:00Z", payload.ringExpiresAt)
 
@@ -52,6 +54,34 @@ class IncomingCallPayloadTest {
         requireNotNull(payload)
         assertEquals("Kit Pay contact", payload.callerName)
         assertFalse(payload.video)
+    }
+
+    @Test
+    fun `ringing payload exposes the validated caller user id for call-waiting merge`() {
+        val callerId = "6f9619ff-8b86-d011-b42d-00cf4fc964ff"
+        val payload = IncomingCallPayload.fromData(
+            mapOf(
+                "type" to "call.ringing",
+                "call_id" to callId,
+                "call_type" to "voice",
+                "initiator_name" to "Grace",
+                "initiator_user_id" to callerId.uppercase(),
+            ),
+        )
+
+        requireNotNull(payload)
+        assertEquals(callerId, payload.callerUserId)
+
+        // A malformed caller id is dropped rather than trusted for the invite/merge call.
+        val malformed = IncomingCallPayload.fromData(
+            mapOf(
+                "type" to "call.ringing",
+                "call_id" to callId,
+                "call_type" to "voice",
+                "initiator_user_id" to "not-a-uuid",
+            ),
+        )
+        assertNull(malformed?.callerUserId)
     }
 
     @Test

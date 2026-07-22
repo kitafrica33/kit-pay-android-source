@@ -73,19 +73,26 @@ class AuthTokenRefresher @Inject constructor(
         val result = try {
             apiCalls.execute {
                 refreshApi.get()
-                    .refresh(current.sessionId, RefreshSessionRequest(current.refreshToken))
+                    .refresh(
+                        current.sessionId,
+                        RefreshSessionRequest(
+                            refreshToken = current.refreshToken,
+                            refreshReplayNonce = current.refreshReplayNonce,
+                        ),
+                    )
             }
         } catch (error: KitWalletApiException) {
-            if (error.isDefinitiveRefreshRejection()) {
-                return SessionRefreshResult.Rejected(error.code)
+            if (error.isDefinitiveSessionRejection()) {
+                return SessionRefreshResult.Rejected(error)
             }
             throw error
         }
-        val session = result.session
-            ?: return SessionRefreshResult.Rejected(code = null)
+        val session = checkNotNull(result.session) {
+            "Successful session refresh omitted credentials"
+        }
         val user = result.user
         if (current.accountId != null && user != null && user.id != current.accountId) {
-            return SessionRefreshResult.Rejected(code = null)
+            error("Session refresh returned a different account")
         }
         val setupState = if (user == null) {
             current.profileSetupState
@@ -98,7 +105,7 @@ class AuthTokenRefresher @Inject constructor(
         }
 
         return SessionRefreshResult.Refreshed(
-            SessionTokens(
+            tokens = SessionTokens(
                 accessToken = session.accessToken,
                 refreshToken = session.refreshToken,
                 sessionId = session.sessionId,
@@ -109,26 +116,32 @@ class AuthTokenRefresher @Inject constructor(
                 cacheScopeId = current.cacheScopeId,
                 profileSetupState = setupState,
                 messagingResetProof = current.messagingResetProof,
+                refreshReplayNonce = java.util.UUID.randomUUID().toString(),
             ),
+            user = user,
         )
     }
 
-    private fun KitWalletApiException.isDefinitiveRefreshRejection(): Boolean =
-        statusCode == 401 || code in DEFINITIVE_REFRESH_REJECTION_CODES
-
-    private companion object {
-        val DEFINITIVE_REFRESH_REJECTION_CODES = setOf(
-            "REFRESH_TOKEN_INVALID",
-            "REFRESH_TOKEN_REUSED",
-            "REFRESH_TOKEN_EXPIRED",
-            "SESSION_REVOKED",
-        )
-    }
 }
 
+/** Only an authenticated backend 401 with a documented terminal code may erase local state. */
+internal fun KitWalletApiException.isDefinitiveSessionRejection(): Boolean =
+    statusCode == 401 && code in DEFINITIVE_SESSION_REJECTION_CODES
+
+private val DEFINITIVE_SESSION_REJECTION_CODES = setOf(
+    "REFRESH_TOKEN_INVALID",
+    "REFRESH_TOKEN_REUSED",
+    "REFRESH_TOKEN_EXPIRED",
+    "SESSION_REVOKED",
+)
+
 internal sealed interface SessionRefreshResult {
-    data class Refreshed(val tokens: SessionTokens) : SessionRefreshResult
-    data class Rejected(val code: String?) : SessionRefreshResult
+    data class Refreshed(
+        val tokens: SessionTokens,
+        val user: UserDto? = null,
+    ) : SessionRefreshResult
+
+    data class Rejected(val error: KitWalletApiException) : SessionRefreshResult
 }
 
 /** Serializes every one-time refresh-token rotation across OkHttp and explicit recovery calls. */
@@ -197,10 +210,16 @@ class SessionAuthenticator @Inject constructor(
 
     private suspend fun invalidate(failedSession: SessionTokens) {
         var failure: Throwable? = null
+        var targetCleared = false
         try {
-            sessions.clearIfCurrent(failedSession.fence())
+            targetCleared = sessions.clearIfCredentialsCurrent(failedSession)
         } catch (error: Throwable) {
             failure = error
+            targetCleared = sessions.current() == null
+        }
+        if (!targetCleared) {
+            failure?.let { throw it }
+            return
         }
         try {
             // The owner check prevents a late failure from deleting a newer account's rows.

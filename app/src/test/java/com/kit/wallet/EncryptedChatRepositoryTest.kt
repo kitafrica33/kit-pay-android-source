@@ -6,6 +6,7 @@ import com.kit.wallet.data.repository.AuthenticatedProjectedText
 import com.kit.wallet.data.repository.AuthenticatedProjectionPage
 import com.kit.wallet.data.repository.AuthenticatedTextDeliveryState
 import com.kit.wallet.data.repository.EncryptedChatRepository
+import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.SecureMessagingChatRuntime
 import com.kit.wallet.data.repository.projectionIsFromCurrentUser
 import com.kit.wallet.ui.model.Contact
@@ -202,6 +203,30 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `saved address book name overrides the registered conversation name`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "Registered Flora")
+        }
+        val localContacts = MutableStateFlow(
+            listOf(
+                Contact(
+                    id = USER_ONE,
+                    name = "Flora from my phone",
+                    phone = "+256761146015",
+                    isKitUser = true,
+                    registeredName = "Registered Flora",
+                    savedInDevice = true,
+                ),
+            ),
+        )
+        val repository = repository(runtime, localContacts)
+
+        runCurrent()
+
+        assertEquals("Flora from my phone", repository.chats.value.single().name)
+    }
+
+    @Test
     fun `explicit lost response retry reuses one durable pending projection and normalized text`() = runTest {
         val runtime = FakeRuntime(sendScenario = SendScenario.LOST_RESPONSE).apply {
             conversations += conversation(CONVERSATION_ONE, "Grace")
@@ -264,9 +289,17 @@ class EncryptedChatRepositoryTest {
         assertEquals(2, messages.map { it.id }.distinct().size)
     }
 
-    private fun kotlinx.coroutines.test.TestScope.repository(runtime: FakeRuntime) =
+    private fun kotlinx.coroutines.test.TestScope.repository(
+        runtime: FakeRuntime,
+        contactState: MutableStateFlow<List<Contact>> = MutableStateFlow(emptyList()),
+    ) =
         EncryptedChatRepository(
             runtime = runtime,
+            contacts = object : ContactRepository {
+                override val contacts: StateFlow<List<Contact>> = contactState
+                override suspend fun refresh() = Unit
+                override suspend fun syncDeviceContacts() = Unit
+            },
             scope = backgroundScope,
             clock = Clock.fixed(Instant.parse("2026-07-20T12:00:00Z"), ZoneOffset.UTC),
         )

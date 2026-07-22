@@ -242,6 +242,8 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
             bindingResolver.assertCurrent(binding)
             processor.recoverPendingOutbox(active.transport)
             bindingResolver.assertCurrent(binding)
+            processor.recoverPendingHistory(active.transport)
+            bindingResolver.assertCurrent(binding)
             return@withLock
         }
     }

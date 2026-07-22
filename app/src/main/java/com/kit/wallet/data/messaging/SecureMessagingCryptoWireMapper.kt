@@ -162,6 +162,7 @@ internal class SecureMessagingDecryptionRequestSnapshot(
     val envelopeKind: SecureMessagingEnvelopeKind,
     ciphertext: ByteArray,
     val replyToMessageId: String?,
+    val isHistoryBackfill: Boolean,
     val provenance: SecureMessagingActivationProvenance,
 ) {
     private val opaqueCiphertext = OpaqueCryptoBytes.copyOf(ciphertext)
@@ -293,6 +294,67 @@ object SecureMessagingCryptoWireMapper {
                 },
                 provenance = provenance,
                 planIdentity = identity,
+            ),
+        )
+    }
+
+    /**
+     * Issues a one-recipient plan for re-encrypting authenticated retained history to another
+     * currently enrolled device of the same account. The complete roster is still validated and
+     * retained for sender/key binding; only ratchet advancement is narrowed to the target device.
+     */
+    fun historyBackfillEncryptionPlan(
+        roster: ValidatedMessagingDeviceRoster,
+        targetDeviceId: String,
+        activation: SecureMessagingActivationCapability,
+    ): SecureMessagingEncryptionPlan {
+        val provenance = SecureMessagingActivationProvenance.requireCurrent(activation)
+        val validatedRoster = SecureMessagingWireValidator.requireValidatedRoster(roster)
+        check(validatedRoster.currentUserId == provenance.binding.userId) {
+            "Validated history roster belongs to another authenticated user"
+        }
+        check(validatedRoster.currentDeviceId == provenance.binding.serverDeviceId) {
+            "Validated history roster belongs to another authenticated device"
+        }
+        val currentDevice = validatedRoster.devices().singleOrNull {
+            it.deviceId == validatedRoster.currentDeviceId
+        } ?: error("Validated history roster lost its current device")
+        val target = validatedRoster.devices().singleOrNull { it.deviceId == targetDeviceId }
+            ?: error("History target is absent from the authoritative roster")
+        check(target.deviceId != currentDevice.deviceId) {
+            "History target cannot be the current device"
+        }
+        check(target.userId == validatedRoster.currentUserId) {
+            "History target belongs to another account"
+        }
+        val targetAddress = SecureMessagingCryptoAddress(
+            userId = target.userId,
+            serverDeviceId = target.deviceId,
+            signalDeviceId = target.signalDeviceId,
+        )
+        return SecureMessagingEncryptionPlanValue(
+            SecureMessagingEncryptionPlanSnapshot(
+                conversationId = validatedRoster.conversationId,
+                rosterRevision = validatedRoster.rosterRevision,
+                recipients = SecureMessagingExactRecipientSet(listOf(targetAddress)),
+                sender = SecureMessagingCryptoAddress(
+                    userId = currentDevice.userId,
+                    serverDeviceId = currentDevice.deviceId,
+                    signalDeviceId = currentDevice.signalDeviceId,
+                ),
+                memberUserIds = validatedRoster.memberUserIds(),
+                deviceBindings = validatedRoster.devices().associate { device ->
+                    SecureMessagingCryptoAddress(
+                        userId = device.userId,
+                        serverDeviceId = device.deviceId,
+                        signalDeviceId = device.signalDeviceId,
+                    ) to SecureMessagingRosterDeviceBinding(
+                        registrationId = device.registrationId,
+                        identityKeySha256 = device.identityKeySha256,
+                    )
+                },
+                provenance = provenance,
+                planIdentity = Any(),
             ),
         )
     }
@@ -521,41 +583,43 @@ object SecureMessagingCryptoWireMapper {
             "Decryption plan belongs to another authentication activation"
         }
         val remoteSender = SecureMessagingCryptoAddress(
-            userId = message.senderUserId,
-            serverDeviceId = message.senderDeviceId,
-            signalDeviceId = message.senderSignalDeviceId,
+            userId = message.cryptoSenderUserId,
+            serverDeviceId = message.cryptoSenderDeviceId,
+            signalDeviceId = message.cryptoSenderSignalDeviceId,
         )
         check(message.conversationId == planSnapshot.conversationId) {
             "Incoming envelope belongs to another conversation"
         }
-        check(message.rosterRevision == planSnapshot.rosterRevision) {
+        check(message.transferRosterRevision == planSnapshot.rosterRevision) {
             "Incoming envelope belongs to another roster revision"
         }
         val senderBinding = checkNotNull(planSnapshot.deviceBinding(remoteSender)) {
             "Incoming envelope sender is absent from the authoritative roster"
         }
-        check(senderBinding.registrationId == message.senderRegistrationId) {
+        check(senderBinding.registrationId == message.cryptoSenderRegistrationId) {
             "Incoming envelope sender registration changed"
         }
-        check(senderBinding.identityKeySha256 == message.senderIdentityKeySha256) {
+        check(senderBinding.identityKeySha256 == message.cryptoSenderIdentityKeySha256) {
             "Incoming envelope sender identity changed"
         }
+        val cryptoClientMessageId = message.transferClientMessageId ?: message.clientMessageId
         val snapshot = SecureMessagingDecryptionRequestSnapshot(
-            messageId = message.messageId,
-            clientMessageId = message.clientMessageId,
+            messageId = if (message.isHistoryBackfill) cryptoClientMessageId else message.messageId,
+            clientMessageId = cryptoClientMessageId,
             conversationId = message.conversationId,
-            rosterRevision = message.rosterRevision,
+            rosterRevision = message.transferRosterRevision,
             sender = remoteSender,
             localRecipient = planSnapshot.sender,
-            senderRegistrationId = message.senderRegistrationId,
-            senderIdentityKeySha256 = message.senderIdentityKeySha256,
+            senderRegistrationId = message.cryptoSenderRegistrationId,
+            senderIdentityKeySha256 = message.cryptoSenderIdentityKeySha256,
             envelopeKind = when (message.envelopeType) {
                 "signal-prekey-v2" -> SecureMessagingEnvelopeKind.PREKEY // gitleaks:allow
                 "signal-message-v2" -> SecureMessagingEnvelopeKind.SESSION
                 else -> error("The validated envelope type is unsupported")
             },
             ciphertext = message.ciphertextBytes(),
-            replyToMessageId = message.replyToMessageId,
+            replyToMessageId = if (message.isHistoryBackfill) null else message.replyToMessageId,
+            isHistoryBackfill = message.isHistoryBackfill,
             provenance = provenance,
         )
         validateDecryptionSnapshot(snapshot)
@@ -582,6 +646,7 @@ object SecureMessagingCryptoWireMapper {
             envelopeKind = request.snapshot.envelopeKind,
             ciphertext = request.snapshot.copyCiphertextBytes(),
             replyToMessageId = request.snapshot.replyToMessageId,
+            isHistoryBackfill = request.snapshot.isHistoryBackfill,
             provenance = request.snapshot.provenance,
         )
     }

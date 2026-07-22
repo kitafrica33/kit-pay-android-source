@@ -2,12 +2,15 @@ package com.kit.wallet
 
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.feature.chat.ConversationViewModel
+import com.kit.wallet.feature.chat.MessageSoundPlayer
 import com.kit.wallet.feature.chat.retryableOutgoingMessageIds
 import com.kit.wallet.ui.model.Beneficiary
 import com.kit.wallet.ui.model.BillProvider
+import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
@@ -44,7 +47,7 @@ class ConversationViewModelTest {
     fun tearDown() = Dispatchers.resetMain()
 
     @Test
-    fun `successful send trims text and clears the draft only through success callback`() = runTest {
+    fun `send trims text and clears the composer instantly`() = runTest {
         val repository = FakeChatRepository()
         val viewModel = viewModel(repository)
         var clearRequests = 0
@@ -58,14 +61,15 @@ class ConversationViewModelTest {
     }
 
     @Test
-    fun `failed send retains draft by withholding success callback and exposes error`() = runTest {
+    fun `failed send still clears the composer instantly and surfaces the error`() = runTest {
         val repository = FakeChatRepository(failure = IllegalStateException("Ciphertext was not accepted"))
         val viewModel = viewModel(repository)
         var clearRequests = 0
 
-        viewModel.send("keep this draft") { clearRequests++ }
+        viewModel.send("send instantly") { clearRequests++ }
 
-        assertEquals(0, clearRequests)
+        // The composer clears immediately; the failed message stays in the thread with a retry.
+        assertEquals(1, clearRequests)
         assertEquals("Ciphertext was not accepted", viewModel.error.value)
         assertFalse(viewModel.sending.value)
 
@@ -74,19 +78,20 @@ class ConversationViewModelTest {
     }
 
     @Test
-    fun `second tap cannot start a concurrent duplicate send`() = runTest {
+    fun `rapid sends are committed instantly without blocking on the network`() = runTest {
         val release = CompletableDeferred<Unit>()
         val repository = FakeChatRepository(blockUntil = release)
         val viewModel = viewModel(repository)
 
+        // Neither send waits on the previous one: both are committed to the outbox immediately,
+        // with no composer spinner and no dropped message.
         viewModel.send("one")
-        assertTrue(viewModel.sending.value)
         viewModel.send("two")
-        assertEquals(listOf(CHAT_ID to "one"), repository.sent)
+        assertEquals(listOf(CHAT_ID to "one", CHAT_ID to "two"), repository.sent)
+        assertFalse(viewModel.sending.value)
 
         release.complete(Unit)
-        assertFalse(viewModel.sending.value)
-        assertEquals(listOf(CHAT_ID to "one"), repository.sent)
+        assertEquals(listOf(CHAT_ID to "one", CHAT_ID to "two"), repository.sent)
     }
 
     @Test
@@ -183,9 +188,13 @@ class ConversationViewModelTest {
         assertEquals(null, viewModel.chat.value)
 
         repository.publishChat()
+        val loaded = listOf(Message("m1", "hi", "12:00", fromMe = false))
+        repository.messages.value = loaded
 
         assertEquals(CHAT_ID, viewModel.chat.value?.id)
-        assertTrue(viewModel.messages === repository.messages)
+        // The conversation view merges call-log entries, so it mirrors the repository's messages
+        // by content rather than being the same flow instance.
+        assertEquals(loaded, viewModel.messages.value)
     }
 
     @Test
@@ -471,8 +480,22 @@ class ConversationViewModelTest {
     private fun viewModel(repository: ChatRepository) = ConversationViewModel(
         chatRepo = repository,
         walletRepo = FakeWalletRepository(),
+        callRepo = FakeCallRepository(),
+        messageSounds = NoOpMessageSoundPlayer,
         savedStateHandle = SavedStateHandle(mapOf("chatId" to CHAT_ID)),
     )
+
+    private object NoOpMessageSoundPlayer : MessageSoundPlayer {
+        override fun playSent() = Unit
+        override fun playReceived() = Unit
+        override fun playPaymentReceived() = Unit
+    }
+
+    /** The conversation call-log merge is exercised elsewhere; these tests need no call data. */
+    private class FakeCallRepository : CallRepository {
+        override val calls: StateFlow<List<CallEntry>> = MutableStateFlow(emptyList())
+        override suspend fun refresh() = Unit
+    }
 
     /** In-chat payments are exercised separately; these tests only need a compile-safe wallet. */
     private class FakeWalletRepository : WalletRepository {

@@ -436,6 +436,7 @@ class SecureMessagingWireValidatorTest {
             data = MessagingSyncEventDataDto(
                 deviceId = OTHER_DEVICE_ID,
                 userId = OTHER_USER_ID,
+                enrollmentEpoch = 2,
                 signalDeviceId = 2,
                 registrationId = 43,
                 previousRegistrationId = 42,
@@ -460,6 +461,7 @@ class SecureMessagingWireValidatorTest {
         assertEquals("device.enrolled", validated.eventType)
         assertEquals(OTHER_USER_ID, validated.userId)
         assertEquals(OTHER_DEVICE_ID, validated.deviceId)
+        assertEquals(2L, validated.enrollmentEpoch)
         assertEquals(2, validated.signalDeviceId)
         assertEquals(43, validated.registrationId)
         assertEquals(42, validated.previousRegistrationId)

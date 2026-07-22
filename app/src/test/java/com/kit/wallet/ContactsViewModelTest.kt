@@ -56,10 +56,37 @@ class ContactsViewModelTest {
         assertTrue(viewModel.error.value.orEmpty().contains("Invite"))
     }
 
-    private class FakeContactRepository : ContactRepository {
+    @Test
+    fun `stale device contact is synchronized and resolved before opening chat`() = runTest {
+        val chats = FakeChatRepository()
+        val resolved = NOT_ON_KIT.copy(
+            id = ON_KIT.id,
+            name = "Flora saved locally",
+            isKitUser = true,
+            savedInDevice = true,
+        )
+        val contacts = FakeContactRepository(resolved)
+        val viewModel = ContactsViewModel(contacts, chats)
+        var opened: String? = null
+
+        viewModel.openDirectConversation(NOT_ON_KIT) { opened = it }
+
+        assertEquals(CONVERSATION_ID, opened)
+        assertEquals(listOf(NOT_ON_KIT), contacts.resolveRequests)
+        assertEquals(listOf(resolved), chats.openRequests)
+    }
+
+    private class FakeContactRepository(
+        private val resolved: Contact? = null,
+    ) : ContactRepository {
         override val contacts: StateFlow<List<Contact>> = MutableStateFlow(emptyList())
+        val resolveRequests = mutableListOf<Contact>()
         override suspend fun refresh() = Unit
         override suspend fun syncDeviceContacts() = Unit
+        override suspend fun resolveForMessaging(contact: Contact): Contact? {
+            resolveRequests += contact
+            return if (contact.isKitUser) contact else resolved
+        }
     }
 
     private class FakeChatRepository : ChatRepository {

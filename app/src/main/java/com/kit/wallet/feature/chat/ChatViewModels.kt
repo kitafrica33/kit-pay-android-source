@@ -4,12 +4,19 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.WalletRepository
+import com.kit.wallet.ui.model.CallDirection
+import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
+import com.kit.wallet.ui.model.MessageKind
 import dagger.hilt.android.lifecycle.HiltViewModel
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import javax.inject.Inject
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
@@ -43,12 +50,17 @@ class ChatsViewModel @Inject constructor(chatRepo: ChatRepository) : ViewModel()
 class ConversationViewModel @Inject constructor(
     private val chatRepo: ChatRepository,
     private val walletRepo: WalletRepository,
+    private val callRepo: CallRepository,
+    private val messageSounds: MessageSoundPlayer,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
 
     private val chatId: String = savedStateHandle.get<String>("chatId")
         ?.trim()
         .orEmpty()
+
+    private val callTimeFormatter =
+        DateTimeFormatter.ofPattern("HH:mm").withZone(ZoneId.systemDefault())
 
     val messagingAvailable = chatRepo.readiness
     val chat: StateFlow<ChatPreview?> = chatRepo.chats
@@ -58,9 +70,53 @@ class ConversationViewModel @Inject constructor(
             SharingStarted.Eagerly,
             chatId.takeIf(String::isNotBlank)?.let(chatRepo::chat),
         )
-    val messages: StateFlow<List<Message>> = chatId.takeIf(String::isNotBlank)
+
+    /** Raw encrypted messages for this conversation, before call-log entries are interleaved. */
+    private val conversationMessages: StateFlow<List<Message>> = chatId.takeIf(String::isNotBlank)
         ?.let(chatRepo::conversation)
         ?: MutableStateFlow<List<Message>>(emptyList()).asStateFlow()
+
+    /** Messages plus this conversation's call-log entries, ordered together like a WhatsApp thread. */
+    val messages: StateFlow<List<Message>> = if (chatId.isBlank()) {
+        MutableStateFlow<List<Message>>(emptyList()).asStateFlow()
+    } else {
+        combine(conversationMessages, callRepo.calls, chat) { msgs, calls, currentChat ->
+            mergeCallLog(msgs, calls, currentChat)
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, conversationMessages.value)
+    }
+
+    private fun mergeCallLog(
+        messages: List<Message>,
+        calls: List<CallEntry>,
+        currentChat: ChatPreview?,
+    ): List<Message> {
+        val peerUserId = currentChat?.peerUserId
+        val relevant = calls.filter { call ->
+            call.conversationId == chatId ||
+                (peerUserId != null && call.participantUserIds.contains(peerUserId))
+        }
+        if (relevant.isEmpty()) return messages
+        val callMessages = relevant.map { call ->
+            Message(
+                id = "call:${call.id}",
+                text = "",
+                time = if (call.startedAtEpochMillis > 0) {
+                    callTimeFormatter.format(Instant.ofEpochMilli(call.startedAtEpochMillis))
+                } else {
+                    call.time
+                },
+                fromMe = call.direction == CallDirection.OUTGOING,
+                kind = MessageKind.CALL,
+                sortEpochMillis = call.startedAtEpochMillis,
+                callDirection = call.direction,
+                callVideo = call.video,
+                callDurationSeconds = call.durationSeconds,
+            )
+        }
+        // sortedBy is stable, so messages keep their authenticated relative order and calls slot in
+        // by start time.
+        return (messages + callMessages).sortedBy { it.sortEpochMillis }
+    }
 
     private val mutableError = MutableStateFlow<String?>(null)
     val error = mutableError.asStateFlow()
@@ -91,13 +147,48 @@ class ConversationViewModel @Inject constructor(
                 combine(
                     mutableConversationVisible,
                     messagingAvailable,
-                    messages,
+                    conversationMessages,
                 ) { visible, ready, projected ->
                     visible && ready && projected.any {
                         !it.fromMe && it.state == DeliveryState.DELIVERED
                     }
                 }.collectLatest { shouldMarkRead ->
                     if (shouldMarkRead) attemptMarkConversationRead()
+                }
+            }
+            // In-conversation sounds while the chat is open:
+            //  - a new incoming message plays the coin tone for a completed payment, else the
+            //    knock tone;
+            //  - an outgoing message plays the water-drop tone when it reaches its first tick.
+            viewModelScope.launch {
+                var knownIncomingIds: Set<String>? = null
+                var previousOutgoingStates: Map<String, DeliveryState>? = null
+                conversationMessages.collect { projected ->
+                    val visible = mutableConversationVisible.value
+
+                    val incoming = projected.filter { !it.fromMe }
+                    val previousIncoming = knownIncomingIds
+                    if (previousIncoming != null && visible) {
+                        val arrived = incoming.filter { it.id !in previousIncoming }
+                        if (arrived.any { it.kind == MessageKind.PAYMENT }) {
+                            messageSounds.playPaymentReceived()
+                        } else if (arrived.isNotEmpty()) {
+                            messageSounds.playReceived()
+                        }
+                    }
+                    knownIncomingIds = incoming.mapTo(mutableSetOf()) { it.id }
+
+                    val outgoingStates = projected.asSequence()
+                        .filter { it.fromMe }
+                        .associate { it.id to it.state }
+                    val previousOutgoing = previousOutgoingStates
+                    if (previousOutgoing != null && visible) {
+                        val reachedFirstTick = outgoingStates.any { (id, state) ->
+                            state == DeliveryState.SENT && previousOutgoing[id] == DeliveryState.SENDING
+                        }
+                        if (reachedFirstTick) messageSounds.playSent()
+                    }
+                    previousOutgoingStates = outgoingStates
                 }
             }
         }
@@ -111,6 +202,8 @@ class ConversationViewModel @Inject constructor(
             foregroundSyncJob = null
             return
         }
+        // Refresh the call log so recent calls appear inline in the conversation.
+        viewModelScope.launch { runCatching { callRepo.refresh() } }
         if (foregroundSyncJob?.isActive == true) return
         foregroundSyncJob = viewModelScope.launch {
             var firstIteration = true
@@ -146,7 +239,7 @@ class ConversationViewModel @Inject constructor(
         if (
             !mutableConversationVisible.value ||
             !messagingAvailable.value ||
-            messages.value.none { !it.fromMe && it.state == DeliveryState.DELIVERED }
+            conversationMessages.value.none { !it.fromMe && it.state == DeliveryState.DELIVERED }
         ) return
         try {
             chatRepo.markConversationRead(chatId)
@@ -161,13 +254,22 @@ class ConversationViewModel @Inject constructor(
     fun send(text: String, onSent: () -> Unit = {}) {
         val selectedChat = chat.value ?: return
         val normalized = text.trim()
-        if (!messagingAvailable.value || normalized.isBlank() || mutableSending.value) return
-        launchSend(
-            selectedChatId = selectedChat.id,
-            normalizedText = normalized,
-            retryingMessageId = null,
-            onSuccess = onSent,
-        )
+        if (!messagingAvailable.value || normalized.isBlank()) return
+        // Clear the composer immediately. The message is committed to the encrypted outbox and
+        // appears in the thread with a clock tick right away — no spinner and no waiting on the
+        // network round-trip. The "sent" sound plays when it reaches its first tick (see below).
+        // Concurrent sends are serialized inside the runtime.
+        onSent()
+        viewModelScope.launch {
+            try {
+                chatRepo.sendMessage(selectedChat.id, normalized)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message
+                    ?: "Secure messaging is temporarily unavailable"
+            }
+        }
     }
 
     fun retry(message: Message, onRetried: () -> Unit = {}) {

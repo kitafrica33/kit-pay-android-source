@@ -92,10 +92,6 @@ class ContactsViewModel @Inject constructor(
 
     fun openDirectConversation(contact: Contact, onOpened: (String) -> Unit) {
         if (mutableOpeningContactId.value != null) return
-        if (!contact.isKitUser) {
-            mutableError.value = "Invite this contact to Kit Pay before starting a secure chat."
-            return
-        }
         if (!chatRepo.readiness.value) {
             mutableError.value = "Secure messaging is not ready on this device yet."
             return
@@ -104,7 +100,13 @@ class ContactsViewModel @Inject constructor(
             mutableOpeningContactId.value = contact.id
             mutableError.value = null
             try {
-                onOpened(chatRepo.openDirectConversation(contact))
+                val resolved = contactRepo.resolveForMessaging(contact)
+                if (resolved == null) {
+                    mutableError.value =
+                        "Invite this contact to Kit Pay before starting a secure chat."
+                    return@launch
+                }
+                onOpened(chatRepo.openDirectConversation(resolved))
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {

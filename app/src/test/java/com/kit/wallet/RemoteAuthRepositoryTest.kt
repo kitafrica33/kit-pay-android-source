@@ -26,6 +26,7 @@ import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.runTest
@@ -180,6 +181,107 @@ class RemoteAuthRepositoryTest {
         assertTrue(failure is SessionInvalidatedException)
         assertNull(sessions.current())
         assertEquals(0, refresh.calls)
+    }
+
+    @Test
+    fun `explicit refreshes share one rotation coordinator and advance credential generations`() =
+        runTest {
+            server.enqueue(
+                jsonResponse(
+                    AUTHENTICATED_JSON
+                        .replace("access-token", "refreshed-access-token")
+                        .replace("refresh-token", "refreshed-refresh-token"),
+                ),
+            )
+            server.enqueue(
+                jsonResponse(
+                    AUTHENTICATED_JSON
+                        .replace("access-token", "twice-refreshed-access-token")
+                        .replace("refresh-token", "twice-refreshed-refresh-token"),
+                ),
+            )
+            val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+            val refresh = FakeRefreshTrigger()
+            val repository = repository(sessions, refresh)
+
+            val first = async { repository.refreshSession() }
+            val second = async { repository.refreshSession() }
+            first.await()
+            second.await()
+
+            val firstRequest = server.takeRequest()
+            val secondRequest = server.takeRequest()
+            assertEquals("/api/kit-wallet/v1/auth/refresh", firstRequest.path)
+            assertEquals(TEST_SESSION.sessionId, firstRequest.getHeader("X-Kit-Wallet-Session-ID"))
+            assertTrue(firstRequest.body.readUtf8().contains("\"refresh_token\":\"refresh-token\""))
+            assertTrue(
+                secondRequest.body.readUtf8()
+                    .contains("\"refresh_token\":\"refreshed-refresh-token\""),
+            )
+            assertEquals("twice-refreshed-access-token", sessions.current()?.accessToken)
+            assertEquals("twice-refreshed-refresh-token", sessions.current()?.refreshToken)
+            assertTrue(sessions.current()?.refreshReplayNonce != TEST_SESSION.refreshReplayNonce)
+            assertEquals(2, refresh.calls)
+        }
+
+    @Test
+    fun `late refresh rejection cannot clear a newer same-session credential`() = runTest {
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+        val replacement = TEST_SESSION.copy(
+            accessToken = "replacement-access-token",
+            refreshToken = "replacement-refresh-token",
+            refreshReplayNonce = "11111111-1111-4111-8111-111111111111",
+        )
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                runBlocking { sessions.save(replacement) }
+                return MockResponse()
+                    .setResponseCode(401)
+                    .setHeader("Content-Type", "application/json")
+                    .setBody(
+                        """{"ok":false,"error":{"code":"SESSION_REVOKED","message":"Revoked"}}""",
+                    )
+            }
+        }
+        val walletSync = FakeWalletSync()
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            walletSync = walletSync,
+        )
+
+        val failure = runCatching { repository.refreshSession() }.exceptionOrNull()
+
+        assertTrue(failure is KitWalletApiException)
+        assertEquals("SESSION_REVOKED", (failure as KitWalletApiException).code)
+        assertEquals(replacement, sessions.current())
+        assertEquals(0, walletSync.clearCalls)
+    }
+
+    @Test
+    fun `terminal refresh rejection clears only its exact local credential`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(401)
+                .setHeader("Content-Type", "application/json")
+                .setBody(
+                    """{"ok":false,"error":{"code":"REFRESH_TOKEN_REUSED","message":"Reused"}}""",
+                ),
+        )
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+        val walletSync = FakeWalletSync()
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            walletSync = walletSync,
+        )
+
+        val failure = runCatching { repository.refreshSession() }.exceptionOrNull()
+
+        assertTrue(failure is KitWalletApiException)
+        assertEquals("REFRESH_TOKEN_REUSED", (failure as KitWalletApiException).code)
+        assertNull(sessions.current())
+        assertEquals(1, walletSync.clearCalls)
     }
 
     @Test
@@ -403,6 +505,38 @@ class RemoteAuthRepositoryTest {
             confirmedReset.getHeader("Authorization"),
         )
         assertEquals("refreshed-access-token", sessions.current()?.accessToken)
+    }
+
+    @Test
+    fun `messaging recovery preserves refreshed session after an ambiguous second 401`() = runTest {
+        server.enqueue(
+            MockResponse().setResponseCode(401).setHeader("Content-Type", "application/json")
+                .setBody(
+                    """{"ok":false,"error":{"code":"ACCESS_TOKEN_EXPIRED","message":"Expired"}}""",
+                ),
+        )
+        server.enqueue(
+            jsonResponse(
+                AUTHENTICATED_JSON
+                    .replace("access-token", "refreshed-access-token")
+                    .replace("refresh-token", "refreshed-refresh-token"),
+            ),
+        )
+        server.enqueue(
+            MockResponse().setResponseCode(401).setHeader("Content-Type", "application/json")
+                .setBody("""{"ok":false}"""),
+        )
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+        val repository = repository(sessions, FakeRefreshTrigger())
+
+        val failure = runCatching {
+            repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+        }.exceptionOrNull()
+
+        assertTrue(failure is KitWalletApiException)
+        assertEquals("HTTP_401", (failure as KitWalletApiException).code)
+        assertEquals("refreshed-access-token", sessions.current()?.accessToken)
+        assertEquals(RESET_PENDING, sessions.current()?.messagingResetProof)
     }
 
     @Test

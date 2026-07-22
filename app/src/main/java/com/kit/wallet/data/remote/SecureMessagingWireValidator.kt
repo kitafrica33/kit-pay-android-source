@@ -439,6 +439,8 @@ object SecureMessagingWireValidator {
         message: EncryptedMessageDto,
         expectedConversationId: String,
         currentDeviceId: String,
+        currentUserId: String? = null,
+        currentEnrollmentEpoch: Long? = null,
     ): ValidatedIncomingEncryptedMessage = validateIncoming(
         IncomingMessageWire(
             id = message.id,
@@ -446,6 +448,7 @@ object SecureMessagingWireValidator {
             clientMessageId = message.clientMessageId,
             sender = message.sender,
             senderDeviceId = message.senderDeviceId,
+            senderEnrollmentEpoch = message.senderEnrollmentEpoch,
             senderSignalDeviceId = message.senderSignalDeviceId,
             senderRegistrationId = message.senderRegistrationId,
             senderProtocolVersion = message.senderProtocolVersion,
@@ -462,12 +465,16 @@ object SecureMessagingWireValidator {
         ),
         expectedConversationId,
         currentDeviceId,
+        currentUserId,
+        currentEnrollmentEpoch,
     )
 
     fun validateIncomingEncryptedMessageEvent(
         event: MessagingSyncEventDto,
         expectedConversationId: String,
         currentDeviceId: String,
+        currentUserId: String? = null,
+        currentEnrollmentEpoch: Long? = null,
     ): ValidatedIncomingEncryptedMessage {
         requireUuid(expectedConversationId, "expected conversation ID")
         requireUuid(currentDeviceId, "current device ID")
@@ -489,6 +496,7 @@ object SecureMessagingWireValidator {
                 clientMessageId = data.clientMessageId,
                 sender = data.sender,
                 senderDeviceId = data.senderDeviceId,
+                senderEnrollmentEpoch = data.senderEnrollmentEpoch,
                 senderSignalDeviceId = data.senderSignalDeviceId,
                 senderRegistrationId = data.senderRegistrationId,
                 senderProtocolVersion = data.senderProtocolVersion,
@@ -505,6 +513,8 @@ object SecureMessagingWireValidator {
             ),
             expectedConversationId,
             currentDeviceId,
+            currentUserId,
+            currentEnrollmentEpoch,
         )
         requireWire(!occurredAt.isBefore(validated.sentAt), "messaging event predates its message")
         return validated
@@ -545,6 +555,7 @@ object SecureMessagingWireValidator {
             )
             requireWire(
                 data.deviceId == null &&
+                    data.enrollmentEpoch == null &&
                     data.signalDeviceId == null &&
                     data.registrationId == null &&
                     data.previousRegistrationId == null &&
@@ -560,6 +571,13 @@ object SecureMessagingWireValidator {
             val deviceId = required(data.deviceId, "messaging lifecycle device ID")
             requireUuid(deviceId, "messaging lifecycle device ID")
             requireWire(event.resourceId == deviceId, "messaging lifecycle device resource changed")
+            if (eventType == DEVICE_ENROLLED_EVENT) {
+                requirePositiveLong(data.enrollmentEpoch, "messaging lifecycle enrollment epoch")
+            } else {
+                data.enrollmentEpoch?.let {
+                    requireWire(it > 0, "messaging lifecycle enrollment epoch")
+                }
+            }
             requireSignalDeviceId(data.signalDeviceId, "messaging lifecycle Signal device ID")
             requireRegistrationId(data.registrationId, "messaging lifecycle registration ID")
             data.previousRegistrationId?.let {
@@ -595,6 +613,7 @@ object SecureMessagingWireValidator {
             eventType = eventType,
             userId = userId,
             deviceId = data.deviceId,
+            enrollmentEpoch = data.enrollmentEpoch,
             signalDeviceId = data.signalDeviceId,
             registrationId = data.registrationId,
             previousRegistrationId = data.previousRegistrationId,
@@ -613,6 +632,8 @@ object SecureMessagingWireValidator {
         message: IncomingMessageWire,
         expectedConversationId: String,
         currentDeviceId: String,
+        currentUserId: String?,
+        currentEnrollmentEpoch: Long?,
     ): ValidatedIncomingEncryptedMessage {
         requireUuid(expectedConversationId, "expected conversation ID")
         requireUuid(currentDeviceId, "current device ID")
@@ -630,7 +651,18 @@ object SecureMessagingWireValidator {
         requireWire(!sender.name.isNullOrBlank(), "encrypted message sender name")
         val senderDeviceId = required(message.senderDeviceId, "encrypted message sender device ID")
         requireUuid(senderDeviceId, "encrypted message sender device ID")
-        requireWire(senderDeviceId != currentDeviceId, "encrypted message is routed from its recipient device")
+        message.senderEnrollmentEpoch?.let {
+            requireWire(it > 0, "encrypted message sender enrollment epoch")
+        }
+        val isHistoryBackfill = message.envelope?.isHistoryBackfill == true
+        if (!isHistoryBackfill) {
+            requireWire(
+                senderDeviceId != currentDeviceId ||
+                    (currentEnrollmentEpoch != null &&
+                        message.senderEnrollmentEpoch != currentEnrollmentEpoch),
+                "encrypted message is routed from its recipient device",
+            )
+        }
         val senderSignalDeviceId = requireSignalDeviceId(
             message.senderSignalDeviceId,
             "encrypted message sender Signal device ID",
@@ -682,6 +714,9 @@ object SecureMessagingWireValidator {
         val recipientDeviceId = required(envelope.recipientDeviceId, "encrypted envelope recipient device ID")
         requireUuid(recipientDeviceId, "encrypted envelope recipient device ID")
         requireWire(recipientDeviceId == currentDeviceId, "encrypted envelope is routed to another device")
+        envelope.recipientEnrollmentEpoch?.let {
+            requireWire(it > 0, "encrypted envelope recipient enrollment epoch")
+        }
         val envelopeType = required(envelope.envelopeType, "encrypted envelope type")
         requireWire(envelopeType in SECURE_MESSAGE_ENVELOPE_TYPES, "encrypted envelope protocol")
         val ciphertext = requireCanonicalBase64(
@@ -692,20 +727,146 @@ object SecureMessagingWireValidator {
         )
         requireMatchingSha256(envelope.ciphertextSha256, ciphertext, "encrypted envelope ciphertext hash")
 
+        val transferClientMessageId: String?
+        val transferRosterRevision: String
+        val senderEnrollmentEpoch: Long?
+        val cryptoSenderUserId: String
+        val cryptoSenderDeviceId: String
+        val cryptoSenderEnrollmentEpoch: Long?
+        val cryptoSenderSignalDeviceId: Int
+        val cryptoSenderRegistrationId: Int
+        val cryptoSenderBundleVersion: Int
+        val cryptoSenderIdentityKeySha256: String
+        if (isHistoryBackfill) {
+            val expectedUser = required(currentUserId, "history recipient user ID")
+            requireUuid(expectedUser, "history recipient user ID")
+            senderEnrollmentEpoch = requireHistorySenderEnrollmentEpoch(
+                value = message.senderEnrollmentEpoch,
+                field = "history original sender enrollment epoch",
+            )
+            currentEnrollmentEpoch?.let {
+                requireWire(it > 0, "history current enrollment epoch")
+            }
+            val recipientEpoch = required(
+                envelope.recipientEnrollmentEpoch,
+                "history envelope recipient enrollment epoch",
+            )
+            requireWire(recipientEpoch > 0, "history envelope recipient enrollment epoch")
+            currentEnrollmentEpoch?.let {
+                requireWire(recipientEpoch == it, "history envelope targets another enrollment")
+            }
+            transferClientMessageId = required(
+                envelope.transferClientMessageId,
+                "history envelope transfer client message ID",
+            )
+            requireUuid(transferClientMessageId, "history envelope transfer client message ID")
+            transferRosterRevision = required(
+                envelope.transferRosterRevision,
+                "history envelope transfer roster revision",
+            )
+            requireWire(
+                SECURE_MESSAGING_ROSTER_REVISION.matches(transferRosterRevision),
+                "history envelope transfer roster revision",
+            )
+            val cryptoSender = required(envelope.cryptoSender, "history envelope crypto sender")
+            cryptoSenderUserId = required(cryptoSender.userId, "history crypto sender user ID")
+            requireUuid(cryptoSenderUserId, "history crypto sender user ID")
+            requireWire(cryptoSenderUserId == expectedUser, "history crypto sender account changed")
+            cryptoSenderDeviceId = required(
+                cryptoSender.deviceId,
+                "history crypto sender device ID",
+            )
+            requireUuid(cryptoSenderDeviceId, "history crypto sender device ID")
+            requireWire(
+                cryptoSenderDeviceId != currentDeviceId,
+                "history crypto sender is the recipient device",
+            )
+            cryptoSenderEnrollmentEpoch = requireHistorySenderEnrollmentEpoch(
+                value = cryptoSender.enrollmentEpoch,
+                field = "history crypto sender enrollment epoch",
+            )
+            cryptoSenderSignalDeviceId = requireSignalDeviceId(
+                cryptoSender.signalDeviceId,
+                "history crypto sender Signal device ID",
+            )
+            cryptoSenderRegistrationId = requireRegistrationId(
+                cryptoSender.registrationId,
+                "history crypto sender registration ID",
+            )
+            requireWire(
+                cryptoSender.protocolVersion == SECURE_MESSAGING_PROTOCOL_VERSION,
+                "history crypto sender protocol",
+            )
+            cryptoSenderBundleVersion = requireBundleVersion(
+                cryptoSender.bundleVersion,
+                "history crypto sender bundle version",
+            )
+            cryptoSenderIdentityKeySha256 = requireSha256(
+                cryptoSender.identityKeySha256,
+                "history crypto sender identity-key hash",
+            )
+        } else {
+            senderEnrollmentEpoch = message.senderEnrollmentEpoch
+            requireWire(
+                envelope.isHistoryBackfill == null || envelope.isHistoryBackfill == false,
+                "ordinary envelope history marker",
+            )
+            requireWire(
+                envelope.transferClientMessageId == null &&
+                    envelope.transferRosterRevision == null,
+                "ordinary envelope contains history metadata",
+            )
+            envelope.cryptoSender?.let { cryptoSender ->
+                requireWire(
+                    cryptoSender.userId == senderUserId &&
+                        cryptoSender.deviceId == senderDeviceId &&
+                        (cryptoSender.enrollmentEpoch == null ||
+                            cryptoSender.enrollmentEpoch == message.senderEnrollmentEpoch) &&
+                        cryptoSender.signalDeviceId == senderSignalDeviceId &&
+                        cryptoSender.registrationId == senderRegistrationId &&
+                        cryptoSender.protocolVersion == SECURE_MESSAGING_PROTOCOL_VERSION &&
+                        cryptoSender.bundleVersion == senderBundleVersion &&
+                        cryptoSender.identityKeySha256 == senderIdentityKeySha256,
+                    "ordinary envelope crypto sender changed",
+                )
+            }
+            transferClientMessageId = null
+            transferRosterRevision = rosterRevision
+            cryptoSenderUserId = senderUserId
+            cryptoSenderDeviceId = senderDeviceId
+            cryptoSenderEnrollmentEpoch = null
+            cryptoSenderSignalDeviceId = senderSignalDeviceId
+            cryptoSenderRegistrationId = senderRegistrationId
+            cryptoSenderBundleVersion = senderBundleVersion
+            cryptoSenderIdentityKeySha256 = senderIdentityKeySha256
+        }
+
         return ValidatedIncomingEncryptedMessage(
             messageId = id,
             conversationId = conversationId,
             clientMessageId = clientMessageId,
             senderUserId = senderUserId,
             senderDeviceId = senderDeviceId,
+            senderEnrollmentEpoch = senderEnrollmentEpoch,
             senderSignalDeviceId = senderSignalDeviceId,
             senderRegistrationId = senderRegistrationId,
             senderBundleVersion = senderBundleVersion,
             senderIdentityKeySha256 = senderIdentityKeySha256,
+            cryptoSenderUserId = cryptoSenderUserId,
+            cryptoSenderDeviceId = cryptoSenderDeviceId,
+            cryptoSenderEnrollmentEpoch = cryptoSenderEnrollmentEpoch,
+            cryptoSenderSignalDeviceId = cryptoSenderSignalDeviceId,
+            cryptoSenderRegistrationId = cryptoSenderRegistrationId,
+            cryptoSenderBundleVersion = cryptoSenderBundleVersion,
+            cryptoSenderIdentityKeySha256 = cryptoSenderIdentityKeySha256,
             rosterRevision = rosterRevision,
+            transferRosterRevision = transferRosterRevision,
             kind = kind,
             replyToMessageId = replyToMessageId,
             envelopeType = envelopeType,
+            recipientEnrollmentEpoch = envelope.recipientEnrollmentEpoch,
+            isHistoryBackfill = isHistoryBackfill,
+            transferClientMessageId = transferClientMessageId,
             sentAt = sentAt,
             ciphertext = ciphertext,
             attachments = validatedAttachments,
@@ -1100,6 +1261,7 @@ object SecureMessagingWireValidator {
         val clientMessageId: String?,
         val sender: EncryptedMessageSenderDto?,
         val senderDeviceId: String?,
+        val senderEnrollmentEpoch: Long?,
         val senderSignalDeviceId: Int?,
         val senderRegistrationId: Int?,
         val senderProtocolVersion: String?,
@@ -1139,6 +1301,7 @@ object SecureMessagingWireValidator {
     private const val MESSAGING_USER_RESOURCE = "messaging_user"
     private const val ALL_DEVICES_REVOKED_EVENT = "devices.revoked"
     private const val IDENTITY_CHANGED_EVENT = "identity.changed"
+    private const val DEVICE_ENROLLED_EVENT = "device.enrolled"
 
     private val UUID_PATTERN = Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
     private val SHA256_HEX = Regex("^[a-f0-9]{64}$")
@@ -1165,6 +1328,23 @@ object SecureMessagingWireValidator {
 
 class SecureMessagingWireValidationException internal constructor(message: String) :
     IllegalArgumentException(message)
+
+/**
+ * Sender enrollment epochs were added after the first v2 messages were already durable. Only a
+ * history-specific validation path may interpret that legacy null sentinel as epoch one; ordinary
+ * messages retain their nullable wire shape. Explicit zero or negative epochs remain malformed.
+ */
+internal fun requireHistorySenderEnrollmentEpoch(value: Long?, field: String): Long {
+    val epoch = value ?: LEGACY_HISTORY_SENDER_ENROLLMENT_EPOCH
+    if (epoch <= 0L) {
+        throw SecureMessagingWireValidationException(
+            "Rejected secure-messaging wire data: $field",
+        )
+    }
+    return epoch
+}
+
+private const val LEGACY_HISTORY_SENDER_ENROLLMENT_EPOCH = 1L
 
 /** An authoritative direct roster bound to one conversation, login user and current device. */
 sealed interface ValidatedMessagingDeviceRoster {
@@ -1321,14 +1501,26 @@ class ValidatedIncomingEncryptedMessage internal constructor(
     val clientMessageId: String,
     val senderUserId: String,
     val senderDeviceId: String,
+    val senderEnrollmentEpoch: Long?,
     val senderSignalDeviceId: Int,
     val senderRegistrationId: Int,
     val senderBundleVersion: Int,
     val senderIdentityKeySha256: String,
+    val cryptoSenderUserId: String,
+    val cryptoSenderDeviceId: String,
+    val cryptoSenderEnrollmentEpoch: Long?,
+    val cryptoSenderSignalDeviceId: Int,
+    val cryptoSenderRegistrationId: Int,
+    val cryptoSenderBundleVersion: Int,
+    val cryptoSenderIdentityKeySha256: String,
     val rosterRevision: String,
+    val transferRosterRevision: String,
     val kind: String,
     val replyToMessageId: String?,
     val envelopeType: String,
+    val recipientEnrollmentEpoch: Long?,
+    val isHistoryBackfill: Boolean,
+    val transferClientMessageId: String?,
     val sentAt: Instant,
     private val ciphertext: ByteArray,
     attachments: List<EncryptedAttachmentRequest>,
@@ -1345,6 +1537,7 @@ class ValidatedMessagingRosterRefresh internal constructor(
     val eventType: String,
     val userId: String,
     val deviceId: String?,
+    val enrollmentEpoch: Long?,
     val signalDeviceId: Int?,
     val registrationId: Int?,
     val previousRegistrationId: Int?,

@@ -2,12 +2,15 @@ package com.kit.wallet
 
 import androidx.lifecycle.SavedStateHandle
 import com.kit.wallet.data.repository.BillsRepository
+import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.feature.bills.BillPayViewModel
 import com.kit.wallet.feature.chat.ConversationViewModel
+import com.kit.wallet.feature.chat.MessageSoundPlayer
 import com.kit.wallet.ui.model.Beneficiary
 import com.kit.wallet.ui.model.BillProvider
+import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Message
@@ -76,6 +79,8 @@ class MissingNavigationArgumentsTest {
         val viewModel = ConversationViewModel(
             chatRepo = chats,
             walletRepo = UnusedWalletRepository,
+            callRepo = UnusedCallRepository,
+            messageSounds = UnusedMessageSoundPlayer,
             savedStateHandle = SavedStateHandle(),
         )
 
@@ -145,5 +150,16 @@ class MissingNavigationArgumentsTest {
             amountMinor: Long,
             paymentPin: String,
         ): Transaction = error("Not used")
+    }
+
+    private object UnusedCallRepository : CallRepository {
+        override val calls: StateFlow<List<CallEntry>> = MutableStateFlow(emptyList())
+        override suspend fun refresh() = Unit
+    }
+
+    private object UnusedMessageSoundPlayer : MessageSoundPlayer {
+        override fun playSent() = Unit
+        override fun playReceived() = Unit
+        override fun playPaymentReceived() = Unit
     }
 }

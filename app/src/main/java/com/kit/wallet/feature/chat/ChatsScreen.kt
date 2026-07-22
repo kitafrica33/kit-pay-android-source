@@ -24,6 +24,7 @@ import androidx.compose.material.icons.rounded.DoneAll
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.NotificationsOff
 import androidx.compose.material.icons.rounded.PushPin
+import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material3.FilterChip
@@ -200,6 +201,7 @@ private fun ChatRow(chat: ChatPreview, onClick: () -> Unit) {
                 if (chat.lastFromMe) {
                     Icon(
                         when (chat.lastState) {
+                            DeliveryState.SENDING -> Icons.Rounded.Schedule
                             DeliveryState.SENT -> Icons.Rounded.Done
                             DeliveryState.RETRY_REQUIRED,
                             DeliveryState.FAILED,
@@ -212,7 +214,7 @@ private fun ChatRow(chat: ChatPreview, onClick: () -> Unit) {
                             .size(15.dp)
                             .padding(end = 2.dp),
                         tint = when (chat.lastState) {
-                            DeliveryState.READ -> KitTheme.colors.success
+                            DeliveryState.READ -> KitTheme.colors.readReceipt
                             DeliveryState.RETRY_REQUIRED,
                             DeliveryState.FAILED,
                             -> MaterialTheme.colorScheme.error

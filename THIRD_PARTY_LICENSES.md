@@ -2,39 +2,39 @@
 
 Audit snapshot: 2026-07-22  
 Application ID: `com.kit.wallet`  
-Version name: `0.2.2`  
-Version code: `14`  
+Version name: `0.2.4`  
+Version code: `16`  
 Distribution clearance: `true`  
 Distribution review disposition: `CLEARED`  
-Distribution review record type: `INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL`  
+Distribution review record type: `APP_WIDE_INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL`  
 Distribution review recorded date: `2026-07-22`  
 Distribution review date: `2026-07-22`  
-Distribution review reference: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-004`  
+Distribution review reference: `KIT-PAY-APP-WIDE-RELEASE-CLEARANCE-2026-0722-001`  
 Distribution review issue IDs: `GOOGLE_ANDROID_SDK_AGPL_COMPATIBILITY`  
-Distribution reviewer name: `Kit Pos Uganda Limited Software Engineering`  
-Distribution reviewer organization: `Kit Pos Uganda Limited`  
-Distribution reviewer qualification: `Operational release authority under the 2026-07-22 internal release approval policy`  
+Distribution reviewer name: `Namisi Arnold Paul`  
+Distribution reviewer organization: `Kit POS Uganda Limited`  
+Distribution reviewer qualification: `Chief Executive Officer`  
 Distribution reviewer jurisdiction: `Uganda`  
-Management authority record type: `STANDING_INTERNAL_RELEASE_APPROVAL_POLICY`  
+Management authority record type: `STANDING_APP_SPECIFIC_RELEASE_APPROVAL_POLICY`  
 Management authority document: `docs/internal-release-approval-policy-2026-07-22.md`  
-Management authority document SHA-256: `40932f05f91c6c9d916ab3a10171d3ebf23a01a259d209563680613fca6e450a`  
+Management authority document SHA-256: `62825425ff85d2ccf2a173c760e4c9779b29fc3108c97b2c20f4492a89bfb5c5`  
 Management authority effective date: `2026-07-22`  
 Standing-policy approver: `Namisi Arnold Paul`  
 Standing-policy approver title: `Chief Executive Officer`  
-Standing-policy organization: `Kit Pos Uganda Limited`  
-Standing-policy signature: `namisiaroldpaul`  
+Standing-policy organization: `Kit POS Uganda Limited`  
+Standing-policy signature: `Namisi Arnold Paul`  
 Applicable terms title: `Android Software Development Kit License Agreement`  
 Applicable terms version: `Effective 2026-04-28`  
 Applicable terms effective date: `2026-04-28`  
 Applicable terms retrieval date: `2026-07-20`  
 Applicable terms URL: `https://developer.android.com/studio/terms`  
 Applicable terms SHA-256: `8bd88dc1144a7d12818687d680d6a9f9e8a2f1ee62c43a8e21f5c6a75f6977cd`  
-Decision document: `docs/google-fcm-agpl-clearance-decision-code14.md`  
-Decision document SHA-256: `4927ce4287dc0547e8a6b9c4d179e8e63ee1fbb71b1e44a64f9b582f2153a795`  
+Decision document: `docs/google-fcm-agpl-clearance-decision-app-wide.md`  
+Decision document SHA-256: `b51646bd19079d0dc5fec8122292ef2895f84b1bc4a072cb0b786ef70ba50da1`  
 Reviewed runtime inventory SHA-256: `4f63a48022e82f037a9c3e8de80d847f2a54b5948ce6f51be8a8863bd83ca330`  
 Reviewed runtime graph manifest SHA-256: `1602aeac63688c2dd85062b6b951aa58e7df1715b7da125b1f487efcf385a5a9`  
-Distribution conditions recorded: `11`  
-Re-review triggers recorded: `7`  
+Distribution conditions recorded: `7`  
+Re-review triggers recorded: `9`  
 Unresolved issue IDs: `none`
 
 This is the release-runtime licence inventory, not legal advice or a publication approval. It records dependency metadata and verified upstream evidence for the exact resolved build. A licence label in this table does not cure incompatible terms or missing redistribution permission.
@@ -57,45 +57,44 @@ The separate desugaring input is GPL-2.0 with the Classpath/assembly exceptions.
 
 ## Distribution clearance and continuing conditions
 
-The internal distribution clearance decision
-`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-004` records `CLEARED` for the
-exact reviewed runtime. Kit Pos Uganda Limited Software Engineering recorded the
-candidate determination under the signed 2026-07-22 management policy. The record is
-classified as an internal distribution clearance approval; it is not described as an
-external-counsel opinion or a separate candidate signature by executive management.
+The app-wide internal distribution clearance decision
+`KIT-PAY-APP-WIDE-RELEASE-CLEARANCE-2026-0722-001` records `CLEARED` for Kit Pay
+under the signed 2026-07-22 app-specific management policy. Namisi Arnold Paul, Chief
+Executive Officer of Kit POS Uganda Limited, recorded the standing determination. The
+record is classified as an app-wide internal distribution clearance approval; it is
+not described as an external-counsel opinion.
 
-Under the approved Kit Pos Uganda Limited internal release policy, engineering verified that code 14 changes crash-safe exact-fingerprint secure-messaging enrollment recovery, valid-session preservation, and stale-target reauthentication behavior without adding or removing runtime dependencies, changing reviewed third-party licences, changing the FCM adapter boundary, changing the libsignal version or licence, or changing the AGPL corresponding-source distribution model. Distribution is approved under the candidate-specific conditions and re-review triggers.
+Namisi Arnold Paul, Chief Executive Officer of Kit POS Uganda Limited, approved all future Kit Pay releases under the app-specific standing policy. The clearance is not bound to a candidate, version name, version code, tag, commit, APK, or AAB. Version and artifact metadata changes do not require a new approval by themselves; material dependency, licence, signing-identity, or distribution-architecture changes require re-review before the affected release may rely on the app-wide clearance.
 
 The recorded distribution conditions are:
 
-1. The exact reviewed dependency versions must remain unchanged.
-2. Any Google SDK or Firebase dependency change requires re-review.
-3. Any libsignal version or licence change requires re-review.
-4. Required third-party notices must remain included.
-5. The final release AAB dependency inventory must match the reviewed inventory.
-6. Any application-architecture change affecting third-party linking boundaries requires review.
-7. Encrypted attachment sends must remain gated to compatible code-13-or-later roster devices.
-8. Remote-enrolled/local-missing recovery must durably bind the exact captured target to the authenticated session before transmission, atomically retain the proved resulting epoch through fenced local erasure and re-enrollment, preserve a valid session on success or transient failure, and never publish new keys until the backend proves that exact enrollment was removed and its epoch advanced; invalid-session, stale-target, corrupt-proof, or replacement-enrollment states require fresh sign-in.
-9. Historical self-invalidation events may be ignored only after exact current server epoch, registration, identity-key digest, and bundle-version revalidation; they must never authorize mutation of a replacement enrollment, and unverifiable states remain fail-closed.
-10. Retryable capability handling must not bypass the exact reviewed v2 post-quantum protocol gate.
-11. Direct sideload publication requires exact-APK signing and physical-device installation and launch evidence.
+1. Required third-party notices and exact AGPL corresponding source must be published before each matching binary.
+2. The release runtime inventory must be generated and checked for each release.
+3. A runtime change that activates a material re-review trigger must not be treated as covered until the affected area is re-reviewed and the app-wide decision is amended or replaced.
+4. Direct-download APKs and Play-upload AABs must use application ID com.kit.wallet and the approved release-signing certificate.
+5. The final APK and AAB must pass the applicable signing, dependency, source-publication, and release-validation gates.
+6. The provider-neutral FCM boundary, AGPL corresponding-source model, libsignal licensing and session boundary, and fail-closed secure-messaging properties must remain materially unchanged unless re-reviewed.
+7. Version-name, version-code, tag, commit, build-time, and artifact-hash changes do not require a new management approval merely because those per-release values change.
 
 The recorded re-review triggers are:
 
-1. Dependency version changes.
-2. Changes to Google licensing terms affecting reviewed components.
-3. Migration away from the reviewed FCM architecture.
-4. Changes to libsignal licensing.
-5. Changes to the distribution model.
-6. Introduction of additional proprietary SDKs.
-7. Material architecture changes affecting licensing or distribution.
+1. Introduction, removal, or material version change of a significant runtime dependency.
+2. A third-party licence change or new licence obligation.
+3. Changes to Google licensing terms affecting reviewed components.
+4. Migration away from the reviewed FCM architecture.
+5. A material change to libsignal licensing or the Signal session boundary.
+6. A material change to the AGPL corresponding-source or binary distribution model.
+7. Introduction of additional proprietary SDKs.
+8. A major application-architecture change affecting third-party linking, licensing, privacy, or distribution.
+9. A change to the approved Android application ID or release-signing identity.
 
 The release gates compare the resolved six Google/Firebase AARs and POMs byte-for-byte
 with the reviewed hashes, bind the complete 188-component runtime inventory, preserve
 the required notices, and verify the attested Gradle, CycloneDX and final-AAB dependency
 graphs before distribution. The graph-manifest digest is derived release evidence, not
-additional reviewer identity or a replacement legal opinion. A trigger
-invalidates this clearance until a replacement decision is recorded.
+additional reviewer identity or a replacement legal opinion. A material trigger
+suspends clearance for the affected change until the app-wide decision is amended or
+replaced.
 
 ### Resolved JAIN-free LiveKit evidence
 

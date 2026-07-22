@@ -6,12 +6,21 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.annotation.VisibleForTesting
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import com.kit.wallet.data.messaging.ACTION_OPEN_AUTHORIZED_SECURE_MESSAGE
 import com.kit.wallet.data.messaging.EXTRA_SECURE_MESSAGE_AUTHORIZATION
 import com.kit.wallet.data.messaging.SecureMessageNavigationAuthorizer
@@ -27,6 +36,8 @@ import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import com.kit.wallet.worker.scheduleAuthenticatedMessagingCatchUp
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
@@ -38,6 +49,9 @@ class MainActivity : ComponentActivity() {
     private var pendingTextShare by mutableStateOf<IncomingTextShareRequest?>(null)
     private var deferredTextShare: IncomingTextShareRequest? = null
     private var pendingTextShareSending = false
+    private var sessionRestorationActionInFlight by mutableStateOf(false)
+    private var sessionRestorationActionFailed by mutableStateOf(false)
+    private var sessionRestorationDiscardConfirmation by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
@@ -46,33 +60,59 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             val activeSession by sessions.session.collectAsStateWithLifecycle()
+            val sessionRestorationPending by sessions.restorationPending.collectAsStateWithLifecycle()
+            val sessionRestorationRetryable by
+                sessions.restorationRetryable.collectAsStateWithLifecycle()
             LaunchedEffect(activeSession?.sessionId, pendingSecureMessage?.sessionEpoch) {
                 if (pendingSecureMessage?.sessionEpoch != activeSession?.sessionId) {
                     pendingSecureMessage = null
                 }
             }
+            LaunchedEffect(sessionRestorationPending) {
+                if (!sessionRestorationPending) {
+                    sessionRestorationDiscardConfirmation = false
+                    sessionRestorationActionFailed = false
+                }
+            }
             KitWalletTheme {
-                KitApp(
-                    deepLinkUri = pendingDeepLink,
-                    onDeepLinkConsumed = { pendingDeepLink = null },
-                    secureMessageConversationId = pendingSecureMessage
-                        ?.takeIf { it.sessionEpoch == activeSession?.sessionId }
-                        ?.conversationId,
-                    onSecureMessageRouteConsumed = { pendingSecureMessage = null },
-                    incomingTextShare = pendingTextShare,
-                    onTextShareConsumed = { token ->
-                        if (pendingTextShare?.token == token) {
-                            pendingTextShare = deferredTextShare
-                            deferredTextShare = null
-                            pendingTextShareSending = false
-                        }
-                    },
-                    onTextShareSendingChanged = { token, sending ->
-                        if (pendingTextShare?.token == token) {
-                            pendingTextShareSending = sending
-                        }
-                    },
-                )
+                if (sessionRestorationPending) {
+                    SessionRestorationGate(
+                        automaticRetryAvailable = sessionRestorationRetryable,
+                        actionInFlight = sessionRestorationActionInFlight,
+                        actionFailed = sessionRestorationActionFailed,
+                        discardConfirmationRequested = sessionRestorationDiscardConfirmation,
+                        onRetry = ::retryRetainedSessionFromUi,
+                        onRequestSignInAgain = {
+                            sessionRestorationDiscardConfirmation = true
+                        },
+                        onCancelSignInAgain = {
+                            sessionRestorationDiscardConfirmation = false
+                        },
+                        onConfirmSignInAgain = ::discardRetainedSessionFromUi,
+                    )
+                } else {
+                    KitApp(
+                        deepLinkUri = pendingDeepLink,
+                        onDeepLinkConsumed = { pendingDeepLink = null },
+                        secureMessageConversationId = pendingSecureMessage
+                            ?.takeIf { it.sessionEpoch == activeSession?.sessionId }
+                            ?.conversationId,
+                        onSecureMessageRouteConsumed = { pendingSecureMessage = null },
+                        incomingTextShare = pendingTextShare,
+                        onTextShareConsumed = { token ->
+                            if (pendingTextShare?.token == token) {
+                                pendingTextShare = deferredTextShare
+                                deferredTextShare = null
+                                pendingTextShareSending = false
+                            }
+                        },
+                        onTextShareSendingChanged = { token, sending ->
+                            if (pendingTextShare?.token == token) {
+                                pendingTextShareSending = sending
+                            }
+                        },
+                    )
+                }
             }
         }
     }
@@ -85,10 +125,42 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        scheduleAuthenticatedMessagingCatchUp(
-            hasSession = sessions.current() != null,
-            schedule = messagingSyncScheduler::schedule,
-        )
+        lifecycleScope.launch {
+            restoreRetainedSessionWithRetries(
+                pending = { sessions.restorationPending.value },
+                retryable = { sessions.restorationRetryable.value },
+                retry = sessions::retryRestore,
+                waitBeforeNextAttempt = { delay(it) },
+            )
+            scheduleAuthenticatedMessagingCatchUp(
+                hasSession = sessions.current() != null,
+                schedule = messagingSyncScheduler::schedule,
+            )
+        }
+    }
+
+    private fun retryRetainedSessionFromUi() {
+        if (sessionRestorationActionInFlight) return
+        sessionRestorationDiscardConfirmation = false
+        sessionRestorationActionInFlight = true
+        sessionRestorationActionFailed = false
+        lifecycleScope.launch {
+            val restored = runCatching { sessions.retryRestore() }.getOrDefault(false)
+            sessionRestorationActionFailed = !restored && sessions.restorationPending.value
+            sessionRestorationActionInFlight = false
+        }
+    }
+
+    private fun discardRetainedSessionFromUi() {
+        if (sessionRestorationActionInFlight) return
+        sessionRestorationActionInFlight = true
+        sessionRestorationActionFailed = false
+        lifecycleScope.launch {
+            val discarded = runCatching { sessions.discardPendingRestoration() }.isSuccess &&
+                !sessions.restorationPending.value
+            sessionRestorationActionFailed = !discarded
+            sessionRestorationActionInFlight = false
+        }
     }
 
     private fun handleIntent(intent: Intent?) {
@@ -108,6 +180,90 @@ class MainActivity : ComponentActivity() {
             pendingTextShareSending = false
         }
     }
+}
+
+@Composable
+private fun SessionRestorationGate(
+    automaticRetryAvailable: Boolean,
+    actionInFlight: Boolean,
+    actionFailed: Boolean,
+    discardConfirmationRequested: Boolean,
+    onRetry: () -> Unit,
+    onRequestSignInAgain: () -> Unit,
+    onCancelSignInAgain: () -> Unit,
+    onConfirmSignInAgain: () -> Unit,
+) {
+    Surface(modifier = Modifier.fillMaxSize()) {}
+    if (discardConfirmationRequested) {
+        AlertDialog(
+            onDismissRequest = onCancelSignInAgain,
+            title = { Text("Erase this device's secure session?") },
+            text = {
+                Text(
+                    "Signing in again erases the saved login plus this device's local " +
+                        "end-to-end encrypted message keys and history. History can be " +
+                        "recovered only if another enrolled device still has it.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = onConfirmSignInAgain, enabled = !actionInFlight) {
+                    Text("Erase and sign in")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onCancelSignInAgain, enabled = !actionInFlight) {
+                    Text("Keep session")
+                }
+            },
+        )
+        return
+    }
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("Restore your Kit Pay session") },
+        text = {
+            Text(
+                when {
+                    actionFailed -> "Kit Pay could not complete that action. Unlock your device and retry."
+                    automaticRetryAvailable ->
+                        "Your encrypted sign-in is still safe. Unlock this device, then retry."
+                    else -> "Kit Pay could not safely open the saved sign-in. Retry, or choose " +
+                        "Sign in again to review the local data that must be erased."
+                },
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onRetry, enabled = !actionInFlight) { Text("Retry") }
+        },
+        dismissButton = {
+            TextButton(onClick = onRequestSignInAgain, enabled = !actionInFlight) {
+                Text("Sign in again")
+            }
+        },
+    )
+}
+
+private const val SESSION_RESTORE_ATTEMPTS = 3
+private const val SESSION_RESTORE_RETRY_DELAY_MILLIS = 250L
+
+@VisibleForTesting
+internal suspend fun restoreRetainedSessionWithRetries(
+    attempts: Int = SESSION_RESTORE_ATTEMPTS,
+    pending: () -> Boolean,
+    retryable: () -> Boolean,
+    retry: suspend () -> Boolean,
+    waitBeforeNextAttempt: suspend (Long) -> Unit,
+): Boolean {
+    require(attempts > 0)
+    repeat(attempts) { attempt ->
+        if (!pending()) return true
+        if (!retryable()) return false
+        if (retry()) return true
+        if (attempt < attempts - 1) {
+            waitBeforeNextAttempt(SESSION_RESTORE_RETRY_DELAY_MILLIS * (attempt + 1L))
+        }
+    }
+    return !pending()
 }
 
 private data class PendingSecureMessageRoute(

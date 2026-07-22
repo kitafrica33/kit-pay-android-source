@@ -339,11 +339,28 @@ data class EncryptedMessageSenderDto(
 )
 
 @JsonClass(generateAdapter = false)
+data class EncryptedMessageCryptoSenderDto(
+    @Json(name = "user_id") val userId: String? = null,
+    @Json(name = "device_id") val deviceId: String? = null,
+    @Json(name = "enrollment_epoch") val enrollmentEpoch: Long? = null,
+    @Json(name = "signal_device_id") val signalDeviceId: Int? = null,
+    @Json(name = "registration_id") val registrationId: Int? = null,
+    @Json(name = "protocol_version") val protocolVersion: String? = null,
+    @Json(name = "bundle_version") val bundleVersion: Int? = null,
+    @Json(name = "identity_key_sha256") val identityKeySha256: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
 data class EncryptedMessageEnvelopeDto(
     @Json(name = "recipient_device_id") val recipientDeviceId: String? = null,
+    @Json(name = "recipient_enrollment_epoch") val recipientEnrollmentEpoch: Long? = null,
     @Json(name = "envelope_type") val envelopeType: String? = null,
     val ciphertext: String? = null,
     @Json(name = "ciphertext_sha256") val ciphertextSha256: String? = null,
+    @Json(name = "is_history_backfill") val isHistoryBackfill: Boolean? = null,
+    @Json(name = "transfer_client_message_id") val transferClientMessageId: String? = null,
+    @Json(name = "transfer_roster_revision") val transferRosterRevision: String? = null,
+    @Json(name = "crypto_sender") val cryptoSender: EncryptedMessageCryptoSenderDto? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -371,6 +388,7 @@ data class EncryptedMessageDto(
     @Json(name = "client_message_id") val clientMessageId: String? = null,
     val sender: EncryptedMessageSenderDto? = null,
     @Json(name = "sender_device_id") val senderDeviceId: String? = null,
+    @Json(name = "sender_enrollment_epoch") val senderEnrollmentEpoch: Long? = null,
     @Json(name = "sender_signal_device_id") val senderSignalDeviceId: Int? = null,
     @Json(name = "sender_registration_id") val senderRegistrationId: Int? = null,
     @Json(name = "sender_protocol_version") val senderProtocolVersion: String? = null,
@@ -393,6 +411,7 @@ data class MessagingSyncEventDataDto(
     @Json(name = "client_message_id") val clientMessageId: String? = null,
     val sender: EncryptedMessageSenderDto? = null,
     @Json(name = "sender_device_id") val senderDeviceId: String? = null,
+    @Json(name = "sender_enrollment_epoch") val senderEnrollmentEpoch: Long? = null,
     @Json(name = "sender_signal_device_id") val senderSignalDeviceId: Int? = null,
     @Json(name = "sender_registration_id") val senderRegistrationId: Int? = null,
     @Json(name = "sender_protocol_version") val senderProtocolVersion: String? = null,
@@ -408,6 +427,7 @@ data class MessagingSyncEventDataDto(
     @Json(name = "revoked_at") val revokedAt: String? = null,
     @Json(name = "device_id") val deviceId: String? = null,
     @Json(name = "user_id") val userId: String? = null,
+    @Json(name = "enrollment_epoch") val enrollmentEpoch: Long? = null,
     @Json(name = "signal_device_id") val signalDeviceId: Int? = null,
     @Json(name = "registration_id") val registrationId: Int? = null,
     @Json(name = "previous_registration_id") val previousRegistrationId: Int? = null,
@@ -443,6 +463,60 @@ data class MessagingSyncEventDto(
 data class MessagingSyncDto(
     val events: List<MessagingSyncEventDto?>? = null,
     val page: CursorPageDto? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class MessagingHistoryTargetCryptoBundleDto(
+    @Json(name = "device_id") val deviceId: String? = null,
+    @Json(name = "user_id") val userId: String? = null,
+    @Json(name = "enrollment_epoch") val enrollmentEpoch: Long? = null,
+    @Json(name = "signal_device_id") val signalDeviceId: Int? = null,
+    @Json(name = "registration_id") val registrationId: Int? = null,
+    @Json(name = "protocol_version") val protocolVersion: String? = null,
+    @Json(name = "bundle_version") val bundleVersion: Int? = null,
+    @Json(name = "identity_key_sha256") val identityKeySha256: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class MessagingHistoryBackfillCandidatesDto(
+    @Json(name = "conversation_id") val conversationId: String? = null,
+    @Json(name = "roster_revision") val rosterRevision: String? = null,
+    @Json(name = "target_crypto_bundle")
+    val targetCryptoBundle: MessagingHistoryTargetCryptoBundleDto? = null,
+    val messages: List<EncryptedMessageDto?>? = null,
+    val page: CursorPageDto? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class StoreMessagingHistoryEnvelopeRequest(
+    @Json(name = "target_device_id") val targetDeviceId: String,
+    @Json(name = "target_enrollment_epoch") val targetEnrollmentEpoch: Long,
+    @Json(name = "transfer_client_message_id") val transferClientMessageId: String,
+    @Json(name = "roster_revision") val rosterRevision: String,
+    @Json(name = "envelope_type") val envelopeType: String,
+    val ciphertext: String,
+) {
+    init {
+        requireCanonicalMessagingUuid(targetDeviceId, "history target device ID")
+        require(targetEnrollmentEpoch > 0) { "Invalid history target enrollment epoch" }
+        requireCanonicalMessagingUuid(transferClientMessageId, "history transfer client message ID")
+        require(SECURE_MESSAGING_ROSTER_REVISION.matches(rosterRevision)) {
+            "Invalid history transfer roster revision"
+        }
+        require(envelopeType in SECURE_MESSAGE_ENVELOPE_TYPES) {
+            "Kit Pay may send only v2 history envelopes"
+        }
+        requireCanonicalCiphertext(ciphertext)
+    }
+}
+
+@JsonClass(generateAdapter = false)
+data class MessagingHistoryEnvelopeResultDto(
+    @Json(name = "message_id") val messageId: String? = null,
+    @Json(name = "target_device_id") val targetDeviceId: String? = null,
+    @Json(name = "target_enrollment_epoch") val targetEnrollmentEpoch: Long? = null,
+    @Json(name = "transfer_client_message_id") val transferClientMessageId: String? = null,
+    val created: Boolean? = null,
 )
 
 @JsonClass(generateAdapter = false)

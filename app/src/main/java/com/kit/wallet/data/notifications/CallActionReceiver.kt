@@ -12,9 +12,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
 /**
- * Handles the Decline action on the incoming-call notification so a ringing Kit Pay call can be
- * rejected straight from the status bar or lock screen without opening the app. The decline is
- * reported to the backend so the caller stops ringing immediately.
+ * Handles call actions initiated by Android Telecom or the incoming-call notification even when
+ * the activity is not visible. Every action is reported to the backend immediately.
  */
 @AndroidEntryPoint
 class CallActionReceiver : BroadcastReceiver() {
@@ -24,7 +23,7 @@ class CallActionReceiver : BroadcastReceiver() {
     @Inject @ApplicationScope lateinit var applicationScope: CoroutineScope
 
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != ACTION_DECLINE) return
+        if (intent.action !in setOf(ACTION_DECLINE, ACTION_END)) return
         val callId = IncomingCallPayload.callId(
             mapOf("call_id" to intent.getStringExtra(EXTRA_CALL_ID).orEmpty()),
         ) ?: return
@@ -33,7 +32,10 @@ class CallActionReceiver : BroadcastReceiver() {
         val pending = goAsync()
         applicationScope.launch {
             try {
-                runCatching { calls.decline(callId) }
+                runCatching {
+                    if (intent.action == ACTION_DECLINE) calls.decline(callId)
+                    else calls.end(callId, intent.getStringExtra(EXTRA_REASON) ?: "cancelled")
+                }
             } finally {
                 pending.finish()
             }
@@ -42,7 +44,9 @@ class CallActionReceiver : BroadcastReceiver() {
 
     companion object {
         const val ACTION_DECLINE = "com.kit.wallet.action.DECLINE_CALL"
+        const val ACTION_END = "com.kit.wallet.action.END_CALL"
         const val EXTRA_CALL_ID = "call_id"
+        const val EXTRA_REASON = "reason"
 
         // Mirrors DefaultPushEnvelopeReceiver's incoming-call notification identity.
         const val NOTIFICATION_ID = 4_101
@@ -53,5 +57,11 @@ class CallActionReceiver : BroadcastReceiver() {
             Intent(context, CallActionReceiver::class.java)
                 .setAction(ACTION_DECLINE)
                 .putExtra(EXTRA_CALL_ID, callId)
+
+        fun endIntent(context: Context, callId: String, reason: String): Intent =
+            Intent(context, CallActionReceiver::class.java)
+                .setAction(ACTION_END)
+                .putExtra(EXTRA_CALL_ID, callId)
+                .putExtra(EXTRA_REASON, reason)
     }
 }

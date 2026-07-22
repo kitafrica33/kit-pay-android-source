@@ -71,10 +71,26 @@ class RemoteContactRepository @Inject constructor(
     }
 
     override suspend fun refresh() {
+        // READ_CONTACTS is granted only after the in-app disclosure and Android permission flow.
+        // Once granted, keep the server contact graph current on login and contacts-screen entry
+        // so a newly saved Kit member is not left as a permanently local, invite-only row.
+        if (hasContactPermission()) {
+            syncDeviceContacts()
+            return
+        }
         val deviceNames = deviceContactNames()
         val registered = apiCalls.execute { api.contacts() }.items.orEmpty()
             .map { it.toUiModel(deviceNames) }
         mutableContacts.value = withLocalOnlyDeviceContacts(registered, deviceNames)
+    }
+
+    override suspend fun resolveForMessaging(contact: Contact): Contact? {
+        if (contact.isKitUser) return contact
+        if (hasContactPermission()) syncDeviceContacts() else refresh()
+        val key = contactNumberKey(contact.phone)
+        return mutableContacts.value.singleOrNull { candidate ->
+            candidate.isKitUser && contactNumberKey(candidate.phone) == key
+        }
     }
 
     /**
@@ -160,8 +176,7 @@ class RemoteContactRepository @Inject constructor(
 
     override suspend fun syncDeviceContacts() {
         check(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) ==
-                PackageManager.PERMISSION_GRANTED,
+            hasContactPermission(),
         ) { "Contacts permission is required before synchronization" }
 
         val projection = arrayOf(
@@ -203,10 +218,7 @@ class RemoteContactRepository @Inject constructor(
      * when Contacts access has not been granted, so registered names remain the fallback.
      */
     private fun deviceContactNames(): Map<String, String> {
-        if (
-            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
+        if (!hasContactPermission()) {
             return emptyMap()
         }
         val projection = arrayOf(
@@ -252,6 +264,10 @@ class RemoteContactRepository @Inject constructor(
 
     /** Matches address-book and server numbers by their trailing national digits (e.g. +256/0 forms). */
     private fun contactNumberKey(raw: String): String = raw.filter(Char::isDigit).takeLast(9)
+
+    private fun hasContactPermission(): Boolean =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) ==
+            PackageManager.PERMISSION_GRANTED
 
     private companion object {
         const val MAX_CONTACTS = 1_000
@@ -326,6 +342,7 @@ class ProviderCatalogRepository @Inject constructor(
 class RemoteCallRepository @Inject constructor(
     private val api: KitWalletApi,
     private val apiCalls: ApiCallExecutor,
+    private val contacts: ContactRepository,
     sessions: SessionStore,
     @ApplicationScope scope: CoroutineScope,
 ) : CallRepository {
@@ -342,10 +359,28 @@ class RemoteCallRepository @Inject constructor(
     }
 
     override suspend fun refresh() {
+        refreshContactPresentation()
+        refreshCallList()
+    }
+
+    private suspend fun refreshCallList() {
         mutableCalls.value = apiCalls.execute { api.calls() }.items.orEmpty().map { call ->
+            val startedAt = runCatching { Instant.parse(call.startedAt) }.getOrNull()
+            val answeredAt = call.answeredAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+            val endedAt = call.endedAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
+            val durationSeconds = if (answeredAt != null && endedAt != null) {
+                java.time.Duration.between(answeredAt, endedAt).seconds.coerceAtLeast(0)
+            } else {
+                0
+            }
+            val presentation = resolveCallPresentation(
+                serverName = call.name,
+                participantUserIds = call.participantUserIds.orEmpty(),
+                contacts = contacts.contacts.value,
+            )
             CallEntry(
                 id = call.id,
-                name = call.name.toCallDisplayName(),
+                name = presentation.name,
                 time = formatTime(call.startedAt),
                 direction = when (call.direction.lowercase()) {
                     "outgoing" -> CallDirection.OUTGOING
@@ -354,6 +389,10 @@ class RemoteCallRepository @Inject constructor(
                 },
                 video = call.video == true || call.type == "video",
                 participantUserIds = call.participantUserIds.orEmpty(),
+                conversationId = call.conversationId,
+                startedAtEpochMillis = startedAt?.toEpochMilli() ?: 0,
+                durationSeconds = durationSeconds,
+                answered = answeredAt != null,
             )
         }
     }
@@ -361,9 +400,14 @@ class RemoteCallRepository @Inject constructor(
     override suspend fun incoming(callId: String): IncomingCallDetails {
         val call = apiCalls.execute { api.call(callId) }
         check(call.id == callId) { "The call lookup returned an unexpected call" }
+        refreshContactPresentation()
+        val participantIds = call.participantUserIds.orEmpty()
+        val presentation = resolveCallPresentation(call.name, participantIds, contacts.contacts.value)
         return IncomingCallDetails(
             callId = call.id,
-            name = call.name.toCallDisplayName(),
+            name = presentation.name,
+            phone = presentation.phone,
+            participantUserIds = participantIds,
             video = call.video == true || call.type == "video",
             direction = call.direction,
             state = call.state,
@@ -386,41 +430,66 @@ class RemoteCallRepository @Inject constructor(
                 ),
             )
         }
+        refreshContactPresentation()
+        runCatching { refreshCallList() }
+        return session.toConnection(recipientUserId)
+    }
+
+    override suspend fun invite(callId: String, recipientUserIds: List<String>) {
+        require(recipientUserIds.isNotEmpty()) { "Choose at least one Kit Pay contact to add" }
+        apiCalls.execute {
+            api.inviteToCall(
+                callId,
+                com.kit.wallet.data.remote.InviteCallRequest(recipientUserIds),
+            )
+        }
         refresh()
-        return session.toConnection()
     }
 
     override suspend fun accept(callId: String): CallConnection {
         val session = apiCalls.execute { api.acceptCall(callId) }
-        refresh()
+        refreshContactPresentation()
+        runCatching { refreshCallList() }
         return session.toConnection()
     }
 
     override suspend fun decline(callId: String) {
         apiCalls.execute { api.declineCall(callId) }
-        refresh()
+        refreshContactPresentation()
+        runCatching { refreshCallList() }
     }
 
     override suspend fun end(callId: String, reason: String) {
         apiCalls.execute { api.endCall(callId, EndCallRequest(reason)) }
-        refresh()
+        refreshContactPresentation()
+        runCatching { refreshCallList() }
     }
 
-    private fun CallSessionDto.toConnection(): CallConnection {
+    private fun CallSessionDto.toConnection(recipientHint: String? = null): CallConnection {
         check(rtc.provider.equals("livekit", ignoreCase = true)) {
             "This version of Kit Pay cannot use the configured call provider"
         }
         check(rtc.url.startsWith("wss://")) { "The call server did not provide a secure WebSocket URL" }
         check(rtc.token.isNotBlank()) { "The call server did not provide a room token" }
+        val participantIds = (call.participantUserIds.orEmpty() + listOfNotNull(recipientHint))
+            .distinctBy(String::lowercase)
+        val presentation = resolveCallPresentation(call.name, participantIds, contacts.contacts.value)
         return CallConnection(
             callId = call.id,
-            name = call.name.toCallDisplayName(),
+            name = presentation.name,
+            phone = presentation.phone,
+            participantUserIds = participantIds,
             video = call.video == true || call.type == "video",
             provider = rtc.provider,
             url = rtc.url,
             token = rtc.token,
             room = rtc.room,
         )
+    }
+
+    /** Exactly one fresh address-book/server-contact merge per public call operation. */
+    private suspend fun refreshContactPresentation() {
+        runCatching { contacts.refresh() }
     }
 
     private fun formatTime(value: String): String = runCatching {
@@ -600,6 +669,3 @@ class RemoteBankingRepository @Inject constructor(
         const val VERIFICATION_POLL_MILLIS = 750L
     }
 }
-
-internal fun String?.toCallDisplayName(): String =
-    this?.trim()?.takeIf(String::isNotBlank) ?: "Kit Pay contact"

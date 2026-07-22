@@ -51,7 +51,7 @@ data class Transaction(
 )
 
 enum class DeliveryState { SENDING, SENT, DELIVERED, READ, RETRY_REQUIRED, FAILED }
-enum class MessageKind { TEXT, PAYMENT, PAYMENT_REQUEST, VOICE_NOTE, IMAGE }
+enum class MessageKind { TEXT, PAYMENT, PAYMENT_REQUEST, VOICE_NOTE, IMAGE, CALL }
 
 data class Message(
     val id: String,
@@ -69,6 +69,12 @@ data class Message(
     val paymentRequestId: String? = null,
     /** For payment messages: an optional sender note carried inside the encrypted descriptor. */
     val paymentNote: String? = null,
+    /** Epoch millis used to interleave messages with call-log entries in a conversation. */
+    val sortEpochMillis: Long = 0,
+    /** For CALL entries: direction, whether it was a video call and the connected duration. */
+    val callDirection: CallDirection? = null,
+    val callVideo: Boolean = false,
+    val callDurationSeconds: Long = 0,
     val reactions: List<String> = emptyList(),
     val replyToText: String? = null,
     val durationSec: Int = 0,
@@ -100,6 +106,14 @@ data class CallEntry(
     val direction: CallDirection,
     val video: Boolean = false,
     val participantUserIds: List<String> = emptyList(),
+    /** The direct conversation this call belongs to, when the backend supplied it. */
+    val conversationId: String? = null,
+    /** Call start time in epoch millis, for interleaving call logs with chat messages. */
+    val startedAtEpochMillis: Long = 0,
+    /** Connected duration in seconds; zero for missed or unanswered calls. */
+    val durationSeconds: Long = 0,
+    /** True when the call actually connected (used to distinguish "no answer" from a real call). */
+    val answered: Boolean = false,
 )
 
 data class BillProvider(

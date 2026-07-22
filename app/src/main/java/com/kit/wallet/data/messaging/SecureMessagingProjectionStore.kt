@@ -76,11 +76,201 @@ internal class SecureMessagingProjectionStore @Inject constructor(
             recordKey = inboundRecordKey(messageId),
         )
 
+    fun historyOutboundIntent(transferClientMessageId: String): SecureMessagingCompanionStateIntent =
+        SecureMessagingCompanionStateIntent.outbound(
+            namespace = HISTORY_COMPANION_NAMESPACE,
+            recordKey = historyOutboundRecordKey(transferClientMessageId),
+        )
+
+    fun historyInboundIntent(transferClientMessageId: String): SecureMessagingCompanionStateIntent =
+        SecureMessagingCompanionStateIntent.inbound(
+            namespace = HISTORY_COMPANION_NAMESPACE,
+            recordKey = historyInboundRecordKey(transferClientMessageId),
+        )
+
     suspend fun readInbound(messageId: String): LibSignalCompanionRecord? =
         companionReader.read(COMPANION_NAMESPACE, inboundRecordKey(messageId))
 
     suspend fun readOutbound(clientMessageId: String): LibSignalCompanionRecord? =
         companionReader.read(COMPANION_NAMESPACE, outboundRecordKey(clientMessageId))
+
+    suspend fun readHistoryOutbound(transferClientMessageId: String): LibSignalCompanionRecord? =
+        companionReader.read(
+            HISTORY_COMPANION_NAMESPACE,
+            historyOutboundRecordKey(transferClientMessageId),
+        )?.also { durable ->
+            validateHistoryCompanion(
+                durable = requireDurableLibSignalCompanionRecord(durable),
+                transferClientMessageId = transferClientMessageId,
+                direction = LibSignalCompanionDirection.OUTBOUND,
+            )
+        }
+
+    suspend fun readHistoryInbound(transferClientMessageId: String): LibSignalCompanionRecord? =
+        companionReader.read(
+            HISTORY_COMPANION_NAMESPACE,
+            historyInboundRecordKey(transferClientMessageId),
+        )?.also { durable ->
+            validateHistoryCompanion(
+                durable = requireDurableLibSignalCompanionRecord(durable),
+                transferClientMessageId = transferClientMessageId,
+                direction = LibSignalCompanionDirection.INBOUND,
+            )
+        }
+
+    /** Materializes only an authenticated, exact-metadata-matched wrapper as original history. */
+    suspend fun recordRecoveredHistory(
+        authenticated: SecureMessagingAuthenticatedHistory,
+    ): LibSignalCompanionRecord {
+        val recordKey = inboundRecordKey(authenticated.messageId)
+        var durable = companionReader.read(COMPANION_NAMESPACE, recordKey)
+        if (durable == null) {
+            val encoded = encodeRecoveredHistoryCompanionRecord(authenticated)
+            try {
+                try {
+                    stateStore.write(
+                        namespace = COMPANION_NAMESPACE,
+                        recordKey = recordKey,
+                        expectedVersion = null,
+                        bytes = encoded,
+                    )
+                } catch (_: SecureMessagingStateConflictException) {
+                    // Another replay/process path may have materialized the same authenticated
+                    // original. Re-read and require byte-equivalent decoded metadata below.
+                }
+            } finally {
+                encoded.fill(0)
+            }
+            durable = companionReader.read(COMPANION_NAMESPACE, recordKey)
+        }
+        val recovered = requireNotNull(durable) {
+            "Authenticated history projection was not durably materialized"
+        }
+        validateRecoveredHistory(recovered, authenticated)
+        return recovered
+    }
+
+    /** Resolves one exact retained original without scanning or truncating a large local history. */
+    suspend fun retainedHistorySource(
+        messageId: String,
+        clientMessageId: String,
+    ): SecureMessagingProjectedMessage? {
+        val possible = listOfNotNull(
+            readInbound(messageId),
+            readOutbound(clientMessageId),
+        ).mapNotNull { record ->
+            val durable = requireDurableLibSignalCompanionRecord(record)
+            validateCompanionAddress(durable)
+            val metadata = readMetadata(durable.recordKey) ?: return@mapNotNull null
+            validateMetadataMatches(metadata, durable)
+            SecureMessagingProjectedMessage(
+                durableRecord = durable,
+                serverMessageId = metadata.serverMessageId,
+                sentAt = Instant.ofEpochMilli(metadata.sentAtEpochMillis),
+                deliveryState = metadata.deliveryState,
+            )
+        }.filter { it.serverMessageId == messageId }
+        check(possible.size <= 1) { "Retained history has duplicate authenticated sources" }
+        return possible.singleOrNull()
+    }
+
+    suspend fun enqueueHistoryBackfill(
+        conversationId: String,
+        targetDeviceId: String,
+        targetEnrollmentEpoch: Long,
+    ) {
+        val key = SecureMessagingHistoryBackfillTaskCodec.recordKey(
+            conversationId,
+            targetDeviceId,
+            targetEnrollmentEpoch,
+        )
+        val existing = stateStore.read(HISTORY_TASK_NAMESPACE, key)
+        if (existing != null) {
+            existing.bytes.fill(0)
+            return
+        }
+        val encoded = SecureMessagingHistoryBackfillTaskCodec.encode(
+            conversationId = conversationId,
+            targetDeviceId = targetDeviceId,
+            targetEnrollmentEpoch = targetEnrollmentEpoch,
+            nextCursor = null,
+            completed = false,
+        )
+        try {
+            try {
+                stateStore.write(
+                    HISTORY_TASK_NAMESPACE,
+                    key,
+                    expectedVersion = null,
+                    bytes = encoded,
+                )
+            } catch (_: SecureMessagingStateConflictException) {
+                val winner = stateStore.read(HISTORY_TASK_NAMESPACE, key)
+                requireNotNull(winner) { "Concurrent history-task creation omitted its record" }
+                    .bytes.fill(0)
+            }
+        } finally {
+            encoded.fill(0)
+        }
+    }
+
+    suspend fun pendingHistoryBackfills(limit: Int): List<SecureMessagingHistoryBackfillTask> {
+        require(limit in 1..MAX_PENDING_HISTORY_TASKS) { "Invalid history-task read limit" }
+        val pending = mutableListOf<SecureMessagingHistoryBackfillTask>()
+        var after: String? = null
+        repeat(MAX_HISTORY_TASK_SCAN_PAGES) {
+            val page = stateStore.readNamespacePage(
+                namespace = HISTORY_TASK_NAMESPACE,
+                afterRecordKey = after,
+                limit = HISTORY_TASK_SCAN_PAGE_SIZE,
+            )
+            page.records().forEach { record ->
+                val task = try {
+                    SecureMessagingHistoryBackfillTaskCodec.decode(
+                        recordKey = record.recordKey,
+                        recordVersion = record.version,
+                        bytes = record.bytes,
+                    )
+                } finally {
+                    record.bytes.fill(0)
+                }
+                if (!task.completed) pending += task
+                if (pending.size == limit) return pending
+            }
+            after = page.nextAfterRecordKey ?: return pending
+        }
+        return pending
+    }
+
+    suspend fun updateHistoryBackfill(
+        task: SecureMessagingHistoryBackfillTask,
+        nextCursor: String?,
+        completed: Boolean,
+    ): SecureMessagingHistoryBackfillTask {
+        check(!task.completed) { "A completed history task cannot be advanced" }
+        val encoded = SecureMessagingHistoryBackfillTaskCodec.encode(
+            conversationId = task.conversationId,
+            targetDeviceId = task.targetDeviceId,
+            targetEnrollmentEpoch = task.targetEnrollmentEpoch,
+            nextCursor = nextCursor,
+            completed = completed,
+        )
+        return try {
+            val version = stateStore.write(
+                namespace = HISTORY_TASK_NAMESPACE,
+                recordKey = task.recordKey,
+                expectedVersion = task.recordVersion,
+                bytes = encoded,
+            )
+            task.copy(
+                recordVersion = version.version,
+                nextCursor = nextCursor,
+                completed = completed,
+            )
+        } finally {
+            encoded.fill(0)
+        }
+    }
 
     /**
      * Returns whether the authenticated inbound projection has already been durably recorded.
@@ -898,6 +1088,44 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         }
     }
 
+    private fun validateHistoryCompanion(
+        durable: LibSignalCompanionRecord,
+        transferClientMessageId: String,
+        direction: LibSignalCompanionDirection,
+    ) {
+        check(
+            durable.recordNamespace == HISTORY_COMPANION_NAMESPACE &&
+                durable.recordKey == when (direction) {
+                    LibSignalCompanionDirection.OUTBOUND ->
+                        historyOutboundRecordKey(transferClientMessageId)
+                    LibSignalCompanionDirection.INBOUND ->
+                        historyInboundRecordKey(transferClientMessageId)
+                } &&
+                durable.direction == direction &&
+                durable.messageId == transferClientMessageId &&
+                durable.clientMessageId == transferClientMessageId,
+        ) { "History companion state does not match its transfer identity" }
+    }
+
+    private fun validateRecoveredHistory(
+        record: LibSignalCompanionRecord,
+        authenticated: SecureMessagingAuthenticatedHistory,
+    ) {
+        val durable = requireDurableLibSignalCompanionRecord(record)
+        validateCompanionAddress(durable)
+        check(
+            durable.direction == LibSignalCompanionDirection.INBOUND &&
+                durable.messageId == authenticated.messageId &&
+                durable.clientMessageId == authenticated.clientMessageId &&
+                durable.conversationId == authenticated.conversationId &&
+                durable.sender == authenticated.sender &&
+                durable.rosterRevision == authenticated.rosterRevision &&
+                durable.replyToMessageId == authenticated.replyToMessageId &&
+                durable.authenticatedText == authenticated.text &&
+                durable.ciphertextFanout().isEmpty(),
+        ) { "Recovered history differs from its authenticated descriptor" }
+    }
+
     private data class VersionedProjectionMetadata(
         val metadata: ProjectionMetadata,
         val version: Long,
@@ -905,7 +1133,12 @@ internal class SecureMessagingProjectionStore @Inject constructor(
 
     companion object {
         const val COMPANION_NAMESPACE = "message-projection-v1"
+        const val HISTORY_COMPANION_NAMESPACE = "history-transfer-v1"
+        private const val HISTORY_TASK_NAMESPACE = "history-backfill-task-v1"
         private const val METADATA_NAMESPACE = "message-metadata-v1"
+        private const val HISTORY_TASK_SCAN_PAGE_SIZE = 100
+        private const val MAX_HISTORY_TASK_SCAN_PAGES = 100
+        private const val MAX_PENDING_HISTORY_TASKS = 16
 
         fun inboundRecordKey(messageId: String): String {
             require(isCanonicalUuid(messageId)) { "Invalid incoming message ID" }
@@ -915,6 +1148,16 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         fun outboundRecordKey(clientMessageId: String): String {
             require(isCanonicalUuid(clientMessageId)) { "Invalid outgoing client message ID" }
             return "out:$clientMessageId"
+        }
+
+        fun historyOutboundRecordKey(transferClientMessageId: String): String {
+            require(isCanonicalUuid(transferClientMessageId)) { "Invalid history transfer ID" }
+            return "history-out:$transferClientMessageId"
+        }
+
+        fun historyInboundRecordKey(transferClientMessageId: String): String {
+            require(isCanonicalUuid(transferClientMessageId)) { "Invalid history transfer ID" }
+            return "history-in:$transferClientMessageId"
         }
     }
 }

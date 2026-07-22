@@ -1059,6 +1059,7 @@ private class LibSignalTransaction(
                         conversationId = request.conversationId,
                         sender = request.sender,
                         plaintext = plaintext,
+                        isHistoryBackfill = request.isHistoryBackfill,
                     )
                 } catch (error: SecureMessagingCryptographicFailureException) {
                     throw error
@@ -2005,12 +2006,23 @@ private object LibSignalCompanionRecordCodec {
                         "Persisted inbound state cannot contain an outbound fanout"
                     }
                 }
-                val authenticated = SecureMessagingAuthenticatedPlaintext(
-                    messageId = messageId,
-                    conversationId = conversationId,
-                    sender = sender,
-                    plaintext = contentBytes,
-                )
+                val authenticated = if (
+                    recordNamespace == SecureMessagingProjectionStore.HISTORY_COMPANION_NAMESPACE
+                ) {
+                    SecureMessagingAuthenticatedPlaintext.history(
+                        messageId = messageId,
+                        conversationId = conversationId,
+                        sender = sender,
+                        plaintext = contentBytes,
+                    )
+                } else {
+                    SecureMessagingAuthenticatedPlaintext(
+                        messageId = messageId,
+                        conversationId = conversationId,
+                        sender = sender,
+                        plaintext = contentBytes,
+                    )
+                }
                 val text = try {
                     check(authenticated.contentBinding.clientMessageId == clientMessageId) {
                         "Persisted content client message ID changed"
@@ -2050,6 +2062,37 @@ private object LibSignalCompanionRecordCodec {
             plaintext?.fill(0)
             owned.fill(0)
         }
+    }
+}
+
+/** Encodes only a metadata-matched, authenticated history value into the canonical projection. */
+internal fun encodeRecoveredHistoryCompanionRecord(
+    history: SecureMessagingAuthenticatedHistory,
+): ByteArray {
+    val content = encodeSecureMessagingTextContent(
+        SecureMessagingTextContentBinding(
+            clientMessageId = history.clientMessageId,
+            conversationId = history.conversationId,
+            rosterRevision = history.rosterRevision,
+            sender = history.sender,
+            replyToMessageId = history.replyToMessageId,
+        ),
+        history.text,
+    )
+    return try {
+        LibSignalCompanionRecordCodec.encode(
+            operation = SecureMessagingCryptoOperation.DECRYPT,
+            messageId = history.messageId,
+            clientMessageId = history.clientMessageId,
+            conversationId = history.conversationId,
+            rosterRevision = history.rosterRevision,
+            sender = history.sender,
+            replyToMessageId = history.replyToMessageId,
+            plaintext = content,
+            envelopes = emptyList(),
+        )
+    } finally {
+        content.fill(0)
     }
 }
 

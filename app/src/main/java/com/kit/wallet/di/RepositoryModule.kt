@@ -29,6 +29,8 @@ import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.RealSecureMessagingSyncEngine
+import com.kit.wallet.feature.chat.AndroidMessageSoundPlayer
+import com.kit.wallet.feature.chat.MessageSoundPlayer
 import com.kit.wallet.data.local.RoomWalletCache
 import com.kit.wallet.data.local.WalletCache
 import dagger.Binds
@@ -120,6 +122,12 @@ abstract class RepositoryBindingsModule {
     @Binds
     @Singleton
     abstract fun bindKycRepository(implementation: RemoteKycRepository): KycRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindMessageSoundPlayer(
+        implementation: AndroidMessageSoundPlayer,
+    ): MessageSoundPlayer
 }
 
 @Module

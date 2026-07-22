@@ -1,18 +1,23 @@
 package com.kit.wallet.feature.calls
 
 import android.content.Context
+import android.content.Intent
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.notifications.ActiveCallStateHolder
 import com.kit.wallet.data.notifications.CallActionReceiver
 import com.kit.wallet.data.notifications.CallLifecycleEvent
 import com.kit.wallet.data.notifications.CallLifecycleEventBus
 import com.kit.wallet.data.notifications.CallLifecycleKind
+import com.kit.wallet.data.notifications.IncomingCallRelay
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.repository.CallConnection
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ContactRepository
+import com.kit.wallet.data.repository.initialCallPresentation
 import com.kit.wallet.di.ApplicationScope
+import com.kit.wallet.ui.model.Contact
 import com.twilio.audioswitch.AudioDevice
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -26,6 +31,7 @@ import io.livekit.android.room.track.CameraPosition
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.Track
 import io.livekit.android.room.track.VideoTrack
+import io.livekit.android.room.track.screencapture.ScreenCaptureParams
 import java.io.IOException
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
@@ -33,7 +39,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -50,6 +60,22 @@ enum class CallPhase {
     ERROR,
 }
 
+/** One other person on the call: their name, current video (camera or screen) and speaking state. */
+data class RemoteCallParticipant(
+    val id: String,
+    val name: String,
+    val videoTrack: VideoTrack? = null,
+    val speaking: Boolean = false,
+)
+
+/** A second call ringing in while this call is connected (call-waiting). */
+data class WaitingCall(
+    val callId: String,
+    val name: String,
+    val video: Boolean,
+    val callerUserId: String?,
+)
+
 data class ActiveCallUiState(
     val name: String = "Kit Pay contact",
     val video: Boolean = false,
@@ -59,11 +85,20 @@ data class ActiveCallUiState(
     val muted: Boolean = false,
     val cameraEnabled: Boolean = false,
     val speakerEnabled: Boolean = false,
+    val screenSharing: Boolean = false,
     val durationSeconds: Long = 0,
-    val remoteVideoTrack: VideoTrack? = null,
+    val remoteParticipants: List<RemoteCallParticipant> = emptyList(),
     val localVideoTrack: VideoTrack? = null,
+    val waitingCall: WaitingCall? = null,
+    val mergingWaitingCall: Boolean = false,
     val error: String? = null,
-)
+) {
+    /** The primary remote video, used by the one-to-one layout. */
+    val remoteVideoTrack: VideoTrack? get() = remoteParticipants.firstOrNull { it.videoTrack != null }?.videoTrack
+
+    /** True once more than one other participant is on the call. */
+    val isGroup: Boolean get() = remoteParticipants.size > 1
+}
 
 @HiltViewModel
 class ActiveCallViewModel @Inject constructor(
@@ -71,17 +106,21 @@ class ActiveCallViewModel @Inject constructor(
     private val calls: CallRepository,
     private val contacts: ContactRepository,
     private val callEvents: CallLifecycleEventBus,
+    private val activeCallState: ActiveCallStateHolder,
+    private val incomingCalls: IncomingCallRelay,
+    private val telecom: KitTelecomBridge,
     @ApplicationScope private val applicationScope: CoroutineScope,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
     private val target: String? = savedStateHandle["name"]
     private val incomingCallId: String? = savedStateHandle["callId"]
+    private val initialPresentation = initialCallPresentation(target, contacts.contacts.value)
     private val mutableState = MutableStateFlow(
         ActiveCallUiState(
             name = if (incomingCallId != null) {
                 "Incoming Kit Pay call"
             } else {
-                target?.takeIf { it.isNotBlank() } ?: "Kit Pay contact"
+                initialPresentation.name
             },
             incoming = incomingCallId != null,
             phase = if (incomingCallId != null) CallPhase.VALIDATING else CallPhase.IDLE,
@@ -103,28 +142,28 @@ class ActiveCallViewModel @Inject constructor(
     private val pendingTerminations = CallTerminationQueue()
     private var terminated = false
 
+    /** Kit Pay contacts that can be added to the call, for the in-call "Add people" picker. */
+    val callableContacts: StateFlow<List<Contact>> = contacts.contacts
+        .map { list -> list.filter { it.isKitUser }.sortedBy { it.name } }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
     init {
         viewModelScope.launch {
             room.events.collect { event ->
                 when (event) {
-                    is RoomEvent.ParticipantConnected -> if (!terminated) markConnected()
-                    is RoomEvent.ParticipantDisconnected -> if (room.remoteParticipants.isEmpty()) {
-                        end("network_error")
+                    is RoomEvent.ParticipantConnected -> if (!terminated) {
+                        markConnected()
+                        syncRemoteParticipants()
                     }
-                    is RoomEvent.TrackSubscribed -> if (!terminated && event.track is VideoTrack) {
-                        // A peer turning their camera on upgrades a voice call to the video layout.
-                        mutableState.value = mutableState.value.copy(
-                            remoteVideoTrack = event.track as VideoTrack,
-                            video = true,
-                        )
+                    is RoomEvent.ParticipantDisconnected -> if (!terminated) {
+                        syncRemoteParticipants()
+                        // End only once nobody else remains; other participants keep a group call live.
+                        if (room.remoteParticipants.isEmpty()) end("network_error")
                     }
-                    is RoomEvent.TrackUnsubscribed -> if (event.track == mutableState.value.remoteVideoTrack) {
-                        // With both cameras off the call settles back into the voice layout.
-                        mutableState.value = mutableState.value.copy(
-                            remoteVideoTrack = null,
-                            video = mutableState.value.cameraEnabled,
-                        )
-                    }
+                    // Any camera/screen track appearing or disappearing rebuilds the participant grid
+                    // and re-derives whether the call is showing video.
+                    is RoomEvent.TrackSubscribed -> if (!terminated) syncRemoteParticipants()
+                    is RoomEvent.TrackUnsubscribed -> if (!terminated) syncRemoteParticipants()
                     is RoomEvent.Reconnecting -> if (!terminated) {
                         mutableState.value = mutableState.value.copy(phase = CallPhase.RECONNECTING)
                     }
@@ -142,7 +181,85 @@ class ActiveCallViewModel @Inject constructor(
         viewModelScope.launch {
             callEvents.events.collect(::handleLifecycleEvent)
         }
+        // A second call ringing in while this one is connected becomes a call-waiting banner.
+        viewModelScope.launch {
+            incomingCalls.events.collect { incoming ->
+                val currentCallId = connection?.callId
+                if (
+                    !terminated &&
+                    currentCallId != null &&
+                    incoming.callId != currentCallId &&
+                    mutableState.value.waitingCall?.callId != incoming.callId
+                ) {
+                    mutableState.value = mutableState.value.copy(
+                        waitingCall = WaitingCall(
+                            callId = incoming.callId,
+                            name = incoming.callerName,
+                            video = incoming.video,
+                            callerUserId = incoming.callerUserId,
+                        ),
+                    )
+                }
+            }
+        }
         if (incomingCallId != null) validateIncomingCall()
+    }
+
+    /** Declines the second, waiting call without disturbing the current call. */
+    fun declineWaitingCall() {
+        val waiting = mutableState.value.waitingCall ?: return
+        mutableState.value = mutableState.value.copy(waitingCall = null, mergingWaitingCall = false)
+        telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
+        applicationScope.launch { runCatching { calls.decline(waiting.callId) } }
+    }
+
+    /**
+     * Merges the waiting call into this one: the waiting caller is added to the current call as a
+     * group call, and their separate incoming call is dismissed. Both parties end up together.
+     */
+    fun mergeWaitingCall() {
+        val waiting = mutableState.value.waitingCall ?: return
+        val currentCallId = connection?.callId ?: return
+        val callerUserId = waiting.callerUserId
+        if (callerUserId == null) {
+            mutableState.value = mutableState.value.copy(
+                waitingCall = null,
+                error = "This call can't be merged. Ask them to call back after this call.",
+            )
+            telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
+            applicationScope.launch { runCatching { calls.decline(waiting.callId) } }
+            return
+        }
+        mutableState.value = mutableState.value.copy(mergingWaitingCall = true)
+        viewModelScope.launch {
+            try {
+                calls.invite(currentCallId, listOf(callerUserId))
+                runCatching { calls.decline(waiting.callId) }
+                telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
+                mutableState.value = mutableState.value.copy(
+                    waitingCall = null,
+                    mergingWaitingCall = false,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                if (!terminated) {
+                    mutableState.value = mutableState.value.copy(
+                        mergingWaitingCall = false,
+                        error = error.userMessage(),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun clearWaitingCall() {
+        if (mutableState.value.waitingCall != null || mutableState.value.mergingWaitingCall) {
+            mutableState.value = mutableState.value.copy(
+                waitingCall = null,
+                mergingWaitingCall = false,
+            )
+        }
     }
 
     fun start(requestedVideo: Boolean) {
@@ -178,6 +295,12 @@ class ActiveCallViewModel @Inject constructor(
                 val session = incomingCallId?.let { calls.accept(it) }
                     ?: calls.start(resolveRecipient(), requestedVideo)
                 connection = session
+                if (incomingCallId == null) {
+                    telecom.trackOutgoing(session.callId, session.name, session.phone, session.video)
+                } else {
+                    telecom.updatePresentation(session.callId, session.name, session.phone, session.video)
+                    telecom.markConnecting(session.callId)
+                }
                 if (terminated) return@launch
                 mutableState.value = mutableState.value.copy(
                     name = session.name,
@@ -195,11 +318,6 @@ class ActiveCallViewModel @Inject constructor(
                 selectSpeaker(session.video)
                 val localTrack = room.localParticipant
                     .getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
-                val remoteTrack = room.remoteParticipants.values
-                    .asSequence()
-                    .flatMap { it.videoTrackPublications.asSequence() }
-                    .mapNotNull { (_, track) -> track as? VideoTrack }
-                    .firstOrNull()
                 mutableState.value = mutableState.value.copy(
                     phase = when {
                         room.remoteParticipants.isNotEmpty() -> CallPhase.CONNECTED
@@ -207,9 +325,11 @@ class ActiveCallViewModel @Inject constructor(
                         else -> CallPhase.RINGING
                     },
                     localVideoTrack = localTrack,
-                    remoteVideoTrack = remoteTrack,
                 )
-                if (mutableState.value.phase == CallPhase.CONNECTED) startTimer()
+                syncRemoteParticipants()
+                if (mutableState.value.phase == CallPhase.CONNECTED) {
+                    markConnected()
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
@@ -257,6 +377,7 @@ class ActiveCallViewModel @Inject constructor(
                         cameraEnabled = enabled,
                         localVideoTrack = track,
                     )
+                    syncRemoteParticipants()
                 }
                 .onFailure(::fail)
         }
@@ -279,6 +400,7 @@ class ActiveCallViewModel @Inject constructor(
                         localVideoTrack = track,
                     )
                     selectSpeaker(true)
+                    syncRemoteParticipants()
                 }
                 .onFailure(::fail)
         }
@@ -293,14 +415,87 @@ class ActiveCallViewModel @Inject constructor(
             runCatching { room.localParticipant.setCameraEnabled(false) }
                 .onSuccess {
                     mutableState.value = mutableState.value.copy(
-                        video = mutableState.value.remoteVideoTrack != null,
                         cameraEnabled = false,
                         localVideoTrack = null,
                     )
-                    if (mutableState.value.remoteVideoTrack == null) selectSpeaker(false)
+                    syncRemoteParticipants()
+                    if (mutableState.value.remoteVideoTrack == null && !mutableState.value.screenSharing) {
+                        selectSpeaker(false)
+                    }
                 }
                 .onFailure(::fail)
         }
+    }
+
+    /**
+     * Starts sharing this device's screen into the call using the granted MediaProjection result.
+     * The screen track publishes as a video track that other participants render.
+     */
+    fun startScreenShare(mediaProjectionData: Intent) {
+        if (mutableState.value.phase !in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)) return
+        viewModelScope.launch {
+            runCatching {
+                room.localParticipant.setScreenShareEnabled(
+                    true,
+                    ScreenCaptureParams(mediaProjectionData),
+                )
+            }
+                .onSuccess {
+                    mutableState.value = mutableState.value.copy(video = true, screenSharing = true)
+                    selectSpeaker(true)
+                    syncRemoteParticipants()
+                }
+                .onFailure(::fail)
+        }
+    }
+
+    fun stopScreenShare() {
+        viewModelScope.launch {
+            runCatching { room.localParticipant.setScreenShareEnabled(false) }
+                .onSuccess {
+                    mutableState.value = mutableState.value.copy(screenSharing = false)
+                    syncRemoteParticipants()
+                }
+                .onFailure(::fail)
+        }
+    }
+
+    /** Invites another Kit Pay user into this call, turning a one-to-one call into a group call. */
+    fun addParticipant(userId: String) {
+        val callId = connection?.callId ?: return
+        if (userId.isBlank()) return
+        viewModelScope.launch {
+            runCatching { calls.invite(callId, listOf(userId)) }
+                .onFailure { error ->
+                    if (!terminated) {
+                        mutableState.value = mutableState.value.copy(error = error.userMessage())
+                    }
+                }
+        }
+    }
+
+    /** Rebuilds the remote-participant grid from the room and re-derives the video/voice layout. */
+    private fun syncRemoteParticipants() {
+        if (terminated) return
+        val participants = room.remoteParticipants.values.map { participant ->
+            val video = participant.videoTrackPublications
+                .asSequence()
+                .mapNotNull { (_, track) -> track as? VideoTrack }
+                .firstOrNull()
+            RemoteCallParticipant(
+                id = participant.identity?.value ?: participant.hashCode().toString(),
+                name = participant.name?.takeIf { it.isNotBlank() } ?: "Participant",
+                videoTrack = video,
+                speaking = participant.isSpeaking,
+            )
+        }
+        val showsVideo = mutableState.value.cameraEnabled ||
+            mutableState.value.screenSharing ||
+            participants.any { it.videoTrack != null }
+        mutableState.value = mutableState.value.copy(
+            remoteParticipants = participants,
+            video = showsVideo,
+        )
     }
 
     fun flipCamera() {
@@ -355,10 +550,12 @@ class ActiveCallViewModel @Inject constructor(
                     phase = CallPhase.INCOMING,
                     error = null,
                 )
+                telecom.trackIncoming(callId, incoming.name, incoming.phone, incoming.video)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Throwable) {
                 if (!terminated) {
+                    telecom.finish(callId, KitTelecomDisconnect.ERROR)
                     mutableState.value = mutableState.value.copy(
                         name = "Incoming Kit Pay call",
                         video = false,
@@ -408,15 +605,26 @@ class ActiveCallViewModel @Inject constructor(
         }
         val safeReason = reason.takeIf { it in setOf("completed", "cancelled", "network_error") }
             ?: "cancelled"
+        val telecomCallId = connection?.callId ?: incomingCallId
+        if (telecomCallId != null) {
+            val disconnect = when {
+                safeReason == "network_error" -> KitTelecomDisconnect.ERROR
+                connection == null && incomingCallId != null -> KitTelecomDisconnect.REJECTED
+                else -> KitTelecomDisconnect.LOCAL
+            }
+            telecom.finish(telecomCallId, disconnect)
+        }
         terminated = true
         validationJob?.cancel()
         timerJob?.cancel()
         timerJob = null
         room.disconnect()
         CallForegroundService.stop(context)
+        activeCallState.setActiveCall(null)
+        clearWaitingCall()
         mutableState.value = mutableState.value.copy(
             phase = CallPhase.ENDING,
-            remoteVideoTrack = null,
+            remoteParticipants = emptyList(),
             localVideoTrack = null,
             error = null,
         )
@@ -449,10 +657,20 @@ class ActiveCallViewModel @Inject constructor(
 
     private fun markConnected() {
         mutableState.value = mutableState.value.copy(phase = CallPhase.CONNECTED)
+        (connection?.callId ?: incomingCallId)?.let(telecom::markActive)
+        // Mark this device busy so a second incoming call is surfaced as call-waiting, not a
+        // full-screen ring over the active call.
+        activeCallState.setActiveCall(connection?.callId)
         startTimer()
     }
 
     private fun handleLifecycleEvent(event: CallLifecycleEvent) {
+        // A waiting call that ends, is missed or is declined elsewhere dismisses its banner.
+        if (event.callId == mutableState.value.waitingCall?.callId) {
+            if (event.kind != CallLifecycleKind.ANSWERED) clearWaitingCall()
+            return
+        }
+
         val activeCallId = connection?.callId ?: incomingCallId
         if (event.callId != activeCallId) return
 
@@ -472,14 +690,17 @@ class ActiveCallViewModel @Inject constructor(
             return
         }
         terminated = true
+        telecom.finish(callId, KitTelecomDisconnect.REMOTE)
         validationJob?.cancel()
         timerJob?.cancel()
         timerJob = null
         room.disconnect()
         CallForegroundService.stop(context)
+        activeCallState.setActiveCall(null)
+        clearWaitingCall()
         mutableState.value = mutableState.value.copy(
             phase = CallPhase.ENDING,
-            remoteVideoTrack = null,
+            remoteParticipants = emptyList(),
             localVideoTrack = null,
         )
         val connecting = startJob
@@ -560,10 +781,12 @@ class ActiveCallViewModel @Inject constructor(
         timerJob = null
         room.disconnect()
         CallForegroundService.stop(context)
+        activeCallState.setActiveCall(null)
+        clearWaitingCall()
         mutableState.value = mutableState.value.copy(
             phase = CallPhase.ENDING,
             error = error.userMessage(),
-            remoteVideoTrack = null,
+            remoteParticipants = emptyList(),
             localVideoTrack = null,
         )
         val connecting = startJob
@@ -572,6 +795,7 @@ class ActiveCallViewModel @Inject constructor(
             val failedCallId = connection?.callId
             connection = null
             if (failedCallId != null) {
+                telecom.finish(failedCallId, KitTelecomDisconnect.ERROR)
                 pendingTerminations.enqueue(
                     PendingCallTermination(
                         callId = failedCallId,
@@ -601,7 +825,9 @@ class ActiveCallViewModel @Inject constructor(
         room.disconnect()
         room.release()
         CallForegroundService.stop(context)
+        activeCallState.setActiveCall(null)
         connection?.callId?.let { activeCallId ->
+            telecom.finish(activeCallId, KitTelecomDisconnect.LOCAL)
             pendingTerminations.enqueue(
                 PendingCallTermination(activeCallId, BackendCallTerminationKind.END, "cancelled"),
             )
@@ -609,6 +835,7 @@ class ActiveCallViewModel @Inject constructor(
         if (connection == null && incomingCallId != null && mutableState.value.incomingVerified &&
             mutableState.value.phase !in setOf(CallPhase.ENDING, CallPhase.ENDED)
         ) {
+            telecom.finish(incomingCallId, KitTelecomDisconnect.REJECTED)
             pendingTerminations.enqueue(
                 PendingCallTermination(incomingCallId, BackendCallTerminationKind.DECLINE),
             )

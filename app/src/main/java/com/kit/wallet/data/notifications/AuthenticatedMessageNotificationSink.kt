@@ -5,8 +5,11 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
 import android.net.Uri
 import androidx.core.app.NotificationCompat
+import androidx.core.app.RemoteInput
+import androidx.core.net.toUri
 import com.kit.wallet.MainActivity
 import com.kit.wallet.R
 import com.kit.wallet.data.messaging.ACTION_OPEN_AUTHORIZED_SECURE_MESSAGE
@@ -37,6 +40,15 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
             ).apply {
                 description = "End-to-end encrypted Kit Pay messages"
                 lockscreenVisibility = NotificationCompat.VISIBILITY_PRIVATE
+                // Always alert with the Kit Pay message tone and vibration for new messages.
+                setSound(
+                    "android.resource://${context.packageName}/${R.raw.msg_received}".toUri(),
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build(),
+                )
+                enableVibration(true)
             },
         )
         val authorization = authorizer.issue(
@@ -61,6 +73,34 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        val notificationTag = "$NOTIFICATION_TAG_PREFIX${notification.messageId}"
+        // Direct reply from the shade. The MUTABLE PendingIntent lets the system inject the typed
+        // text; the receiver sends it through the encrypted path and the runtime re-validates the
+        // conversation against the current session.
+        val replyPendingIntent = PendingIntent.getBroadcast(
+            context,
+            notification.messageId.hashCode(),
+            MessageReplyReceiver.replyIntent(
+                context = context,
+                conversationId = notification.conversationId,
+                notificationTag = notificationTag,
+                notificationId = NOTIFICATION_ID,
+            ),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+        )
+        val replyAction = NotificationCompat.Action.Builder(
+            R.drawable.ic_kit_mark,
+            "Reply",
+            replyPendingIntent,
+        )
+            .addRemoteInput(
+                RemoteInput.Builder(MessageReplyReceiver.KEY_REPLY)
+                    .setLabel("Reply securely")
+                    .build(),
+            )
+            .setAllowGeneratedReplies(false)
+            .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
+            .build()
         val publicVersion = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_kit_mark)
             .setContentTitle("New secure message")
@@ -78,10 +118,11 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
             .setOnlyAlertOnce(true)
             .setAutoCancel(true)
             .setContentIntent(openApp)
+            .addAction(replyAction)
             .build()
         // A stable tag makes sync replay an idempotent replacement rather than a duplicate alert.
         manager.notify(
-            "$NOTIFICATION_TAG_PREFIX${notification.messageId}",
+            notificationTag,
             NOTIFICATION_ID,
             built,
         )
@@ -99,7 +140,9 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
     }
 
     private companion object {
-        const val CHANNEL_ID = "kit_secure_messages_v1"
+        // Notification-channel sound/vibration is immutable once created, so bumping the id is
+        // required for the explicit alert settings to take effect on upgrades.
+        const val CHANNEL_ID = "kit_secure_messages_v2"
         const val NOTIFICATION_ID = 4_201
         const val NOTIFICATION_TAG_PREFIX = "kit_secure_message:"
         const val PRIVATE_COPY = "Open Kit Pay to read it."

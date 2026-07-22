@@ -634,6 +634,8 @@ class RemoteSecureMessagingTransportTest {
             clientMessageId = incoming.clientMessageId,
             senderUserId = incoming.senderUserId,
             senderDeviceId = incoming.senderDeviceId,
+            senderEnrollmentEpoch = incoming.senderEnrollmentEpoch,
+            senderSignalDeviceId = incoming.senderSignalDeviceId,
             sentAt = incoming.sentAt,
             replyToMessageId = incoming.replyToMessageId,
             kind = incoming.kind,

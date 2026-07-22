@@ -59,6 +59,28 @@ internal interface SecureMessagingWireApi {
         @Body request: SendEncryptedMessageRequest,
     ): ApiEnvelope<EncryptedMessageDto>
 
+    @GET(
+        "api/kit-wallet/v1/messaging/conversations/{conversation}/" +
+            "history-backfill/candidates",
+    )
+    suspend fun messagingHistoryBackfillCandidates(
+        @Path("conversation") conversationId: String,
+        @Query("target_device_id") targetDeviceId: String,
+        @Query("target_enrollment_epoch") targetEnrollmentEpoch: Long,
+        @Query("after") cursor: String? = null,
+        @Query("limit") limit: Int = 50,
+    ): ApiEnvelope<MessagingHistoryBackfillCandidatesDto>
+
+    @POST(
+        "api/kit-wallet/v1/messaging/conversations/{conversation}/messages/{message}/" +
+            "history-envelopes",
+    )
+    suspend fun storeMessagingHistoryEnvelope(
+        @Path("conversation") conversationId: String,
+        @Path("message") messageId: String,
+        @Body request: StoreMessagingHistoryEnvelopeRequest,
+    ): ApiEnvelope<MessagingHistoryEnvelopeResultDto>
+
     @GET("api/kit-wallet/v1/messaging/sync")
     suspend fun syncEncryptedMessages(
         @Query("cursor") cursor: String? = null,

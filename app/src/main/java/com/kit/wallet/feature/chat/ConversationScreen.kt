@@ -28,6 +28,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.CallMade
+import androidx.compose.material.icons.automirrored.rounded.CallMissed
+import androidx.compose.material.icons.automirrored.rounded.CallReceived
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CheckCircle
@@ -37,6 +40,7 @@ import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Payments
 import androidx.compose.material.icons.rounded.Photo
+import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.AlertDialog
@@ -86,6 +90,7 @@ import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
 import com.kit.wallet.data.messaging.readBoundedMedia
 import com.kit.wallet.ui.components.KitAvatar
+import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
@@ -391,7 +396,6 @@ private fun ConversationContent(
                 }
                 Composer(
                     draft = draft,
-                    sending = sending,
                     onDraft = {
                         draft = it
                         if (error != null) onClearError()
@@ -457,23 +461,36 @@ private fun ConversationContent(
             }
             items(messages.size) { i ->
                 val message = messages[i]
-                MessageBubble(
-                    msg = message,
-                    operationInFlight = sending,
-                    retrying = retryingMessageId == message.id,
-                    retryEnabled = message.id in retryableMessageIds,
-                    onRetry = {
-                        onRetry(message) {
-                            if (draft.trim() == message.text) draft = ""
-                        }
-                    },
-                    mediaBytes = mediaBytes[message.id],
-                    mediaLoading = message.id in mediaLoading,
-                    mediaError = mediaErrors[message.id],
-                    onOpenMedia = { onOpenMedia(message) },
-                    onRetryMedia = { onRetryMedia(message) },
-                    onPayRequest = { payTarget = message },
-                )
+                if (message.kind == MessageKind.CALL) {
+                    CallLogBubble(
+                        msg = message,
+                        onCall = {
+                            message.callDirection?.let {
+                                chat.peerUserId?.let { peer ->
+                                    if (message.callVideo) onVideoCall(peer) else onVoiceCall(peer)
+                                }
+                            }
+                        },
+                    )
+                } else {
+                    MessageBubble(
+                        msg = message,
+                        operationInFlight = sending,
+                        retrying = retryingMessageId == message.id,
+                        retryEnabled = message.id in retryableMessageIds,
+                        onRetry = {
+                            onRetry(message) {
+                                if (draft.trim() == message.text) draft = ""
+                            }
+                        },
+                        mediaBytes = mediaBytes[message.id],
+                        mediaLoading = message.id in mediaLoading,
+                        mediaError = mediaErrors[message.id],
+                        onOpenMedia = { onOpenMedia(message) },
+                        onRetryMedia = { onRetryMedia(message) },
+                        onPayRequest = { payTarget = message },
+                    )
+                }
             }
             item { Spacer(Modifier.height(8.dp)) }
         }
@@ -553,18 +570,14 @@ internal fun MessageBubble(
                     ) {
                         if (
                             msg.fromMe &&
-                            msg.state in setOf(
-                                DeliveryState.SENDING,
+                            (retrying || msg.state in setOf(
                                 DeliveryState.RETRY_REQUIRED,
                                 DeliveryState.FAILED,
-                            )
+                            ))
                         ) {
                             Text(
                                 when {
                                     retrying -> "Retrying…"
-                                    msg.state == DeliveryState.SENDING && retryEnabled ->
-                                        "Pending · Retry"
-                                    msg.state == DeliveryState.SENDING -> "Pending"
                                     retryEnabled -> "Not sent · Retry"
                                     msg.state == DeliveryState.FAILED ->
                                         "Photo expired · Send again"
@@ -583,49 +596,33 @@ internal fun MessageBubble(
                             )
                             Spacer(Modifier.width(5.dp))
                         }
-                        if (
-                            msg.fromMe &&
-                            msg.state in setOf(
-                                DeliveryState.SENT,
-                                DeliveryState.DELIVERED,
-                                DeliveryState.READ,
-                            )
-                        ) {
-                            Text(
-                                outgoingDeliveryLabel(msg.state),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (msg.state == DeliveryState.READ) {
-                                    KitTheme.colors.success
-                                } else {
-                                    contentColor.copy(alpha = 0.65f)
-                                },
-                            )
-                            Spacer(Modifier.width(5.dp))
-                        }
                         Text(
                             msg.time,
                             style = MaterialTheme.typography.labelSmall,
                             color = contentColor.copy(alpha = 0.65f),
                         )
-                        if (msg.fromMe) {
+                        if (
+                            msg.fromMe &&
+                            msg.state !in setOf(
+                                DeliveryState.RETRY_REQUIRED,
+                                DeliveryState.FAILED,
+                            )
+                        ) {
                             Spacer(Modifier.width(3.dp))
                             Icon(
+                                // Clock while sending, one tick when sent, two ticks once
+                                // delivered, and two blue ticks once the peer has read it.
                                 when (msg.state) {
+                                    DeliveryState.SENDING -> Icons.Rounded.Schedule
                                     DeliveryState.SENT -> Icons.Rounded.Done
-                                    DeliveryState.RETRY_REQUIRED,
-                                    DeliveryState.FAILED,
-                                    -> Icons.Rounded.ErrorOutline
                                     else -> Icons.Rounded.DoneAll
                                 },
                                 // The adjacent visible status text already owns accessibility
                                 // semantics; announcing the decorative tick repeats every receipt.
                                 contentDescription = null,
-                                modifier = Modifier.size(14.dp),
+                                modifier = Modifier.size(15.dp),
                                 tint = when (msg.state) {
-                                    DeliveryState.READ -> KitTheme.colors.success
-                                    DeliveryState.RETRY_REQUIRED,
-                                    DeliveryState.FAILED,
-                                    -> MaterialTheme.colorScheme.error
+                                    DeliveryState.READ -> KitTheme.colors.readReceipt
                                     DeliveryState.DELIVERED -> contentColor.copy(alpha = 0.75f)
                                     else -> contentColor.copy(alpha = 0.5f)
                                 },
@@ -921,6 +918,85 @@ private fun VoiceNoteRow(msg: Message) {
 }
 
 /**
+ * A call-log entry shown inline in the conversation, like a WhatsApp call bubble: a directional
+ * icon, the call type (and "Missed" when it went unanswered), the time and connected duration, and
+ * a tap target to call the person back.
+ */
+@Composable
+private fun CallLogBubble(msg: Message, onCall: () -> Unit) {
+    val colors = KitTheme.colors
+    val missed = msg.callDirection == CallDirection.MISSED
+    val contentColor = if (msg.fromMe) colors.onChatBubbleMe else colors.onChatBubbleOther
+    val (directionIcon, directionTint) = when (msg.callDirection) {
+        CallDirection.OUTGOING -> Icons.AutoMirrored.Rounded.CallMade to colors.success
+        CallDirection.MISSED -> Icons.AutoMirrored.Rounded.CallMissed to MaterialTheme.colorScheme.error
+        else -> Icons.AutoMirrored.Rounded.CallReceived to colors.success
+    }
+    val title = buildString {
+        if (missed) append("Missed ")
+        append(if (msg.callVideo) "video call" else "voice call")
+    }.replaceFirstChar { it.uppercase() }
+    val subtitle = if (msg.callDurationSeconds > 0) {
+        "${msg.time} · ${formatCallDuration(msg.callDurationSeconds)}"
+    } else {
+        msg.time
+    }
+    Box(Modifier.fillMaxWidth()) {
+        Surface(
+            color = if (msg.fromMe) colors.chatBubbleMe else colors.chatBubbleOther,
+            shape = RoundedCornerShape(16.dp),
+            shadowElevation = 1.dp,
+            modifier = Modifier
+                .align(if (msg.fromMe) Alignment.CenterEnd else Alignment.CenterStart)
+                .padding(vertical = 4.dp)
+                .clickable(onClick = onCall),
+        ) {
+            Row(
+                Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    directionIcon,
+                    contentDescription = null,
+                    tint = directionTint,
+                    modifier = Modifier.size(22.dp),
+                )
+                Spacer(Modifier.width(12.dp))
+                Column {
+                    Text(
+                        title,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = if (missed) MaterialTheme.colorScheme.error else contentColor,
+                    )
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = contentColor.copy(alpha = 0.7f),
+                    )
+                }
+                Spacer(Modifier.width(18.dp))
+                Icon(
+                    if (msg.callVideo) Icons.Rounded.Videocam else Icons.Rounded.Call,
+                    contentDescription = "Call back",
+                    tint = MaterialTheme.colorScheme.secondary,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+        }
+    }
+}
+
+private fun formatCallDuration(seconds: Long): String {
+    val minutes = seconds / 60
+    val secs = seconds % 60
+    return if (minutes >= 60) {
+        "%d:%02d:%02d".format(minutes / 60, minutes % 60, secs)
+    } else {
+        "%d:%02d".format(minutes, secs)
+    }
+}
+
+/**
  * An end-to-end encrypted photo bubble. A user tap starts its serialized ciphertext download;
  * decrypted bytes render entirely in memory and nothing is written to disk in plaintext.
  */
@@ -1075,7 +1151,6 @@ private val secureImageDecodeMutex = Mutex()
 @Composable
 private fun Composer(
     draft: String,
-    sending: Boolean,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
     onAttach: () -> Unit = {},
@@ -1097,10 +1172,11 @@ private fun Composer(
             modifier = Modifier.weight(1f),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                // The composer is never disabled while a send is in flight: text goes into the
+                // thread instantly and the user can keep typing and firing messages without waiting.
                 TextField(
                     value = draft,
                     onValueChange = onDraft,
-                    enabled = !sending,
                     modifier = Modifier.weight(1f),
                     placeholder = { Text("Message") },
                     colors = TextFieldDefaults.colors(
@@ -1112,7 +1188,7 @@ private fun Composer(
                     maxLines = 4,
                 )
                 if (mediaEnabled) {
-                    IconButton(onClick = onAttach, enabled = !sending) {
+                    IconButton(onClick = onAttach) {
                         Icon(
                             Icons.Rounded.Photo,
                             contentDescription = "Send an encrypted photo",
@@ -1120,7 +1196,7 @@ private fun Composer(
                         )
                     }
                 }
-                IconButton(onClick = onRequestPayment, enabled = !sending) {
+                IconButton(onClick = onRequestPayment) {
                     Icon(
                         Icons.Rounded.Payments,
                         contentDescription = "Request a payment",
@@ -1134,24 +1210,16 @@ private fun Composer(
             Modifier
                 .size(50.dp)
                 .background(MaterialTheme.colorScheme.secondary, CircleShape)
-                .clickable(enabled = draft.isNotBlank() && !sending, onClick = onSend),
+                .clickable(enabled = draft.isNotBlank(), onClick = onSend),
             contentAlignment = Alignment.Center,
         ) {
-            if (sending) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(22.dp),
-                    color = MaterialTheme.colorScheme.onSecondary,
-                    strokeWidth = 2.dp,
-                )
-            } else {
-                Icon(
-                    Icons.AutoMirrored.Rounded.Send,
-                    contentDescription = "Send",
-                    tint = MaterialTheme.colorScheme.onSecondary.copy(
-                        alpha = if (draft.isNotBlank()) 1f else 0.45f,
-                    ),
-                )
-            }
+            Icon(
+                Icons.AutoMirrored.Rounded.Send,
+                contentDescription = "Send",
+                tint = MaterialTheme.colorScheme.onSecondary.copy(
+                    alpha = if (draft.isNotBlank()) 1f else 0.45f,
+                ),
+            )
         }
     }
 }

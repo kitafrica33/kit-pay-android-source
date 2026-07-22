@@ -5,6 +5,7 @@ import com.kit.wallet.data.messaging.LibSignalCompanionRecord
 import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
 import com.kit.wallet.data.messaging.SecureMessagingCryptoAddress
 import com.kit.wallet.data.messaging.SecureMessagingEnvelopeKind
+import com.kit.wallet.data.messaging.SecureMessagingTextContentBinding
 import com.kit.wallet.data.messaging.SecureMessagingRecord
 import com.kit.wallet.data.messaging.SecureMessagingRecordPage
 import com.kit.wallet.data.messaging.SecureMessagingRecordVersion
@@ -12,6 +13,7 @@ import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingStateStore
 import com.kit.wallet.data.messaging.SecureMessagingStateWrite
 import com.kit.wallet.data.messaging.validateSecureMessagingNamespacePageRequest
+import com.kit.wallet.data.messaging.encodeSecureMessagingTextContent
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 
@@ -138,17 +140,16 @@ internal suspend fun TestSecureMessagingStateStore.persistCompanionRecordForTest
     text: String,
     envelopes: List<PersistedCompanionEnvelopeFixture> = emptyList(),
 ): LibSignalCompanionRecord {
-    val reply = replyToMessageId?.let { "\"$it\"" } ?: "null"
-    val plaintext = (
-        "{\"schema\":\"kit.messaging.content.v1\",\"type\":\"text\"," +
-            "\"client_message_id\":\"$clientMessageId\"," +
-            "\"conversation_id\":\"$conversationId\"," +
-            "\"roster_revision\":\"$rosterRevision\"," +
-            "\"sender_user_id\":\"${sender.userId}\"," +
-            "\"sender_device_id\":\"${sender.serverDeviceId}\"," +
-            "\"sender_signal_device_id\":${sender.signalDeviceId}," +
-            "\"reply_to_message_id\":$reply,\"text\":\"$text\"}"
-        ).toByteArray(Charsets.UTF_8)
+    val plaintext = encodeSecureMessagingTextContent(
+        SecureMessagingTextContentBinding(
+            clientMessageId = clientMessageId,
+            conversationId = conversationId,
+            rosterRevision = rosterRevision,
+            sender = sender,
+            replyToMessageId = replyToMessageId,
+        ),
+        text,
+    )
     val output = ByteArrayOutputStream()
     val encoded = try {
         DataOutputStream(output).use { data ->

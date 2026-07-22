@@ -31,6 +31,21 @@ internal class CallTonePlayer {
     }
 
     /**
+     * Plays the standard telephony call-waiting tone once. Callers repeat it on a cadence while a
+     * second call is waiting, matching the familiar in-call "someone else is calling" beep.
+     */
+    fun playCallWaiting() {
+        val generator = runCatching {
+            ToneGenerator(AudioManager.STREAM_VOICE_CALL, CALL_WAITING_VOLUME)
+        }.getOrNull() ?: return
+        runCatching { generator.startTone(ToneGenerator.TONE_SUP_CALL_WAITING, CALL_WAITING_TONE_MILLIS) }
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+            { runCatching { generator.release() } },
+            CALL_WAITING_TONE_MILLIS + RELEASE_GRACE_MILLIS,
+        )
+    }
+
+    /**
      * Plays the brief end-of-call tone. The generator releases itself after the burst window,
      * so a screen teardown immediately after hangup cannot leak the audio resource.
      */
@@ -57,5 +72,8 @@ internal class CallTonePlayer {
         const val DISCONNECT_VOLUME = 80
         const val DISCONNECT_TONE_MILLIS = 900
         const val DISCONNECT_RELEASE_MILLIS = 1_100L
+        const val CALL_WAITING_VOLUME = 85
+        const val CALL_WAITING_TONE_MILLIS = 800
+        const val RELEASE_GRACE_MILLIS = 300L
     }
 }

@@ -4,7 +4,9 @@ import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionDiskPayload
 import com.kit.wallet.data.session.SessionTokens
 import com.kit.wallet.data.session.SecureMessagingResetProofFence
+import com.kit.wallet.data.session.decodeSessionPersistingLegacyNonce
 import com.kit.wallet.data.session.requireValidCredentials
+import com.kit.wallet.data.session.restoreRetainingEncryptedSession
 import com.kit.wallet.data.session.toDiskPayload
 import com.kit.wallet.data.session.toSessionTokens
 import com.squareup.moshi.Moshi
@@ -50,6 +52,7 @@ class SessionTokensTest {
         assertEquals("account-1", restored.accountId)
         assertEquals("account-1:session", restored.cacheScopeId)
         assertEquals(ProfileSetupState.REQUIRED, restored.profileSetupState)
+        assertEquals(tokens.refreshReplayNonce, restored.refreshReplayNonce)
         assertTrue(restored.profileSetupState.requiresSetup)
     }
 
@@ -102,6 +105,70 @@ class SessionTokensTest {
         assertEquals("legacy-session", restored.cacheScopeId)
         assertEquals(ProfileSetupState.UNKNOWN, restored.profileSetupState)
         assertTrue(restored.profileSetupState.requiresSetup)
+        assertTrue(restored.refreshReplayNonce.isNotBlank())
+    }
+
+    @Test
+    fun `legacy replay nonce is durable and identical across process starts`() {
+        var durableSession = diskAdapter.toJson(
+            SessionDiskPayload(
+                accessToken = "legacy-access",
+                refreshToken = "legacy-refresh",
+                sessionId = "legacy-session",
+                accessTokenExpiresAtEpochSeconds = null,
+            ),
+        )
+        var migrations = 0
+
+        fun restoreAfterProcessStart(): SessionTokens = decodeSessionPersistingLegacyNonce(
+            encryptedSession = durableSession,
+            decodePayload = { checkNotNull(diskAdapter.fromJson(it)) },
+            encodePayload = diskAdapter::toJson,
+            persistEncryptedSession = {
+                migrations++
+                durableSession = it
+                true
+            },
+        )
+
+        val firstProcess = restoreAfterProcessStart()
+        val secondProcess = restoreAfterProcessStart()
+
+        assertEquals(firstProcess.refreshReplayNonce, secondProcess.refreshReplayNonce)
+        assertEquals(1, migrations)
+        assertEquals(
+            firstProcess.refreshReplayNonce,
+            checkNotNull(diskAdapter.fromJson(durableSession)).refreshReplayNonce,
+        )
+    }
+
+    @Test
+    fun `failed legacy nonce persistence keeps restoration pending without credentials`() {
+        val retainedSession = diskAdapter.toJson(
+            SessionDiskPayload(
+                accessToken = "legacy-access",
+                refreshToken = "legacy-refresh",
+                sessionId = "legacy-session",
+                accessTokenExpiresAtEpochSeconds = null,
+            ),
+        )
+
+        val restore = restoreRetainingEncryptedSession(
+            encryptedSession = retainedSession,
+            messagingErasurePending = false,
+            decode = { encrypted ->
+                decodeSessionPersistingLegacyNonce(
+                    encryptedSession = encrypted,
+                    decodePayload = { checkNotNull(diskAdapter.fromJson(it)) },
+                    encodePayload = diskAdapter::toJson,
+                    persistEncryptedSession = { false },
+                )
+            },
+        )
+
+        assertEquals(null, restore.tokens)
+        assertTrue(restore.pending)
+        assertTrue(restore.recoveryRequired)
     }
 
     @Test

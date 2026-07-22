@@ -1,6 +1,7 @@
 package com.kit.wallet.data.session
 
 import com.kit.wallet.data.messaging.SecureMessagingSessionFence
+import java.util.UUID
 import kotlinx.coroutines.flow.StateFlow
 
 enum class ProfileSetupState {
@@ -27,10 +28,15 @@ data class SessionTokens(
     val cacheScopeId: String = sessionId,
     val profileSetupState: ProfileSetupState = ProfileSetupState.UNKNOWN,
     val messagingResetProof: SecureMessagingResetProofFence? = null,
+    /** Device-local replay proof for recovering one committed refresh whose response was lost. */
+    val refreshReplayNonce: String = UUID.randomUUID().toString(),
 ) {
     init {
         require(sessionId.isNotBlank()) { "Session ID must not be blank" }
         require(cacheScopeId.isNotBlank()) { "Cache scope ID must not be blank" }
+        require(runCatching { UUID.fromString(refreshReplayNonce).toString() }.getOrNull() ==
+            refreshReplayNonce
+        ) { "Refresh replay nonce must be a canonical UUID" }
     }
 
     fun fence(): SessionFence = SessionFence(
@@ -72,6 +78,12 @@ internal fun SessionTokens.requireValidCredentials() {
     require(sessionId.isNotBlank()) { "Session ID must not be blank" }
 }
 
+internal fun SessionTokens.hasSameRefreshCredential(other: SessionTokens): Boolean =
+    sessionId == other.sessionId &&
+        accessToken == other.accessToken &&
+        refreshToken == other.refreshToken &&
+        refreshReplayNonce == other.refreshReplayNonce
+
 data class SessionFence(
     val sessionId: String,
     val cacheScopeId: String,
@@ -91,9 +103,25 @@ class SessionInvalidatedException : IllegalStateException(
 interface SessionStore {
     val session: StateFlow<SessionTokens?>
 
+    /** True while an existing encrypted credential is retained for a retryable secure-store read. */
+    val restorationPending: StateFlow<Boolean>
+        get() = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /** True only when foreground retries may recover the retained credential without user action. */
+    val restorationRetryable: StateFlow<Boolean>
+        get() = kotlinx.coroutines.flow.MutableStateFlow(false)
+
     fun current(): SessionTokens?
 
     fun snapshot(): SessionSnapshot
+
+    /** Retries a retained credential after device unlock/foreground without deleting it on failure. */
+    suspend fun retryRestore(): Boolean = current() != null
+
+    /** Explicitly abandons an unreadable retained credential after the user chooses to sign in again. */
+    suspend fun discardPendingRestoration() {
+        clear()
+    }
 
     suspend fun save(tokens: SessionTokens)
 
@@ -113,7 +141,8 @@ interface SessionStore {
         val latest = current() ?: return false
         if (latest.sessionId != expectedCredentials.sessionId ||
             latest.accessToken != expectedCredentials.accessToken ||
-            latest.refreshToken != expectedCredentials.refreshToken
+            latest.refreshToken != expectedCredentials.refreshToken ||
+            latest.refreshReplayNonce != expectedCredentials.refreshReplayNonce
         ) {
             return false
         }
@@ -153,6 +182,13 @@ interface SessionStore {
 
     /** Clears credentials only if [expected] still owns the local authenticated session. */
     suspend fun clearIfCurrent(expected: SessionFence): Boolean
+
+    /** Clears only the exact refresh generation rejected by the server. */
+    suspend fun clearIfCredentialsCurrent(expected: SessionTokens): Boolean {
+        val latest = current() ?: return false
+        if (!latest.hasSameRefreshCredential(expected)) return false
+        return clearIfCurrent(expected.fence())
+    }
 
     /**
      * Crash-safely erases and reopens messaging state only while [expected] and the exact

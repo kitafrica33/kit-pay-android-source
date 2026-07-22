@@ -53,3 +53,7 @@ val KitWarning = Color(0xFFB77800)
 val KitWarningDark = Color(0xFFF7C566)
 val KitSuccess = KitGreen600
 val KitSuccessDark = KitGreen400
+
+/** Read-receipt blue for double-tick "read" state, matching common messenger conventions. */
+val KitReadReceipt = Color(0xFF34B7F1)
+val KitReadReceiptDark = Color(0xFF53BDEB)

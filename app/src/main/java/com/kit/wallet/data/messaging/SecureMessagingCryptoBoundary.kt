@@ -369,9 +369,13 @@ private data class DecodedSecureMessagingTextContent(
  * metadata substitutions are rejected before any text can reach a projection or UI.
  */
 private object SecureMessagingTextContentCodec {
-    fun encode(binding: SecureMessagingTextContentBinding, text: String): ByteArray {
+    fun encode(
+        binding: SecureMessagingTextContentBinding,
+        text: String,
+        maxTextScalars: Int = MAX_STANDARD_TEXT_SCALARS,
+    ): ByteArray {
         validateBinding(binding)
-        validateText(text)
+        validateText(text, maxTextScalars)
         val buffer = Buffer()
         val writer = JsonWriter.of(buffer).apply { serializeNulls = true }
         writer.beginObject()
@@ -397,7 +401,10 @@ private object SecureMessagingTextContentCodec {
         }
     }
 
-    fun decode(bytes: ByteArray): DecodedSecureMessagingTextContent {
+    fun decode(
+        bytes: ByteArray,
+        maxTextScalars: Int = MAX_STANDARD_TEXT_SCALARS,
+    ): DecodedSecureMessagingTextContent {
         require(bytes.isNotEmpty()) { "Secure message plaintext must not be empty" }
         require(bytes.size <= MAX_PLAINTEXT_BYTES) { "Secure message plaintext is too large" }
         val json = try {
@@ -411,7 +418,7 @@ private object SecureMessagingTextContentCodec {
         }
 
         return try {
-            decodeJson(json)
+            decodeJson(json, maxTextScalars)
         } catch (error: IllegalArgumentException) {
             throw error
         } catch (error: Exception) {
@@ -426,7 +433,10 @@ private object SecureMessagingTextContentCodec {
         binding.replyToMessageId?.let { requireCanonicalUuid(it, "content reply target") }
     }
 
-    private fun decodeJson(json: String): DecodedSecureMessagingTextContent {
+    private fun decodeJson(
+        json: String,
+        maxTextScalars: Int,
+    ): DecodedSecureMessagingTextContent {
         val reader = JsonReader.of(Buffer().writeUtf8(json)).apply { isLenient = false }
         require(reader.peek() == JsonReader.Token.BEGIN_OBJECT) {
             "Secure message content must be a JSON object"
@@ -491,7 +501,7 @@ private object SecureMessagingTextContentCodec {
         )
         validateBinding(binding)
         val validatedText = requireNotNull(text) { "Secure message text is missing" }
-        validateText(validatedText)
+        validateText(validatedText, maxTextScalars)
         return DecodedSecureMessagingTextContent(binding, validatedText)
     }
 
@@ -513,7 +523,10 @@ private object SecureMessagingTextContentCodec {
         return requireNotNull(encoded.toIntOrNull()) { "Secure message $field is outside the integer range" }
     }
 
-    private fun validateText(text: String) {
+    private fun validateText(text: String, maxTextScalars: Int) {
+        require(maxTextScalars in 1..MAX_HISTORY_DESCRIPTOR_SCALARS) {
+            "Invalid secure message text bound"
+        }
         require('\u0000' !in text) { "Secure message text cannot contain NUL" }
         var scalarCount = 0
         var index = 0
@@ -533,14 +546,15 @@ private object SecureMessagingTextContentCodec {
             }
             scalarCount++
         }
-        require(scalarCount in 1..MAX_TEXT_SCALARS) {
-            "Secure message text must contain 1 to $MAX_TEXT_SCALARS Unicode scalars"
+        require(scalarCount in 1..maxTextScalars) {
+            "Secure message text must contain 1 to $maxTextScalars Unicode scalars"
         }
     }
 
     private const val CONTENT_SCHEMA = "kit.messaging.content.v1"
     private const val CONTENT_TYPE = "text"
-    private const val MAX_TEXT_SCALARS = 8_000
+    private const val MAX_STANDARD_TEXT_SCALARS = 8_000
+    private const val MAX_HISTORY_DESCRIPTOR_SCALARS = 48 * 1024
     private val JSON_INTEGER = Regex("^-?(0|[1-9][0-9]*)$")
     private val CONTENT_MEMBERS = setOf(
         "schema",
@@ -556,6 +570,12 @@ private object SecureMessagingTextContentCodec {
     )
 }
 
+/** Encodes a recovered original using exactly the ordinary secure-message content profile. */
+internal fun encodeSecureMessagingTextContent(
+    binding: SecureMessagingTextContentBinding,
+    text: String,
+): ByteArray = SecureMessagingTextContentCodec.encode(binding, text)
+
 sealed interface SecureMessagingSessionEstablishmentRequest {
     val conversationId: String
     val rosterRevision: String
@@ -566,12 +586,25 @@ sealed interface SecureMessagingSessionEstablishmentRequest {
 /** Exact roster-derived authority for one outbound encryption attempt. */
 sealed interface SecureMessagingEncryptionPlan
 
-class SecureMessagingEncryptionRequest(
+private enum class SecureMessagingTextProfile(val maxScalars: Int) {
+    STANDARD(8_000),
+    HISTORY_DESCRIPTOR(48 * 1024),
+}
+
+class SecureMessagingEncryptionRequest private constructor(
     val plan: SecureMessagingEncryptionPlan,
     val clientMessageId: String,
     text: String,
-    val replyToMessageId: String? = null,
+    val replyToMessageId: String?,
+    textProfile: SecureMessagingTextProfile,
 ) : AutoCloseable {
+    constructor(
+        plan: SecureMessagingEncryptionPlan,
+        clientMessageId: String,
+        text: String,
+        replyToMessageId: String? = null,
+    ) : this(plan, clientMessageId, text, replyToMessageId, SecureMessagingTextProfile.STANDARD)
+
     private val sensitivePlaintext: SensitiveCryptoBytes
     internal val planSnapshot = SecureMessagingCryptoWireMapper.requireEncryptionPlan(plan)
 
@@ -585,6 +618,7 @@ class SecureMessagingEncryptionRequest(
                 replyToMessageId = replyToMessageId,
             ),
             text,
+            textProfile.maxScalars,
         )
         sensitivePlaintext = try {
             SensitiveCryptoBytes.copyOf(encoded)
@@ -596,6 +630,20 @@ class SecureMessagingEncryptionRequest(
     fun copyPlaintextBytes(): ByteArray = sensitivePlaintext.copyBytes()
 
     override fun close() = sensitivePlaintext.close()
+
+    internal companion object {
+        fun history(
+            plan: SecureMessagingEncryptionPlan,
+            clientMessageId: String,
+            descriptor: String,
+        ): SecureMessagingEncryptionRequest = SecureMessagingEncryptionRequest(
+            plan = plan,
+            clientMessageId = clientMessageId,
+            text = descriptor,
+            replyToMessageId = null,
+            textProfile = SecureMessagingTextProfile.HISTORY_DESCRIPTOR,
+        )
+    }
 }
 
 enum class SecureMessagingEnvelopeKind {
@@ -651,12 +699,20 @@ class SecureMessagingPreparedFanout(
         get() = immutableEnvelopes.toList()
 }
 
-class SecureMessagingAuthenticatedPlaintext(
+class SecureMessagingAuthenticatedPlaintext private constructor(
     val messageId: String,
     val conversationId: String,
     val sender: SecureMessagingCryptoAddress,
     plaintext: ByteArray,
+    private val maxTextScalars: Int,
 ) : AutoCloseable {
+    constructor(
+        messageId: String,
+        conversationId: String,
+        sender: SecureMessagingCryptoAddress,
+        plaintext: ByteArray,
+    ) : this(messageId, conversationId, sender, plaintext, STANDARD_TEXT_SCALARS)
+
     private val sensitivePlaintext: SensitiveCryptoBytes
     internal val contentBinding: SecureMessagingTextContentBinding
 
@@ -665,7 +721,7 @@ class SecureMessagingAuthenticatedPlaintext(
         requireCanonicalUuid(conversationId, "conversation ID")
         val ownedCopy = plaintext.copyOf()
         try {
-            val decoded = SecureMessagingTextContentCodec.decode(ownedCopy)
+            val decoded = SecureMessagingTextContentCodec.decode(ownedCopy, maxTextScalars)
             require(decoded.binding.conversationId == conversationId) {
                 "Authenticated content conversation does not match its message"
             }
@@ -689,7 +745,7 @@ class SecureMessagingAuthenticatedPlaintext(
     fun copyText(): String {
         val bytes = sensitivePlaintext.copyBytes()
         return try {
-            SecureMessagingTextContentCodec.decode(bytes).text
+            SecureMessagingTextContentCodec.decode(bytes, maxTextScalars).text
         } finally {
             bytes.fill(0)
         }
@@ -697,6 +753,24 @@ class SecureMessagingAuthenticatedPlaintext(
 
     override fun close() {
         if (closed.compareAndSet(false, true)) sensitivePlaintext.close()
+    }
+
+    internal companion object {
+        private const val STANDARD_TEXT_SCALARS = 8_000
+        private const val HISTORY_DESCRIPTOR_SCALARS = 48 * 1024
+
+        fun history(
+            messageId: String,
+            conversationId: String,
+            sender: SecureMessagingCryptoAddress,
+            plaintext: ByteArray,
+        ): SecureMessagingAuthenticatedPlaintext = SecureMessagingAuthenticatedPlaintext(
+            messageId,
+            conversationId,
+            sender,
+            plaintext,
+            HISTORY_DESCRIPTOR_SCALARS,
+        )
     }
 }
 
@@ -1227,14 +1301,24 @@ abstract class FailClosedSecureMessagingCryptoTransaction(
         conversationId: String,
         sender: SecureMessagingCryptoAddress,
         plaintext: ByteArray,
+        isHistoryBackfill: Boolean = false,
     ): PreparedCommit = registerPreparedPayload(
         PreparedPayload.Decryption(
-            SecureMessagingAuthenticatedPlaintext(
-                messageId = messageId,
-                conversationId = conversationId,
-                sender = sender,
-                plaintext = plaintext,
-            ),
+            if (isHistoryBackfill) {
+                SecureMessagingAuthenticatedPlaintext.history(
+                    messageId = messageId,
+                    conversationId = conversationId,
+                    sender = sender,
+                    plaintext = plaintext,
+                )
+            } else {
+                SecureMessagingAuthenticatedPlaintext(
+                    messageId = messageId,
+                    conversationId = conversationId,
+                    sender = sender,
+                    plaintext = plaintext,
+                )
+            },
         ),
     )
 

@@ -99,6 +99,17 @@ interface ContactRepository {
     suspend fun refresh()
     suspend fun syncDeviceContacts()
 
+    /** Refreshes a stale device row and returns its current Kit-account identity when available. */
+    suspend fun resolveForMessaging(contact: Contact): Contact? {
+        if (contact.isKitUser) return contact
+        refresh()
+        val phoneKey = contact.phone.filter(Char::isDigit).takeLast(9)
+        return contacts.value.singleOrNull { candidate ->
+            candidate.isKitUser &&
+                candidate.phone.filter(Char::isDigit).takeLast(9) == phoneKey
+        }
+    }
+
     /** Finds Kit Pay members by their public @kittag; used when a search query starts with `@`. */
     suspend fun searchByKitTag(query: String): List<Contact> = emptyList()
 }
@@ -147,6 +158,9 @@ interface CallRepository {
         conversationId: String? = null,
     ): CallConnection = error("Calling is unavailable")
 
+    /** Adds more Kit Pay users to an active or ringing call, turning it into a group call. */
+    suspend fun invite(callId: String, recipientUserIds: List<String>) = Unit
+
     suspend fun accept(callId: String): CallConnection = error("Calling is unavailable")
 
     suspend fun decline(callId: String) = Unit
@@ -157,6 +171,8 @@ interface CallRepository {
 data class IncomingCallDetails(
     val callId: String,
     val name: String,
+    val phone: String? = null,
+    val participantUserIds: List<String> = emptyList(),
     val video: Boolean,
     val direction: String,
     val state: String,
@@ -178,6 +194,8 @@ fun IncomingCallDetails.requireAnswerable(now: Instant = Instant.now()): Incomin
 data class CallConnection(
     val callId: String,
     val name: String,
+    val phone: String? = null,
+    val participantUserIds: List<String> = emptyList(),
     val video: Boolean,
     val provider: String,
     val url: String,

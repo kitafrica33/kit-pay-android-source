@@ -1,7 +1,10 @@
 package com.kit.wallet.feature.calls
 
 import android.Manifest
+import android.app.Activity
+import android.content.Context
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -22,13 +25,16 @@ import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
@@ -38,13 +44,18 @@ import androidx.compose.material.icons.rounded.Cameraswitch
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.MicOff
+import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.ScreenShare
+import androidx.compose.material.icons.rounded.StopScreenShare
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material.icons.rounded.VideocamOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -71,7 +82,9 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.initialsOf
+import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.theme.KitGreen100
 import com.kit.wallet.ui.theme.KitGreen500
 import com.kit.wallet.ui.theme.KitGreen700
@@ -124,6 +137,31 @@ fun ActiveCallScreen(
     ) { granted ->
         if (granted) viewModel.switchToVideo()
     }
+    // Screen sharing needs the user's MediaProjection consent; the granted result Intent is what
+    // LiveKit needs to publish the screen track.
+    val mediaProjectionManager = remember {
+        context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+    }
+    val screenCaptureRequest = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == Activity.RESULT_OK && data != null) {
+            viewModel.startScreenShare(data)
+        }
+    }
+    val contactsToAdd by viewModel.callableContacts.collectAsStateWithLifecycle()
+    var showAddPeople by remember { mutableStateOf(false) }
+    if (showAddPeople) {
+        AddPeopleDialog(
+            contacts = contactsToAdd,
+            onDismiss = { showAddPeople = false },
+            onPick = { contact ->
+                viewModel.addParticipant(contact.id)
+                showAddPeople = false
+            },
+        )
+    }
 
     val connectCall = {
         val missing = permissions.filter {
@@ -169,6 +207,15 @@ fun ActiveCallScreen(
         if (outgoingRinging) tones.startRingback()
         onDispose { tones.stopRingback() }
     }
+    // Repeat the standard call-waiting tone while a second call is ringing in.
+    LaunchedEffect(state.waitingCall != null) {
+        if (state.waitingCall != null) {
+            while (true) {
+                tones.playCallWaiting()
+                kotlinx.coroutines.delay(3_500)
+            }
+        }
+    }
     var previousPhase by remember { mutableStateOf(state.phase) }
     LaunchedEffect(state.phase) {
         val was = previousPhase
@@ -208,6 +255,17 @@ fun ActiveCallScreen(
             }
         },
         onSwitchToAudio = viewModel::switchToAudio,
+        onDeclineWaiting = viewModel::declineWaitingCall,
+        onMergeWaiting = viewModel::mergeWaitingCall,
+        onAddParticipant = { showAddPeople = true },
+        onToggleScreenShare = {
+            if (state.screenSharing) {
+                viewModel.stopScreenShare()
+            } else {
+                runCatching { mediaProjectionManager.createScreenCaptureIntent() }
+                    .onSuccess(screenCaptureRequest::launch)
+            }
+        },
         onAccept = connectCall,
         onDecline = viewModel::decline,
         onRetry = {
@@ -236,6 +294,10 @@ private fun ActiveCallContent(
     onFlip: () -> Unit,
     onSwitchToVideo: () -> Unit,
     onSwitchToAudio: () -> Unit,
+    onDeclineWaiting: () -> Unit,
+    onMergeWaiting: () -> Unit,
+    onAddParticipant: () -> Unit,
+    onToggleScreenShare: () -> Unit,
     onAccept: () -> Unit,
     onDecline: () -> Unit,
     onRetry: () -> Unit,
@@ -251,7 +313,12 @@ private fun ActiveCallContent(
                 ),
             ),
     ) {
-        if (state.video && state.remoteVideoTrack != null) {
+        // A group video call renders every remote participant as a tile; a one-to-one video call
+        // fills the screen with the single remote video behind the local self-view.
+        if (state.video && state.isGroup) {
+            GroupVideoGrid(state = state, room = room, modifier = Modifier.fillMaxSize())
+            Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.18f)))
+        } else if (state.video && state.remoteVideoTrack != null) {
             LiveKitVideoRenderer(
                 room = room,
                 track = state.remoteVideoTrack,
@@ -321,6 +388,21 @@ private fun ActiveCallContent(
                 )
             ) {
                 val connected = state.phase in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)
+                // Add people to the call and share the screen — available once connected.
+                if (connected) {
+                    Row(
+                        Modifier.padding(bottom = 14.dp),
+                        horizontalArrangement = Arrangement.spacedBy(20.dp),
+                    ) {
+                        CallControl(Icons.Rounded.PersonAdd, "Add", onClick = onAddParticipant)
+                        CallControl(
+                            if (state.screenSharing) Icons.Rounded.StopScreenShare else Icons.Rounded.ScreenShare,
+                            "Share",
+                            active = state.screenSharing,
+                            onClick = onToggleScreenShare,
+                        )
+                    }
+                }
                 Surface(
                     color = if (state.video) Color(0xFF081524).copy(alpha = 0.62f) else Color.Transparent,
                     shape = MaterialTheme.shapes.extraLarge,
@@ -378,6 +460,67 @@ private fun ActiveCallContent(
                     }
                 }
             }
+        }
+
+        state.waitingCall?.let { waiting ->
+            CallWaitingBanner(
+                waiting = waiting,
+                merging = state.mergingWaitingCall,
+                onDecline = onDeclineWaiting,
+                onMerge = onMergeWaiting,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            )
+        }
+    }
+}
+
+/** The call-waiting overlay: shows the second caller with Decline and Merge-to-group actions. */
+@Composable
+private fun CallWaitingBanner(
+    waiting: WaitingCall,
+    merging: Boolean,
+    onDecline: () -> Unit,
+    onMerge: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        color = Color(0xFF0B1D2E).copy(alpha = 0.96f),
+        shape = MaterialTheme.shapes.large,
+        shadowElevation = 6.dp,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    "Call waiting",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White.copy(alpha = 0.7f),
+                )
+                Text(
+                    waiting.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color.White,
+                )
+                Text(
+                    if (waiting.video) "Incoming video call" else "Incoming voice call",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White.copy(alpha = 0.7f),
+                )
+            }
+            CallControl(Icons.Rounded.CallEnd, "Decline", danger = true, onClick = onDecline)
+            Spacer(Modifier.width(14.dp))
+            CallControl(
+                Icons.Rounded.PersonAdd,
+                if (merging) "Merging…" else "Merge",
+                success = true,
+                onClick = { if (!merging) onMerge() },
+            )
         }
     }
 }
@@ -584,4 +727,96 @@ private fun CallControl(
         Spacer(Modifier.height(7.dp))
         Text(label, style = MaterialTheme.typography.labelSmall, color = Color.White.copy(alpha = 0.82f))
     }
+}
+
+/** A tile grid of the other participants in a group video call: their camera/screen or an avatar. */
+@Composable
+private fun GroupVideoGrid(
+    state: ActiveCallUiState,
+    room: io.livekit.android.room.Room,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier.padding(top = 56.dp)) {
+        state.remoteParticipants.chunked(2).forEach { rowParticipants ->
+            Row(Modifier.fillMaxWidth().weight(1f)) {
+                rowParticipants.forEach { participant ->
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .fillMaxSize()
+                            .padding(3.dp)
+                            .clip(MaterialTheme.shapes.medium)
+                            .background(Color(0xFF2B4A66)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (participant.videoTrack != null) {
+                            LiveKitVideoRenderer(
+                                room = room,
+                                track = participant.videoTrack,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        } else {
+                            Text(
+                                initialsOf(participant.name),
+                                fontSize = 34.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color.White,
+                            )
+                        }
+                        Text(
+                            participant.name,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White,
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .padding(6.dp),
+                        )
+                    }
+                }
+                // Keep a single trailing tile left-aligned in its row.
+                if (rowParticipants.size == 1) Spacer(Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+/** In-call people picker: tap a Kit Pay contact to invite them into the call. */
+@Composable
+private fun AddPeopleDialog(
+    contacts: List<Contact>,
+    onDismiss: () -> Unit,
+    onPick: (Contact) -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add to call") },
+        text = {
+            if (contacts.isEmpty()) {
+                Text(
+                    "No Kit Pay contacts to add yet. Sync your contacts to find people on Kit Pay.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            } else {
+                LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                    items(contacts.size) { index ->
+                        val contact = contacts[index]
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable { onPick(contact) }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            KitAvatar(contact.name, size = 40.dp)
+                            Spacer(Modifier.width(12.dp))
+                            Text(contact.name, style = MaterialTheme.typography.titleSmall)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Done") }
+        },
+    )
 }

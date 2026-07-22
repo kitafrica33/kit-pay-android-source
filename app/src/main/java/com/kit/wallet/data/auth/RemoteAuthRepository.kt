@@ -15,13 +15,14 @@ import com.kit.wallet.data.remote.LogoutRequest
 import com.kit.wallet.data.remote.PhoneOtpRequest
 import com.kit.wallet.data.remote.PhoneOtpVerifyRequest
 import com.kit.wallet.data.remote.RequestAccountDeletionDto
-import com.kit.wallet.data.remote.RefreshSessionRequest
 import com.kit.wallet.data.remote.ResetMessagingEnrollmentDto
 import com.kit.wallet.data.remote.ResetMessagingEnrollmentRequest
 import com.kit.wallet.data.remote.ResetPasswordRequest
 import com.kit.wallet.data.remote.SecureMessagingEnrollmentRecoveryApi
 import com.kit.wallet.data.remote.SessionRefreshResult
+import com.kit.wallet.data.remote.isDefinitiveSessionRejection
 import com.kit.wallet.data.remote.TwoFactorVerifyRequest
+import com.kit.wallet.data.remote.UserDto
 import com.kit.wallet.data.remote.VerifyIdentityTokenRequest
 import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.repository.WalletSyncRepository
@@ -197,13 +198,33 @@ class RemoteAuthRepository @Inject constructor(
     }
 
     override suspend fun refreshSession(): AuthOutcome.Authenticated {
-        val expected = sessions.snapshot()
-        val current = requireNotNull(sessions.current()) { "No session to refresh" }
-        if (expected.fence != current.fence()) throw SessionInvalidatedException()
-        val outcome = apiCalls.execute { api.refresh(RefreshSessionRequest(current.refreshToken)) }
-            .toOutcome(expected, allowAccountReplacement = false)
-        return outcome as? AuthOutcome.Authenticated
-            ?: error("Refresh unexpectedly required another authentication challenge")
+        return refreshCoordinator.serialized {
+            val current = requireNotNull(sessions.current()) { "No session to refresh" }
+            when (val refresh = tokenRefresher.refresh(current)) {
+                is SessionRefreshResult.Refreshed -> {
+                    val authenticatedUser = requireNotNull(refresh.user) {
+                        "Successful session refresh omitted user"
+                    }
+                    if (!sessions.adoptRefreshedCredentialsIfCurrent(
+                            current,
+                            refresh.tokens,
+                        )
+                    ) {
+                        throw SessionInvalidatedException()
+                    }
+                    walletRefreshTrigger.refreshNow()
+                    AuthOutcome.Authenticated(
+                        authenticatedUser.toAuthenticatedUser(
+                            refresh.tokens.profileSetupState,
+                        ),
+                    )
+                }
+                is SessionRefreshResult.Rejected -> {
+                    clearLocalUserDataIfCredentialsCurrent(current)
+                    throw refresh.error
+                }
+            }
+        }
     }
 
     override suspend fun logout(allDevices: Boolean): LogoutResult {
@@ -337,7 +358,7 @@ class RemoteAuthRepository @Inject constructor(
                     targetFence = targetSession.fence()
                     continue
                 }
-                if (error.statusCode == 401) {
+                if (error.isDefinitiveSessionRejection()) {
                     requireFreshAuthentication(targetFence)
                 }
                 throw error
@@ -463,6 +484,34 @@ class RemoteAuthRepository @Inject constructor(
         return targetCleared
     }
 
+    private suspend fun clearLocalUserDataIfCredentialsCurrent(
+        expected: SessionTokens,
+    ): Boolean {
+        var sessionFailure: Exception? = null
+        var targetCleared = false
+        try {
+            targetCleared = sessions.clearIfCredentialsCurrent(expected)
+        } catch (error: Exception) {
+            sessionFailure = error
+            targetCleared = sessions.current() == null
+        }
+
+        if (!targetCleared) {
+            sessionFailure?.let { throw it }
+            return false
+        }
+
+        try {
+            walletSync.clearCachedUserData(expected.cacheScopeId)
+        } catch (cacheFailure: Exception) {
+            sessionFailure?.addSuppressed(cacheFailure)
+            if (sessionFailure == null) throw cacheFailure
+        }
+
+        sessionFailure?.let { throw it }
+        return true
+    }
+
     private suspend fun AuthResultDto.toOutcome(
         expected: SessionSnapshot,
         allowAccountReplacement: Boolean = true,
@@ -513,15 +562,7 @@ class RemoteAuthRepository @Inject constructor(
             if (!sessions.saveIfUnchanged(expected, tokens)) throw SessionInvalidatedException()
             walletRefreshTrigger.refreshNow()
             return AuthOutcome.Authenticated(
-                AuthenticatedUser(
-                    id = authenticatedUser.id,
-                    name = profileName,
-                    email = authenticatedUser.email,
-                    phone = authenticatedUser.phone,
-                    tag = authenticatedUser.tag,
-                    paymentPinSet = authenticatedUser.paymentPinSet == true,
-                    profileSetupRequired = setupState.requiresSetup,
-                ),
+                authenticatedUser.toAuthenticatedUser(setupState, profileName),
             )
         }
 
@@ -561,6 +602,19 @@ class RemoteAuthRepository @Inject constructor(
     private fun Double?.toCooldownSecondsOrNull(): Long? = this
         ?.takeIf { it.isFinite() }
         ?.let { ceil(it).toLong().coerceAtLeast(0L) }
+
+    private fun UserDto.toAuthenticatedUser(
+        setupState: ProfileSetupState,
+        normalizedName: String = profileNameOrPlaceholder(name),
+    ) = AuthenticatedUser(
+        id = id,
+        name = normalizedName,
+        email = email,
+        phone = phone,
+        tag = tag,
+        paymentPinSet = paymentPinSet == true,
+        profileSetupRequired = setupState.requiresSetup,
+    )
 
     private fun String?.orFallback(fallback: String): String =
         this?.trim()?.takeIf(String::isNotBlank) ?: fallback

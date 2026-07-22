@@ -16,12 +16,14 @@ import com.kit.wallet.data.remote.SessionHeaderInterceptor
 import com.kit.wallet.data.remote.SessionRefreshApi
 import com.kit.wallet.data.remote.UserDto
 import com.kit.wallet.data.session.ProfileSetupState
+import com.kit.wallet.data.session.SessionDiskPayload
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionSnapshot
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
 import com.kit.wallet.data.session.SecureMessagingResetProofFence
+import com.kit.wallet.data.session.decodeSessionPersistingLegacyNonce
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.io.IOException
@@ -46,12 +48,71 @@ import retrofit2.Response as RetrofitResponse
 
 class SessionNetworkingTest {
     @Test
+    fun `migrated legacy nonce recovers a lost refresh response after process restart`() {
+        val adapter = Moshi.Builder()
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(SessionDiskPayload::class.java)
+        var durableSession = adapter.toJson(
+            SessionDiskPayload(
+                accessToken = OLD_SESSION.accessToken,
+                refreshToken = OLD_SESSION.refreshToken,
+                sessionId = OLD_SESSION.sessionId,
+                accessTokenExpiresAtEpochSeconds = null,
+                accountId = OLD_SESSION.accountId,
+                cacheScopeId = OLD_SESSION.cacheScopeId,
+            ),
+        )
+
+        fun restoreAfterProcessStart(): SessionTokens = decodeSessionPersistingLegacyNonce(
+            encryptedSession = durableSession,
+            decodePayload = { checkNotNull(adapter.fromJson(it)) },
+            encodePayload = adapter::toJson,
+            persistEncryptedSession = {
+                durableSession = it
+                true
+            },
+        )
+
+        var committedNonce: String? = null
+        val api = FakeRefreshApi { _, request ->
+            if (committedNonce == null) {
+                committedNonce = request.refreshReplayNonce
+                throw IOException("refresh committed but its response was lost")
+            }
+            assertEquals(committedNonce, request.refreshReplayNonce)
+            successfulRefresh(REFRESHED_SESSION)
+        }
+
+        val firstProcess = restoreAfterProcessStart()
+        val firstSessions = FakeSessionStore(firstProcess)
+        assertNull(
+            authenticator(firstSessions, FakeWalletCache(firstProcess.cacheScopeId), api)
+                .authenticate(null, unauthorizedResponse(firstProcess)),
+        )
+        assertEquals(firstProcess, firstSessions.current())
+
+        val secondProcess = restoreAfterProcessStart()
+        assertEquals(firstProcess.refreshReplayNonce, secondProcess.refreshReplayNonce)
+        val replayed = authenticator(
+            FakeSessionStore(secondProcess),
+            FakeWalletCache(secondProcess.cacheScopeId),
+            api,
+        ).authenticate(null, unauthorizedResponse(secondProcess))
+
+        assertNotNull(replayed)
+        assertEquals(2, api.calls)
+        assertEquals(firstProcess.refreshReplayNonce, committedNonce)
+    }
+
+    @Test
     fun `concurrent 401s reuse the refresh completed by the first request`() {
         val sessions = FakeSessionStore(OLD_SESSION)
         val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
         val refreshEntered = CountDownLatch(1)
         val releaseRefresh = CountDownLatch(1)
-        val api = FakeRefreshApi { _, _ ->
+        val api = FakeRefreshApi { _, request ->
+            assertEquals(OLD_SESSION.refreshReplayNonce, request.refreshReplayNonce)
             refreshEntered.countDown()
             check(releaseRefresh.await(5, TimeUnit.SECONDS))
             successfulRefresh(REFRESHED_SESSION)
@@ -86,7 +147,14 @@ class SessionNetworkingTest {
                 )
             }
             assertEquals(1, api.calls)
-            assertEquals(REFRESHED_SESSION, sessions.current())
+            val persisted = sessions.current()
+            assertEquals(
+                REFRESHED_SESSION.copy(
+                    refreshReplayNonce = checkNotNull(persisted).refreshReplayNonce,
+                ),
+                persisted,
+            )
+            assertTrue(persisted.refreshReplayNonce != OLD_SESSION.refreshReplayNonce)
             assertEquals(OLD_SESSION.cacheScopeId, cache.currentOwner)
         } finally {
             releaseRefresh.countDown()
@@ -174,6 +242,24 @@ class SessionNetworkingTest {
     }
 
     @Test
+    fun `refresh adoption rejects the same token strings with another replay nonce`() {
+        val currentGeneration = OLD_SESSION.copy(
+            refreshReplayNonce = "11111111-1111-4111-8111-111111111111",
+        )
+        val staleExpected = currentGeneration.copy(
+            refreshReplayNonce = "22222222-2222-4222-8222-222222222222",
+        )
+        val sessions = FakeSessionStore(currentGeneration)
+
+        val adopted = runBlocking {
+            sessions.adoptRefreshedCredentialsIfCurrent(staleExpected, REFRESHED_SESSION)
+        }
+
+        assertEquals(false, adopted)
+        assertEquals(currentGeneration, sessions.current())
+    }
+
+    @Test
     fun `request from an obsolete login is not replayed with a newer account`() {
         val sessions = FakeSessionStore(NEW_ACCOUNT_SESSION)
         val cache = FakeWalletCache(NEW_ACCOUNT_SESSION.cacheScopeId)
@@ -232,7 +318,7 @@ class SessionNetworkingTest {
     }
 
     @Test
-    fun `401 refresh rejection clears the matching session and cache owner`() {
+    fun `ambiguous 401 refresh response preserves the matching session for retry`() {
         val sessions = FakeSessionStore(OLD_SESSION)
         val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
         val api = FakeRefreshApi { _, _ -> throw httpFailure(401) }
@@ -241,35 +327,34 @@ class SessionNetworkingTest {
             .authenticate(null, unauthorizedResponse(OLD_SESSION))
 
         assertNull(retried)
-        assertNull(sessions.current())
-        assertNull(cache.currentOwner)
-        assertEquals(listOf(OLD_SESSION.cacheScopeId), cache.clearAttempts)
+        assertEquals(OLD_SESSION, sessions.current())
+        assertEquals(OLD_SESSION.cacheScopeId, cache.currentOwner)
+        assertTrue(cache.clearAttempts.isEmpty())
     }
 
     @Test
     fun `definitive refresh error code clears the matching session and cache owner`() {
-        val sessions = FakeSessionStore(OLD_SESSION)
-        val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
-        val api = FakeRefreshApi { _, _ ->
-            ApiEnvelope(
-                ok = false,
-                error = ApiErrorDto(
-                    code = "REFRESH_TOKEN_REUSED",
-                    message = "Refresh token was already used",
-                ),
-            )
+        listOf(
+            "REFRESH_TOKEN_INVALID",
+            "REFRESH_TOKEN_REUSED",
+            "REFRESH_TOKEN_EXPIRED",
+            "SESSION_REVOKED",
+        ).forEach { rejectionCode ->
+            val sessions = FakeSessionStore(OLD_SESSION)
+            val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
+            val api = FakeRefreshApi { _, _ -> throw httpFailure(401, rejectionCode) }
+
+            val retried = authenticator(sessions, cache, api)
+                .authenticate(null, unauthorizedResponse(OLD_SESSION))
+
+            assertNull(retried)
+            assertNull(sessions.current())
+            assertNull(cache.currentOwner)
         }
-
-        val retried = authenticator(sessions, cache, api)
-            .authenticate(null, unauthorizedResponse(OLD_SESSION))
-
-        assertNull(retried)
-        assertNull(sessions.current())
-        assertNull(cache.currentOwner)
     }
 
     @Test
-    fun `refresh response for a different account invalidates the matching owner`() {
+    fun `refresh response for a different account preserves the matching owner`() {
         val sessions = FakeSessionStore(OLD_SESSION)
         val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
         val api = FakeRefreshApi { _, _ ->
@@ -283,8 +368,52 @@ class SessionNetworkingTest {
             .authenticate(null, unauthorizedResponse(OLD_SESSION))
 
         assertNull(retried)
-        assertNull(sessions.current())
-        assertNull(cache.currentOwner)
+        assertEquals(OLD_SESSION, sessions.current())
+        assertEquals(OLD_SESSION.cacheScopeId, cache.currentOwner)
+        assertTrue(cache.clearAttempts.isEmpty())
+    }
+
+    @Test
+    fun `successful refresh without credentials preserves the matching owner`() {
+        val sessions = FakeSessionStore(OLD_SESSION)
+        val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
+        val api = FakeRefreshApi { _, _ ->
+            ApiEnvelope(
+                ok = true,
+                data = AuthResultDto(state = "authenticated", session = null, user = null),
+            )
+        }
+
+        val retried = authenticator(sessions, cache, api)
+            .authenticate(null, unauthorizedResponse(OLD_SESSION))
+
+        assertNull(retried)
+        assertEquals(OLD_SESSION, sessions.current())
+        assertEquals(OLD_SESSION.cacheScopeId, cache.currentOwner)
+        assertTrue(cache.clearAttempts.isEmpty())
+    }
+
+    @Test
+    fun `terminal code without an HTTP 401 preserves the matching owner`() {
+        val sessions = FakeSessionStore(OLD_SESSION)
+        val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
+        val api = FakeRefreshApi { _, _ ->
+            ApiEnvelope(
+                ok = false,
+                error = ApiErrorDto(
+                    code = "SESSION_REVOKED",
+                    message = "Malformed success response",
+                ),
+            )
+        }
+
+        val retried = authenticator(sessions, cache, api)
+            .authenticate(null, unauthorizedResponse(OLD_SESSION))
+
+        assertNull(retried)
+        assertEquals(OLD_SESSION, sessions.current())
+        assertEquals(OLD_SESSION.cacheScopeId, cache.currentOwner)
+        assertTrue(cache.clearAttempts.isEmpty())
     }
 
     @Test
@@ -294,13 +423,7 @@ class SessionNetworkingTest {
         val api = FakeRefreshApi { _, _ ->
             sessions.save(NEW_ACCOUNT_SESSION)
             cache.claim(NEW_ACCOUNT_SESSION.cacheScopeId)
-            ApiEnvelope(
-                ok = false,
-                error = ApiErrorDto(
-                    code = "SESSION_REVOKED",
-                    message = "Old session revoked",
-                ),
-            )
+            throw httpFailure(401, "SESSION_REVOKED")
         }
 
         val retried = authenticator(sessions, cache, api)
@@ -309,7 +432,7 @@ class SessionNetworkingTest {
         assertNull(retried)
         assertEquals(NEW_ACCOUNT_SESSION, sessions.current())
         assertEquals(NEW_ACCOUNT_SESSION.cacheScopeId, cache.currentOwner)
-        assertEquals(listOf(OLD_SESSION.cacheScopeId), cache.clearAttempts)
+        assertTrue(cache.clearAttempts.isEmpty())
     }
 
     private fun authenticator(
@@ -355,8 +478,12 @@ class SessionNetworkingTest {
         ),
     )
 
-    private fun httpFailure(status: Int): HttpException {
-        val body = """{"ok":false}"""
+    private fun httpFailure(status: Int, code: String? = null): HttpException {
+        val body = if (code == null) {
+            """{"ok":false}"""
+        } else {
+            """{"ok":false,"error":{"code":"$code","message":"Rejected"}}"""
+        }
             .toResponseBody("application/json".toMediaType())
         return HttpException(RetrofitResponse.error<ApiEnvelope<AuthResultDto>>(status, body))
     }

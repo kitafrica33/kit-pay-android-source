@@ -170,10 +170,14 @@ object SecureMessagingTransportValidator {
         requestedCursor: String?,
         requestedLimit: Int,
         previousEventId: Long? = null,
+        currentEnrollmentEpoch: Long? = null,
     ): ValidatedMessagingSyncPage {
         requireUuid(currentUserId, "current user ID")
         requireUuid(currentDeviceId, "current device ID")
         validateSyncRequest(requestedCursor, requestedLimit, previousEventId)
+        currentEnrollmentEpoch?.let {
+            requireTransport(it > 0, "current messaging enrollment epoch")
+        }
 
         val page = required(response.page, "messaging sync page")
         val nextCursor = required(page.nextCursor, "messaging sync next cursor")
@@ -214,6 +218,7 @@ object SecureMessagingTransportValidator {
                 eventId = eventId,
                 currentUserId = currentUserId,
                 currentDeviceId = currentDeviceId,
+                currentEnrollmentEpoch = currentEnrollmentEpoch,
             )
         }
 
@@ -239,12 +244,245 @@ object SecureMessagingTransportValidator {
         }
     }
 
+    fun validateHistoryBackfillCandidates(
+        response: MessagingHistoryBackfillCandidatesDto,
+        authoritativeRoster: ValidatedMessagingDeviceRoster,
+        expectedConversationId: String,
+        expectedCurrentUserId: String,
+        expectedCurrentDeviceId: String,
+        expectedCurrentEnrollmentEpoch: Long,
+        expectedTargetDeviceId: String,
+        expectedTargetEnrollmentEpoch: Long,
+        requestedAfter: String?,
+        requestedLimit: Int,
+    ): ValidatedMessagingHistoryBackfillPage {
+        requireUuid(expectedConversationId, "history conversation ID")
+        requireUuid(expectedCurrentUserId, "history current user ID")
+        requireUuid(expectedCurrentDeviceId, "history current device ID")
+        requireTransport(expectedCurrentEnrollmentEpoch > 0, "history current enrollment epoch")
+        requireUuid(expectedTargetDeviceId, "history target device ID")
+        requireTransport(
+            expectedTargetDeviceId != expectedCurrentDeviceId,
+            "history target is the current device",
+        )
+        requireTransport(expectedTargetEnrollmentEpoch > 0, "history target enrollment epoch")
+        requireTransport(requestedLimit in 1..MAX_HISTORY_PAGE_SIZE, "history page limit")
+        requestedAfter?.let { requireHistoryCursor(it, "history page cursor") }
+
+        requireTransport(
+            authoritativeRoster.conversationId == expectedConversationId &&
+                authoritativeRoster.currentUserId == expectedCurrentUserId &&
+                authoritativeRoster.currentDeviceId == expectedCurrentDeviceId,
+            "history authoritative roster binding",
+        )
+        requireTransport(
+            response.conversationId == expectedConversationId,
+            "history response conversation changed",
+        )
+        requireTransport(
+            response.rosterRevision == authoritativeRoster.rosterRevision,
+            "history response roster changed",
+        )
+        val target = required(response.targetCryptoBundle, "history target crypto bundle")
+        requireTransport(target.deviceId == expectedTargetDeviceId, "history target device changed")
+        requireTransport(target.userId == expectedCurrentUserId, "history target account changed")
+        requireTransport(
+            target.enrollmentEpoch == expectedTargetEnrollmentEpoch,
+            "history target enrollment changed",
+        )
+        requireSignalDeviceId(target.signalDeviceId, "history target Signal device ID")
+        requireRegistrationId(target.registrationId, "history target registration ID")
+        requireTransport(
+            target.protocolVersion == SECURE_MESSAGING_PROTOCOL_VERSION,
+            "history target protocol",
+        )
+        val targetBundleVersion = required(target.bundleVersion, "history target bundle version")
+        requireTransport(targetBundleVersion > 0, "history target bundle version")
+        requireSha256(target.identityKeySha256, "history target identity-key hash")
+        val rosterTarget = authoritativeRoster.devices().singleOrNull {
+            it.deviceId == expectedTargetDeviceId
+        } ?: rejectTransport("history target is absent from the authoritative roster")
+        requireTransport(
+            rosterTarget.userId == expectedCurrentUserId &&
+                rosterTarget.signalDeviceId == target.signalDeviceId &&
+                rosterTarget.registrationId == target.registrationId &&
+                rosterTarget.protocolVersion == target.protocolVersion &&
+                rosterTarget.bundleVersion == targetBundleVersion &&
+                rosterTarget.identityKeySha256 == target.identityKeySha256,
+            "history target claims differ from the authoritative roster",
+        )
+
+        val nullableMessages = required(response.messages, "history candidate messages")
+        requireTransport(
+            nullableMessages.size <= requestedLimit,
+            "history response exceeds requested limit",
+        )
+        val seenMessageIds = mutableSetOf<String>()
+        val messages = nullableMessages.mapIndexed { index, nullableMessage ->
+            val message = required(nullableMessage, "history candidate $index")
+            val senderDeviceId = required(
+                message.senderDeviceId,
+                "history candidate $index sender device ID",
+            )
+            val senderEnrollmentEpoch = requireHistorySenderEnrollmentEpoch(
+                value = message.senderEnrollmentEpoch,
+                field = "history candidate $index sender enrollment epoch",
+            )
+            val authoredByCurrentInstallation =
+                senderDeviceId == expectedCurrentDeviceId &&
+                    senderEnrollmentEpoch == expectedCurrentEnrollmentEpoch
+            val validatedIncoming = if (authoredByCurrentInstallation) {
+                validateOwnOutboundMessage(
+                    message = message,
+                    expectedConversationId = expectedConversationId,
+                    expectedClientMessageId = required(
+                        message.clientMessageId,
+                        "history candidate $index client message ID",
+                    ),
+                    expectedCurrentUserId = expectedCurrentUserId,
+                    expectedCurrentDeviceId = expectedCurrentDeviceId,
+                    expectedCurrentEnrollmentEpoch = expectedCurrentEnrollmentEpoch,
+                    expectedRosterRevision = required(
+                        message.rosterRevision,
+                        "history candidate $index roster revision",
+                    ),
+                )
+                null
+            } else {
+                SecureMessagingWireValidator.validateIncomingEncryptedMessage(
+                    message = message,
+                    expectedConversationId = expectedConversationId,
+                    currentDeviceId = expectedCurrentDeviceId,
+                    currentUserId = expectedCurrentUserId,
+                    currentEnrollmentEpoch = expectedCurrentEnrollmentEpoch,
+                )
+            }
+            val messageId = required(message.id, "history candidate $index message ID")
+            requireUuid(messageId, "history candidate $index message ID")
+            requireTransport(
+                seenMessageIds.add(messageId),
+                "history candidates contain duplicate message IDs",
+            )
+            val sender = required(message.sender, "history candidate $index sender")
+            val senderUserId = required(sender.id, "history candidate $index sender user ID")
+            requireUuid(senderUserId, "history candidate $index sender user ID")
+            val senderSignalDeviceId = required(
+                message.senderSignalDeviceId,
+                "history candidate $index sender Signal device ID",
+            )
+            requireSignalDeviceId(
+                senderSignalDeviceId,
+                "history candidate $index sender Signal device ID",
+            )
+            val clientMessageId = required(
+                message.clientMessageId,
+                "history candidate $index client message ID",
+            )
+            requireUuid(clientMessageId, "history candidate $index client message ID")
+            val originalRosterRevision = required(
+                message.rosterRevision,
+                "history candidate $index roster revision",
+            )
+            requireTransport(
+                SECURE_MESSAGING_ROSTER_REVISION.matches(originalRosterRevision),
+                "history candidate $index roster revision",
+            )
+            val kind = required(message.kind, "history candidate $index kind")
+            requireTransport(
+                kind == ENCRYPTED_MESSAGE_KIND || kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+                "history candidate $index kind",
+            )
+            val replyToMessageId = message.replyToMessageId
+            replyToMessageId?.let { requireUuid(it, "history candidate $index reply target") }
+            val sentAt = validatedIncoming?.sentAt
+                ?: requireTimestamp(message.sentAt, "history candidate $index send time")
+            requireTransport(message.revokedAt == null, "history candidate $index is revoked")
+            ValidatedMessagingHistoryCandidate(
+                messageId = messageId,
+                conversationId = expectedConversationId,
+                clientMessageId = clientMessageId,
+                senderUserId = senderUserId,
+                senderDeviceId = senderDeviceId,
+                senderEnrollmentEpoch = senderEnrollmentEpoch,
+                senderSignalDeviceId = senderSignalDeviceId,
+                rosterRevision = originalRosterRevision,
+                kind = kind,
+                replyToMessageId = replyToMessageId,
+                sentAt = sentAt,
+            )
+        }
+
+        val page = required(response.page, "history candidate page")
+        val hasMore = required(page.hasMore, "history candidate has-more state")
+        requireTransport(page.limit == requestedLimit, "history candidate page limit changed")
+        val nextCursor = page.nextCursor
+        nextCursor?.let { requireHistoryCursor(it, "history candidate next cursor") }
+        requireTransport(!hasMore || nextCursor != null, "history candidate continuation is missing")
+        requireTransport(
+            requestedAfter == null ||
+                nextCursor == null ||
+                (!hasMore && messages.isEmpty()) ||
+                nextCursor != requestedAfter,
+            "history candidate cursor did not advance",
+        )
+        return ValidatedMessagingHistoryBackfillPage(
+            conversationId = expectedConversationId,
+            rosterRevision = authoritativeRoster.rosterRevision,
+            target = ValidatedMessagingHistoryTarget(
+                deviceId = expectedTargetDeviceId,
+                userId = expectedCurrentUserId,
+                enrollmentEpoch = expectedTargetEnrollmentEpoch,
+                signalDeviceId = checkNotNull(target.signalDeviceId),
+                registrationId = checkNotNull(target.registrationId),
+                bundleVersion = targetBundleVersion,
+                identityKeySha256 = checkNotNull(target.identityKeySha256),
+            ),
+            messages = messages,
+            nextCursor = nextCursor,
+            hasMore = hasMore,
+        )
+    }
+
+    fun validateHistoryEnvelopeResult(
+        response: MessagingHistoryEnvelopeResultDto,
+        expectedMessageId: String,
+        expectedTargetDeviceId: String,
+        expectedTargetEnrollmentEpoch: Long,
+        expectedTransferClientMessageId: String,
+    ): ValidatedMessagingHistoryEnvelopeResult {
+        requireUuid(expectedMessageId, "history result message ID")
+        requireUuid(expectedTargetDeviceId, "history result target device ID")
+        requireTransport(expectedTargetEnrollmentEpoch > 0, "history result target epoch")
+        requireUuid(expectedTransferClientMessageId, "history result transfer ID")
+        requireTransport(response.messageId == expectedMessageId, "history result message changed")
+        requireTransport(
+            response.targetDeviceId == expectedTargetDeviceId,
+            "history result target changed",
+        )
+        requireTransport(
+            response.targetEnrollmentEpoch == expectedTargetEnrollmentEpoch,
+            "history result target enrollment changed",
+        )
+        requireTransport(
+            response.transferClientMessageId == expectedTransferClientMessageId,
+            "history result transfer changed",
+        )
+        return ValidatedMessagingHistoryEnvelopeResult(
+            messageId = expectedMessageId,
+            targetDeviceId = expectedTargetDeviceId,
+            targetEnrollmentEpoch = expectedTargetEnrollmentEpoch,
+            transferClientMessageId = expectedTransferClientMessageId,
+            created = required(response.created, "history result created state"),
+        )
+    }
+
     fun validateOutboundSendResponse(
         response: EncryptedMessageDto,
         expectedConversationId: String,
         expectedClientMessageId: String,
         expectedCurrentUserId: String,
         expectedCurrentDeviceId: String,
+        expectedCurrentEnrollmentEpoch: Long? = null,
         expectedRosterRevision: String,
     ): ValidatedOutboundEncryptedMessage {
         requireUuid(expectedConversationId, "expected conversation ID")
@@ -261,6 +499,7 @@ object SecureMessagingTransportValidator {
             expectedClientMessageId = expectedClientMessageId,
             expectedCurrentUserId = expectedCurrentUserId,
             expectedCurrentDeviceId = expectedCurrentDeviceId,
+            expectedCurrentEnrollmentEpoch = expectedCurrentEnrollmentEpoch,
             expectedRosterRevision = expectedRosterRevision,
         )
     }
@@ -370,6 +609,7 @@ object SecureMessagingTransportValidator {
         eventId: Long,
         currentUserId: String,
         currentDeviceId: String,
+        currentEnrollmentEpoch: Long?,
     ): ValidatedMessagingSyncEvent {
         val type = required(event.type, "messaging sync event type")
         requireTransport(type in SYNC_EVENT_TYPES, "messaging sync event type")
@@ -385,6 +625,7 @@ object SecureMessagingTransportValidator {
                 occurredAt,
                 currentUserId,
                 currentDeviceId,
+                currentEnrollmentEpoch,
             )
             MESSAGE_DELIVERY_UPDATED_EVENT -> validateDeliveryReceiptEvent(
                 event = event,
@@ -505,17 +746,29 @@ object SecureMessagingTransportValidator {
         occurredAt: Instant,
         currentUserId: String,
         currentDeviceId: String,
+        currentEnrollmentEpoch: Long?,
     ): ValidatedMessagingSyncEvent {
         requireTransport(event.resourceType == MESSAGE_RESOURCE, "message event resource type")
         val data = required(event.data, "message event data")
         val senderDeviceId = required(data.senderDeviceId, "message event sender device ID")
-        val validated = if (senderDeviceId == currentDeviceId) {
+        val senderEnrollmentEpoch = data.senderEnrollmentEpoch
+        senderEnrollmentEpoch?.let {
+            requireTransport(it > 0, "message sender epoch")
+        }
+        val authoredByCurrentInstallation =
+            senderDeviceId == currentDeviceId &&
+                (senderEnrollmentEpoch == null ||
+                    currentEnrollmentEpoch == null ||
+                    senderEnrollmentEpoch == currentEnrollmentEpoch)
+        val isHistoryBackfill = data.envelope?.isHistoryBackfill == true
+        val validated = if (authoredByCurrentInstallation && !isHistoryBackfill) {
             val outbound = validateOwnOutboundMessage(
                 message = data.toEncryptedMessageDto(),
                 expectedConversationId = conversationId,
                 expectedClientMessageId = required(data.clientMessageId, "outbound client message ID"),
                 expectedCurrentUserId = currentUserId,
                 expectedCurrentDeviceId = currentDeviceId,
+                expectedCurrentEnrollmentEpoch = currentEnrollmentEpoch,
                 expectedRosterRevision = required(data.rosterRevision, "outbound roster revision"),
             )
             requireTransport(event.resourceId == outbound.messageId, "message event resource changed")
@@ -531,6 +784,8 @@ object SecureMessagingTransportValidator {
                 event,
                 conversationId,
                 currentDeviceId,
+                currentUserId,
+                currentEnrollmentEpoch,
             )
         }
         return ValidatedMessagingSyncEvent.IncomingMessage(
@@ -547,6 +802,7 @@ object SecureMessagingTransportValidator {
         expectedClientMessageId: String,
         expectedCurrentUserId: String,
         expectedCurrentDeviceId: String,
+        expectedCurrentEnrollmentEpoch: Long? = null,
         expectedRosterRevision: String,
     ): ValidatedOutboundEncryptedMessage {
         val messageId = required(message.id, "outbound message ID")
@@ -557,6 +813,13 @@ object SecureMessagingTransportValidator {
         requireTransport(sender.id == expectedCurrentUserId, "outbound sender changed")
         requireTransport(!sender.name.isNullOrBlank(), "outbound sender name")
         requireTransport(message.senderDeviceId == expectedCurrentDeviceId, "outbound sender device changed")
+        expectedCurrentEnrollmentEpoch?.let { expectedEpoch ->
+            requireTransport(
+                message.senderEnrollmentEpoch == null ||
+                    message.senderEnrollmentEpoch == expectedEpoch,
+                "outbound sender enrollment changed",
+            )
+        }
         requireSignalDeviceId(message.senderSignalDeviceId, "outbound sender Signal device ID")
         requireRegistrationId(message.senderRegistrationId, "outbound sender registration ID")
         requireTransport(
@@ -597,6 +860,7 @@ object SecureMessagingTransportValidator {
             conversationId = expectedConversationId,
             clientMessageId = expectedClientMessageId,
             senderDeviceId = expectedCurrentDeviceId,
+            senderEnrollmentEpoch = message.senderEnrollmentEpoch,
             rosterRevision = expectedRosterRevision,
             senderBundleVersion = senderBundleVersion,
             sentAt = sentAt,
@@ -609,6 +873,7 @@ object SecureMessagingTransportValidator {
         clientMessageId = clientMessageId,
         sender = sender,
         senderDeviceId = senderDeviceId,
+        senderEnrollmentEpoch = senderEnrollmentEpoch,
         senderSignalDeviceId = senderSignalDeviceId,
         senderRegistrationId = senderRegistrationId,
         senderProtocolVersion = senderProtocolVersion,
@@ -626,6 +891,13 @@ object SecureMessagingTransportValidator {
 
     private fun requireCursor(value: String, field: String) {
         requireTransport(value.length <= MAX_CURSOR_LENGTH && CURSOR.matches(value), field)
+    }
+
+    private fun requireHistoryCursor(value: String, field: String) {
+        requireTransport(
+            value.length <= MAX_CURSOR_LENGTH && HISTORY_CURSOR.matches(value),
+            field,
+        )
     }
 
     private fun requireUuid(value: String, field: String) {
@@ -668,6 +940,7 @@ object SecureMessagingTransportValidator {
     private const val MAX_SERVER_DEVICES = 1_000
     private const val MAX_CONVERSATIONS = 10_000
     private const val MAX_SYNC_PAGE_SIZE = 100
+    private const val MAX_HISTORY_PAGE_SIZE = 50
     private const val MAX_CURSOR_LENGTH = 2_048
     private const val DIRECT_MEMBER_COUNT = 2
     private const val DELIVERY_STATE = "delivered_to_device"
@@ -686,6 +959,7 @@ object SecureMessagingTransportValidator {
     private val SHA256_HEX = Regex("^[a-f0-9]{64}$")
     private val POSITIVE_DECIMAL = Regex("^[0-9]+$")
     private val CURSOR = Regex("^[A-Za-z0-9_-]+$")
+    private val HISTORY_CURSOR = Regex("^[A-Za-z0-9_.-]+$")
     private val UTC_TIMESTAMP = Regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
     private val CONVERSATION_TYPES = setOf("direct", "group", "community", "channel")
     private val MEMBER_ROLES = setOf("owner", "admin", "moderator", "member")
@@ -732,6 +1006,47 @@ data class ValidatedMessagingSyncPage(
     val hasMore: Boolean,
     val limit: Int,
     val lastEventId: Long?,
+)
+
+data class ValidatedMessagingHistoryTarget(
+    val deviceId: String,
+    val userId: String,
+    val enrollmentEpoch: Long,
+    val signalDeviceId: Int,
+    val registrationId: Int,
+    val bundleVersion: Int,
+    val identityKeySha256: String,
+)
+
+data class ValidatedMessagingHistoryCandidate(
+    val messageId: String,
+    val conversationId: String,
+    val clientMessageId: String,
+    val senderUserId: String,
+    val senderDeviceId: String,
+    val senderEnrollmentEpoch: Long,
+    val senderSignalDeviceId: Int,
+    val rosterRevision: String,
+    val kind: String,
+    val replyToMessageId: String?,
+    val sentAt: Instant,
+)
+
+data class ValidatedMessagingHistoryBackfillPage(
+    val conversationId: String,
+    val rosterRevision: String,
+    val target: ValidatedMessagingHistoryTarget,
+    val messages: List<ValidatedMessagingHistoryCandidate>,
+    val nextCursor: String?,
+    val hasMore: Boolean,
+)
+
+data class ValidatedMessagingHistoryEnvelopeResult(
+    val messageId: String,
+    val targetDeviceId: String,
+    val targetEnrollmentEpoch: Long,
+    val transferClientMessageId: String,
+    val created: Boolean,
 )
 
 sealed interface ValidatedMessagingSyncEvent {
@@ -790,6 +1105,7 @@ data class ValidatedOutboundEncryptedMessage(
     val conversationId: String,
     val clientMessageId: String,
     val senderDeviceId: String,
+    val senderEnrollmentEpoch: Long?,
     val rosterRevision: String,
     val senderBundleVersion: Int,
     val sentAt: Instant,

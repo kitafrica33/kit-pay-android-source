@@ -11,6 +11,8 @@ data class IncomingCallPayload(
     val callId: String,
     val callerName: String,
     val video: Boolean,
+    /** Caller's public user id, used to add them to an in-progress call (call-waiting merge). */
+    val callerUserId: String? = null,
     val ringExpiresAt: String? = null,
     /** True when the notification's Answer action asked the app to accept immediately. */
     val acceptRequested: Boolean = false,
@@ -32,6 +34,7 @@ data class IncomingCallPayload(
             return create(
                 callId = data["call_id"],
                 callerName = data["initiator_name"],
+                callerUserId = data["initiator_user_id"],
                 video = data["call_type"].equals("video", ignoreCase = true) ||
                     data["video"]?.toBooleanStrictOrNull() == true,
                 ringExpiresAt = data["ring_expires_at"],
@@ -67,6 +70,7 @@ data class IncomingCallPayload(
         private fun create(
             callId: String?,
             callerName: String?,
+            callerUserId: String? = null,
             video: Boolean,
             ringExpiresAt: String? = null,
         ): IncomingCallPayload? {
@@ -80,8 +84,14 @@ data class IncomingCallPayload(
                 callId = normalizedCallId,
                 callerName = safeCaller,
                 video = video,
+                callerUserId = normalizedUserId(callerUserId),
                 ringExpiresAt = ringExpiresAt?.trim()?.takeIf(String::isNotEmpty),
             )
+        }
+
+        private fun normalizedUserId(raw: String?): String? {
+            val trimmed = raw?.trim()?.takeIf(String::isNotEmpty) ?: return null
+            return runCatching { UUID.fromString(trimmed).toString() }.getOrNull()
         }
 
         private fun normalizedCallId(raw: String?): String? {

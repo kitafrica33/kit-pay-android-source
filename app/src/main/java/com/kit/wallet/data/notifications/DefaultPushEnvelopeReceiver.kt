@@ -11,6 +11,10 @@ import android.net.Uri
 import androidx.core.app.NotificationCompat
 import com.kit.wallet.MainActivity
 import com.kit.wallet.R
+import com.kit.wallet.data.repository.ContactRepository
+import com.kit.wallet.data.repository.resolveCallPresentation
+import com.kit.wallet.feature.calls.KitTelecomBridge
+import com.kit.wallet.feature.calls.KitTelecomDisconnect
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.time.Clock
@@ -23,6 +27,10 @@ import javax.inject.Singleton
 class DefaultPushEnvelopeReceiver @Inject constructor(
     @param:ApplicationContext private val context: Context,
     private val callEvents: CallLifecycleEventBus,
+    private val activeCallState: ActiveCallStateHolder,
+    private val incomingCallRelay: IncomingCallRelay,
+    private val contacts: ContactRepository,
+    private val telecom: KitTelecomBridge,
     private val messagingSync: SecureMessagingSyncScheduler,
     private val clock: Clock,
 ) : PushEnvelopeReceiver {
@@ -42,12 +50,28 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         if (lifecycleEvent != null) {
             callEvents.publish(envelope.data)
             manager.cancel(callTag(lifecycleEvent.callId), CALL_NOTIFICATION_ID)
+            when (lifecycleEvent.kind) {
+                CallLifecycleKind.ANSWERED -> telecom.markConnecting(lifecycleEvent.callId)
+                CallLifecycleKind.DECLINED -> if (lifecycleEvent.terminal) {
+                    telecom.finish(lifecycleEvent.callId, KitTelecomDisconnect.REJECTED)
+                }
+                CallLifecycleKind.ENDED ->
+                    telecom.finish(lifecycleEvent.callId, KitTelecomDisconnect.REMOTE)
+                CallLifecycleKind.MISSED ->
+                    telecom.finish(lifecycleEvent.callId, KitTelecomDisconnect.MISSED)
+            }
             return
         }
 
         val incomingCall = IncomingCallPayload.fromData(envelope.data)
         if (incomingCall != null) {
-            showIncomingCall(manager, envelope, incomingCall)
+            val presentation = resolveCallPresentation(
+                serverName = incomingCall.callerName,
+                participantUserIds = listOfNotNull(incomingCall.callerUserId),
+                contacts = contacts.contacts.value,
+            )
+            val presentedCall = incomingCall.copy(callerName = presentation.name)
+            showIncomingCall(manager, envelope, presentedCall, presentation.phone)
             return
         }
 
@@ -81,12 +105,31 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         manager: NotificationManager,
         envelope: PushEnvelope,
         call: IncomingCallPayload,
+        phone: String?,
     ) {
         val expiresAt = call.ringExpiresAt ?: return
         val timeoutMillis = runCatching {
             Duration.between(Instant.now(clock), Instant.parse(expiresAt)).toMillis()
         }.getOrNull()?.coerceAtMost(MAX_RING_TIMEOUT_MILLIS) ?: return
         if (timeoutMillis <= 0) return
+
+        // If the user is already on another call, this is a call-waiting call: hand it to the
+        // active call screen (banner + call-waiting tone) instead of ringing full-screen over it.
+        val activeCallId = activeCallState.activeCallId.value
+        if (activeCallId != null && activeCallId != call.callId) {
+            incomingCallRelay.publish(call)
+            showCallWaitingNotification(manager, envelope, call, timeoutMillis)
+            return
+        }
+
+        // Only register calls that passed ring-expiry validation and will use the normal incoming
+        // call UI. Waiting calls stay in the active-call banner so Telecom cannot ring over them.
+        telecom.trackIncoming(
+            callId = call.callId,
+            name = call.callerName,
+            phone = phone,
+            video = call.video,
+        )
 
         val ringtoneUri = RingtoneManager.getActualDefaultRingtoneUri(
             context,
@@ -161,6 +204,57 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
                 // Surface the ringing call full-screen on a locked/backgrounded device. When the
                 // OS declines the full-screen intent it falls back to a ringing heads-up alert.
                 .setFullScreenIntent(openCall, true)
+                .build(),
+        )
+    }
+
+    /**
+     * A call-waiting call arriving during another call: a quiet heads-up alert (no full-screen
+     * takeover) that opens the active call screen, which shows the in-app waiting banner and plays
+     * the call-waiting tone. Decline is still offered from the shade.
+     */
+    private fun showCallWaitingNotification(
+        manager: NotificationManager,
+        envelope: PushEnvelope,
+        call: IncomingCallPayload,
+        timeoutMillis: Long,
+    ) {
+        manager.createNotificationChannel(
+            NotificationChannel(
+                ALERTS_CHANNEL_ID,
+                "Kit Pay alerts",
+                NotificationManager.IMPORTANCE_HIGH,
+            ),
+        )
+        val openCall = PendingIntent.getActivity(
+            context,
+            call.callId.hashCode(),
+            Intent(context, MainActivity::class.java)
+                .setData(Uri.parse(call.deepLinkUri()))
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val declineCall = PendingIntent.getBroadcast(
+            context,
+            call.callId.hashCode() + 2,
+            CallActionReceiver.declineIntent(context, call.callId),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        manager.notify(
+            callTag(call.callId),
+            CALL_NOTIFICATION_ID,
+            NotificationCompat.Builder(context, ALERTS_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_kit_mark)
+                .setContentTitle("Call waiting")
+                .setContentText("${call.callerName} is calling.")
+                .setCategory(NotificationCompat.CATEGORY_CALL)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setOnlyAlertOnce(true)
+                .setAutoCancel(true)
+                .setTimeoutAfter(timeoutMillis)
+                .setContentIntent(openCall)
+                .addAction(0, "Decline", declineCall)
                 .build(),
         )
     }

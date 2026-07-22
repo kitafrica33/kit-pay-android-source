@@ -163,6 +163,12 @@ interface KitWalletApi {
     @GET("api/kit-wallet/v1/calls/{callId}")
     suspend fun call(@Path("callId") callId: String): ApiEnvelope<CallDto>
 
+    @POST("api/kit-wallet/v1/calls/{callId}/invite")
+    suspend fun inviteToCall(
+        @Path("callId") callId: String,
+        @Body request: InviteCallRequest,
+    ): ApiEnvelope<CallDto>
+
     @POST("api/kit-wallet/v1/calls/{callId}/accept")
     suspend fun acceptCall(@Path("callId") callId: String): ApiEnvelope<CallSessionDto>
 

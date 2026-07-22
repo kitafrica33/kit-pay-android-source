@@ -730,6 +730,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
 @Singleton
 class EncryptedChatRepository @Inject internal constructor(
     private val runtime: SecureMessagingChatRuntime,
+    private val contacts: ContactRepository,
     @ApplicationScope scope: CoroutineScope,
     clock: Clock,
 ) : ChatRepository {
@@ -747,13 +748,17 @@ class EncryptedChatRepository @Inject internal constructor(
 
     init {
         scope.launch {
-            combine(runtime.sessionEpoch, runtime.projectionChanges) { epoch, _ -> epoch }
-                .collectLatest { epoch ->
+            combine(
+                runtime.sessionEpoch,
+                runtime.projectionChanges,
+                contacts.contacts,
+            ) { epoch, _, contactList -> epoch to contactList }
+                .collectLatest { (epoch, contactList) ->
                     if (epoch == null) {
                         clearPublishedState()
                     } else {
                         try {
-                            refresh(epoch)
+                            refresh(epoch, contactList)
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (_: Exception) {
@@ -779,7 +784,7 @@ class EncryptedChatRepository @Inject internal constructor(
             "Only contacts who are on Kit Pay can receive secure messages"
         }
         val created = runtime.createDirectConversation(contact.id)
-        refresh(checkNotNull(runtime.sessionEpoch.value))
+        refresh(checkNotNull(runtime.sessionEpoch.value), contacts.contacts.value)
         check(chat(created.id) != null) { "The secure conversation was not added to the projection" }
         return created.id
     }
@@ -791,7 +796,7 @@ class EncryptedChatRepository @Inject internal constructor(
         try {
             runtime.sendText(chatId, normalized, retryClientMessageId = null)
         } finally {
-            runtime.sessionEpoch.value?.let { refresh(it) }
+            runtime.sessionEpoch.value?.let { refresh(it, contacts.contacts.value) }
         }
     }
 
@@ -802,7 +807,7 @@ class EncryptedChatRepository @Inject internal constructor(
         try {
             runtime.sendText(chatId, normalized, retryClientMessageId = clientMessageId)
         } finally {
-            runtime.sessionEpoch.value?.let { refresh(it) }
+            runtime.sessionEpoch.value?.let { refresh(it, contacts.contacts.value) }
         }
     }
 
@@ -816,7 +821,7 @@ class EncryptedChatRepository @Inject internal constructor(
         try {
             runtime.sendImage(chatId, bytes, mediaType, caption)
         } finally {
-            runtime.sessionEpoch.value?.let { refresh(it) }
+            runtime.sessionEpoch.value?.let { refresh(it, contacts.contacts.value) }
         }
     }
 
@@ -828,7 +833,7 @@ class EncryptedChatRepository @Inject internal constructor(
     override suspend fun markConversationRead(chatId: String) {
         check(readiness.value) { "Secure messaging has no active message-ready session" }
         runtime.markConversationRead(chatId)
-        runtime.sessionEpoch.value?.let { refresh(it) }
+        runtime.sessionEpoch.value?.let { refresh(it, contacts.contacts.value) }
     }
 
     override suspend fun synchronizeConversation(chatId: String) {
@@ -836,7 +841,10 @@ class EncryptedChatRepository @Inject internal constructor(
         runtime.synchronizeConversation(chatId)
     }
 
-    private suspend fun refresh(epoch: String) = refreshMutex.withLock {
+    private suspend fun refresh(
+        epoch: String,
+        localContacts: List<Contact>,
+    ) = refreshMutex.withLock {
         if (runtime.sessionEpoch.value != epoch) return@withLock
         var conversations = runtime.directConversations(forceRefresh = false)
         val projections = readAllProjectionPages()
@@ -846,7 +854,7 @@ class EncryptedChatRepository @Inject internal constructor(
         check(runtime.sessionEpoch.value == epoch) {
             "Secure messaging session changed while publishing chat projections"
         }
-        publish(epoch, conversations, projections)
+        publish(epoch, conversations, projections, localContacts)
     }
 
     private suspend fun readAllProjectionPages(): List<AuthenticatedProjectedText> {
@@ -866,6 +874,7 @@ class EncryptedChatRepository @Inject internal constructor(
         epoch: String,
         conversations: List<AuthenticatedDirectConversation>,
         projections: List<AuthenticatedProjectedText>,
+        localContacts: List<Contact>,
     ) {
         val conversationIds = conversations.mapTo(mutableSetOf()) { it.id }
         val authenticated = projections.filter { it.conversationId in conversationIds }
@@ -892,6 +901,9 @@ class EncryptedChatRepository @Inject internal constructor(
         val latestByConversation = projectedByConversation.mapValues { (_, messages) ->
             messages.maxWithOrNull(authenticatedProjectionOrder)
         }
+        val savedNames = localContacts.asSequence()
+            .filter { it.isKitUser && it.savedInDevice }
+            .associate { it.id to it.name.trim() }
         mutableChats.value = conversations.sortedWith(
             compareByDescending<AuthenticatedDirectConversation> { conversation ->
                 latestByConversation[conversation.id]?.sentAt?.toEpochMilli() ?: Long.MIN_VALUE
@@ -900,7 +912,8 @@ class EncryptedChatRepository @Inject internal constructor(
             val last = latestByConversation[conversation.id]
             ChatPreview(
                 id = conversation.id,
-                name = conversation.peerName?.trim()?.takeIf(String::isNotEmpty)
+                name = savedNames[conversation.peerUserId]?.takeIf(String::isNotEmpty)
+                    ?: conversation.peerName?.trim()?.takeIf(String::isNotEmpty)
                     ?: "Kit Pay contact",
                 lastMessage = last?.text?.let { text ->
                     KitMediaMessage.parse(text)?.let { media -> media.caption ?: "📷 Photo" }
@@ -952,6 +965,7 @@ class EncryptedChatRepository @Inject internal constructor(
             },
             paymentRequestId = payment?.paymentRequestId,
             paymentNote = payment?.note,
+            sortEpochMillis = projected.sentAt.toEpochMilli(),
         )
     }
 
