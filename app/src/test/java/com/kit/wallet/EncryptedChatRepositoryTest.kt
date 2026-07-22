@@ -94,6 +94,46 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `equal-time mixed directions use server IDs with a pending client fallback`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+            projected += message(
+                recordKey = "out:z-storage",
+                conversationId = CONVERSATION_ONE,
+                text = "server-low outgoing",
+                fromMe = true,
+                serverMessageId = LOW_SERVER_MESSAGE_ID,
+            )
+            projected += message(
+                recordKey = "out:a-storage",
+                conversationId = CONVERSATION_ONE,
+                text = "pending fallback",
+                fromMe = true,
+                state = AuthenticatedTextDeliveryState.PENDING,
+                serverMessageId = null,
+                clientMessageId = PENDING_CLIENT_MESSAGE_ID,
+            )
+            projected += message(
+                recordKey = "in:a-storage",
+                conversationId = CONVERSATION_ONE,
+                text = "server-high inbound",
+                fromMe = false,
+                serverMessageId = HIGH_SERVER_MESSAGE_ID,
+            )
+        }
+        val repository = repository(runtime)
+
+        runCurrent()
+
+        assertEquals(
+            listOf("server-low outgoing", "pending fallback", "server-high inbound"),
+            repository.conversation(CONVERSATION_ONE).value.map { it.text },
+        )
+        assertEquals("server-high inbound", repository.chats.value.single().lastMessage)
+        assertFalse(repository.chats.value.single().lastFromMe)
+    }
+
+    @Test
     fun `authenticated inbound messages remain unread until the conversation is opened`() = runTest {
         val runtime = FakeRuntime().apply {
             conversations += conversation(CONVERSATION_ONE, "Grace")
@@ -315,6 +355,8 @@ class EncryptedChatRepositoryTest {
             if (changed) projectionChanges.value++
         }
 
+        override suspend fun synchronizeConversation(conversationId: String) = Unit
+
         private fun retryScenario(
             conversationId: String,
             text: String,
@@ -375,6 +417,12 @@ class EncryptedChatRepositoryTest {
         const val USER_ONE = "22222222-2222-4222-8222-222222222222"
         const val USER_TWO = "33333333-3333-4333-8333-333333333333"
 
+        // Equal-timestamp ordering keys chosen so the pending message's client-ID fallback sorts
+        // between the two server IDs: LOW_SERVER < PENDING_CLIENT < HIGH_SERVER.
+        const val LOW_SERVER_MESSAGE_ID = "server-msg-0001"
+        const val PENDING_CLIENT_MESSAGE_ID = "server-msg-0500"
+        const val HIGH_SERVER_MESSAGE_ID = "server-msg-0999"
+
         fun conversation(id: String, name: String) = AuthenticatedDirectConversation(
             id = id,
             peerUserId = USER_ONE,
@@ -392,10 +440,13 @@ class EncryptedChatRepositoryTest {
                 AuthenticatedTextDeliveryState.RECEIVED
             },
             sentAt: Instant = Instant.parse("2026-07-20T12:00:00Z"),
+            serverMessageId: String? = recordKey,
+            clientMessageId: String = recordKey,
         ) = AuthenticatedProjectedText(
             recordKey = recordKey,
             messageId = recordKey,
-            clientMessageId = recordKey,
+            serverMessageId = serverMessageId,
+            clientMessageId = clientMessageId,
             conversationId = conversationId,
             senderUserId = if (fromMe) USER_TWO else USER_ONE,
             fromCurrentUser = fromMe,

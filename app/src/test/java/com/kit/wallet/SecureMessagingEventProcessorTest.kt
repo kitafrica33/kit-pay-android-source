@@ -1,12 +1,15 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.messaging.FailClosedSecureMessagingCryptoTransaction
+import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
+import com.kit.wallet.data.messaging.MediaAttachmentCipher
 import com.kit.wallet.data.messaging.OpaqueCryptoBytes
 import com.kit.wallet.data.messaging.RealSecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.SecureMessagingActivationCapability
+import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
 import com.kit.wallet.data.messaging.SecureMessagingCommittedResult
 import com.kit.wallet.data.messaging.SecureMessagingCompanionStateIntent
 import com.kit.wallet.data.messaging.SecureMessagingCurrentActivationRevocation
@@ -41,9 +44,14 @@ import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingStateStore
 import com.kit.wallet.data.messaging.SecureMessagingStateWrite
 import com.kit.wallet.data.messaging.SecureMessagingSyncCursorStore
+import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.requireSecureMessagingSyncResumePosition
+import com.kit.wallet.data.repository.DefaultSecureMessagingChatRuntime
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.CursorPageDto
+import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
+import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
+import com.kit.wallet.data.remote.EncryptedAttachmentDto
 import com.kit.wallet.data.remote.EncryptedMessageEnvelopeDto
 import com.kit.wallet.data.remote.EncryptedMessageDto
 import com.kit.wallet.data.remote.EncryptedMessageSenderDto
@@ -62,7 +70,13 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Instant
+import java.time.Clock
+import java.time.ZoneOffset
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -164,6 +178,338 @@ class SecureMessagingEventProcessorTest {
         assertTrue(resumed.path?.contains("cursor=cursor_one") == true)
         assertTrue(resumed.path?.contains("limit=50") == true)
         assertEquals(1, crypto.openedTransactions)
+    }
+
+    @Test
+    fun `receipt events and an exact send replay cannot regress read state`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val processor = processor(
+                stateStore,
+                PersistingDecryptionEngine(stateStore),
+                projections,
+            )
+            val roster = authoritativeRoster()
+            val outbound = stateStore.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = OUTBOUND_CLIENT_ID,
+                clientMessageId = OUTBOUND_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = "receipt projection",
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        PEER,
+                        SecureMessagingEnvelopeKind.SESSION,
+                        byteArrayOf(7, 8, 9),
+                    ),
+                ),
+            )
+            projections.recordOutboundPending(outbound, Instant.parse(TIMESTAMP))
+            enqueueSync(
+                events = listOf(
+                    outboundEvent(roster, 10),
+                    deliveryReceiptEvent(11),
+                    readReceiptEvent(12, PEER_USER_ID),
+                    deliveryReceiptEvent(13),
+                    outboundEvent(roster, 14),
+                ),
+                nextCursor = "receipt_cursor",
+            )
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+
+            processor.synchronize(session)
+
+            assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+            assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
+            val restarted = projectionStore(stateStore).readPage(limit = 10).messages().single()
+            assertEquals(OUTBOUND_SERVER_ID, restarted.serverMessageId)
+            assertEquals(SecureMessagingProjectionDeliveryState.OUTBOUND_READ, restarted.deliveryState)
+            assertEquals(
+                "receipt_cursor" to 14L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+        }
+
+    @Test
+    fun `read on another account device clears peer inbound state idempotently`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(
+            stateStore,
+            PersistingDecryptionEngine(stateStore),
+            projections,
+        )
+        val roster = authoritativeRoster()
+        enqueueSync(
+            events = listOf(
+                incomingEvent(roster, 10),
+                readReceiptEvent(11, CURRENT_USER_ID, INCOMING_MESSAGE_ID),
+                // A replay before cursor persistence must be a monotonic no-op.
+                readReceiptEvent(12, CURRENT_USER_ID, INCOMING_MESSAGE_ID),
+            ),
+            nextCursor = "own_read_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+
+        processor.synchronize(session)
+
+        val projected = projections.readPage(limit = 10).messages().single()
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.INBOUND_READ,
+            projected.deliveryState,
+        )
+        assertEquals(2, projections.changes.value)
+        assertEquals(
+            "own_read_cursor" to 12L,
+            requireSecureMessagingSyncResumePosition(
+                checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+            ),
+        )
+    }
+
+    @Test
+    fun `peer read marker includes lower UUID messages at the same server timestamp`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(
+            stateStore,
+            PersistingDecryptionEngine(stateStore),
+            projections,
+        )
+        val roster = authoritativeRoster()
+        suspend fun persistOutbound(clientMessageId: String, text: String) =
+            stateStore.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(clientMessageId),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = clientMessageId,
+                clientMessageId = clientMessageId,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = text,
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        PEER,
+                        SecureMessagingEnvelopeKind.SESSION,
+                        byteArrayOf(7, 8, 9),
+                    ),
+                ),
+            )
+        val first = persistOutbound(OUTBOUND_CLIENT_ID, "first equal-time message")
+        val second = persistOutbound(
+            SECOND_OUTBOUND_CLIENT_ID,
+            "second equal-time message",
+        )
+        projections.recordOutboundPending(first, Instant.parse(TIMESTAMP))
+        projections.recordOutboundPending(second, Instant.parse(TIMESTAMP))
+        enqueueSync(
+            events = listOf(
+                outboundEvent(roster, 10),
+                outboundEvent(
+                    roster,
+                    11,
+                    clientMessageId = SECOND_OUTBOUND_CLIENT_ID,
+                    serverMessageId = SECOND_OUTBOUND_SERVER_ID,
+                ),
+                readReceiptEvent(
+                    12,
+                    PEER_USER_ID,
+                    lastReadMessageId = SECOND_OUTBOUND_SERVER_ID,
+                ),
+            ),
+            nextCursor = "equal_timestamp_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+
+        processor.synchronize(session)
+
+        val states = projections.readPage(limit = 10).messages()
+            .associate { it.serverMessageId to it.deliveryState }
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_READ,
+            states[OUTBOUND_SERVER_ID],
+        )
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_READ,
+            states[SECOND_OUTBOUND_SERVER_ID],
+        )
+    }
+
+    @Test
+    fun `concurrent send response and sync echo converge on one immutable receipt`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val roster = authoritativeRoster()
+        enqueueSync(events = listOf(outboundEvent(roster, 10)), nextCursor = "race_cursor")
+        val batch = session.sync(session.initialSyncCheckpoint(), limit = 50)
+        val event = batch.events().single() as RemoteSecureMessagingTransport.Session.OutboundEvent
+
+        val durableState = TestSecureMessagingStateStore()
+        val racingState = TwoWriterProjectionRaceStateStore(durableState)
+        val projections = projectionStore(racingState)
+        val outbound = durableState.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = OUTBOUND_CLIENT_ID,
+            clientMessageId = OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = "racing receipt",
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(1, 2, 3),
+                ),
+            ),
+        )
+        projections.recordOutboundPending(outbound, Instant.parse(TIMESTAMP))
+        racingState.interceptNextTwoMetadataWrites(outbound.recordKey)
+
+        listOf(
+            async { projections.markOutboundSent(outbound, event) },
+            async { projections.markOutboundSent(outbound, event) },
+        ).awaitAll()
+
+        val projected = projections.readPage(limit = 10).messages().single()
+        assertEquals(OUTBOUND_SERVER_ID, projected.serverMessageId)
+        assertEquals(SecureMessagingProjectionDeliveryState.OUTBOUND_SENT, projected.deliveryState)
+        assertEquals(2, racingState.interceptedWrites.get())
+    }
+
+    @Test
+    fun `concurrent delivery and read receipt converge monotonically and replay is idempotent`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            val roster = authoritativeRoster()
+            enqueueSync(events = listOf(outboundEvent(roster, 10)), nextCursor = "race_cursor")
+            val batch = session.sync(session.initialSyncCheckpoint(), limit = 50)
+            val event = batch.events().single() as RemoteSecureMessagingTransport.Session.OutboundEvent
+
+            val durableState = TestSecureMessagingStateStore()
+            val racingState = TwoWriterProjectionRaceStateStore(durableState)
+            val projections = projectionStore(racingState)
+            val outbound = durableState.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = OUTBOUND_CLIENT_ID,
+                clientMessageId = OUTBOUND_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = "racing delivery and read",
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        PEER,
+                        SecureMessagingEnvelopeKind.SESSION,
+                        byteArrayOf(1, 2, 3),
+                    ),
+                ),
+            )
+            projections.recordOutboundPending(outbound, Instant.parse(TIMESTAMP))
+            projections.markOutboundSent(outbound, event)
+            racingState.interceptNextTwoMetadataWrites(outbound.recordKey)
+
+            listOf(
+                async {
+                    projections.markAuthoredDelivered(
+                        CONVERSATION_ID,
+                        OUTBOUND_SERVER_ID,
+                        CURRENT_USER_ID,
+                        Instant.parse(TIMESTAMP),
+                    )
+                },
+                async {
+                    projections.markAuthoredReadThrough(
+                        CONVERSATION_ID,
+                        OUTBOUND_SERVER_ID,
+                        CURRENT_USER_ID,
+                        Instant.parse(TIMESTAMP),
+                    )
+                },
+            ).awaitAll()
+
+            assertEquals(
+                SecureMessagingProjectionDeliveryState.OUTBOUND_READ,
+                projections.readPage(limit = 10).messages().single().deliveryState,
+            )
+            val revision = projections.changes.value
+            projections.markAuthoredDelivered(
+                CONVERSATION_ID,
+                OUTBOUND_SERVER_ID,
+                CURRENT_USER_ID,
+                Instant.parse(TIMESTAMP),
+            )
+            projections.markAuthoredReadThrough(
+                CONVERSATION_ID,
+                OUTBOUND_SERVER_ID,
+                CURRENT_USER_ID,
+                Instant.parse(TIMESTAMP),
+            )
+            assertEquals(revision, projections.changes.value)
+        }
+
+    @Test
+    fun `current user read event never advances a self-authored outbound message`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(
+            stateStore,
+            PersistingDecryptionEngine(stateStore),
+            projections,
+        )
+        val roster = authoritativeRoster()
+        val outbound = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = OUTBOUND_CLIENT_ID,
+            clientMessageId = OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = "self receipt",
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(7, 8, 9),
+                ),
+            ),
+        )
+        projections.recordOutboundPending(outbound, Instant.parse(TIMESTAMP))
+        enqueueSync(
+            events = listOf(
+                outboundEvent(roster, 10),
+                readReceiptEvent(11, CURRENT_USER_ID),
+            ),
+            nextCursor = "self_receipt_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+
+        processor.synchronize(session)
+
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_SENT,
+            projections.readPage(limit = 10).messages().single().deliveryState,
+        )
+        assertEquals(5, server.requestCount)
     }
 
     @Test
@@ -435,6 +781,170 @@ class SecureMessagingEventProcessorTest {
     }
 
     @Test
+    fun `matching authenticated media metadata is projected and acknowledged`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val media = mediaDescriptor()
+        val processor = processor(
+            stateStore,
+            PersistingDecryptionEngine(stateStore, authenticatedText = media.encode()),
+            projections,
+        )
+        val roster = authoritativeRoster()
+        enqueueSync(
+            listOf(
+                incomingEvent(
+                    roster = roster,
+                    eventId = 10,
+                    kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+                    attachments = listOf(mediaAttachment(media)),
+                ),
+            ),
+            "media_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+
+        processor.synchronize(session)
+
+        assertEquals(
+            media.encode(),
+            checkNotNull(projections.readInbound(INCOMING_MESSAGE_ID)).authenticatedText,
+        )
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED,
+            projections.readPage(limit = 10).messages().single().deliveryState,
+        )
+        assertEquals(
+            "media_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(
+                checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+            ),
+        )
+    }
+
+    @Test
+    fun `forged wire attachment metadata is dropped without quarantining activation`() =
+        runTest {
+            val (session, lifecycle, fence) = openSyncingSession()
+            lifecycle.finishActivation(fence)
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val notifications = mutableListOf<SecureMessagingIncomingNotification>()
+            val media = mediaDescriptor()
+            val processor = processor(
+                stateStore,
+                PersistingDecryptionEngine(stateStore, authenticatedText = media.encode()),
+                projections,
+                SecureMessagingIncomingNotificationSink(notifications::add),
+            )
+            val roster = authoritativeRoster()
+            enqueueSync(
+                listOf(
+                    incomingEvent(
+                        roster = roster,
+                        eventId = 10,
+                        kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+                        attachments = listOf(
+                            mediaAttachment(media).copy(ciphertextSha256 = "cd".repeat(32)),
+                        ),
+                    ),
+                ),
+                "forged_media_cursor",
+            )
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            enqueueRoster(roster)
+            enqueueDeliveryAcknowledgement()
+
+            processor.synchronize(session)
+
+            assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+            assertNotNull(projections.readInbound(INCOMING_MESSAGE_ID))
+            assertTrue(projections.readPage(limit = 10).messages().isEmpty())
+            val restarted = projectionStore(stateStore)
+            assertTrue(restarted.readPage(limit = 10).messages().isEmpty())
+            assertNull(
+                restarted.newestUnreadInboundMessageId(CONVERSATION_ID, PEER_USER_ID),
+            )
+            assertTrue(notifications.isEmpty())
+            assertEquals(
+                "forged_media_cursor" to 10L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+        }
+
+    @Test
+    fun `authenticated media without wire attachment metadata is dropped locally`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val media = mediaDescriptor()
+        val processor = processor(
+            stateStore,
+            PersistingDecryptionEngine(stateStore, authenticatedText = media.encode()),
+            projections,
+        )
+        val roster = authoritativeRoster()
+        enqueueSync(
+            listOf(incomingEvent(roster = roster, eventId = 10)),
+            "missing_media_metadata_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+
+        processor.synchronize(session)
+
+        assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+        assertNotNull(projections.readInbound(INCOMING_MESSAGE_ID))
+        assertTrue(projections.readPage(limit = 10).messages().isEmpty())
+        assertEquals(
+            "missing_media_metadata_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(
+                checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+            ),
+        )
+    }
+
+    @Test
+    fun `malicious reserved prefix text remains ordinary and cannot quarantine`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val text = "${KitMediaMessage.PREFIX}v=1&id=invalid"
+        val processor = processor(
+            stateStore,
+            PersistingDecryptionEngine(
+                stateStore,
+                authenticatedText = text,
+            ),
+            projections,
+        )
+        val roster = authoritativeRoster()
+        enqueueSync(listOf(incomingEvent(roster, 10)), "malformed_media_cursor")
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+
+        processor.synchronize(session)
+
+        assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+        assertEquals(text, projections.readPage(limit = 10).messages().single().durableRecord.authenticatedText)
+        assertEquals(
+            "malformed_media_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(
+                checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+            ),
+        )
+    }
+
+    @Test
     fun `malformed sync page quarantines ready session and cannot be retried in place`() = runTest {
         val (session, lifecycle, fence) = openSyncingSession()
         lifecycle.finishActivation(fence)
@@ -585,6 +1095,303 @@ class SecureMessagingEventProcessorTest {
         }
 
     @Test
+    fun `stale media outbox retry preserves authenticated attachment metadata`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(stateStore, PersistingDecryptionEngine(stateStore), projections)
+        val roster = authoritativeRoster()
+        val descriptor = KitMediaMessage(
+            attachmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            storageKey = "0f0e0d0c-0b0a-4a0b-8c0d-0e0f10111213",
+            mediaType = "image/jpeg",
+            ciphertextByteSize = 4_096,
+            ciphertextSha256 = "ab".repeat(32),
+            keyMaterialBase64 = Base64.getEncoder().encodeToString(
+                ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES) { it.toByte() },
+            ),
+            plaintextByteSize = 4_000,
+            caption = null,
+        ).encode()
+        val outbound = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = OUTBOUND_CLIENT_ID,
+            clientMessageId = OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = descriptor,
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(7, 8, 9),
+                ),
+            ),
+        )
+        projections.recordOutboundPending(outbound, Instant.parse(TIMESTAMP))
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueOutboundReceipt(roster, OUTBOUND_CLIENT_ID)
+
+        processor.recoverPendingOutbox(session)
+
+        server.takeRequest()
+        server.takeRequest()
+        val body = server.takeRequest().body.readUtf8()
+        assertTrue(body.contains("\"kind\":\"encrypted_attachment\""))
+        assertTrue(body.contains("\"storage_key\":\"0f0e0d0c-0b0a-4a0b-8c0d-0e0f10111213\""))
+        assertTrue(body.contains("\"ciphertext_sha256\":\"${"ab".repeat(32)}\""))
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_SENT,
+            projections.readPage(limit = 10).messages().single().deliveryState,
+        )
+    }
+
+    @Test
+    fun `permanent and compatibility media failures do not starve later text`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(stateStore, PersistingDecryptionEngine(stateStore), projections)
+        val roster = authoritativeRoster()
+        val expiredMedia = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = OUTBOUND_CLIENT_ID,
+            clientMessageId = OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = encodedMediaDescriptor(),
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(7, 8, 9),
+                ),
+            ),
+        )
+        val upgradeBlockedMedia = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(
+                SECOND_OUTBOUND_CLIENT_ID,
+            ),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = SECOND_OUTBOUND_CLIENT_ID,
+            clientMessageId = SECOND_OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = encodedMediaDescriptor(),
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(10, 11, 12),
+                ),
+            ),
+        )
+        val laterText = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(
+                THIRD_OUTBOUND_CLIENT_ID,
+            ),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = THIRD_OUTBOUND_CLIENT_ID,
+            clientMessageId = THIRD_OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = "send after blocked media",
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(13, 14, 15),
+                ),
+            ),
+        )
+        projections.recordOutboundPending(expiredMedia, Instant.parse(TIMESTAMP))
+        projections.recordOutboundPending(upgradeBlockedMedia, Instant.parse(TIMESTAMP))
+        projections.recordOutboundPending(laterText, Instant.parse(TIMESTAMP))
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        server.enqueue(apiErrorResponse(422, "ATTACHMENT_REFERENCE_INVALID"))
+        server.enqueue(apiErrorResponse(409, "MESSAGING_ATTACHMENT_CLIENT_UPGRADE_REQUIRED"))
+        enqueueOutboundReceipt(roster, THIRD_OUTBOUND_CLIENT_ID)
+
+        processor.recoverPendingOutbox(session)
+
+        server.takeRequest()
+        server.takeRequest()
+        val expiredRequest = server.takeRequest().body.readUtf8()
+        val upgradeBlockedRequest = server.takeRequest().body.readUtf8()
+        val textRequest = server.takeRequest().body.readUtf8()
+        assertTrue(expiredRequest.contains("\"client_message_id\":\"$OUTBOUND_CLIENT_ID\""))
+        assertTrue(
+            upgradeBlockedRequest.contains(
+                "\"client_message_id\":\"$SECOND_OUTBOUND_CLIENT_ID\"",
+            ),
+        )
+        assertTrue(textRequest.contains("\"client_message_id\":\"$THIRD_OUTBOUND_CLIENT_ID\""))
+        val projected = projections.readPage(limit = 10).messages()
+            .associateBy { it.durableRecord.clientMessageId }
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_PERMANENT_FAILURE,
+            projected.getValue(OUTBOUND_CLIENT_ID).deliveryState,
+        )
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_RETRY_REQUIRED,
+            projected.getValue(SECOND_OUTBOUND_CLIENT_ID).deliveryState,
+        )
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_SENT,
+            projected.getValue(THIRD_OUTBOUND_CLIENT_ID).deliveryState,
+        )
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_PERMANENT_FAILURE,
+            projectionStore(stateStore).readPage(limit = 10).messages()
+                .single { it.durableRecord.clientMessageId == OUTBOUND_CLIENT_ID }
+                .deliveryState,
+        )
+    }
+
+    @Test
+    fun `already attached media outbox is retired as a permanent binding failure`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(stateStore, PersistingDecryptionEngine(stateStore), projections)
+        val roster = authoritativeRoster()
+        val media = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = OUTBOUND_CLIENT_ID,
+            clientMessageId = OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = encodedMediaDescriptor(),
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(7, 8, 9),
+                ),
+            ),
+        )
+        projections.recordOutboundPending(media, Instant.parse(TIMESTAMP))
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        server.enqueue(apiErrorResponse(409, "ATTACHMENT_ALREADY_ATTACHED"))
+
+        processor.recoverPendingOutbox(session)
+
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_PERMANENT_FAILURE,
+            projections.readPage(limit = 10).messages().single().deliveryState,
+        )
+
+        // Bypass Compose and exercise the runtime boundary directly: a stale descriptor cannot
+        // be encrypted under a fresh client ID or issue another message POST.
+        val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+        registry.publish(session, fence)
+        val runtime = DefaultSecureMessagingChatRuntime(
+            sessions = registry,
+            engine = PersistingDecryptionEngine(stateStore),
+            projections = projections,
+            syncEngine = object : SecureMessagingSyncEngine {
+                override val isReady = true
+                override suspend fun synchronize() = Unit
+            },
+            scope = backgroundScope,
+            clock = Clock.fixed(Instant.parse(TIMESTAMP), ZoneOffset.UTC),
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster) // Sentinel: a broken gate would consume this response.
+        val requestsBeforeRetry = server.requestCount
+
+        runtime.sendText(
+            CONVERSATION_ID,
+            media.authenticatedText,
+            retryClientMessageId = OUTBOUND_CLIENT_ID,
+        )
+
+        assertEquals(requestsBeforeRetry + 1, server.requestCount)
+    }
+
+    @Test
+    fun `transient media outbox failure remains pending and stops later recovery`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(stateStore, PersistingDecryptionEngine(stateStore), projections)
+        val roster = authoritativeRoster()
+        val media = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = OUTBOUND_CLIENT_ID,
+            clientMessageId = OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = encodedMediaDescriptor(),
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(7, 8, 9),
+                ),
+            ),
+        )
+        val laterText = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(
+                SECOND_OUTBOUND_CLIENT_ID,
+            ),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = SECOND_OUTBOUND_CLIENT_ID,
+            clientMessageId = SECOND_OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = "must wait for transient retry",
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(10, 11, 12),
+                ),
+            ),
+        )
+        projections.recordOutboundPending(media, Instant.parse(TIMESTAMP))
+        projections.recordOutboundPending(laterText, Instant.parse(TIMESTAMP))
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        server.enqueue(apiErrorResponse(503, "TEMPORARY_FAILURE"))
+
+        val failure = runCatching { processor.recoverPendingOutbox(session) }.exceptionOrNull()
+
+        assertTrue(failure != null)
+        assertEquals(6, server.requestCount)
+        assertTrue(
+            projections.readPage(limit = 10).messages().all {
+                it.deliveryState == SecureMessagingProjectionDeliveryState.OUTBOUND_PENDING
+            },
+        )
+    }
+
+    @Test
     fun `outbox fanout for an obsolete roster is retired without a network send`() = runTest {
         val (session, lifecycle, fence) = openSyncingSession()
         lifecycle.finishActivation(fence)
@@ -689,6 +1496,28 @@ class SecureMessagingEventProcessorTest {
         server.enqueue(jsonResponse("""{"ok":true,"data":$encoded}"""))
     }
 
+    private fun mediaDescriptor() = KitMediaMessage(
+        attachmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        storageKey = "0f0e0d0c-0b0a-4a0b-8c0d-0e0f10111213",
+        mediaType = "image/jpeg",
+        ciphertextByteSize = 4_096,
+        ciphertextSha256 = "ab".repeat(32),
+        keyMaterialBase64 = Base64.getEncoder().encodeToString(
+            ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES) { it.toByte() },
+        ),
+        plaintextByteSize = 4_000,
+        caption = null,
+    )
+
+    private fun mediaAttachment(media: KitMediaMessage) = EncryptedAttachmentDto(
+        id = media.attachmentId,
+        storageKey = media.storageKey,
+        mediaType = media.mediaType,
+        byteSize = media.ciphertextByteSize,
+        ciphertextSha256 = media.ciphertextSha256,
+        encryptionMetadataCiphertext = null,
+    )
+
     private fun deviceLifecycleEvent(
         eventType: String,
         userId: String,
@@ -744,7 +1573,25 @@ class SecureMessagingEventProcessorTest {
         server.enqueue(jsonResponse("""{"ok":true,"data":$encoded}"""))
     }
 
-    private fun incomingEvent(roster: MessagingDeviceRosterDto, eventId: Long): MessagingSyncEventDto {
+    private fun encodedMediaDescriptor(): String = KitMediaMessage(
+        attachmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        storageKey = "0f0e0d0c-0b0a-4a0b-8c0d-0e0f10111213",
+        mediaType = "image/jpeg",
+        ciphertextByteSize = 4_096,
+        ciphertextSha256 = "ab".repeat(32),
+        keyMaterialBase64 = Base64.getEncoder().encodeToString(
+            ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES) { it.toByte() },
+        ),
+        plaintextByteSize = 4_000,
+        caption = null,
+    ).encode()
+
+    private fun incomingEvent(
+        roster: MessagingDeviceRosterDto,
+        eventId: Long,
+        kind: String = ENCRYPTED_MESSAGE_KIND,
+        attachments: List<EncryptedAttachmentDto?> = emptyList(),
+    ): MessagingSyncEventDto {
         val peer = roster.devices.orEmpty().filterNotNull().single { it.deviceId == PEER_DEVICE_ID }
         val ciphertext = "opaque incoming ciphertext".toByteArray(StandardCharsets.UTF_8)
         return MessagingSyncEventDto(
@@ -765,7 +1612,7 @@ class SecureMessagingEventProcessorTest {
                 senderBundleVersion = peer.bundleVersion,
                 senderIdentityKeySha256 = peer.identityKeySha256,
                 rosterRevision = roster.rosterRevision,
-                kind = "encrypted",
+                kind = kind,
                 replyToMessageId = null,
                 envelope = EncryptedMessageEnvelopeDto(
                     recipientDeviceId = CURRENT_DEVICE_ID,
@@ -773,7 +1620,7 @@ class SecureMessagingEventProcessorTest {
                     ciphertext = Base64.getEncoder().encodeToString(ciphertext),
                     ciphertextSha256 = sha256(ciphertext),
                 ),
-                attachments = emptyList(),
+                attachments = attachments,
                 reactions = emptyList(),
                 sentAt = TIMESTAMP,
                 revokedAt = null,
@@ -782,7 +1629,12 @@ class SecureMessagingEventProcessorTest {
         )
     }
 
-    private fun outboundEvent(roster: MessagingDeviceRosterDto, eventId: Long): MessagingSyncEventDto {
+    private fun outboundEvent(
+        roster: MessagingDeviceRosterDto,
+        eventId: Long,
+        clientMessageId: String = OUTBOUND_CLIENT_ID,
+        serverMessageId: String = OUTBOUND_SERVER_ID,
+    ): MessagingSyncEventDto {
         val current = roster.devices.orEmpty().filterNotNull()
             .single { it.deviceId == CURRENT_DEVICE_ID }
         return MessagingSyncEventDto(
@@ -790,11 +1642,11 @@ class SecureMessagingEventProcessorTest {
             type = "message.created",
             conversationId = CONVERSATION_ID,
             resourceType = "message",
-            resourceId = OUTBOUND_SERVER_ID,
+            resourceId = serverMessageId,
             data = MessagingSyncEventDataDto(
-                id = OUTBOUND_SERVER_ID,
+                id = serverMessageId,
                 conversationId = CONVERSATION_ID,
-                clientMessageId = OUTBOUND_CLIENT_ID,
+                clientMessageId = clientMessageId,
                 sender = EncryptedMessageSenderDto(CURRENT_USER_ID, "Current User"),
                 senderDeviceId = CURRENT_DEVICE_ID,
                 senderSignalDeviceId = current.signalDeviceId,
@@ -814,6 +1666,38 @@ class SecureMessagingEventProcessorTest {
             occurredAt = TIMESTAMP,
         )
     }
+
+    private fun deliveryReceiptEvent(eventId: Long) = MessagingSyncEventDto(
+        id = eventId.toString(),
+        type = "message.delivery.updated",
+        conversationId = CONVERSATION_ID,
+        resourceType = "message_delivery",
+        resourceId = OUTBOUND_SERVER_ID,
+        data = MessagingSyncEventDataDto(
+            messageId = OUTBOUND_SERVER_ID,
+            deliveryState = "delivered_to_peer",
+            deliveredAt = TIMESTAMP,
+        ),
+        occurredAt = TIMESTAMP,
+    )
+
+    private fun readReceiptEvent(
+        eventId: Long,
+        userId: String,
+        lastReadMessageId: String = OUTBOUND_SERVER_ID,
+    ) = MessagingSyncEventDto(
+        id = eventId.toString(),
+        type = "read_receipt.updated",
+        conversationId = CONVERSATION_ID,
+        resourceType = "read_receipt",
+        resourceId = "$CONVERSATION_ID:42",
+        data = MessagingSyncEventDataDto(
+            userId = userId,
+            lastReadMessageId = lastReadMessageId,
+            readAt = TIMESTAMP,
+        ),
+        occurredAt = TIMESTAMP,
+    )
 
     private fun authoritativeRoster(): MessagingDeviceRosterDto {
         val devices = listOf(
@@ -902,9 +1786,15 @@ class SecureMessagingEventProcessorTest {
         .setResponseCode(200)
         .setBody(body)
 
+    private fun apiErrorResponse(status: Int, code: String) = MockResponse()
+        .setHeader("Content-Type", "application/json")
+        .setResponseCode(status)
+        .setBody("""{"ok":false,"error":{"code":"$code","message":"rejected"}}""")
+
     private class PersistingDecryptionEngine(
         private val stateStore: TestSecureMessagingStateStore,
         failedCommits: Int = 0,
+        private val authenticatedText: String = "processor plaintext",
     ) : SecureMessagingCryptoEngine {
         var openedTransactions = 0
             private set
@@ -920,6 +1810,7 @@ class SecureMessagingEventProcessorTest {
                 stateStore,
                 shouldFail = { remainingFailures > 0 },
                 didFail = { remainingFailures-- },
+                authenticatedText = authenticatedText,
             )
         }
 
@@ -969,6 +1860,7 @@ class SecureMessagingEventProcessorTest {
         private val stateStore: TestSecureMessagingStateStore,
         private val shouldFail: () -> Boolean,
         private val didFail: () -> Unit,
+        private val authenticatedText: String,
     ) : FailClosedSecureMessagingCryptoTransaction(activation) {
         private var request: SecureMessagingDecryptionRequestSnapshot? = null
         private var destination: CompanionStateDestination? = null
@@ -1033,7 +1925,7 @@ class SecureMessagingEventProcessorTest {
                 rosterRevision = snapshot.rosterRevision,
                 sender = snapshot.sender,
                 replyToMessageId = snapshot.replyToMessageId,
-                text = "processor plaintext",
+                text = authenticatedText,
             )
         }
 
@@ -1054,8 +1946,41 @@ class SecureMessagingEventProcessorTest {
                     "\"sender_user_id\":\"${snapshot.sender.userId}\"," +
                     "\"sender_device_id\":\"${snapshot.sender.serverDeviceId}\"," +
                     "\"sender_signal_device_id\":${snapshot.sender.signalDeviceId}," +
-                    "\"reply_to_message_id\":$reply,\"text\":\"processor plaintext\"}"
+                    "\"reply_to_message_id\":$reply,\"text\":\"$authenticatedText\"}"
                 ).toByteArray(StandardCharsets.UTF_8)
+        }
+    }
+
+    private class TwoWriterProjectionRaceStateStore(
+        private val delegate: TestSecureMessagingStateStore,
+    ) : SecureMessagingStateStore by delegate {
+        val interceptedWrites = AtomicInteger(0)
+        private val bothWritersReady = CompletableDeferred<Unit>()
+
+        @Volatile
+        private var targetRecordKey: String? = null
+
+        fun interceptNextTwoMetadataWrites(recordKey: String) {
+            check(targetRecordKey == null)
+            targetRecordKey = recordKey
+        }
+
+        override suspend fun write(
+            namespace: String,
+            recordKey: String,
+            expectedVersion: Long?,
+            bytes: ByteArray,
+        ): SecureMessagingRecordVersion {
+            if (
+                namespace == "message-metadata-v1" &&
+                recordKey == targetRecordKey &&
+                expectedVersion != null &&
+                interceptedWrites.get() < 2
+            ) {
+                if (interceptedWrites.incrementAndGet() == 2) bothWritersReady.complete(Unit)
+                bothWritersReady.await()
+            }
+            return delegate.write(namespace, recordKey, expectedVersion, bytes)
         }
     }
 
@@ -1088,8 +2013,11 @@ class SecureMessagingEventProcessorTest {
         const val CONVERSATION_ID = "66666666-6666-4666-8666-666666666666"
         const val INCOMING_CLIENT_ID = "77777777-7777-4777-8777-777777777777"
         const val OUTBOUND_CLIENT_ID = "88888888-8888-4888-8888-888888888888"
+        const val SECOND_OUTBOUND_CLIENT_ID = "99999999-9999-4999-8999-999999999999"
+        const val THIRD_OUTBOUND_CLIENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab"
         const val INCOMING_MESSAGE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         const val OUTBOUND_SERVER_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        const val SECOND_OUTBOUND_SERVER_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         const val TIMESTAMP = "2026-07-20T12:00:00Z"
         val CURRENT = SecureMessagingCryptoAddress(CURRENT_USER_ID, CURRENT_DEVICE_ID, 1)
         val PEER = SecureMessagingCryptoAddress(PEER_USER_ID, PEER_DEVICE_ID, 2)

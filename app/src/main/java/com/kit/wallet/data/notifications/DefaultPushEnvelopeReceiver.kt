@@ -5,6 +5,8 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.net.Uri
 import androidx.core.app.NotificationCompat
 import com.kit.wallet.MainActivity
@@ -86,12 +88,28 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         }.getOrNull()?.coerceAtMost(MAX_RING_TIMEOUT_MILLIS) ?: return
         if (timeoutMillis <= 0) return
 
+        val ringtoneUri = RingtoneManager.getActualDefaultRingtoneUri(
+            context,
+            RingtoneManager.TYPE_RINGTONE,
+        ) ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
         manager.createNotificationChannel(
             NotificationChannel(
                 CALLS_CHANNEL_ID,
                 "Incoming Kit Pay calls",
                 NotificationManager.IMPORTANCE_HIGH,
-            ),
+            ).apply {
+                description = "Rings for incoming Kit Pay voice and video calls"
+                lockscreenVisibility = NotificationCompat.VISIBILITY_PRIVATE
+                setSound(
+                    ringtoneUri,
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build(),
+                )
+                enableVibration(true)
+                vibrationPattern = longArrayOf(0L, 700L, 900L, 700L, 900L)
+            },
         )
         val openCall = PendingIntent.getActivity(
             context,
@@ -117,13 +135,18 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
                 .setAutoCancel(true)
                 .setTimeoutAfter(timeoutMillis)
                 .setContentIntent(openCall)
+                // Surface the ringing call full-screen on a locked/backgrounded device. When the
+                // OS declines the full-screen intent it falls back to a ringing heads-up alert.
+                .setFullScreenIntent(openCall, true)
                 .build(),
         )
     }
 
     private companion object {
         const val ALERTS_CHANNEL_ID = "kit_wallet_alerts"
-        const val CALLS_CHANNEL_ID = "kit_incoming_calls"
+        // Bumped from "kit_incoming_calls": notification-channel sound and vibration are immutable
+        // once created, so a new id is required for the ringtone settings to apply on upgrades.
+        const val CALLS_CHANNEL_ID = "kit_incoming_calls_v2"
         const val CALL_NOTIFICATION_ID = 4_101
         const val MAX_RING_TIMEOUT_MILLIS = 60_000L
 

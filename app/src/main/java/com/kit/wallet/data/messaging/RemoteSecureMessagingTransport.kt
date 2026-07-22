@@ -5,11 +5,15 @@ import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.ApiEnvelope
 import com.kit.wallet.data.remote.ConsumeMessagingKeyBundlesRequest
 import com.kit.wallet.data.remote.CreateDirectMessagingConversationRequest
+import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
+import com.kit.wallet.data.remote.EncryptedAttachmentRequest
 import com.kit.wallet.data.remote.KitFeature
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.MessageDeliveryAcknowledgementDto
+import com.kit.wallet.data.remote.MarkMessagingConversationReadRequest
 import com.kit.wallet.data.remote.MessagingConversationListDto
 import com.kit.wallet.data.remote.MessagingKeyStatusDto
+import com.kit.wallet.data.remote.MessagingReadReceiptDto
 import com.kit.wallet.data.remote.SECURE_MESSAGING_ROSTER_REVISION
 import com.kit.wallet.data.remote.SECURE_MESSAGING_PROTOCOL_VERSION
 import com.kit.wallet.data.remote.SecureMessagingWireApi
@@ -19,14 +23,19 @@ import com.kit.wallet.data.remote.SecureMessagingWireValidator
 import com.kit.wallet.data.remote.ValidatedDirectConversation
 import com.kit.wallet.data.remote.ValidatedMessageDeliveryAcknowledgement
 import com.kit.wallet.data.remote.ValidatedMessagingDeviceRoster
+import com.kit.wallet.data.remote.ValidatedMessagingReadReceipt
 import com.kit.wallet.data.remote.ValidatedMessagingSyncEvent
 import com.kit.wallet.data.remote.ValidatedMessagingSyncPage
 import com.kit.wallet.data.remote.ValidatedOutboundEncryptedMessage
+import java.security.MessageDigest
 import java.time.Instant
 import java.util.Collections
 import java.util.WeakHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
+import okhttp3.RequestBody.Companion.toRequestBody
 
 internal data class SecureMessagingRemoteContext(
     val currentUserId: String,
@@ -100,7 +109,11 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val sentAt: Instant,
             val replyToMessageId: String?,
             val rosterRevision: String = "",
-        ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt)
+            internal val kind: String,
+            attachments: List<EncryptedAttachmentRequest>,
+        ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt) {
+            internal val attachments = attachments.toList()
+        }
 
         class OutboundEvent internal constructor(
             owner: Session,
@@ -112,6 +125,27 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val clientMessageId: String,
             val rosterRevision: String,
             val sentAt: Instant,
+        ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt)
+
+        class DeliveryReceiptEvent internal constructor(
+            owner: Session,
+            issuanceIdentity: Any,
+            eventId: Long,
+            conversationId: String,
+            occurredAt: Instant,
+            val messageId: String,
+            val deliveredAt: Instant,
+        ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt)
+
+        class ReadReceiptEvent internal constructor(
+            owner: Session,
+            issuanceIdentity: Any,
+            eventId: Long,
+            conversationId: String,
+            occurredAt: Instant,
+            val readerUserId: String,
+            val lastReadMessageId: String,
+            val readAt: Instant,
         ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt)
 
         class RosterRefreshEvent internal constructor(
@@ -196,6 +230,14 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             internal val issuanceIdentity: Any,
             val acknowledgedCount: Int,
             val newlyAcknowledgedCount: Int,
+        )
+
+        class ReadReceipt internal constructor(
+            private val owner: Session,
+            internal val issuanceIdentity: Any,
+            val conversationId: String,
+            val lastReadMessageId: String,
+            val readAt: Instant,
         )
 
         private data class IssuedConversation(
@@ -598,6 +640,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         suspend fun send(
             conversation: DirectConversation,
             encryptedSend: SecureMessagingEncryptedSend,
+            attachments: List<EncryptedAttachmentRequest>,
         ): OutboundReceipt {
             val validatedConversation = requireConversation(conversation)
             val conversationId = validatedConversation.conversationId
@@ -622,7 +665,16 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             check(
                 send.memberUserIds() == setOf(context.currentUserId, validatedConversation.peerUserId),
             ) { "Encrypted send command belongs to another direct membership" }
-            val request = send.request()
+            // The committed fanout stays byte-identical; attachment metadata only decorates the
+            // wire request. The data-class initializer re-validates the kind/metadata pairing.
+            val request = if (attachments.isEmpty()) {
+                send.request()
+            } else {
+                send.request().copy(
+                    kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+                    attachments = attachments.toList(),
+                )
+            }
             val response = owner.fencedSessionCall(
                 this,
                 issuanceIdentity,
@@ -642,6 +694,114 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                     expectedRosterRevision = request.rosterRevision,
                 ),
             )
+        }
+
+        /** Uploaded ciphertext identity returned by the blob store. */
+        data class UploadedAttachment(
+            val storageKey: String,
+            val byteSize: Long,
+            val ciphertextSha256: String,
+        )
+
+        /**
+         * Uploads opaque attachment ciphertext and returns its server identity. The response is
+         * checked against the exact bytes sent so a corrupted store can never be referenced.
+         */
+        suspend fun uploadAttachment(mediaType: String, ciphertext: ByteArray): UploadedAttachment {
+            require(mediaType.isNotBlank() && mediaType.length <= 160) { "Invalid media type" }
+            require(ciphertext.isNotEmpty()) { "Attachment ciphertext is empty" }
+            val expectedSha256 = sha256Hex(ciphertext)
+            val response = owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                uploadMessagingAttachment(
+                    mediaType = mediaType
+                        .toRequestBody("text/plain".toMediaType()),
+                    ciphertext = MultipartBody.Part.createFormData(
+                        "ciphertext",
+                        "blob.bin",
+                        ciphertext.toRequestBody("application/octet-stream".toMediaType()),
+                    ),
+                )
+            }
+            val storageKey = response.storageKey
+            check(!storageKey.isNullOrBlank() && storageKey.length <= 512) {
+                "The attachment store returned an invalid storage key"
+            }
+            check(response.byteSize == ciphertext.size.toLong()) {
+                "The attachment store recorded a different ciphertext size"
+            }
+            check(response.ciphertextSha256?.lowercase() == expectedSha256) {
+                "The attachment store recorded a different ciphertext digest"
+            }
+            return UploadedAttachment(
+                storageKey = storageKey,
+                byteSize = ciphertext.size.toLong(),
+                ciphertextSha256 = expectedSha256,
+            )
+        }
+
+        /**
+         * Downloads opaque attachment ciphertext. Integrity is enforced by the caller against the
+         * end-to-end descriptor's digest, never against anything the server asserts.
+         */
+        suspend fun downloadAttachment(storageKey: String, maximumBytes: Long): ByteArray {
+            require(storageKey.isNotBlank() && storageKey.length <= 512) { "Invalid storage key" }
+            require(maximumBytes in 1..MAX_ATTACHMENT_DOWNLOAD_BYTES) { "Invalid download bound" }
+            val body = owner.rawFencedSessionCall(this, issuanceIdentity, lifecycle, fence) {
+                downloadMessagingAttachment(storageKey)
+            }
+            var bytes: ByteArray? = null
+            try {
+                body.use { responseBody ->
+                    val length = responseBody.contentLength()
+                    check(length == -1L || length <= maximumBytes) {
+                        "The encrypted attachment exceeds its authenticated size"
+                    }
+                    bytes = responseBody.byteStream().use { input ->
+                        input.readBoundedAttachmentCiphertext(maximumBytes)
+                    }
+                }
+                // Retrofit's response suspension ends before a streaming body is consumed. Fence
+                // the complete read so bytes from an obsolete activation never reach decryption.
+                lifecycle.assertCurrent(activation)
+                return checkNotNull(bytes)
+            } catch (error: Throwable) {
+                bytes?.fill(0)
+                throw error
+            }
+        }
+
+        suspend fun markConversationRead(
+            conversation: DirectConversation,
+            messageId: String,
+        ): ReadReceipt {
+            val validatedConversation = requireConversation(conversation)
+            requireUuid(messageId, "last-read message ID")
+            val response: MessagingReadReceiptDto = owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                markMessagingConversationRead(
+                    validatedConversation.conversationId,
+                    MarkMessagingConversationReadRequest(messageId),
+                )
+            }
+            val validated = SecureMessagingTransportValidator.validateReadReceipt(
+                response = response,
+                expectedConversationId = validatedConversation.conversationId,
+                expectedCurrentUserId = context.currentUserId,
+                requestedMessageId = messageId,
+            )
+            lifecycle.assertCurrent(activation)
+            return issueReadReceipt(validated)
         }
 
         /**
@@ -1009,6 +1169,16 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             sentAt = validated.sentAt,
         )
 
+        private fun issueReadReceipt(
+            validated: ValidatedMessagingReadReceipt,
+        ): ReadReceipt = ReadReceipt(
+            owner = this,
+            issuanceIdentity = Any(),
+            conversationId = validated.conversationId,
+            lastReadMessageId = validated.lastReadMessageId,
+            readAt = validated.readAt,
+        )
+
         private fun issueCheckpointLocked(
             cursor: String?,
             previousEventId: Long?,
@@ -1129,6 +1299,8 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 sentAt = validated.message.sentAt,
                 rosterRevision = validated.message.rosterRevision,
                 replyToMessageId = validated.message.replyToMessageId,
+                kind = validated.message.kind,
+                attachments = validated.message.attachments(),
             )
             is ValidatedMessagingSyncEvent.OutboundMessage -> OutboundEvent(
                 owner = this,
@@ -1140,6 +1312,25 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 clientMessageId = validated.message.clientMessageId,
                 rosterRevision = validated.message.rosterRevision,
                 sentAt = validated.message.sentAt,
+            )
+            is ValidatedMessagingSyncEvent.DeliveryReceipt -> DeliveryReceiptEvent(
+                owner = this,
+                issuanceIdentity = identity,
+                eventId = validated.eventId,
+                conversationId = validated.conversationId,
+                occurredAt = validated.occurredAt,
+                messageId = validated.messageId,
+                deliveredAt = validated.deliveredAt,
+            )
+            is ValidatedMessagingSyncEvent.ReadReceipt -> ReadReceiptEvent(
+                owner = this,
+                issuanceIdentity = identity,
+                eventId = validated.eventId,
+                conversationId = validated.conversationId,
+                occurredAt = validated.occurredAt,
+                readerUserId = validated.userId,
+                lastReadMessageId = validated.lastReadMessageId,
+                readAt = validated.readAt,
             )
             is ValidatedMessagingSyncEvent.RosterRefresh -> RosterRefreshEvent(
                 owner = this,
@@ -1367,6 +1558,31 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         return fencedCall(lifecycle, fence, readyRequired) { messagingApi.call() }
     }
 
+    /**
+     * Fenced call for endpoints whose response is raw bytes rather than an API envelope.
+     * Activation fencing matches [fencedSessionCall]; error unwrapping is the caller's concern.
+     */
+    private suspend fun <T> rawFencedSessionCall(
+        session: Session,
+        issuanceIdentity: Any,
+        lifecycle: SecureMessagingLifecycleGuard,
+        fence: SecureMessagingSessionFence,
+        call: suspend SecureMessagingWireApi.() -> T,
+    ): T {
+        check(issuedSessions[session] === issuanceIdentity) {
+            "Secure messaging transport session was not issued by this readiness gate"
+        }
+        lifecycle.assertCurrent(fence, readyRequired = true)
+        val response = try {
+            messagingApi.call()
+        } catch (error: Throwable) {
+            lifecycle.assertCurrent(fence, readyRequired = true)
+            throw error
+        }
+        lifecycle.assertCurrent(fence, readyRequired = true)
+        return response
+    }
+
     private suspend fun <T> fencedCall(
         lifecycle: SecureMessagingLifecycleGuard,
         fence: SecureMessagingSessionFence,
@@ -1401,5 +1617,12 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         val UUID_PATTERN = Regex(
             "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         )
+
+        /** Matches the backend's messaging attachment blob size bound. */
+        const val MAX_ATTACHMENT_DOWNLOAD_BYTES = 100L * 1024L * 1024L
+
+        fun sha256Hex(bytes: ByteArray): String =
+            MessageDigest.getInstance("SHA-256").digest(bytes)
+                .joinToString("") { "%02x".format(it) }
     }
 }

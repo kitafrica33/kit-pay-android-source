@@ -392,8 +392,8 @@ android {
         applicationId = kitPayApplicationId
         minSdk = 26
         targetSdk = 36
-        versionCode = 12
-        versionName = "0.2.0"
+        versionCode = 13
+        versionName = "0.2.1"
 
         if (kitPaySideloadAbi != null) {
             ndk { abiFilters += kitPaySideloadAbi }
@@ -409,6 +409,11 @@ android {
             "KIT_PRIVACY_NOTICE_VERSION",
             quotedBuildValue(kitPrivacyNoticeVersion.get()),
         )
+        // Photo messaging ships dormant in 0.2.0 (code 12): the backend's v2 content profile
+        // still rejects encrypted_attachment sends (MESSAGING_V2_CONTENT_PROFILE_UNAVAILABLE),
+        // and the server-side client-version rollout exposes new wire shapes to 0.2.1 (code 13)
+        // and later. Flip alongside that rollout; the implementation and its tests stay compiled.
+        buildConfigField("boolean", "MEDIA_MESSAGING_ENABLED", "true")
         buildConfigField("boolean", "FIREBASE_CONFIGURED", firebaseValues.isNotEmpty().toString())
         buildConfigField("String", "FIREBASE_PROJECT_ID", quotedBuildValue(firebaseValues["projectId"].orEmpty()))
         buildConfigField("String", "FIREBASE_SENDER_ID", quotedBuildValue(firebaseValues["senderId"].orEmpty()))

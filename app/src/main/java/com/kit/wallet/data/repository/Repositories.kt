@@ -84,10 +84,26 @@ interface ChatRepository {
     fun chat(chatId: String): ChatPreview?
     fun conversation(chatId: String): StateFlow<List<Message>>
     suspend fun markConversationRead(chatId: String) = Unit
+    suspend fun synchronizeConversation(chatId: String) = Unit
     suspend fun openDirectConversation(contact: Contact): String
     suspend fun sendMessage(chatId: String, text: String)
     suspend fun retryMessage(chatId: String, clientMessageId: String, text: String) {
         error("This chat repository does not support explicit secure-message retries")
+    }
+
+    /** Sends one image end-to-end encrypted; the server stores only opaque ciphertext. */
+    suspend fun sendImageMessage(
+        chatId: String,
+        bytes: ByteArray,
+        mediaType: String,
+        caption: String? = null,
+    ) {
+        error("This chat repository does not support secure media messages")
+    }
+
+    /** Downloads and decrypts the media referenced by a message's authenticated descriptor. */
+    suspend fun openImageMessage(chatId: String, mediaDescriptor: String): ByteArray {
+        error("This chat repository does not support secure media messages")
     }
 }
 

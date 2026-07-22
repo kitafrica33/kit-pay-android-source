@@ -1,5 +1,8 @@
 package com.kit.wallet.data.messaging
 
+import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
+import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
+import com.kit.wallet.data.remote.KitWalletApiException
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
@@ -166,7 +169,33 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                         error,
                     )
                 }
-                val receipt = session.send(conversation, encrypted)
+                // Attachment metadata is server-visible but is authenticated inside the durable
+                // Signal plaintext descriptor. Re-derive it on every retry just as the initial
+                // send path does; retrying an attachment as ordinary encrypted text would create
+                // a message that the recipient can decrypt but can never authorize/download.
+                val attachments = KitMediaMessage.attachmentsFor(durable.authenticatedText)
+                val receipt = try {
+                    session.send(conversation, encrypted, attachments)
+                } catch (error: KitWalletApiException) {
+                    if (attachments.isNotEmpty()) {
+                        if (error.isPermanentAttachmentBindingFailure()) {
+                            // An unclaimed blob expires after 24 hours, and a handle claimed by
+                            // another accepted message can never be reused. Retire only this
+                            // durable media fanout so it cannot starve later outbox entries.
+                            projections.markOutboundPermanentFailure(durable)
+                            return@forEach
+                        }
+                        if (error.isAttachmentCompatibilityFailure()) {
+                            // The blob can still be valid, but a code-12 roster device or a
+                            // temporarily disabled content profile cannot accept it today. Stop
+                            // automatic recovery from wedging later text; retain explicit retry
+                            // for after every device/server profile supports attachments.
+                            projections.markOutboundRetryRequired(durable)
+                            return@forEach
+                        }
+                    }
+                    throw error
+                }
                 projections.markOutboundSent(durable, receipt)
             }
         } catch (error: SecureMessagingCryptographicFailureException) {
@@ -208,6 +237,15 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         )
     }
 
+    private fun KitWalletApiException.isPermanentAttachmentBindingFailure(): Boolean = when (code) {
+        ATTACHMENT_REFERENCE_INVALID -> statusCode == 422
+        ATTACHMENT_ALREADY_ATTACHED -> statusCode == 409
+        else -> false
+    }
+
+    private fun KitWalletApiException.isAttachmentCompatibilityFailure(): Boolean =
+        statusCode == 409 && code in ATTACHMENT_COMPATIBILITY_FAILURES
+
     private suspend fun stateFor(
         session: RemoteSecureMessagingTransport.Session,
     ): SessionState {
@@ -227,6 +265,10 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     processIncoming(state, event)
                 is RemoteSecureMessagingTransport.Session.OutboundEvent ->
                     processOutbound(event)
+                is RemoteSecureMessagingTransport.Session.DeliveryReceiptEvent ->
+                    processDeliveryReceipt(state, event)
+                is RemoteSecureMessagingTransport.Session.ReadReceiptEvent ->
+                    processReadReceipt(state, event)
                 is RemoteSecureMessagingTransport.Session.RosterRefreshEvent ->
                     processRosterRefresh(state, event)
                 is RemoteSecureMessagingTransport.Session.MetadataEvent ->
@@ -319,6 +361,24 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             }
 
             val persisted = checkNotNull(durable)
+            if (!hasAuthenticatedAttachmentBinding(envelope, persisted)) {
+                // A peer controls both the outer metadata and encrypted plaintext it sends. A
+                // mismatch is therefore message-local hostile input, not evidence that this
+                // account activation or ratchet is corrupt. Keep the durable crypto commit,
+                // suppress projection/opening, acknowledge the envelope and advance the cursor
+                // so the peer cannot remotely quarantine or permanently wedge this recipient.
+                // Commit the tombstone before acknowledgement/cursor advance. If this write is
+                // interrupted, replay sees the companion commit, revalidates the same binding,
+                // and retries suppression without re-running the ratchet.
+                projections.recordInboundSuppressed(persisted, envelope.sentAt)
+                val token = if (decrypted != null) {
+                    state.session.deliveryToken(envelope, decrypted)
+                } else {
+                    state.session.deliveryTokenFromDurableState(envelope, persisted)
+                }
+                state.deliveryTokens += token
+                return
+            }
             if (!projections.isInboundPublicationRecorded(persisted, envelope.sentAt)) {
                 // The companion record is already durable, but projection metadata is committed
                 // only after publication. A failure therefore leaves retryable work, while the
@@ -349,6 +409,22 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         }
     }
 
+    private fun hasAuthenticatedAttachmentBinding(
+        envelope: RemoteSecureMessagingTransport.Session.IncomingEnvelope,
+        durable: LibSignalCompanionRecord,
+    ): Boolean {
+        val descriptor = KitMediaMessage.parse(durable.authenticatedText)
+        val authenticatedAttachments = descriptor?.let { listOf(it.toAttachmentRequest()) }
+            ?: emptyList()
+        val authenticatedKind = if (authenticatedAttachments.isEmpty()) {
+            ENCRYPTED_MESSAGE_KIND
+        } else {
+            ENCRYPTED_ATTACHMENT_MESSAGE_KIND
+        }
+        return envelope.kind == authenticatedKind &&
+            envelope.attachments == authenticatedAttachments
+    }
+
     private suspend fun commitDecryption(
         session: RemoteSecureMessagingTransport.Session,
         request: SecureMessagingDecryptionRequest,
@@ -374,6 +450,51 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     ) {
         val durable = projections.readOutbound(event.clientMessageId) ?: return
         projections.markOutboundSent(durable, event)
+    }
+
+    private suspend fun processDeliveryReceipt(
+        state: SessionState,
+        event: RemoteSecureMessagingTransport.Session.DeliveryReceiptEvent,
+    ) {
+        projections.markAuthoredDelivered(
+            conversationId = event.conversationId,
+            messageId = event.messageId,
+            currentUserId = state.session.binding.userId,
+            deliveredAt = event.deliveredAt,
+        )
+    }
+
+    private suspend fun processReadReceipt(
+        state: SessionState,
+        event: RemoteSecureMessagingTransport.Session.ReadReceiptEvent,
+    ) {
+        val conversations = state.conversations ?: state.session.directConversations()
+            .associateBy(RemoteSecureMessagingTransport.Session.DirectConversation::conversationId)
+            .also { state.conversations = it }
+        val conversation = checkNotNull(conversations[event.conversationId]) {
+            "Read receipt belongs to an unavailable direct conversation"
+        }
+        if (event.readerUserId == state.session.binding.userId) {
+            // The backend broadcasts this account's marker to every enrolled device. It is not
+            // peer-read evidence for self-authored bubbles, but it does clear authenticated inbound
+            // messages from the direct peer on this account's other devices.
+            projections.markInboundReadThroughCanonicalIfKnown(
+                conversationId = event.conversationId,
+                peerUserId = conversation.peerUserId,
+                canonicalLastReadMessageId = event.lastReadMessageId,
+                canonicalReadAt = event.readAt,
+            )
+            return
+        }
+        check(conversation.peerUserId == event.readerUserId) {
+            "Read receipt actor is not the authenticated direct peer"
+        }
+        projections.markAuthoredReadThrough(
+            conversationId = event.conversationId,
+            lastReadMessageId = event.lastReadMessageId,
+            currentUserId = state.session.binding.userId,
+            readAt = event.readAt,
+        )
     }
 
     private suspend fun historicalPlan(
@@ -428,6 +549,12 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     }
 
     private companion object {
+        const val ATTACHMENT_REFERENCE_INVALID = "ATTACHMENT_REFERENCE_INVALID"
+        const val ATTACHMENT_ALREADY_ATTACHED = "ATTACHMENT_ALREADY_ATTACHED"
+        val ATTACHMENT_COMPATIBILITY_FAILURES = setOf(
+            "MESSAGING_ATTACHMENT_CLIENT_UPGRADE_REQUIRED",
+            "MESSAGING_V2_CONTENT_PROFILE_UNAVAILABLE",
+        )
         const val SYNC_PAGE_SIZE = 50
         const val OUTBOX_PAGE_SIZE = 100
         const val MAX_OUTBOX_PAGES = 100

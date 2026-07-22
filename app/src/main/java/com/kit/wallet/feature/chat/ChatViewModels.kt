@@ -7,18 +7,29 @@ import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
+import dagger.hilt.android.lifecycle.HiltViewModel
+import javax.inject.Inject
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import dagger.hilt.android.lifecycle.HiltViewModel
-import javax.inject.Inject
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+
+/** Process-wide receive gate: navigation must not overlap bounded download/decrypt buffer sets. */
+private val secureMediaOpenMutex = Mutex()
 
 @HiltViewModel
 class ChatsViewModel @Inject constructor(chatRepo: ChatRepository) : ViewModel() {
@@ -57,28 +68,91 @@ class ConversationViewModel @Inject constructor(
     private val mutableRetryingMessageId = MutableStateFlow<String?>(null)
     val retryingMessageId = mutableRetryingMessageId.asStateFlow()
 
+    private val mutableMediaBytes = MutableStateFlow<Map<String, ByteArray>>(emptyMap())
+    val mediaBytes = mutableMediaBytes.asStateFlow()
+    private val mediaCache = LinkedHashMap<String, ByteArray>()
+    private var mediaCacheByteCount = 0
+
+    private val mutableMediaLoading = MutableStateFlow<Set<String>>(emptySet())
+    val mediaLoading = mutableMediaLoading.asStateFlow()
+
+    private val mutableMediaErrors = MutableStateFlow<Map<String, String>>(emptyMap())
+    val mediaErrors = mutableMediaErrors.asStateFlow()
+
+    private val mutableConversationVisible = MutableStateFlow(false)
+    private var foregroundSyncJob: Job? = null
+
     init {
         if (chatId.isNotBlank()) {
             viewModelScope.launch {
-                combine(messagingAvailable, messages) { ready, projected ->
-                    ready && projected.any { !it.fromMe }
+                combine(
+                    mutableConversationVisible,
+                    messagingAvailable,
+                    messages,
+                ) { visible, ready, projected ->
+                    visible && ready && projected.any {
+                        !it.fromMe && it.state == DeliveryState.DELIVERED
+                    }
                 }.collectLatest { shouldMarkRead ->
-                    if (!shouldMarkRead) return@collectLatest
+                    if (shouldMarkRead) attemptMarkConversationRead()
+                }
+            }
+        }
+    }
+
+    /** Starts one cancellable, sequential sync loop only while this conversation is visible. */
+    fun setConversationVisible(visible: Boolean) {
+        mutableConversationVisible.value = visible
+        if (!visible || chatId.isBlank()) {
+            foregroundSyncJob?.cancel()
+            foregroundSyncJob = null
+            return
+        }
+        if (foregroundSyncJob?.isActive == true) return
+        foregroundSyncJob = viewModelScope.launch {
+            var firstIteration = true
+            while (true) {
+                if (messagingAvailable.value) {
                     try {
-                        chatRepo.markConversationRead(chatId)
+                        chatRepo.synchronizeConversation(chatId)
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (_: Exception) {
-                        // Reading remains available if a local marker cannot be persisted. A later
-                        // projection/readiness emission retries without leaking a remote receipt.
+                        // FCM and WorkManager remain recovery paths. A visible conversation makes
+                        // another bounded foreground attempt on the next cadence.
                     }
                 }
+                // Projection changes attempt immediately through the collector above. If that
+                // POST fails without changing local state, retry it on the next foreground tick.
+                if (!firstIteration) attemptMarkConversationRead()
+                firstIteration = false
+                delay(FOREGROUND_SYNC_INTERVAL_MILLIS)
             }
         }
     }
 
     fun clearError() {
         mutableError.value = null
+    }
+
+    fun reportMediaSelectionError(message: String) {
+        mutableError.value = message
+    }
+
+    private suspend fun attemptMarkConversationRead() {
+        if (
+            !mutableConversationVisible.value ||
+            !messagingAvailable.value ||
+            messages.value.none { !it.fromMe && it.state == DeliveryState.DELIVERED }
+        ) return
+        try {
+            chatRepo.markConversationRead(chatId)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // Durable unread state is the retry signal. A projection/readiness emission or the
+            // two-second visible-conversation cadence will try the receipt again.
+        }
     }
 
     fun send(text: String, onSent: () -> Unit = {}) {
@@ -99,7 +173,8 @@ class ConversationViewModel @Inject constructor(
             !message.fromMe ||
             message.state !in setOf(DeliveryState.SENDING, DeliveryState.RETRY_REQUIRED)
         ) return
-        val normalized = message.text.trim()
+        // A media message retries its authenticated descriptor, not its display caption.
+        val normalized = (message.mediaDescriptor ?: message.text).trim()
         if (!messagingAvailable.value || normalized.isBlank() || mutableSending.value) return
         launchSend(
             selectedChatId = selectedChat.id,
@@ -107,6 +182,119 @@ class ConversationViewModel @Inject constructor(
             retryingMessageId = message.id,
             onSuccess = onRetried,
         )
+    }
+
+    fun sendImage(bytes: ByteArray, mediaType: String, onSent: () -> Unit = {}) {
+        val selectedChat = chat.value
+        if (
+            selectedChat == null ||
+            !messagingAvailable.value ||
+            bytes.isEmpty() ||
+            mutableSending.value
+        ) {
+            bytes.fill(0)
+            return
+        }
+        val sendJob = viewModelScope.launch {
+            mutableSending.value = true
+            mutableError.value = null
+            try {
+                chatRepo.sendImageMessage(selectedChat.id, bytes, mediaType)
+                onSent()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message
+                    ?: "The secure photo could not be sent"
+            } finally {
+                bytes.fill(0)
+                mutableSending.value = false
+            }
+        }
+        // A launch into an already-cleared ViewModel can be cancelled before its body (and
+        // finally block) starts. Completion is the final ownership boundary for picker plaintext.
+        sendJob.invokeOnCompletion { bytes.fill(0) }
+    }
+
+    /** Downloads and decrypts a media message once; results and failures are keyed by message. */
+    fun openMedia(message: Message) {
+        val selectedChat = chat.value ?: return
+        val descriptor = message.mediaDescriptor ?: return
+        if (!messagingAvailable.value) return
+        if (
+            mutableMediaBytes.value.containsKey(message.id) ||
+            message.id in mutableMediaLoading.value ||
+            mutableMediaErrors.value.containsKey(message.id)
+        ) return
+        mutableMediaLoading.value = mutableMediaLoading.value + message.id
+        viewModelScope.launch {
+            var opened: ByteArray? = null
+            try {
+                // One authenticated blob may transiently occupy ciphertext, plaintext and decode
+                // buffers. Serialize receive work. The non-cancellable handoff ensures a returned
+                // plaintext array is assigned before cancellation can discard its only owner.
+                secureMediaOpenMutex.withLock {
+                    withContext(NonCancellable) {
+                        opened = chatRepo.openImageMessage(selectedChat.id, descriptor)
+                    }
+                }
+                coroutineContext.ensureActive()
+                cacheMedia(message.id, checkNotNull(opened))
+                opened = null // Ownership moved into the bounded cache.
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableMediaErrors.value = mutableMediaErrors.value +
+                    (message.id to (error.message ?: "The secure photo could not be opened"))
+            } finally {
+                opened?.fill(0)
+                mutableMediaLoading.value = mutableMediaLoading.value - message.id
+            }
+        }
+    }
+
+    fun retryMedia(message: Message) {
+        discardMedia(message.id)
+        mutableMediaErrors.value = mutableMediaErrors.value - message.id
+        openMedia(message)
+    }
+
+    private fun cacheMedia(messageId: String, bytes: ByteArray) {
+        val erased = mutableListOf<ByteArray>()
+        mediaCache.remove(messageId)?.let { previous ->
+            mediaCacheByteCount -= previous.size
+            erased += previous
+        }
+        while (
+            mediaCache.isNotEmpty() &&
+            (mediaCache.size >= MAX_MEDIA_CACHE_ENTRIES ||
+                mediaCacheByteCount + bytes.size > MAX_MEDIA_CACHE_BYTES)
+        ) {
+            val oldest = mediaCache.entries.first()
+            mediaCache.remove(oldest.key)
+            mediaCacheByteCount -= oldest.value.size
+            erased += oldest.value
+        }
+        mediaCache[messageId] = bytes
+        mediaCacheByteCount += bytes.size
+        mutableMediaBytes.value = mediaCache.toMap()
+        erased.forEach { it.fill(0) }
+    }
+
+    private fun discardMedia(messageId: String) {
+        val removed = mediaCache.remove(messageId) ?: return
+        mediaCacheByteCount -= removed.size
+        mutableMediaBytes.value = mediaCache.toMap()
+        removed.fill(0)
+    }
+
+    override fun onCleared() {
+        foregroundSyncJob?.cancel()
+        mutableMediaBytes.value = emptyMap()
+        mediaCache.values.forEach { it.fill(0) }
+        mediaCache.clear()
+        mediaCacheByteCount = 0
+        super.onCleared()
     }
 
     private fun launchSend(
@@ -140,5 +328,11 @@ class ConversationViewModel @Inject constructor(
                 mutableSending.value = false
             }
         }
+    }
+
+    private companion object {
+        const val FOREGROUND_SYNC_INTERVAL_MILLIS = 2_000L
+        const val MAX_MEDIA_CACHE_ENTRIES = 4
+        const val MAX_MEDIA_CACHE_BYTES = 24 * 1024 * 1024
     }
 }

@@ -6,12 +6,17 @@ package com.kit.wallet.ui.model
 
 data class Contact(
     val id: String,
+    /** Display name: the device address-book name when saved, otherwise the registered name. */
     val name: String,
     val phone: String,
     val isKitUser: Boolean = true,
     val favorite: Boolean = false,
     val status: String = "Hey there! I'm using Kit Pay",
     val receivingWalletId: String? = null,
+    /** The name this person registered on Kit Pay, shown WhatsApp-style as "~ name" when it differs. */
+    val registeredName: String? = null,
+    /** True when the phone number is already saved in this device's address book. */
+    val savedInDevice: Boolean = false,
 )
 
 data class UserProfile(
@@ -45,7 +50,7 @@ data class Transaction(
     val reference: String,
 )
 
-enum class DeliveryState { SENDING, SENT, DELIVERED, READ, RETRY_REQUIRED }
+enum class DeliveryState { SENDING, SENT, DELIVERED, READ, RETRY_REQUIRED, FAILED }
 enum class MessageKind { TEXT, PAYMENT, VOICE_NOTE, IMAGE }
 
 data class Message(
@@ -56,6 +61,8 @@ data class Message(
     val senderName: String? = null,
     val state: DeliveryState = DeliveryState.READ,
     val kind: MessageKind = MessageKind.TEXT,
+    /** For IMAGE messages: the opaque end-to-end media descriptor used to fetch and decrypt. */
+    val mediaDescriptor: String? = null,
     /** For PAYMENT messages: signed minor units. */
     val amountMinor: Long = 0,
     val reactions: List<String> = emptyList(),

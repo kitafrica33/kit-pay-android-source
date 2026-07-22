@@ -1,5 +1,9 @@
 package com.kit.wallet.feature.chat
 
+import android.graphics.BitmapFactory
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -10,6 +14,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -25,9 +30,11 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Done
 import androidx.compose.material.icons.rounded.DoneAll
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.Photo
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -42,22 +49,35 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.kit.wallet.BuildConfig
 import com.kit.wallet.R
 import com.kit.wallet.data.demo.DemoData
+import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
+import com.kit.wallet.data.messaging.readBoundedMedia
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.DeliveryState
@@ -67,7 +87,16 @@ import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.theme.KitGreen300
 import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
+import kotlin.coroutines.coroutineContext
 import kotlin.math.abs
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -78,12 +107,65 @@ fun ConversationScreen(
     onVideoCall: (String) -> Unit,
     viewModel: ConversationViewModel = hiltViewModel(),
 ) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> viewModel.setConversationVisible(true)
+                Lifecycle.Event.ON_STOP -> viewModel.setConversationVisible(false)
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        viewModel.setConversationVisible(
+            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
+        )
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.setConversationVisible(false)
+        }
+    }
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val messagingAvailable by viewModel.messagingAvailable.collectAsStateWithLifecycle()
     val chat by viewModel.chat.collectAsStateWithLifecycle()
     val sending by viewModel.sending.collectAsStateWithLifecycle()
     val retryingMessageId by viewModel.retryingMessageId.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
+    val mediaBytes by viewModel.mediaBytes.collectAsStateWithLifecycle()
+    val mediaLoading by viewModel.mediaLoading.collectAsStateWithLifecycle()
+    val mediaErrors by viewModel.mediaErrors.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val pickImage = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri ->
+        if (uri != null) {
+            coroutineScope.launch {
+                var selectedBytes: ByteArray? = null
+                try {
+                    var mediaType = "image/jpeg"
+                    withContext(Dispatchers.IO + NonCancellable) {
+                        selectedBytes = context.contentResolver.openInputStream(uri)?.use {
+                            it.readBoundedMedia(MAX_IMAGE_PLAINTEXT_BYTES)
+                        } ?: error("The selected photo could not be opened")
+                        mediaType = context.contentResolver.getType(uri) ?: mediaType
+                    }
+                    coroutineContext.ensureActive()
+                    val owned = checkNotNull(selectedBytes)
+                    viewModel.sendImage(owned, mediaType)
+                    selectedBytes = null // Ownership moved to the ViewModel send job.
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    viewModel.reportMediaSelectionError(
+                        error.message ?: "The selected photo could not be opened",
+                    )
+                } finally {
+                    selectedBytes?.fill(0)
+                }
+            }
+        }
+    }
     val currentChat = chat
     if (!messagingAvailable) {
         SecureMessagingUnavailable(onBack)
@@ -105,6 +187,21 @@ fun ConversationScreen(
         onClearError = viewModel::clearError,
         onSend = viewModel::send,
         onRetry = viewModel::retry,
+        onAttach = {
+            // Dormant-feature guard: the composer hides the affordance, and this keeps even a
+            // stale composition from opening the picker while the release profile is text-only.
+            if (BuildConfig.MEDIA_MESSAGING_ENABLED) {
+                pickImage.launch(
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                )
+            }
+        },
+        mediaEnabled = BuildConfig.MEDIA_MESSAGING_ENABLED,
+        mediaBytes = mediaBytes,
+        mediaLoading = mediaLoading,
+        mediaErrors = mediaErrors,
+        onOpenMedia = viewModel::openMedia,
+        onRetryMedia = viewModel::retryMedia,
     )
 }
 
@@ -193,6 +290,13 @@ private fun ConversationContent(
     onClearError: () -> Unit,
     onSend: (String, () -> Unit) -> Unit,
     onRetry: (Message, () -> Unit) -> Unit,
+    onAttach: () -> Unit = {},
+    mediaEnabled: Boolean = false,
+    mediaBytes: Map<String, ByteArray> = emptyMap(),
+    mediaLoading: Set<String> = emptySet(),
+    mediaErrors: Map<String, String> = emptyMap(),
+    onOpenMedia: (Message) -> Unit = {},
+    onRetryMedia: (Message) -> Unit = {},
 ) {
     // Message plaintext must not enter the Activity saved-instance-state bundle. A rotation or
     // process death deliberately discards this in-memory draft until an encrypted draft store exists.
@@ -260,6 +364,8 @@ private fun ConversationContent(
                         if (error != null) onClearError()
                     },
                     onSend = { onSend(draft) { draft = "" } },
+                    onAttach = onAttach,
+                    mediaEnabled = mediaEnabled,
                 )
             }
         },
@@ -324,6 +430,11 @@ private fun ConversationContent(
                             if (draft.trim() == message.text) draft = ""
                         }
                     },
+                    mediaBytes = mediaBytes[message.id],
+                    mediaLoading = message.id in mediaLoading,
+                    mediaError = mediaErrors[message.id],
+                    onOpenMedia = { onOpenMedia(message) },
+                    onRetryMedia = { onRetryMedia(message) },
                 )
             }
             item { Spacer(Modifier.height(8.dp)) }
@@ -332,12 +443,17 @@ private fun ConversationContent(
 }
 
 @Composable
-private fun MessageBubble(
+internal fun MessageBubble(
     msg: Message,
     operationInFlight: Boolean,
     retrying: Boolean,
     retryEnabled: Boolean,
     onRetry: () -> Unit,
+    mediaBytes: ByteArray? = null,
+    mediaLoading: Boolean = false,
+    mediaError: String? = null,
+    onOpenMedia: () -> Unit = {},
+    onRetryMedia: () -> Unit = {},
 ) {
     val colors = KitTheme.colors
     val bubbleColor = if (msg.fromMe) colors.chatBubbleMe else colors.chatBubbleOther
@@ -375,6 +491,14 @@ private fun MessageBubble(
                     when (msg.kind) {
                         MessageKind.PAYMENT -> PaymentChatCard(msg)
                         MessageKind.VOICE_NOTE -> VoiceNoteRow(msg)
+                        MessageKind.IMAGE -> SecureImageContent(
+                            msg = msg,
+                            mediaBytes = mediaBytes,
+                            mediaLoading = mediaLoading,
+                            mediaError = mediaError,
+                            onOpenMedia = onOpenMedia,
+                            onRetryMedia = onRetryMedia,
+                        )
                         else -> Text(msg.text, style = MaterialTheme.typography.bodyLarge)
                     }
                     Row(
@@ -385,7 +509,11 @@ private fun MessageBubble(
                     ) {
                         if (
                             msg.fromMe &&
-                            msg.state in setOf(DeliveryState.SENDING, DeliveryState.RETRY_REQUIRED)
+                            msg.state in setOf(
+                                DeliveryState.SENDING,
+                                DeliveryState.RETRY_REQUIRED,
+                                DeliveryState.FAILED,
+                            )
                         ) {
                             Text(
                                 when {
@@ -394,6 +522,8 @@ private fun MessageBubble(
                                         "Pending · Retry"
                                     msg.state == DeliveryState.SENDING -> "Pending"
                                     retryEnabled -> "Not sent · Retry"
+                                    msg.state == DeliveryState.FAILED ->
+                                        "Photo expired · Send again"
                                     else -> "Not sent"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
@@ -409,6 +539,25 @@ private fun MessageBubble(
                             )
                             Spacer(Modifier.width(5.dp))
                         }
+                        if (
+                            msg.fromMe &&
+                            msg.state in setOf(
+                                DeliveryState.SENT,
+                                DeliveryState.DELIVERED,
+                                DeliveryState.READ,
+                            )
+                        ) {
+                            Text(
+                                outgoingDeliveryLabel(msg.state),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (msg.state == DeliveryState.READ) {
+                                    KitTheme.colors.success
+                                } else {
+                                    contentColor.copy(alpha = 0.65f)
+                                },
+                            )
+                            Spacer(Modifier.width(5.dp))
+                        }
                         Text(
                             msg.time,
                             style = MaterialTheme.typography.labelSmall,
@@ -417,30 +566,23 @@ private fun MessageBubble(
                         if (msg.fromMe) {
                             Spacer(Modifier.width(3.dp))
                             Icon(
-                                if (msg.state == DeliveryState.RETRY_REQUIRED) {
-                                    Icons.Rounded.ErrorOutline
-                                } else {
-                                    Icons.Rounded.DoneAll
+                                when (msg.state) {
+                                    DeliveryState.SENT -> Icons.Rounded.Done
+                                    DeliveryState.RETRY_REQUIRED,
+                                    DeliveryState.FAILED,
+                                    -> Icons.Rounded.ErrorOutline
+                                    else -> Icons.Rounded.DoneAll
                                 },
-                                contentDescription = when (msg.state) {
-                                    DeliveryState.READ -> "Read"
-                                    DeliveryState.DELIVERED -> "Delivered"
-                                    DeliveryState.SENDING -> if (retryEnabled) {
-                                        "Pending delivery; retry available"
-                                    } else {
-                                        "Pending delivery"
-                                    }
-                                    DeliveryState.RETRY_REQUIRED -> if (retryEnabled) {
-                                        "Not sent; retry required"
-                                    } else {
-                                        "Not sent"
-                                    }
-                                    else -> "Sent"
-                                },
+                                // The adjacent visible status text already owns accessibility
+                                // semantics; announcing the decorative tick repeats every receipt.
+                                contentDescription = null,
                                 modifier = Modifier.size(14.dp),
                                 tint = when (msg.state) {
                                     DeliveryState.READ -> KitTheme.colors.success
-                                    DeliveryState.RETRY_REQUIRED -> MaterialTheme.colorScheme.error
+                                    DeliveryState.RETRY_REQUIRED,
+                                    DeliveryState.FAILED,
+                                    -> MaterialTheme.colorScheme.error
+                                    DeliveryState.DELIVERED -> contentColor.copy(alpha = 0.75f)
                                     else -> contentColor.copy(alpha = 0.5f)
                                 },
                             )
@@ -468,6 +610,15 @@ private fun MessageBubble(
     }
 }
 
+internal fun outgoingDeliveryLabel(state: DeliveryState): String = when (state) {
+    DeliveryState.SENDING -> "Pending"
+    DeliveryState.SENT -> "Sent"
+    DeliveryState.DELIVERED -> "Delivered"
+    DeliveryState.READ -> "Read"
+    DeliveryState.RETRY_REQUIRED -> "Not sent"
+    DeliveryState.FAILED -> "Photo expired"
+}
+
 /**
  * A stale roster retry remains visible for audit, but must stop being actionable after a newer
  * outgoing copy of the same authenticated text exists. Otherwise tapping the old bubble after a
@@ -475,11 +626,13 @@ private fun MessageBubble(
  */
 internal fun retryableOutgoingMessageIds(messages: List<Message>): Set<String> = buildSet {
     messages.forEachIndexed { index, message ->
+        // Media messages compare their authenticated descriptor, not their shared display caption.
+        val messageContent = message.mediaDescriptor ?: message.text
         if (
             message.fromMe &&
             message.state in setOf(DeliveryState.SENDING, DeliveryState.RETRY_REQUIRED) &&
             messages.subList(index + 1, messages.size).none { newer ->
-                newer.fromMe && newer.text == message.text
+                newer.fromMe && (newer.mediaDescriptor ?: newer.text) == messageContent
             }
         ) {
             add(message.id)
@@ -552,6 +705,157 @@ private fun VoiceNoteRow(msg: Message) {
     }
 }
 
+/**
+ * An end-to-end encrypted photo bubble. A user tap starts its serialized ciphertext download;
+ * decrypted bytes render entirely in memory and nothing is written to disk in plaintext.
+ */
+@Composable
+private fun SecureImageContent(
+    msg: Message,
+    mediaBytes: ByteArray?,
+    mediaLoading: Boolean,
+    mediaError: String?,
+    onOpenMedia: () -> Unit,
+    onRetryMedia: () -> Unit,
+) {
+    var bitmap by remember(mediaBytes) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var decodeFailed by remember(mediaBytes) { mutableStateOf(false) }
+    var decoding by remember(mediaBytes) { mutableStateOf(mediaBytes != null) }
+    LaunchedEffect(mediaBytes) {
+        bitmap = null
+        decodeFailed = false
+        decoding = mediaBytes != null
+        if (mediaBytes != null) {
+            bitmap = withOwnedSecureMediaSnapshot(mediaBytes) { ownedBytes ->
+                withContext(Dispatchers.Default) {
+                    secureImageDecodeMutex.withLock {
+                        decodeBoundedSecureImage(ownedBytes)
+                    }
+                }
+            }
+            decodeFailed = bitmap == null
+            decoding = false
+        }
+    }
+    val displayError = mediaError ?: if (decodeFailed) {
+        "The secure photo could not be decoded safely"
+    } else {
+        null
+    }
+    val renderedBitmap = bitmap
+    Column {
+        when {
+            renderedBitmap != null -> Image(
+                bitmap = renderedBitmap,
+                contentDescription = "Encrypted photo",
+                modifier = Modifier
+                    .widthIn(max = 260.dp)
+                    .heightIn(max = 320.dp)
+                    .clip(RoundedCornerShape(12.dp)),
+                contentScale = ContentScale.Fit,
+            )
+            displayError != null -> Column {
+                Text(
+                    displayError,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Text(
+                    "Tap to retry",
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier
+                        .padding(top = 4.dp)
+                        .clickable(onClick = onRetryMedia),
+                )
+            }
+            mediaLoading || decoding -> Box(
+                Modifier
+                    .size(width = 220.dp, height = 160.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+            }
+            mediaBytes == null -> Box(
+                Modifier
+                    .size(width = 220.dp, height = 160.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
+                    .clickable(onClick = onOpenMedia),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "Tap to load secure photo",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            else -> Text(
+                "The secure photo is unavailable",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        if (msg.text.isNotBlank() && msg.text != "📷 Photo") {
+            Text(
+                msg.text,
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+    }
+}
+
+/**
+ * Pins an ownership-safe plaintext snapshot for a decoder and erases it on success, failure or
+ * cancellation. The cache may therefore evict/zero its own array without mutating in-flight input.
+ */
+internal suspend fun <T> withOwnedSecureMediaSnapshot(
+    cachedBytes: ByteArray,
+    block: suspend (ByteArray) -> T,
+): T {
+    val owned = cachedBytes.copyOf()
+    return try {
+        block(owned)
+    } finally {
+        owned.fill(0)
+    }
+}
+
+internal fun decodeBoundedSecureImage(bytes: ByteArray): androidx.compose.ui.graphics.ImageBitmap? =
+    try {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val width = bounds.outWidth
+        val height = bounds.outHeight
+        if (width <= 0 || height <= 0 || width > MAX_SOURCE_IMAGE_DIMENSION ||
+            height > MAX_SOURCE_IMAGE_DIMENSION
+        ) {
+            null
+        } else {
+            var sampleSize = 1
+            while (
+                width / sampleSize > MAX_RENDERED_IMAGE_DIMENSION ||
+                height / sampleSize > MAX_RENDERED_IMAGE_DIMENSION ||
+                (width.toLong() / sampleSize) * (height.toLong() / sampleSize) >
+                MAX_RENDERED_IMAGE_PIXELS
+            ) {
+                sampleSize = Math.multiplyExact(sampleSize, 2)
+            }
+            val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.asImageBitmap()
+        }
+    } catch (_: RuntimeException) {
+        // Malformed or unsupported decoder input is rendered through the existing retry/error UI.
+        null
+    }
+
+private const val MAX_SOURCE_IMAGE_DIMENSION = 32_768
+private const val MAX_RENDERED_IMAGE_DIMENSION = 4_096
+private const val MAX_RENDERED_IMAGE_PIXELS = 4_000_000L
+private val secureImageDecodeMutex = Mutex()
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun Composer(
@@ -559,6 +863,8 @@ private fun Composer(
     sending: Boolean,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
+    onAttach: () -> Unit = {},
+    mediaEnabled: Boolean = false,
 ) {
     Row(
         Modifier
@@ -589,6 +895,15 @@ private fun Composer(
                     ),
                     maxLines = 4,
                 )
+                if (mediaEnabled) {
+                    IconButton(onClick = onAttach, enabled = !sending) {
+                        Icon(
+                            Icons.Rounded.Photo,
+                            contentDescription = "Send an encrypted photo",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
             }
         }
         Spacer(Modifier.width(8.dp))

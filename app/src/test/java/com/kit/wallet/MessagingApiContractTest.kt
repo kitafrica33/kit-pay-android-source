@@ -174,7 +174,9 @@ class MessagingApiContractTest {
         assertEquals(4, sync.events?.first()?.data?.senderBundleVersion)
         assertEquals("c".repeat(64), sync.events?.first()?.data?.senderIdentityKeySha256)
         assertEquals(ROSTER_REVISION, sync.events?.first()?.data?.rosterRevision)
-        assertEquals(MESSAGE_ID, sync.events?.get(1)?.data?.lastReadMessageId)
+        assertEquals("delivered_to_peer", sync.events?.get(1)?.data?.deliveryState)
+        assertEquals(MESSAGE_ID, sync.events?.get(1)?.data?.messageId)
+        assertEquals(MESSAGE_ID, sync.events?.get(2)?.data?.lastReadMessageId)
         assertNull(sync.events?.last())
         assertEquals("delivered_to_device", acknowledgement.deliveryState)
         assertEquals(1, acknowledgement.acknowledgedCount)
@@ -378,6 +380,19 @@ class MessagingApiContractTest {
                 },
                 {
                   "id":"2",
+                  "type":"message.delivery.updated",
+                  "conversation_id":"$CONVERSATION_ID",
+                  "resource_type":"message_delivery",
+                  "resource_id":"$MESSAGE_ID",
+                  "data":{
+                    "message_id":"$MESSAGE_ID",
+                    "delivery_state":"delivered_to_peer",
+                    "delivered_at":"2026-07-19T20:01:00Z"
+                  },
+                  "occurred_at":"2026-07-19T20:01:00Z"
+                },
+                {
+                  "id":"3",
                   "type":"read_receipt.updated",
                   "conversation_id":"$CONVERSATION_ID",
                   "resource_type":"read_receipt",

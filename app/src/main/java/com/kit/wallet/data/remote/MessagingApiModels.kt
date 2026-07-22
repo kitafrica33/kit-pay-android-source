@@ -279,8 +279,37 @@ data class SendEncryptedMessageRequest(
         require(envelopes.map(EncryptedDeviceEnvelopeRequest::recipientDeviceId).distinct().size == envelopes.size) {
             "An encrypted message requires exactly one envelope per recipient device"
         }
-        require(attachments.isEmpty() && kind == ENCRYPTED_MESSAGE_KIND) {
-            "The v2 secure direct-message profile supports encrypted text only"
+        // Mirrors the server contract: encrypted text carries no attachment metadata, while an
+        // encrypted_attachment message must carry at least one row. Key material never appears
+        // here; it rides end-to-end inside the per-device envelopes.
+        require(kind == ENCRYPTED_MESSAGE_KIND || kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND) {
+            "Unsupported secure-message kind"
+        }
+        require((kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND) == attachments.isNotEmpty()) {
+            "Encrypted attachment metadata must accompany exactly the encrypted_attachment kind"
+        }
+        require(attachments.size <= MAX_SECURE_MESSAGE_ATTACHMENTS) {
+            "An encrypted message supports at most $MAX_SECURE_MESSAGE_ATTACHMENTS attachments"
+        }
+        require(attachments.map(EncryptedAttachmentRequest::id).distinct().size == attachments.size) {
+            "Encrypted attachment IDs must be unique"
+        }
+        require(
+            attachments.map(EncryptedAttachmentRequest::storageKey).distinct().size ==
+                attachments.size,
+        ) { "Encrypted attachment storage keys must be unique" }
+        attachments.forEach { attachment ->
+            requireCanonicalMessagingUuid(attachment.id, "encrypted-attachment ID")
+            require(attachment.storageKey.isNotBlank() && attachment.storageKey.length <= 512) {
+                "Invalid encrypted-attachment storage key"
+            }
+            require(attachment.mediaType.isNotBlank() && attachment.mediaType.length <= 160) {
+                "Invalid encrypted-attachment media type"
+            }
+            require(attachment.byteSize >= 1) { "Invalid encrypted-attachment byte size" }
+            require(SECURE_MESSAGE_ATTACHMENT_SHA256.matches(attachment.ciphertextSha256)) {
+                "Invalid encrypted-attachment ciphertext digest"
+            }
         }
     }
 }
@@ -376,6 +405,9 @@ data class MessagingSyncEventDataDto(
     @Json(name = "transition_hash") val transitionHash: String? = null,
     @Json(name = "last_read_message_id") val lastReadMessageId: String? = null,
     @Json(name = "read_at") val readAt: String? = null,
+    @Json(name = "message_id") val messageId: String? = null,
+    @Json(name = "delivery_state") val deliveryState: String? = null,
+    @Json(name = "delivered_at") val deliveredAt: String? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -440,12 +472,22 @@ data class MessagingReadReceiptDto(
     @Json(name = "read_at") val readAt: String? = null,
 )
 
+@JsonClass(generateAdapter = false)
+data class MessagingAttachmentUploadDto(
+    @Json(name = "storage_key") val storageKey: String? = null,
+    @Json(name = "byte_size") val byteSize: Long? = null,
+    @Json(name = "ciphertext_sha256") val ciphertextSha256: String? = null,
+)
+
 const val SECURE_MESSAGING_PROTOCOL_VERSION = "v2"
 const val DIRECT_CONVERSATION_TYPE = "direct"
 const val ENCRYPTED_MESSAGE_KIND = "encrypted"
 const val ENCRYPTED_ATTACHMENT_MESSAGE_KIND = "encrypted_attachment"
 const val MAX_DELIVERY_ACKNOWLEDGEMENT_BATCH = 100
 const val MAX_SECURE_MESSAGE_RECIPIENT_DEVICES = 99
+const val MAX_SECURE_MESSAGE_ATTACHMENTS = 20
+
+val SECURE_MESSAGE_ATTACHMENT_SHA256 = Regex("^[a-fA-F0-9]{64}$")
 
 val SECURE_MESSAGE_ENVELOPE_TYPES: Set<String> = setOf(
     "signal-prekey-v2",

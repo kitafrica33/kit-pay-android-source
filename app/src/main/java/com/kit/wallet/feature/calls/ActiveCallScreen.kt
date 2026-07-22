@@ -38,6 +38,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -118,6 +119,13 @@ fun ActiveCallScreen(
     LaunchedEffect(state.phase) {
         if (state.phase == CallPhase.ENDED) onEnd()
     }
+    // Ring and vibrate for the callee only while the verified call is still ringing. Accepting,
+    // declining, connecting or any error immediately flips this off and disposes the ringer.
+    val ringing = state.incoming && state.phase == CallPhase.INCOMING
+    DisposableEffect(ringing) {
+        val ringer = if (ringing) CallRinger(context).also { it.start() } else null
+        onDispose { ringer?.stop() }
+    }
     BackHandler { viewModel.end("cancelled") }
 
     ActiveCallContent(
@@ -194,7 +202,7 @@ private fun ActiveCallContent(
                 )
                 Spacer(Modifier.width(5.dp))
                 Text(
-                    "Secure WebRTC media",
+                    "Kit Pay secure media",
                     style = MaterialTheme.typography.labelSmall,
                     color = Color.White.copy(alpha = 0.7f),
                 )

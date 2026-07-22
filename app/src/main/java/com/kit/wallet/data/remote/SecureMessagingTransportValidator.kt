@@ -337,6 +337,34 @@ object SecureMessagingTransportValidator {
         )
     }
 
+    fun validateReadReceipt(
+        response: MessagingReadReceiptDto,
+        expectedConversationId: String,
+        expectedCurrentUserId: String,
+        requestedMessageId: String,
+    ): ValidatedMessagingReadReceipt {
+        requireUuid(expectedConversationId, "expected read-receipt conversation ID")
+        requireUuid(expectedCurrentUserId, "expected read-receipt user ID")
+        requireUuid(requestedMessageId, "requested last-read message ID")
+        requireTransport(
+            response.conversationId == expectedConversationId,
+            "read-receipt conversation changed",
+        )
+        requireTransport(response.userId == expectedCurrentUserId, "read-receipt user changed")
+        val canonicalMessageId = required(
+            response.lastReadMessageId,
+            "canonical last-read message ID",
+        )
+        requireUuid(canonicalMessageId, "canonical last-read message ID")
+        val readAt = requireTimestamp(response.readAt, "read-receipt time")
+        return ValidatedMessagingReadReceipt(
+            conversationId = expectedConversationId,
+            userId = expectedCurrentUserId,
+            lastReadMessageId = canonicalMessageId,
+            readAt = readAt,
+        )
+    }
+
     private fun validateSyncEvent(
         event: MessagingSyncEventDto,
         eventId: Long,
@@ -357,6 +385,18 @@ object SecureMessagingTransportValidator {
                 occurredAt,
                 currentUserId,
                 currentDeviceId,
+            )
+            MESSAGE_DELIVERY_UPDATED_EVENT -> validateDeliveryReceiptEvent(
+                event = event,
+                eventId = eventId,
+                conversationId = conversationId,
+                occurredAt = occurredAt,
+            )
+            READ_RECEIPT_UPDATED_EVENT -> validateReadReceiptEvent(
+                event = event,
+                eventId = eventId,
+                conversationId = conversationId,
+                occurredAt = occurredAt,
             )
             in DEVICE_LIFECYCLE_EVENT_TYPES -> {
                 val refresh = SecureMessagingWireValidator.validateDeviceLifecycleEvent(
@@ -392,6 +432,70 @@ object SecureMessagingTransportValidator {
             }
             else -> rejectTransport("messaging sync event type")
         }
+    }
+
+    private fun validateDeliveryReceiptEvent(
+        event: MessagingSyncEventDto,
+        eventId: Long,
+        conversationId: String,
+        occurredAt: Instant,
+    ): ValidatedMessagingSyncEvent.DeliveryReceipt {
+        requireTransport(
+            event.resourceType == MESSAGE_DELIVERY_RESOURCE,
+            "message-delivery event resource type",
+        )
+        val data = required(event.data, "message-delivery event data")
+        val messageId = required(data.messageId, "message-delivery message ID")
+        requireUuid(messageId, "message-delivery message ID")
+        requireTransport(event.resourceId == messageId, "message-delivery resource changed")
+        requireTransport(
+            data.deliveryState == PEER_DELIVERY_STATE,
+            "message-delivery state",
+        )
+        val deliveredAt = requireTimestamp(data.deliveredAt, "message-delivery time")
+        requireTransport(!occurredAt.isBefore(deliveredAt), "message-delivery event chronology")
+        return ValidatedMessagingSyncEvent.DeliveryReceipt(
+            eventId = eventId,
+            conversationId = conversationId,
+            occurredAt = occurredAt,
+            messageId = messageId,
+            deliveredAt = deliveredAt,
+        )
+    }
+
+    private fun validateReadReceiptEvent(
+        event: MessagingSyncEventDto,
+        eventId: Long,
+        conversationId: String,
+        occurredAt: Instant,
+    ): ValidatedMessagingSyncEvent.ReadReceipt {
+        requireTransport(
+            event.resourceType == READ_RECEIPT_RESOURCE,
+            "read-receipt event resource type",
+        )
+        val resourceId = required(event.resourceId, "read-receipt resource ID")
+        requireTransport(
+            resourceId.matches(Regex("^${Regex.escape(conversationId)}:[1-9][0-9]*$")),
+            "read-receipt resource ID",
+        )
+        val data = required(event.data, "read-receipt event data")
+        val userId = required(data.userId, "read-receipt user ID")
+        requireUuid(userId, "read-receipt user ID")
+        val lastReadMessageId = required(
+            data.lastReadMessageId,
+            "read-receipt last-read message ID",
+        )
+        requireUuid(lastReadMessageId, "read-receipt last-read message ID")
+        val readAt = requireTimestamp(data.readAt, "read-receipt time")
+        requireTransport(!occurredAt.isBefore(readAt), "read-receipt event chronology")
+        return ValidatedMessagingSyncEvent.ReadReceipt(
+            eventId = eventId,
+            conversationId = conversationId,
+            occurredAt = occurredAt,
+            userId = userId,
+            lastReadMessageId = lastReadMessageId,
+            readAt = readAt,
+        )
     }
 
     private fun validateMessageEvent(
@@ -467,11 +571,17 @@ object SecureMessagingTransportValidator {
             SECURE_MESSAGING_ROSTER_REVISION.matches(expectedRosterRevision),
             "outbound roster revision",
         )
-        requireTransport(message.kind == ENCRYPTED_MESSAGE_KIND, "outbound message kind")
-        message.replyToMessageId?.let { requireUuid(it, "outbound reply target") }
         requireTransport(
-            required(message.attachments, "outbound attachments").isEmpty(),
-            "outbound text message contains attachments",
+            message.kind == ENCRYPTED_MESSAGE_KIND || message.kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+            "outbound message kind",
+        )
+        message.replyToMessageId?.let { requireUuid(it, "outbound reply target") }
+        // Attachment metadata rows accompany exactly the encrypted_attachment kind; the media
+        // descriptor with its key material still travels only inside the per-device ciphertext.
+        requireTransport(
+            (message.kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND) ==
+                required(message.attachments, "outbound attachments").isNotEmpty(),
+            "outbound attachment metadata must match its kind",
         )
         requireTransport(
             required(message.reactions, "outbound reactions").isEmpty(),
@@ -562,8 +672,13 @@ object SecureMessagingTransportValidator {
     private const val DIRECT_MEMBER_COUNT = 2
     private const val DELIVERY_STATE = "delivered_to_device"
     private const val MESSAGE_CREATED_EVENT = "message.created"
+    private const val MESSAGE_DELIVERY_UPDATED_EVENT = "message.delivery.updated"
+    private const val READ_RECEIPT_UPDATED_EVENT = "read_receipt.updated"
     private const val CONVERSATION_CREATED_EVENT = "conversation.created"
     private const val MESSAGE_RESOURCE = "message"
+    private const val MESSAGE_DELIVERY_RESOURCE = "message_delivery"
+    private const val READ_RECEIPT_RESOURCE = "read_receipt"
+    private const val PEER_DELIVERY_STATE = "delivered_to_peer"
     private const val CONVERSATION_RESOURCE = "conversation"
     private const val CONVERSATION_MEMBER_RESOURCE = "conversation_member"
 
@@ -589,6 +704,8 @@ object SecureMessagingTransportValidator {
     )
     private val SYNC_EVENT_TYPES = setOf(
         MESSAGE_CREATED_EVENT,
+        MESSAGE_DELIVERY_UPDATED_EVENT,
+        READ_RECEIPT_UPDATED_EVENT,
         CONVERSATION_CREATED_EVENT,
     ) + MEMBERSHIP_EVENT_TYPES + DEVICE_LIFECYCLE_EVENT_TYPES
 }
@@ -636,6 +753,23 @@ sealed interface ValidatedMessagingSyncEvent {
         val message: ValidatedOutboundEncryptedMessage,
     ) : ValidatedMessagingSyncEvent
 
+    data class DeliveryReceipt(
+        override val eventId: Long,
+        override val conversationId: String,
+        override val occurredAt: Instant,
+        val messageId: String,
+        val deliveredAt: Instant,
+    ) : ValidatedMessagingSyncEvent
+
+    data class ReadReceipt(
+        override val eventId: Long,
+        override val conversationId: String,
+        override val occurredAt: Instant,
+        val userId: String,
+        val lastReadMessageId: String,
+        val readAt: Instant,
+    ) : ValidatedMessagingSyncEvent
+
     data class RosterRefresh(
         override val eventId: Long,
         override val conversationId: String,
@@ -670,4 +804,11 @@ data class ValidatedMessageDeliveryAcknowledgement(
     val deviceId: String,
     val newlyAcknowledgedCount: Int,
     val items: List<ValidatedMessageDeliveryReceipt>,
+)
+
+data class ValidatedMessagingReadReceipt(
+    val conversationId: String,
+    val userId: String,
+    val lastReadMessageId: String,
+    val readAt: Instant,
 )

@@ -1,7 +1,9 @@
 package com.kit.wallet.feature.contacts
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.provider.ContactsContract
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -22,6 +24,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Call
+import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material.icons.rounded.Videocam
@@ -134,6 +138,19 @@ fun ContactsScreen(
             ).nextStage
         }
     }
+    // Opens the system contact editor: edits the existing entry, or pre-fills a new one with the
+    // number (and the registered name) when the person is not yet in the device address book.
+    val onManageContact: (Contact) -> Unit = { contact ->
+        val intent = Intent(Intent.ACTION_INSERT_OR_EDIT)
+            .setType(ContactsContract.Contacts.CONTENT_ITEM_TYPE)
+            .putExtra(ContactsContract.Intents.Insert.PHONE, contact.phone)
+        if (!contact.savedInDevice) {
+            contact.registeredName?.takeIf(String::isNotBlank)?.let { registered ->
+                intent.putExtra(ContactsContract.Intents.Insert.NAME, registered)
+            }
+        }
+        runCatching { context.startActivity(intent) }
+    }
     ContactsContent(
         allContacts = contacts,
         syncing = syncing,
@@ -145,6 +162,7 @@ fun ContactsScreen(
         onVoiceCall = onVoiceCall,
         onVideoCall = onVideoCall,
         onSync = requestSync,
+        onManageContact = onManageContact,
     )
 }
 
@@ -220,6 +238,7 @@ private fun ContactsContent(
     onVoiceCall: (String) -> Unit,
     onVideoCall: (String) -> Unit,
     onSync: () -> Unit,
+    onManageContact: (Contact) -> Unit,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     val contacts = allContacts
@@ -307,7 +326,7 @@ private fun ContactsContent(
                     Column(Modifier.weight(1f)) {
                         Text(c.name, style = MaterialTheme.typography.titleSmall)
                         Text(
-                            if (c.isKitUser) c.status else c.phone,
+                            contactSubtitle(c),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -317,24 +336,38 @@ private fun ContactsContent(
                             modifier = Modifier.size(22.dp),
                             strokeWidth = 2.dp,
                         )
-                    } else if (!c.isKitUser) {
-                        Text(
-                            "Invite",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.secondary,
-                        )
-                    } else if (purpose == ContactPickerPurpose.CALL) {
-                        IconButton(onClick = { onVoiceCall(c.id) }) {
-                            Icon(
-                                Icons.Rounded.Call,
-                                contentDescription = "Voice call ${c.name}",
+                    } else {
+                        if (!c.isKitUser) {
+                            Text(
+                                "Invite",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.secondary,
                             )
+                        } else if (purpose == ContactPickerPurpose.CALL) {
+                            IconButton(onClick = { onVoiceCall(c.id) }) {
+                                Icon(
+                                    Icons.Rounded.Call,
+                                    contentDescription = "Voice call ${c.name}",
+                                )
+                            }
+                            IconButton(onClick = { onVideoCall(c.id) }) {
+                                Icon(
+                                    Icons.Rounded.Videocam,
+                                    contentDescription = "Video call ${c.name}",
+                                )
+                            }
                         }
-                        IconButton(onClick = { onVideoCall(c.id) }) {
-                            Icon(
-                                Icons.Rounded.Videocam,
-                                contentDescription = "Video call ${c.name}",
-                            )
+                        if (purpose == ContactPickerPurpose.CHAT) {
+                            IconButton(onClick = { onManageContact(c) }) {
+                                Icon(
+                                    if (c.savedInDevice) Icons.Rounded.Edit else Icons.Rounded.PersonAdd,
+                                    contentDescription = if (c.savedInDevice) {
+                                        "Edit ${c.name} in contacts"
+                                    } else {
+                                        "Save ${c.name} to contacts"
+                                    },
+                                )
+                            }
                         }
                     }
                 }
@@ -371,6 +404,18 @@ private fun ActionRow(icon: ImageVector, label: String, onClick: () -> Unit) {
     }
 }
 
+/** WhatsApp-style secondary line: the registered name (as "~ name") when the row shows a saved
+ *  device name that differs, otherwise the Kit Pay status for members or the raw number. */
+private fun contactSubtitle(contact: Contact): String {
+    val registered = contact.registeredName
+    return when {
+        contact.savedInDevice && !registered.isNullOrBlank() &&
+            !registered.equals(contact.name, ignoreCase = true) -> "~ $registered"
+        contact.isKitUser -> contact.status
+        else -> contact.phone
+    }
+}
+
 @Preview(showBackground = true)
 @Composable
 private fun ContactsPreview() {
@@ -386,6 +431,7 @@ private fun ContactsPreview() {
             onVoiceCall = {},
             onVideoCall = {},
             onSync = {},
+            onManageContact = {},
         )
     }
 }

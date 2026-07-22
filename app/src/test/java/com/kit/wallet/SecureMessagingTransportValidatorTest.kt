@@ -11,6 +11,7 @@ import com.kit.wallet.data.remote.MessageDeliveryReceiptDto
 import com.kit.wallet.data.remote.MessagingConversationDto
 import com.kit.wallet.data.remote.MessagingConversationListDto
 import com.kit.wallet.data.remote.MessagingConversationMemberDto
+import com.kit.wallet.data.remote.MessagingReadReceiptDto
 import com.kit.wallet.data.remote.MessagingSyncDto
 import com.kit.wallet.data.remote.MessagingSyncEventDataDto
 import com.kit.wallet.data.remote.MessagingSyncEventDto
@@ -174,9 +175,38 @@ class SecureMessagingTransportValidatorTest {
     }
 
     @Test
-    fun `sync rejects read receipt and reaction events from the v2 text only profile`() {
+    fun `sync strictly validates delivery and read receipt events`() {
+        val validated = SecureMessagingTransportValidator.validateSyncPage(
+            response = MessagingSyncDto(
+                events = listOf(
+                    deliveryReceiptEvent(id = "12"),
+                    readReceiptEvent(id = "13"),
+                ),
+                page = CursorPageDto(nextCursor = "receipt_cursor", hasMore = false, limit = 2),
+            ),
+            currentUserId = CURRENT_USER_ID,
+            currentDeviceId = CURRENT_DEVICE_ID,
+            requestedCursor = "old_cursor",
+            requestedLimit = 2,
+            previousEventId = 11,
+        )
+
+        val delivery = validated.events[0] as ValidatedMessagingSyncEvent.DeliveryReceipt
+        assertEquals(MESSAGE_ID, delivery.messageId)
+        val read = validated.events[1] as ValidatedMessagingSyncEvent.ReadReceipt
+        assertEquals(OTHER_USER_ID, read.userId)
+        assertEquals(MESSAGE_ID, read.lastReadMessageId)
+
         listOf(
-            readReceiptEvent(id = "12"),
+            deliveryReceiptEvent("12").copy(resourceType = "message"),
+            deliveryReceiptEvent("12").copy(resourceId = OTHER_MESSAGE_ID),
+            deliveryReceiptEvent("12").copy(
+                data = deliveryReceiptEvent("12").data?.copy(deliveryState = "delivered_to_device"),
+            ),
+            deliveryReceiptEvent("12").copy(occurredAt = SENT_AT),
+            readReceiptEvent("12").copy(resourceId = OTHER_USER_ID),
+            readReceiptEvent("12").copy(data = readReceiptEvent("12").data?.copy(userId = "bad")),
+            readReceiptEvent("12").copy(occurredAt = SENT_AT),
             readReceiptEvent(id = "12").copy(type = "reaction.changed"),
         ).forEach { unsupported ->
             assertRejected {
@@ -364,6 +394,41 @@ class SecureMessagingTransportValidatorTest {
         }
     }
 
+    @Test
+    fun `read receipt validates canonical server marker without requiring request equality`() {
+        val response = MessagingReadReceiptDto(
+            conversationId = CONVERSATION_ID,
+            userId = CURRENT_USER_ID,
+            lastReadMessageId = OTHER_MESSAGE_ID,
+            readAt = READ_AT,
+        )
+
+        val validated = SecureMessagingTransportValidator.validateReadReceipt(
+            response = response,
+            expectedConversationId = CONVERSATION_ID,
+            expectedCurrentUserId = CURRENT_USER_ID,
+            requestedMessageId = MESSAGE_ID,
+        )
+        assertEquals(OTHER_MESSAGE_ID, validated.lastReadMessageId)
+
+        listOf(
+            response.copy(conversationId = GROUP_ID),
+            response.copy(userId = OTHER_USER_ID),
+            response.copy(lastReadMessageId = "not-a-message-id"),
+            response.copy(lastReadMessageId = null),
+            response.copy(readAt = null),
+        ).forEach { malformed ->
+            assertRejected {
+                SecureMessagingTransportValidator.validateReadReceipt(
+                    response = malformed,
+                    expectedConversationId = CONVERSATION_ID,
+                    expectedCurrentUserId = CURRENT_USER_ID,
+                    requestedMessageId = MESSAGE_ID,
+                )
+            }
+        }
+    }
+
     private fun device(id: String, isCurrent: Boolean) = DeviceDto(
         id = id,
         name = "Android phone",
@@ -448,6 +513,20 @@ class SecureMessagingTransportValidatorTest {
             userId = OTHER_USER_ID,
             lastReadMessageId = MESSAGE_ID,
             readAt = READ_AT,
+        ),
+        occurredAt = READ_AT,
+    )
+
+    private fun deliveryReceiptEvent(id: String) = MessagingSyncEventDto(
+        id = id,
+        type = "message.delivery.updated",
+        conversationId = CONVERSATION_ID,
+        resourceType = "message_delivery",
+        resourceId = MESSAGE_ID,
+        data = MessagingSyncEventDataDto(
+            messageId = MESSAGE_ID,
+            deliveryState = "delivered_to_peer",
+            deliveredAt = READ_AT,
         ),
         occurredAt = READ_AT,
     )

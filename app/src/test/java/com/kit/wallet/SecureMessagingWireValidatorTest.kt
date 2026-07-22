@@ -2,7 +2,10 @@ package com.kit.wallet
 
 import com.kit.wallet.data.remote.ConsumedMessagingKeyBundleDto
 import com.kit.wallet.data.remote.ConsumedMessagingKeyBundlesDto
+import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
+import com.kit.wallet.data.remote.EncryptedAttachmentDto
+import com.kit.wallet.data.remote.EncryptedAttachmentRequest
 import com.kit.wallet.data.remote.EncryptedMessageDto
 import com.kit.wallet.data.remote.EncryptedMessageEnvelopeDto
 import com.kit.wallet.data.remote.EncryptedMessageSenderDto
@@ -286,6 +289,49 @@ class SecureMessagingWireValidatorTest {
         assertEquals("signal-prekey-v2", validated.envelopeType)
         assertEquals("c".repeat(64), validated.senderIdentityKeySha256)
         assertArrayEquals(CIPHERTEXT, validated.ciphertextBytes())
+    }
+
+    @Test
+    fun `incoming attachment metadata is validated and preserved for plaintext binding`() {
+        val attachment = EncryptedAttachmentDto(
+            id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            storageKey = "0f0e0d0c-0b0a-4a0b-8c0d-0e0f10111213",
+            mediaType = "image/jpeg",
+            byteSize = 4_096,
+            ciphertextSha256 = "ab".repeat(32),
+        )
+        val message = incomingMessage().copy(
+            kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+            attachments = listOf(attachment),
+        )
+
+        val validated = SecureMessagingWireValidator.validateIncomingEncryptedMessage(
+            message,
+            CONVERSATION_ID,
+            CURRENT_DEVICE_ID,
+        )
+
+        assertEquals(
+            listOf(
+                EncryptedAttachmentRequest(
+                    id = checkNotNull(attachment.id),
+                    storageKey = checkNotNull(attachment.storageKey),
+                    mediaType = checkNotNull(attachment.mediaType),
+                    byteSize = checkNotNull(attachment.byteSize),
+                    ciphertextSha256 = checkNotNull(attachment.ciphertextSha256),
+                ),
+            ),
+            validated.attachments(),
+        )
+        assertRejected {
+            SecureMessagingWireValidator.validateIncomingEncryptedMessage(
+                message.copy(
+                    attachments = listOf(attachment.copy(storageKey = "not-a-storage-key")),
+                ),
+                CONVERSATION_ID,
+                CURRENT_DEVICE_ID,
+            )
+        }
     }
 
     @Test

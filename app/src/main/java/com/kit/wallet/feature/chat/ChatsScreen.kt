@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AddComment
+import androidx.compose.material.icons.rounded.Done
 import androidx.compose.material.icons.rounded.DoneAll
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.NotificationsOff
@@ -198,20 +199,24 @@ private fun ChatRow(chat: ChatPreview, onClick: () -> Unit) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (chat.lastFromMe) {
                     Icon(
-                        if (chat.lastState == DeliveryState.RETRY_REQUIRED) {
-                            Icons.Rounded.ErrorOutline
-                        } else {
-                            Icons.Rounded.DoneAll
+                        when (chat.lastState) {
+                            DeliveryState.SENT -> Icons.Rounded.Done
+                            DeliveryState.RETRY_REQUIRED,
+                            DeliveryState.FAILED,
+                            -> Icons.Rounded.ErrorOutline
+                            else -> Icons.Rounded.DoneAll
                         },
-                        contentDescription = if (
-                            chat.lastState == DeliveryState.RETRY_REQUIRED
-                        ) "Not sent; retry required" else null,
+                        // The preview text immediately below announces this same delivery state.
+                        contentDescription = null,
                         modifier = Modifier
                             .size(15.dp)
                             .padding(end = 2.dp),
                         tint = when (chat.lastState) {
                             DeliveryState.READ -> KitTheme.colors.success
-                            DeliveryState.RETRY_REQUIRED -> MaterialTheme.colorScheme.error
+                            DeliveryState.RETRY_REQUIRED,
+                            DeliveryState.FAILED,
+                            -> MaterialTheme.colorScheme.error
+                            DeliveryState.DELIVERED -> MaterialTheme.colorScheme.onSurfaceVariant
                             else -> MaterialTheme.colorScheme.outline
                         },
                     )
@@ -221,6 +226,10 @@ private fun ChatRow(chat: ChatPreview, onClick: () -> Unit) {
                         chat.typing -> "typing…"
                         chat.lastState == DeliveryState.RETRY_REQUIRED ->
                             "Not sent · ${chat.lastMessage}"
+                        chat.lastState == DeliveryState.FAILED ->
+                            "Photo expired · Send again"
+                        chat.lastFromMe ->
+                            "${outgoingDeliveryLabel(chat.lastState)} · ${chat.lastMessage}"
                         else -> chat.lastMessage
                     },
                     style = MaterialTheme.typography.bodyMedium,

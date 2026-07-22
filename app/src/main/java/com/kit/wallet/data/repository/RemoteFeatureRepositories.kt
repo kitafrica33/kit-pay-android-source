@@ -71,8 +71,9 @@ class RemoteContactRepository @Inject constructor(
     }
 
     override suspend fun refresh() {
+        val deviceNames = deviceContactNames()
         mutableContacts.value = apiCalls.execute { api.contacts() }.items.orEmpty()
-            .map { it.toUiModel() }
+            .map { it.toUiModel(deviceNames) }
     }
 
     override suspend fun syncDeviceContacts() {
@@ -108,20 +109,66 @@ class RemoteContactRepository @Inject constructor(
                 }
             }
         }
+        val deviceNames = localContacts.associate { contactNumberKey(it.phone) to it.name }
         mutableContacts.value = apiCalls.execute {
             api.syncContacts(ContactSyncRequest(localContacts))
-        }.items.orEmpty().map { it.toUiModel() }
+        }.items.orEmpty().map { it.toUiModel(deviceNames) }
     }
 
-    private fun ContactDto.toUiModel() = Contact(
-        id = id,
-        name = name,
-        phone = phone,
-        receivingWalletId = receivingWalletId,
-        isKitUser = isKitUser == true,
-        favorite = favorite == true,
-        status = status ?: if (isKitUser == true) "On Kit Pay" else "",
-    )
+    /**
+     * Best-effort address-book display names keyed by normalized phone number. Returns an empty map
+     * when Contacts access has not been granted, so registered names remain the fallback.
+     */
+    private fun deviceContactNames(): Map<String, String> {
+        if (
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return emptyMap()
+        }
+        val projection = arrayOf(
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
+            ContactsContract.CommonDataKinds.Phone.NUMBER,
+        )
+        return buildMap {
+            runCatching {
+                context.contentResolver.query(
+                    ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                    projection,
+                    null,
+                    null,
+                    null,
+                )?.use { cursor ->
+                    val nameIndex = cursor.getColumnIndexOrThrow(projection[0])
+                    val numberIndex = cursor.getColumnIndexOrThrow(projection[1])
+                    while (cursor.moveToNext() && size < MAX_CONTACTS) {
+                        val name = cursor.getString(nameIndex)?.trim().orEmpty()
+                        val key = contactNumberKey(cursor.getString(numberIndex).orEmpty())
+                        if (name.isNotEmpty() && key.isNotEmpty()) putIfAbsent(key, name)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun ContactDto.toUiModel(deviceNames: Map<String, String>): Contact {
+        val registeredName = name
+        val localName = deviceNames[contactNumberKey(phone)]?.takeIf(String::isNotBlank)
+        return Contact(
+            id = id,
+            name = localName ?: registeredName,
+            phone = phone,
+            receivingWalletId = receivingWalletId,
+            isKitUser = isKitUser == true,
+            favorite = favorite == true,
+            status = status ?: if (isKitUser == true) "On Kit Pay" else "",
+            registeredName = registeredName,
+            savedInDevice = localName != null,
+        )
+    }
+
+    /** Matches address-book and server numbers by their trailing national digits (e.g. +256/0 forms). */
+    private fun contactNumberKey(raw: String): String = raw.filter(Char::isDigit).takeLast(9)
 
     private companion object {
         const val MAX_CONTACTS = 1_000

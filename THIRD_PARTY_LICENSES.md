@@ -1,32 +1,40 @@
 # Android runtime third-party licences
 
-Audit snapshot: 2026-07-21  
+Audit snapshot: 2026-07-22  
 Application ID: `com.kit.wallet`  
-Version name: `0.2.0`  
-Version code: `12`  
+Version name: `0.2.1`  
+Version code: `13`  
 Distribution clearance: `true`  
 Distribution review disposition: `CLEARED`  
 Distribution review record type: `INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL`  
-Distribution review recorded date: `2026-07-21`  
-Distribution review date: `2026-07-21`  
-Distribution review reference: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-002`  
+Distribution review recorded date: `2026-07-22`  
+Distribution review date: `2026-07-22`  
+Distribution review reference: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-003`  
 Distribution review issue IDs: `GOOGLE_ANDROID_SDK_AGPL_COMPATIBILITY`  
-Distribution reviewer name: `Namisi Arnold Paul`  
+Distribution reviewer name: `Kit Pos Uganda Limited Software Engineering`  
 Distribution reviewer organization: `Kit Pos Uganda Limited`  
-Distribution reviewer qualification: `Chief Executive Officer (CEO) and Product Owner`  
+Distribution reviewer qualification: `Operational release authority under the 2026-07-22 internal release approval policy`  
 Distribution reviewer jurisdiction: `Uganda`  
+Management authority record type: `STANDING_INTERNAL_RELEASE_APPROVAL_POLICY`  
+Management authority document: `docs/internal-release-approval-policy-2026-07-22.md`  
+Management authority document SHA-256: `40932f05f91c6c9d916ab3a10171d3ebf23a01a259d209563680613fca6e450a`  
+Management authority effective date: `2026-07-22`  
+Standing-policy approver: `Namisi Arnold Paul`  
+Standing-policy approver title: `Chief Executive Officer`  
+Standing-policy organization: `Kit Pos Uganda Limited`  
+Standing-policy signature: `namisiaroldpaul`  
 Applicable terms title: `Android Software Development Kit License Agreement`  
 Applicable terms version: `Effective 2026-04-28`  
 Applicable terms effective date: `2026-04-28`  
 Applicable terms retrieval date: `2026-07-20`  
 Applicable terms URL: `https://developer.android.com/studio/terms`  
 Applicable terms SHA-256: `8bd88dc1144a7d12818687d680d6a9f9e8a2f1ee62c43a8e21f5c6a75f6977cd`  
-Decision document: `docs/google-fcm-agpl-clearance-decision-code12.md`  
-Decision document SHA-256: `699c8cc8671235bf2de907c8b0d2f679ffd25c1c9a0d51fa970ddaec80963b18`  
+Decision document: `docs/google-fcm-agpl-clearance-decision-code13.md`  
+Decision document SHA-256: `94fb6ea6d9bf5fe46ae1b44f4c92e8ebe688f714554d96617abd279f6ef17d3e`  
 Reviewed runtime inventory SHA-256: `4f63a48022e82f037a9c3e8de80d847f2a54b5948ce6f51be8a8863bd83ca330`  
 Reviewed runtime graph manifest SHA-256: `1602aeac63688c2dd85062b6b951aa58e7df1715b7da125b1f487efcf385a5a9`  
-Distribution conditions recorded: `6`  
-Re-review triggers recorded: `6`  
+Distribution conditions recorded: `8`  
+Re-review triggers recorded: `7`  
 Unresolved issue IDs: `none`
 
 This is the release-runtime licence inventory, not legal advice or a publication approval. It records dependency metadata and verified upstream evidence for the exact resolved build. A licence label in this table does not cure incompatible terms or missing redistribution permission.
@@ -50,13 +58,13 @@ The separate desugaring input is GPL-2.0 with the Classpath/assembly exceptions.
 ## Distribution clearance and continuing conditions
 
 The internal distribution clearance decision
-`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-002` records `CLEARED` for the
-exact reviewed runtime. It is signed by Namisi Arnold Paul for Kit Pos Uganda Limited
-in the stated capacity of Chief Executive Officer (CEO) and Product Owner. The record
-is classified as an internal distribution clearance approval; it is not described as
-an external-counsel opinion.
+`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-003` records `CLEARED` for the
+exact reviewed runtime. Kit Pos Uganda Limited Software Engineering recorded the
+candidate determination under the signed 2026-07-22 management policy. The record is
+classified as an internal distribution clearance approval; it is not described as an
+external-counsel opinion or a separate candidate signature by executive management.
 
-Based on the reviewed architecture and dependency usage, the distribution is approved. The Google client libraries are treated as independent third-party components distributed under their applicable Google terms, while Kit Pay source obligations remain governed by the applicable AGPL requirements. No additional Signal permission is required for the reviewed libsignal usage.
+Under the approved Kit Pos Uganda Limited internal release policy, engineering verified that code 13 changes application behavior without adding or removing runtime dependencies, changing reviewed third-party licences, changing the FCM adapter boundary, changing the libsignal version or licence, or changing the AGPL corresponding-source distribution model. Distribution is approved under the candidate-specific conditions and re-review triggers.
 
 The recorded distribution conditions are:
 
@@ -66,6 +74,8 @@ The recorded distribution conditions are:
 4. Required third-party notices must remain included.
 5. The final release AAB dependency inventory must match the reviewed inventory.
 6. Any application-architecture change affecting third-party linking boundaries requires review.
+7. Encrypted attachment sends must remain gated to compatible code-13-or-later roster devices.
+8. Direct sideload publication requires exact-APK signing and physical-device installation and launch evidence.
 
 The recorded re-review triggers are:
 
@@ -75,6 +85,7 @@ The recorded re-review triggers are:
 4. Changes to libsignal licensing.
 5. Changes to the distribution model.
 6. Introduction of additional proprietary SDKs.
+7. Material architecture changes affecting licensing or distribution.
 
 The release gates compare the resolved six Google/Firebase AARs and POMs byte-for-byte
 with the reviewed hashes, bind the complete 188-component runtime inventory, preserve
@@ -86,7 +97,7 @@ invalidates this clearance until a replacement decision is recorded.
 ### Resolved JAIN-free LiveKit evidence
 
 Kit Pay consumes only the checked-in `africa.kit.livekit:livekit-android:2.27.0-kitpay.1`
-publication. The fork commit is `0387bfe237332e049dfdeba55f44c905628c5e3e`,
+publication. The fork commit is `fe82899113a2f6468be4cb8b0e757052cb539903`,
 based on upstream LiveKit Android 2.27.0 commit
 `5011da6fc302fefcdc869faecae2e07055f1c8c5`. It removes
 `javax.sip:android-jain-sip-ri` and replaces the used SDP surface with an internal,
@@ -98,7 +109,7 @@ deterministic full source archive are retained under `third_party/livekit/`.
 `PROVENANCE.json` pins all primary bytes and source commits. The checked-in verifier
 rejects altered hashes, unsafe archives, an old/remote coordinate, `mavenLocal()`, or
 JAIN-SIP metadata/classes. The fork source archive SHA-256 is
-`9f497ee396db5d1d18c1753155bc055beb35b3818e13b3b36c9829084c0e96e6`.
+`8cae9d2cfa17d1c0b4687c160118b1781f511e09fe653fda18812a1c8518011b`.
 
 ### Resolved WebRTC evidence
 

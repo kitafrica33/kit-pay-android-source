@@ -38,6 +38,7 @@ import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.MessageDeliveryAcknowledgementDto
 import com.kit.wallet.data.remote.MessageDeliveryReceiptDto
 import com.kit.wallet.data.remote.MessagingKeyTransparencyDto
+import com.kit.wallet.data.remote.MessagingReadReceiptDto
 import com.kit.wallet.data.remote.MessagingOneTimePrekeyDto
 import com.kit.wallet.data.remote.MessagingPqPrekeyDto
 import com.kit.wallet.data.remote.MessagingDeviceRosterDto
@@ -130,6 +131,92 @@ class RemoteSecureMessagingTransportTest {
 
         assertTrue(failure is IllegalStateException)
         assertEquals(3, server.requestCount)
+    }
+
+    @Test
+    fun `read receipt accepts a different canonical marker from monotonic server state`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation()
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        finishActivation(lifecycle, fence)
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        val conversation = session.directConversations().first()
+        assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
+        val response = MessagingReadReceiptDto(
+            conversationId = CONVERSATION_ID,
+            userId = CURRENT_USER_ID,
+            lastReadMessageId = CANONICAL_READ_MESSAGE_ID,
+            readAt = TIMESTAMP,
+        )
+        val encoded = moshi.adapter(MessagingReadReceiptDto::class.java).toJson(response)
+        server.enqueue(jsonResponse("""{"ok":true,"data":$encoded}"""))
+
+        val receipt = session.markConversationRead(conversation, INCOMING_MESSAGE_ID)
+
+        val request = server.takeRequest()
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/conversations/$CONVERSATION_ID/read-receipts",
+            request.path,
+        )
+        assertEquals("{\"message_id\":\"$INCOMING_MESSAGE_ID\"}", request.body.readUtf8())
+        assertEquals(CANONICAL_READ_MESSAGE_ID, receipt.lastReadMessageId)
+    }
+
+    @Test
+    fun `chunked attachment download stops at the authenticated byte bound`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation()
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        finishActivation(lifecycle, fence)
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/octet-stream")
+                .setChunkedBody("12345", 1),
+        )
+
+        val failure = runCatching {
+            session.downloadAttachment("0f0e0d0c-0b0a-4a0b-8c0d-0e0f10111213", 4)
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalStateException)
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/attachments/0f0e0d0c-0b0a-4a0b-8c0d-0e0f10111213",
+            server.takeRequest().path,
+        )
+    }
+
+    @Test
+    fun `attachment bytes are discarded when the session changes during streaming`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation()
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        finishActivation(lifecycle, fence)
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/octet-stream")
+                .setBody("1234")
+                .throttleBody(1, 100, TimeUnit.MILLISECONDS),
+        )
+
+        val pending = async(Dispatchers.IO) {
+            runCatching {
+                session.downloadAttachment(
+                    "0f0e0d0c-0b0a-4a0b-8c0d-0e0f10111213",
+                    4,
+                )
+            }.exceptionOrNull()
+        }
+        val request = withContext(Dispatchers.IO) { server.takeRequest(2, TimeUnit.SECONDS) }
+        checkNotNull(request)
+        lifecycle.beginErasure()
+        lifecycle.finishErasure()
+
+        assertTrue(pending.await() is IllegalStateException)
     }
 
     @Test
@@ -319,7 +406,9 @@ class RemoteSecureMessagingTransportTest {
         )
         val before = server.requestCount
 
-        val failure = runCatching { session.send(conversations.last(), encryptedSend) }.exceptionOrNull()
+        val failure = runCatching {
+            session.send(conversations.last(), encryptedSend, emptyList())
+        }.exceptionOrNull()
 
         assertTrue(failure is IllegalStateException)
         assertEquals(before, server.requestCount)
@@ -361,7 +450,7 @@ class RemoteSecureMessagingTransportTest {
         val before = server.requestCount
 
         val failure = runCatching {
-            replacement.send(replacementConversation, staleSend)
+            replacement.send(replacementConversation, staleSend, emptyList())
         }.exceptionOrNull()
 
         assertTrue(failure is IllegalStateException)
@@ -547,6 +636,8 @@ class RemoteSecureMessagingTransportTest {
             senderDeviceId = incoming.senderDeviceId,
             sentAt = incoming.sentAt,
             replyToMessageId = incoming.replyToMessageId,
+            kind = incoming.kind,
+            attachments = incoming.attachments,
         )
         assertTrue(runCatching { session.decryptionRequest(forged, roster, plan) }.isFailure)
 
@@ -692,7 +783,7 @@ class RemoteSecureMessagingTransportTest {
         assertEquals(Base64.getEncoder().encodeToString(ciphertext), retriedRequest.envelopes.single().ciphertext)
         enqueueOutboundReceipt(rosterDto, retriedRequest.clientMessageId)
 
-        val receipt = session.send(conversation, retried)
+        val receipt = session.send(conversation, retried, emptyList())
         val sentRequest = server.takeRequest()
         assertTrue(sentRequest.body.readUtf8().contains(Base64.getEncoder().encodeToString(ciphertext)))
         restartedProjection.markOutboundSent(persistedOutbound, receipt)
@@ -1114,6 +1205,7 @@ class RemoteSecureMessagingTransportTest {
         const val OUTSIDER_DEVICE_ID = "99999999-9999-4999-8999-999999999999"
         const val INCOMING_MESSAGE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         const val OUTBOUND_MESSAGE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        const val CANONICAL_READ_MESSAGE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         const val TIMESTAMP = "2026-07-20T08:00:00Z"
         val BINDING = SecureMessagingSessionBinding(
             sessionEpoch = "epoch-1",

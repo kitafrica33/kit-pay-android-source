@@ -1,25 +1,35 @@
 {
   "schema_version": 3,
   "application_id": "com.kit.wallet",
-  "version_name": "0.2.0",
-  "version_code": 12,
-  "audit_date": "2026-07-21",
+  "version_name": "0.2.1",
+  "version_code": 13,
+  "audit_date": "2026-07-22",
   "distribution_clearance": true,
   "unresolved_issue_ids": [],
   "distribution_review": {
     "disposition": "CLEARED",
     "record_type": "INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL",
-    "recorded_date": "2026-07-21",
-    "review_date": "2026-07-21",
-    "reference": "KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0721-002",
+    "recorded_date": "2026-07-22",
+    "review_date": "2026-07-22",
+    "reference": "KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-003",
     "issue_ids": [
       "GOOGLE_ANDROID_SDK_AGPL_COMPATIBILITY"
     ],
     "reviewer": {
-      "name": "Namisi Arnold Paul",
+      "name": "Kit Pos Uganda Limited Software Engineering",
       "organization": "Kit Pos Uganda Limited",
-      "qualification": "Chief Executive Officer (CEO) and Product Owner",
+      "qualification": "Operational release authority under the 2026-07-22 internal release approval policy",
       "jurisdiction": "Uganda"
+    },
+    "management_authority": {
+      "record_type": "STANDING_INTERNAL_RELEASE_APPROVAL_POLICY",
+      "document": "docs/internal-release-approval-policy-2026-07-22.md",
+      "document_sha256": "40932f05f91c6c9d916ab3a10171d3ebf23a01a259d209563680613fca6e450a",
+      "effective_date": "2026-07-22",
+      "approver_name": "Namisi Arnold Paul",
+      "approver_title": "Chief Executive Officer",
+      "organization": "Kit Pos Uganda Limited",
+      "signature": "namisiaroldpaul"
     },
     "applicable_terms": {
       "title": "Android Software Development Kit License Agreement",
@@ -35,7 +45,9 @@
       "Any libsignal version or licence change requires re-review.",
       "Required third-party notices must remain included.",
       "The final release AAB dependency inventory must match the reviewed inventory.",
-      "Any application-architecture change affecting third-party linking boundaries requires review."
+      "Any application-architecture change affecting third-party linking boundaries requires review.",
+      "Encrypted attachment sends must remain gated to compatible code-13-or-later roster devices.",
+      "Direct sideload publication requires exact-APK signing and physical-device installation and launch evidence."
     ],
     "re_review_triggers": [
       "Dependency version changes.",
@@ -43,11 +55,12 @@
       "Migration away from the reviewed FCM architecture.",
       "Changes to libsignal licensing.",
       "Changes to the distribution model.",
-      "Introduction of additional proprietary SDKs."
+      "Introduction of additional proprietary SDKs.",
+      "Material architecture changes affecting licensing or distribution."
     ],
-    "rationale": "Based on the reviewed architecture and dependency usage, the distribution is approved. The Google client libraries are treated as independent third-party components distributed under their applicable Google terms, while Kit Pay source obligations remain governed by the applicable AGPL requirements. No additional Signal permission is required for the reviewed libsignal usage.",
-    "decision_document": "docs/google-fcm-agpl-clearance-decision-code12.md",
-    "decision_document_sha256": "699c8cc8671235bf2de907c8b0d2f679ffd25c1c9a0d51fa970ddaec80963b18",
+    "rationale": "Under the approved Kit Pos Uganda Limited internal release policy, engineering verified that code 13 changes application behavior without adding or removing runtime dependencies, changing reviewed third-party licences, changing the FCM adapter boundary, changing the libsignal version or licence, or changing the AGPL corresponding-source distribution model. Distribution is approved under the candidate-specific conditions and re-review triggers.",
+    "decision_document": "docs/google-fcm-agpl-clearance-decision-code13.md",
+    "decision_document_sha256": "94fb6ea6d9bf5fe46ae1b44f4c92e8ebe688f714554d96617abd279f6ef17d3e",
     "reviewed_runtime_inventory_sha256": "4f63a48022e82f037a9c3e8de80d847f2a54b5948ce6f51be8a8863bd83ca330",
     "reviewed_runtime_graph_manifest_sha256": "1602aeac63688c2dd85062b6b951aa58e7df1715b7da125b1f487efcf385a5a9",
     "reviewed_artifacts": [

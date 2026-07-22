@@ -656,11 +656,17 @@ object SecureMessagingWireValidator {
         val attachments = required(message.attachments, "encrypted message attachments").mapIndexed { index, item ->
             required(item, "encrypted message attachment $index")
         }
-        validateAttachments(attachments)
+        val validatedAttachments = validateAttachments(attachments)
         val kind = required(message.kind, "encrypted message kind")
         requireWire(
-            kind == ENCRYPTED_MESSAGE_KIND && attachments.isEmpty(),
-            "v2 encrypted messages must contain text ciphertext only",
+            kind == ENCRYPTED_MESSAGE_KIND || kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+            "encrypted message kind",
+        )
+        // Attachment metadata accompanies exactly the encrypted_attachment kind. The end-to-end
+        // media descriptor (including key material) still travels only inside the text ciphertext.
+        requireWire(
+            (kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND) == attachments.isNotEmpty(),
+            "encrypted message attachment metadata must match its kind",
         )
         val replyToMessageId = message.replyToMessageId
         replyToMessageId?.let { requireUuid(it, "encrypted message reply target") }
@@ -701,6 +707,7 @@ object SecureMessagingWireValidator {
             envelopeType = envelopeType,
             sentAt = sentAt,
             ciphertext = ciphertext,
+            attachments = validatedAttachments,
         )
     }
 
@@ -859,23 +866,28 @@ object SecureMessagingWireValidator {
         }
     }
 
-    private fun validateAttachments(attachments: List<EncryptedAttachmentDto>) {
+    private fun validateAttachments(
+        attachments: List<EncryptedAttachmentDto>,
+    ): List<EncryptedAttachmentRequest> {
         requireWire(attachments.size <= MAX_ATTACHMENTS, "encrypted attachment count")
         val ids = mutableSetOf<String>()
         val storageKeys = mutableSetOf<String>()
-        attachments.forEachIndexed { index, attachment ->
+        return attachments.mapIndexed { index, attachment ->
             val prefix = "encrypted attachment $index"
             val id = required(attachment.id, "$prefix ID")
             requireUuid(id, "$prefix ID")
             requireWire(ids.add(id), "duplicate encrypted attachment ID")
             val storageKey = required(attachment.storageKey, "$prefix storage key")
-            requireWire(storageKey.isNotBlank() && storageKey.length <= 512, "$prefix storage key")
+            requireUuid(storageKey, "$prefix storage key")
             requireWire(storageKeys.add(storageKey), "duplicate encrypted attachment storage key")
             val mediaType = required(attachment.mediaType, "$prefix media type")
             requireWire(mediaType.isNotBlank() && mediaType.length <= 160, "$prefix media type")
             val byteSize = required(attachment.byteSize, "$prefix byte size")
             requireWire(byteSize in 1..MAX_ATTACHMENT_BYTES, "$prefix byte size")
-            requireSha256(attachment.ciphertextSha256, "$prefix ciphertext hash")
+            val ciphertextSha256 = requireSha256(
+                attachment.ciphertextSha256,
+                "$prefix ciphertext hash",
+            )
             attachment.encryptionMetadataCiphertext?.let {
                 requireCanonicalBase64(
                     it,
@@ -884,6 +896,14 @@ object SecureMessagingWireValidator {
                     maximumEncodedLength = MAX_ATTACHMENT_METADATA_ENCODED_LENGTH,
                 )
             }
+            EncryptedAttachmentRequest(
+                id = id,
+                storageKey = storageKey,
+                mediaType = mediaType,
+                byteSize = byteSize,
+                ciphertextSha256 = ciphertextSha256,
+                encryptionMetadataCiphertext = attachment.encryptionMetadataCiphertext,
+            )
         }
     }
 
@@ -1304,8 +1324,13 @@ class ValidatedIncomingEncryptedMessage internal constructor(
     val envelopeType: String,
     val sentAt: Instant,
     private val ciphertext: ByteArray,
+    attachments: List<EncryptedAttachmentRequest>,
 ) {
+    private val immutableAttachments = attachments.toList()
+
     fun ciphertextBytes(): ByteArray = ciphertext.copyOf()
+
+    fun attachments(): List<EncryptedAttachmentRequest> = immutableAttachments.toList()
 }
 
 class ValidatedMessagingRosterRefresh internal constructor(
