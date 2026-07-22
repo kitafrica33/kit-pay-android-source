@@ -1504,7 +1504,6 @@ enum class SecureMessagingRuntimeStage {
 }
 
 enum class SecureMessagingQuarantineReason {
-    CAPABILITY_MISMATCH,
     MALFORMED_WIRE_DATA,
     SIGNATURE_FAILURE,
     IDENTITY_CHANGED,
@@ -1692,6 +1691,32 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
         return result.first
     }
 
+    /** Starts erasure only for the exact activation that requested enrollment recovery. */
+    internal fun beginRecoveryErasure(fence: SecureMessagingSessionFence) {
+        val listeners = synchronized(lock) {
+            check(currentActivationIdentity === fence.activationIdentity) {
+                "Secure messaging recovery activation generation changed"
+            }
+            check(current.binding == fence.binding) {
+                "Secure messaging recovery session epoch changed"
+            }
+            check(
+                current.stage in setOf(
+                    SecureMessagingRuntimeStage.PREPARING_KEYS,
+                    SecureMessagingRuntimeStage.QUARANTINED,
+                ),
+            ) { "Secure messaging recovery cannot erase from ${current.stage}" }
+            setCurrentLocked(
+                SecureMessagingRuntimeSnapshot(
+                    stage = SecureMessagingRuntimeStage.ERASING,
+                    binding = current.binding,
+                ),
+            )
+            readinessInvalidationListeners.toList()
+        }
+        notifyReadinessInvalidated(listeners)
+    }
+
     fun finishErasure() {
         val listeners = synchronized(lock) {
             check(current.stage == SecureMessagingRuntimeStage.ERASING) {
@@ -1739,11 +1764,7 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
                 "Illegal secure messaging lifecycle transition from ${current.stage} to $to"
             }
             setCurrentLocked(SecureMessagingRuntimeSnapshot(stage = to, binding = fence.binding))
-            if (to == SecureMessagingRuntimeStage.READY) {
-                emptyList()
-            } else {
-                readinessInvalidationListeners.toList()
-            }
+            readinessInvalidationListeners.toList()
         }
         notifyReadinessInvalidated(listeners)
     }

@@ -7,6 +7,7 @@ import com.kit.wallet.data.messaging.SecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingKeyReconciliationException
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
+import com.kit.wallet.data.messaging.SecureMessagingProtocolUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
 import com.kit.wallet.data.messaging.SecureMessagingRuntimeStage
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
@@ -141,6 +142,37 @@ class SecureMessagingActivationCoordinatorTest {
     }
 
     @Test
+    fun `server readiness rollout retries the same fenced activation`() = runTest {
+        var keyCalls = 0
+        var syncCalls = 0
+        val coordinator = coordinator(
+            keys = { keyCalls++ },
+            initialSync = { syncCalls++ },
+        )
+        server.enqueue(jsonResponse(NOT_READY_CAPABILITIES))
+
+        val unavailable = runCatching { coordinator.ensureActivated(BINDING) }.exceptionOrNull()
+
+        assertTrue(unavailable is SecureMessagingProtocolUnavailableException)
+        assertEquals(SecureMessagingRuntimeStage.CHECKING_CAPABILITIES, lifecycle.snapshot().stage)
+        assertNull(lifecycle.snapshot().quarantineReason)
+        assertNull(registry.currentOrNull())
+        assertEquals(0, keyCalls)
+        assertEquals(0, syncCalls)
+
+        enqueueRemoteActivation()
+        coordinator.ensureActivated(BINDING)
+
+        assertEquals(1, keyCalls)
+        assertEquals(1, syncCalls)
+        assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+        assertSame(coordinator.activeSession.value, registry.requireCurrent())
+        assertEquals(4, server.requestCount)
+        assertEquals("/api/kit-wallet/v1/capabilities", server.takeRequest().path)
+        assertActivationRequestPaths()
+    }
+
+    @Test
     fun `key integrity mismatch quarantines activation and cannot be retried`() = runTest {
         val coordinator = coordinator(
             keys = {
@@ -264,6 +296,10 @@ class SecureMessagingActivationCoordinatorTest {
             "ready":true,"version":"v2","suite":"signal-pqxdh-kyber1024-double-ratchet-v2",
             "post_quantum":true}}}}
         """
+        val NOT_READY_CAPABILITIES = READY_CAPABILITIES.replace(
+            "\"ready\":true",
+            "\"ready\":false",
+        )
         const val PROFILE = """
             {"ok":true,"data":{"id":"$CURRENT_USER_ID","name":"Kit User"}}
         """

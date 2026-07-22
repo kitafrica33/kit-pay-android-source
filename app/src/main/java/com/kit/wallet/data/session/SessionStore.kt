@@ -1,5 +1,6 @@
 package com.kit.wallet.data.session
 
+import com.kit.wallet.data.messaging.SecureMessagingSessionFence
 import kotlinx.coroutines.flow.StateFlow
 
 enum class ProfileSetupState {
@@ -25,6 +26,7 @@ data class SessionTokens(
      */
     val cacheScopeId: String = sessionId,
     val profileSetupState: ProfileSetupState = ProfileSetupState.UNKNOWN,
+    val messagingResetProof: SecureMessagingResetProofFence? = null,
 ) {
     init {
         require(sessionId.isNotBlank()) { "Session ID must not be blank" }
@@ -43,6 +45,24 @@ data class SessionTokens(
     ): Boolean = accessToken.isNotBlank() &&
         (accessTokenExpiresAtEpochSeconds == null ||
             accessTokenExpiresAtEpochSeconds > nowEpochSeconds + clockSkewSeconds)
+}
+
+/** AEAD-persisted exact reset intent, upgraded with N+1 only after validated server proof. */
+data class SecureMessagingResetProofFence(
+    val serverDeviceId: String,
+    val previousEnrollmentEpoch: Long,
+    val resultingEnrollmentEpoch: Long? = null,
+    val previousRegistrationId: Int,
+    val previousIdentityKeySha256: String,
+    val previousBundleVersion: Int,
+) {
+    init {
+        resultingEnrollmentEpoch?.let {
+            require(it == previousEnrollmentEpoch + 1L)
+        }
+    }
+
+    val proved: Boolean get() = resultingEnrollmentEpoch != null
 }
 
 /** Applies the credential checks required before a session can be persisted. */
@@ -83,6 +103,40 @@ interface SessionStore {
      */
     suspend fun saveIfUnchanged(expected: SessionSnapshot, tokens: SessionTokens): Boolean
 
+    /** Adopts rotated credentials while merging metadata written during the refresh request. */
+    suspend fun adoptRefreshedCredentialsIfCurrent(
+        expectedCredentials: SessionTokens,
+        refreshedCredentials: SessionTokens,
+    ): Boolean {
+        refreshedCredentials.requireValidCredentials()
+        val expectedSnapshot = snapshot()
+        val latest = current() ?: return false
+        if (latest.sessionId != expectedCredentials.sessionId ||
+            latest.accessToken != expectedCredentials.accessToken ||
+            latest.refreshToken != expectedCredentials.refreshToken
+        ) {
+            return false
+        }
+        check(refreshedCredentials.sessionId == latest.sessionId) {
+            "A token refresh cannot replace the authenticated session epoch"
+        }
+        return saveIfUnchanged(
+            expectedSnapshot,
+            refreshedCredentials.copy(
+                accountId = latest.accountId ?: refreshedCredentials.accountId,
+                cacheScopeId = latest.cacheScopeId,
+                profileSetupState = if (
+                    latest.profileSetupState != expectedCredentials.profileSetupState
+                ) {
+                    latest.profileSetupState
+                } else {
+                    refreshedCredentials.profileSetupState
+                },
+                messagingResetProof = latest.messagingResetProof,
+            ),
+        )
+    }
+
     /** Updates the durable setup gate only while the same authenticated cache owner is active. */
     suspend fun updateProfileSetupState(
         expected: SessionFence,
@@ -99,6 +153,32 @@ interface SessionStore {
 
     /** Clears credentials only if [expected] still owns the local authenticated session. */
     suspend fun clearIfCurrent(expected: SessionFence): Boolean
+
+    /**
+     * Crash-safely erases and reopens messaging state only while [expected] and the exact
+     * messaging activation generation still own this session.
+     */
+    suspend fun resetSecureMessagingStateIfCurrent(
+        expected: SessionFence,
+        activationFence: SecureMessagingSessionFence,
+    ): Boolean = throw UnsupportedOperationException(
+        "This session store cannot reset secure messaging state",
+    )
+
+    suspend fun recordMessagingResetPendingIfCurrent(
+        expected: SessionFence,
+        pending: SecureMessagingResetProofFence,
+    ): Boolean = false
+
+    suspend fun recordMessagingResetProofIfCurrent(
+        expected: SessionFence,
+        proof: SecureMessagingResetProofFence,
+    ): Boolean = false
+
+    suspend fun clearMessagingResetProofIfCurrent(
+        expected: SessionFence,
+        proof: SecureMessagingResetProofFence,
+    ): Boolean = false
 
     suspend fun clear()
 }

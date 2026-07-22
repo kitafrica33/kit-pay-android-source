@@ -1,8 +1,8 @@
 {
   "schema_version": 3,
   "application_id": "com.kit.wallet",
-  "version_name": "0.2.1",
-  "version_code": 13,
+  "version_name": "0.2.2",
+  "version_code": 14,
   "audit_date": "2026-07-22",
   "distribution_clearance": true,
   "unresolved_issue_ids": [],
@@ -11,7 +11,7 @@
     "record_type": "INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL",
     "recorded_date": "2026-07-22",
     "review_date": "2026-07-22",
-    "reference": "KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-003",
+    "reference": "KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-004",
     "issue_ids": [
       "GOOGLE_ANDROID_SDK_AGPL_COMPATIBILITY"
     ],
@@ -47,6 +47,9 @@
       "The final release AAB dependency inventory must match the reviewed inventory.",
       "Any application-architecture change affecting third-party linking boundaries requires review.",
       "Encrypted attachment sends must remain gated to compatible code-13-or-later roster devices.",
+      "Remote-enrolled/local-missing recovery must durably bind the exact captured target to the authenticated session before transmission, atomically retain the proved resulting epoch through fenced local erasure and re-enrollment, preserve a valid session on success or transient failure, and never publish new keys until the backend proves that exact enrollment was removed and its epoch advanced; invalid-session, stale-target, corrupt-proof, or replacement-enrollment states require fresh sign-in.",
+      "Historical self-invalidation events may be ignored only after exact current server epoch, registration, identity-key digest, and bundle-version revalidation; they must never authorize mutation of a replacement enrollment, and unverifiable states remain fail-closed.",
+      "Retryable capability handling must not bypass the exact reviewed v2 post-quantum protocol gate.",
       "Direct sideload publication requires exact-APK signing and physical-device installation and launch evidence."
     ],
     "re_review_triggers": [
@@ -58,9 +61,9 @@
       "Introduction of additional proprietary SDKs.",
       "Material architecture changes affecting licensing or distribution."
     ],
-    "rationale": "Under the approved Kit Pos Uganda Limited internal release policy, engineering verified that code 13 changes application behavior without adding or removing runtime dependencies, changing reviewed third-party licences, changing the FCM adapter boundary, changing the libsignal version or licence, or changing the AGPL corresponding-source distribution model. Distribution is approved under the candidate-specific conditions and re-review triggers.",
-    "decision_document": "docs/google-fcm-agpl-clearance-decision-code13.md",
-    "decision_document_sha256": "94fb6ea6d9bf5fe46ae1b44f4c92e8ebe688f714554d96617abd279f6ef17d3e",
+    "rationale": "Under the approved Kit Pos Uganda Limited internal release policy, engineering verified that code 14 changes crash-safe exact-fingerprint secure-messaging enrollment recovery, valid-session preservation, and stale-target reauthentication behavior without adding or removing runtime dependencies, changing reviewed third-party licences, changing the FCM adapter boundary, changing the libsignal version or licence, or changing the AGPL corresponding-source distribution model. Distribution is approved under the candidate-specific conditions and re-review triggers.",
+    "decision_document": "docs/google-fcm-agpl-clearance-decision-code14.md",
+    "decision_document_sha256": "4927ce4287dc0547e8a6b9c4d179e8e63ee1fbb71b1e44a64f9b582f2153a795",
     "reviewed_runtime_inventory_sha256": "4f63a48022e82f037a9c3e8de80d847f2a54b5948ce6f51be8a8863bd83ca330",
     "reviewed_runtime_graph_manifest_sha256": "1602aeac63688c2dd85062b6b951aa58e7df1715b7da125b1f487efcf385a5a9",
     "reviewed_artifacts": [

@@ -3,9 +3,13 @@ package com.kit.wallet
 import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionDiskPayload
 import com.kit.wallet.data.session.SessionTokens
+import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.kit.wallet.data.session.requireValidCredentials
 import com.kit.wallet.data.session.toDiskPayload
 import com.kit.wallet.data.session.toSessionTokens
+import com.squareup.moshi.Moshi
+import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -13,6 +17,10 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 class SessionTokensTest {
+    private val diskAdapter = Moshi.Builder()
+        .add(KotlinJsonAdapterFactory())
+        .build()
+        .adapter(SessionDiskPayload::class.java)
     private val tokens = SessionTokens(
         accessToken = "access",
         refreshToken = "refresh",
@@ -46,6 +54,43 @@ class SessionTokensTest {
     }
 
     @Test
+    fun `pending and proved messaging reset fences survive persisted JSON round trip`() {
+        val pending = SecureMessagingResetProofFence(
+            serverDeviceId = "device-1",
+            previousEnrollmentEpoch = 7,
+            previousRegistrationId = 42,
+            previousIdentityKeySha256 = "1".repeat(64),
+            previousBundleVersion = 3,
+        )
+
+        listOf(
+            pending,
+            pending.copy(resultingEnrollmentEpoch = 8),
+        ).forEach { resetFence ->
+            val encoded = diskAdapter.toJson(
+                tokens.copy(messagingResetProof = resetFence).toDiskPayload(),
+            )
+            val restored = checkNotNull(diskAdapter.fromJson(encoded))
+                .toSessionTokens()
+
+            assertEquals(resetFence, restored.messagingResetProof)
+            assertEquals(resetFence.proved, restored.messagingResetProof?.proved)
+        }
+    }
+
+    @Test
+    fun `release shrinker keeps the complete reflective session payload graph`() {
+        val rules = File(repositoryRoot(), "app/proguard-rules.pro").readLines()
+            .map(String::trim)
+        listOf(
+            "-keep class com.kit.wallet.data.session.SessionDiskPayload { *; }",
+            "-keep class com.kit.wallet.data.session.SecureMessagingResetProofFence { *; }",
+        ).forEach { requiredRule ->
+            assertEquals(1, rules.count { it == requiredRule })
+        }
+    }
+
+    @Test
     fun `legacy payload restores unknown setup state and fails closed`() {
         val restored = SessionDiskPayload(
             accessToken = "access",
@@ -72,5 +117,12 @@ class SessionTokensTest {
                 // Expected: save and compare-and-save both use this validation boundary.
             }
         }
+    }
+
+    private fun repositoryRoot(): File {
+        val workingDirectory = File(checkNotNull(System.getProperty("user.dir"))).canonicalFile
+        return generateSequence(workingDirectory) { it.parentFile }
+            .firstOrNull { File(it, "app/build.gradle.kts").isFile }
+            ?: error("Could not locate the Android repository root from $workingDirectory")
     }
 }

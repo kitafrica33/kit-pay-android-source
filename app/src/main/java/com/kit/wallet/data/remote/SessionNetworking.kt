@@ -9,6 +9,8 @@ import java.time.Instant
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.Authenticator
 import okhttp3.Interceptor
 import okhttp3.Request
@@ -49,6 +51,19 @@ interface SessionRefreshApi {
     ): ApiEnvelope<AuthResultDto>
 }
 
+/**
+ * Metadata-only client for resetting one snapshotted messaging enrollment without consulting
+ * mutable local session state or invoking the normal access-token authenticator.
+ */
+interface SecureMessagingEnrollmentRecoveryApi {
+    @POST("api/kit-wallet/v1/messaging/enrollment/reset")
+    suspend fun reset(
+        @Header("Authorization") authorization: String,
+        @Header(SessionHeaderInterceptor.SESSION_ID_HEADER) sessionId: String,
+        @Body request: ResetMessagingEnrollmentRequest,
+    ): ApiEnvelope<ResetMessagingEnrollmentDto>
+}
+
 @Singleton
 class AuthTokenRefresher @Inject constructor(
     private val refreshApi: dagger.Lazy<SessionRefreshApi>,
@@ -62,15 +77,15 @@ class AuthTokenRefresher @Inject constructor(
             }
         } catch (error: KitWalletApiException) {
             if (error.isDefinitiveRefreshRejection()) {
-                return SessionRefreshResult.Rejected
+                return SessionRefreshResult.Rejected(error.code)
             }
             throw error
         }
         val session = result.session
-            ?: return SessionRefreshResult.Rejected
+            ?: return SessionRefreshResult.Rejected(code = null)
         val user = result.user
         if (current.accountId != null && user != null && user.id != current.accountId) {
-            return SessionRefreshResult.Rejected
+            return SessionRefreshResult.Rejected(code = null)
         }
         val setupState = if (user == null) {
             current.profileSetupState
@@ -93,6 +108,7 @@ class AuthTokenRefresher @Inject constructor(
                 accountId = current.accountId ?: user?.id,
                 cacheScopeId = current.cacheScopeId,
                 profileSetupState = setupState,
+                messagingResetProof = current.messagingResetProof,
             ),
         )
     }
@@ -112,7 +128,15 @@ class AuthTokenRefresher @Inject constructor(
 
 internal sealed interface SessionRefreshResult {
     data class Refreshed(val tokens: SessionTokens) : SessionRefreshResult
-    data object Rejected : SessionRefreshResult
+    data class Rejected(val code: String?) : SessionRefreshResult
+}
+
+/** Serializes every one-time refresh-token rotation across OkHttp and explicit recovery calls. */
+@Singleton
+class AuthSessionRefreshCoordinator @Inject constructor() {
+    private val mutex = Mutex()
+
+    internal suspend fun <T> serialized(block: suspend () -> T): T = mutex.withLock { block() }
 }
 
 @Singleton
@@ -120,9 +144,8 @@ class SessionAuthenticator @Inject constructor(
     private val sessions: SessionStore,
     private val tokenRefresher: dagger.Lazy<AuthTokenRefresher>,
     private val walletCache: WalletCache,
+    private val refreshCoordinator: AuthSessionRefreshCoordinator = AuthSessionRefreshCoordinator(),
 ) : Authenticator {
-    private val refreshLock = Any()
-
     override fun authenticate(route: Route?, response: Response): Request? {
         if (responseCount(response) >= MAX_AUTH_ATTEMPTS) return null
         val failedAccessToken = response.request.bearerToken() ?: return null
@@ -130,44 +153,43 @@ class SessionAuthenticator @Inject constructor(
             ?.takeIf(String::isNotBlank)
             ?: return null
 
-        synchronized(refreshLock) {
-            val latest = sessions.current() ?: return null
+        return runBlocking {
+            refreshCoordinator.serialized {
+                val latest = sessions.current() ?: return@serialized null
 
-            // Never replay a request from a previous login under the current account.
-            if (latest.sessionId != failedSessionId) return null
+                // Never replay a request from a previous login under the current account.
+                if (latest.sessionId != failedSessionId) return@serialized null
 
-            // Another request refreshed this authenticated session while the response was in flight.
-            if (latest.accessToken != failedAccessToken) {
-                return response.request.withSession(latest)
-            }
-
-            val expected = sessions.snapshot()
-            if (expected.fence != latest.fence()) return null
-
-            val refreshResult = runCatching {
-                runBlocking { tokenRefresher.get().refresh(latest) }
-            }.getOrElse {
-                // Connectivity, server, and decoding failures do not prove the session is invalid.
-                return null
-            }
-
-            return when (refreshResult) {
-                SessionRefreshResult.Rejected -> {
-                    runBlocking { invalidate(latest) }
-                    null
+                // Another request refreshed this session while the response was in flight.
+                if (latest.accessToken != failedAccessToken) {
+                    return@serialized response.request.withSession(latest)
                 }
-                is SessionRefreshResult.Refreshed -> {
-                    val adopted = runCatching {
-                        runBlocking {
-                            sessions.saveIfUnchanged(expected, refreshResult.tokens)
-                        }
-                    }.getOrElse {
-                        // A malformed refresh result or local persistence failure must not erase
-                        // the last known session.
-                        return null
+
+                val refreshResult = runCatching {
+                    tokenRefresher.get().refresh(latest)
+                }.getOrElse {
+                    // Connectivity, server, and decoding failures do not prove invalidity.
+                    return@serialized null
+                }
+
+                when (refreshResult) {
+                    is SessionRefreshResult.Rejected -> {
+                        invalidate(latest)
+                        null
                     }
-                    if (!adopted) return null
-                    response.request.withSession(refreshResult.tokens)
+                    is SessionRefreshResult.Refreshed -> {
+                        val adopted = runCatching {
+                            sessions.adoptRefreshedCredentialsIfCurrent(
+                                latest,
+                                refreshResult.tokens,
+                            )
+                        }.getOrElse {
+                            // Persistence failure must not erase the last known session.
+                            return@serialized null
+                        }
+                        if (!adopted) return@serialized null
+                        response.request.withSession(refreshResult.tokens)
+                    }
                 }
             }
         }

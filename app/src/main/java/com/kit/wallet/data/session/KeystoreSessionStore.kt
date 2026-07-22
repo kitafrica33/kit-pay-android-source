@@ -5,6 +5,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.annotation.VisibleForTesting
+import com.kit.wallet.data.messaging.SecureMessagingSessionFence
 import com.kit.wallet.data.messaging.SecureMessagingSessionLifecycle
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
@@ -81,6 +82,40 @@ class KeystoreSessionStore @Inject constructor(
         }
     }
 
+    override suspend fun adoptRefreshedCredentialsIfCurrent(
+        expectedCredentials: SessionTokens,
+        refreshedCredentials: SessionTokens,
+    ): Boolean {
+        refreshedCredentials.requireValidCredentials()
+        return mutex.withLock {
+            val latest = _session.value ?: return@withLock false
+            if (latest.sessionId != expectedCredentials.sessionId ||
+                latest.accessToken != expectedCredentials.accessToken ||
+                latest.refreshToken != expectedCredentials.refreshToken
+            ) {
+                return@withLock false
+            }
+            check(refreshedCredentials.sessionId == latest.sessionId) {
+                "A token refresh cannot replace the authenticated session epoch"
+            }
+            persistLocked(
+                refreshedCredentials.copy(
+                    accountId = latest.accountId ?: refreshedCredentials.accountId,
+                    cacheScopeId = latest.cacheScopeId,
+                    profileSetupState = if (
+                        latest.profileSetupState != expectedCredentials.profileSetupState
+                    ) {
+                        latest.profileSetupState
+                    } else {
+                        refreshedCredentials.profileSetupState
+                    },
+                    messagingResetProof = latest.messagingResetProof,
+                ),
+            )
+            true
+        }
+    }
+
     override suspend fun updateProfileSetupState(
         expected: SessionFence,
         state: ProfileSetupState,
@@ -105,6 +140,80 @@ class KeystoreSessionStore @Inject constructor(
     override suspend fun clearIfCurrent(expected: SessionFence): Boolean = mutex.withLock {
         if (_session.value?.fence() != expected) return@withLock false
         clearLocked()
+        true
+    }
+
+    override suspend fun resetSecureMessagingStateIfCurrent(
+        expected: SessionFence,
+        activationFence: SecureMessagingSessionFence,
+    ): Boolean = mutex.withLock {
+        if (_session.value?.fence() != expected) return@withLock false
+
+        markMessagingErasurePending()
+        try {
+            messagingLifecycle.resetForRecovery(activationFence)
+        } catch (error: Throwable) {
+            abandonSessionDuringPendingMessagingErasure()
+            throw error
+        }
+
+        if (!preferences.edit().remove(KEY_MESSAGING_ERASURE_PENDING).commit()) {
+            abandonSessionDuringPendingMessagingErasure()
+            error("The secure messaging erasure marker could not be cleared")
+        }
+        try {
+            messagingLifecycle.afterSessionSave()
+        } catch (error: Throwable) {
+            runCatching { markMessagingErasurePending() }
+                .exceptionOrNull()
+                ?.let(error::addSuppressed)
+            abandonSessionDuringPendingMessagingErasure()
+            throw error
+        }
+        runCatching { messagingSyncScheduler.get().schedule() }
+        true
+    }
+
+    override suspend fun recordMessagingResetPendingIfCurrent(
+        expected: SessionFence,
+        pending: SecureMessagingResetProofFence,
+    ): Boolean = mutex.withLock {
+        require(!pending.proved) { "A pending reset cannot contain a result epoch" }
+        val current = _session.value ?: return@withLock false
+        if (current.fence() != expected) return@withLock false
+        val existing = current.messagingResetProof
+        if (existing != null) {
+            return@withLock existing.copy(resultingEnrollmentEpoch = null) == pending
+        }
+        persistLocked(current.copy(messagingResetProof = pending))
+        true
+    }
+
+    override suspend fun recordMessagingResetProofIfCurrent(
+        expected: SessionFence,
+        proof: SecureMessagingResetProofFence,
+    ): Boolean = mutex.withLock {
+        val current = _session.value ?: return@withLock false
+        if (current.fence() != expected || !proof.proved) return@withLock false
+        val pending = current.messagingResetProof ?: return@withLock false
+        if (pending.copy(resultingEnrollmentEpoch = null) !=
+            proof.copy(resultingEnrollmentEpoch = null)
+        ) {
+            return@withLock false
+        }
+        persistLocked(current.copy(messagingResetProof = proof))
+        true
+    }
+
+    override suspend fun clearMessagingResetProofIfCurrent(
+        expected: SessionFence,
+        proof: SecureMessagingResetProofFence,
+    ): Boolean = mutex.withLock {
+        val current = _session.value ?: return@withLock false
+        if (current.fence() != expected || current.messagingResetProof != proof) {
+            return@withLock false
+        }
+        persistLocked(current.copy(messagingResetProof = null))
         true
     }
 
@@ -322,6 +431,7 @@ internal data class SessionDiskPayload(
     val accountId: String? = null,
     val cacheScopeId: String? = null,
     val profileSetupState: String? = null,
+    val messagingResetProof: SecureMessagingResetProofFence? = null,
 )
 
 @VisibleForTesting
@@ -337,6 +447,7 @@ internal fun SessionTokens.toDiskPayload() = SessionDiskPayload(
         ProfileSetupState.REQUIRED -> "required"
         ProfileSetupState.COMPLETED -> "completed"
     },
+    messagingResetProof = messagingResetProof,
 )
 
 @VisibleForTesting
@@ -352,4 +463,5 @@ internal fun SessionDiskPayload.toSessionTokens() = SessionTokens(
         "completed" -> ProfileSetupState.COMPLETED
         else -> ProfileSetupState.UNKNOWN
     },
+    messagingResetProof = messagingResetProof,
 )

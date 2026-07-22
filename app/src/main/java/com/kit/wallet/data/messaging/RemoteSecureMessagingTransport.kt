@@ -1,5 +1,6 @@
 package com.kit.wallet.data.messaging
 
+import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
 import com.kit.wallet.data.remote.AcknowledgeMessageDeliveryRequest
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.ApiEnvelope
@@ -43,6 +44,10 @@ internal data class SecureMessagingRemoteContext(
 )
 
 class SecureMessagingProtocolUnavailableException(message: String) : IllegalStateException(message)
+
+internal enum class ReconciledIdentityStatus { CURRENT, UNENROLLED, MISMATCH }
+
+internal enum class ReconciledIdentityRevalidationPhase { INITIAL_SYNC, READY_SESSION }
 
 /**
  * Authenticated, ciphertext-only transport for the reviewed v2 contract.
@@ -199,14 +204,16 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         )
 
         class KeyStatus internal constructor(
-            private val owner: Session,
+            internal val owner: Session,
             internal val issuanceIdentity: Any,
             val enrolled: Boolean,
+            val enrollmentEpoch: Long,
             val signalDeviceId: Int?,
             val registrationId: Int?,
             val identityKeySha256: String?,
             val signedPrekeyId: Int?,
             val pqLastResortPrekeyId: Int?,
+            val bundleVersion: Int?,
             val availableOneTimePrekeys: Int,
             val availableEcOneTimePrekeys: Int,
             val availablePqOneTimePrekeys: Int,
@@ -317,9 +324,12 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         private val issuedDeliveryTokens = WeakHashMap<DeliveryToken, IssuedDeliveryToken>()
         private val tokenizedIncomingIdentities = mutableSetOf<Any>()
         private var initialCheckpointIssued = false
+        private var reconciledKeyIdentity: SecureMessagingEnrollmentResetTarget? = null
 
         val binding: SecureMessagingSessionBinding
             get() = fence.binding
+
+        internal fun activationFence(): SecureMessagingSessionFence = fence
 
         internal fun quarantine(error: SecureMessagingCryptographicFailureException) {
             lifecycle.quarantine(fence, error.quarantineReason)
@@ -335,6 +345,121 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                     context.currentDeviceId,
                 ),
             )
+        }
+
+        /**
+         * Pins the exact server enrollment that completed local/private-key reconciliation.
+         * Lifecycle events are hints from an append-only history, so the event processor must
+         * compare them with current server state before invalidating this activation.
+         */
+        internal fun recordReconciledKeyIdentity(status: KeyStatus) {
+            check(status.enrolled) { "A reconciled secure-messaging identity must be enrolled" }
+            val reconciled = SecureMessagingEnrollmentResetTarget(
+                serverDeviceId = binding.serverDeviceId,
+                enrollmentEpoch = status.enrollmentEpoch,
+                registrationId = checkNotNull(status.registrationId) {
+                    "A reconciled secure-messaging identity omitted its registration ID"
+                },
+                identityKeySha256 = checkNotNull(status.identityKeySha256) {
+                    "A reconciled secure-messaging identity omitted its key hash"
+                },
+                bundleVersion = checkNotNull(status.bundleVersion) {
+                    "A reconciled secure-messaging identity omitted its bundle version"
+                },
+            )
+            lifecycle.assertCurrent(activation)
+            synchronized(issuanceLock) {
+                reconciledKeyIdentity?.let { existing ->
+                    check(
+                        existing.serverDeviceId == reconciled.serverDeviceId &&
+                            existing.enrollmentEpoch == reconciled.enrollmentEpoch &&
+                            existing.registrationId == reconciled.registrationId &&
+                            existing.identityKeySha256 == reconciled.identityKeySha256,
+                    ) {
+                        "Secure-messaging reconciliation changed enrollment within one activation"
+                    }
+                    check(reconciled.bundleVersion >= existing.bundleVersion) {
+                        "Secure-messaging reconciliation rolled back the server bundle version"
+                    }
+                }
+                reconciledKeyIdentity = reconciled
+            }
+            lifecycle.assertCurrent(activation)
+        }
+
+        /** Re-fetches authoritative public state before accepting a self-invalidation hint. */
+        internal suspend fun revalidateReconciledKeyIdentity(): ReconciledIdentityStatus {
+            val expected = synchronized(issuanceLock) {
+                checkNotNull(reconciledKeyIdentity) {
+                    "Secure-messaging enrollment was not reconciled before lifecycle validation"
+                }
+            }
+            val current = keyStatus()
+            if (!current.enrolled) return ReconciledIdentityStatus.UNENROLLED
+            return if (
+                current.enrollmentEpoch == expected.enrollmentEpoch &&
+                current.registrationId == expected.registrationId &&
+                current.identityKeySha256 == expected.identityKeySha256 &&
+                current.bundleVersion == expected.bundleVersion
+            ) {
+                ReconciledIdentityStatus.CURRENT
+            } else {
+                ReconciledIdentityStatus.MISMATCH
+            }
+        }
+
+        internal fun reconciledKeyIdentityResetTarget(): SecureMessagingEnrollmentResetTarget =
+            synchronized(issuanceLock) {
+                checkNotNull(reconciledKeyIdentity) {
+                    "Secure-messaging enrollment was not reconciled before lifecycle validation"
+                }
+            }
+
+        /** Withdraws an established handle, while initial sync revalidates before first publish. */
+        internal fun beginReconciledKeyIdentityRevalidation():
+            ReconciledIdentityRevalidationPhase {
+            lifecycle.assertCurrent(activation)
+            return when (lifecycle.snapshot().stage) {
+                SecureMessagingRuntimeStage.SYNCING_ROSTER -> {
+                    // Initial activation has not published a message-ready handle. Moving back to
+                    // PREPARING_KEYS is illegal and unnecessary; keep the fenced initial sync in
+                    // place while its authoritative status request runs.
+                    lifecycle.assertCurrent(activation)
+                    ReconciledIdentityRevalidationPhase.INITIAL_SYNC
+                }
+                SecureMessagingRuntimeStage.READY -> {
+                    lifecycle.beginKeyPreparation(fence)
+                    ReconciledIdentityRevalidationPhase.READY_SESSION
+                }
+                SecureMessagingRuntimeStage.PREPARING_KEYS -> {
+                    // A retry after a transient established-session revalidation failure retains
+                    // the exact withdrawn activation at PREPARING_KEYS.
+                    lifecycle.assertCurrent(activation)
+                    ReconciledIdentityRevalidationPhase.READY_SESSION
+                }
+                else -> error(
+                    "Secure-messaging identity cannot be revalidated from " +
+                        lifecycle.snapshot().stage,
+                )
+            }
+        }
+
+        /** Restores only a handle that was READY before the authoritative status check. */
+        internal fun finishReconciledKeyIdentityRevalidation(
+            phase: ReconciledIdentityRevalidationPhase,
+        ) {
+            when (phase) {
+                ReconciledIdentityRevalidationPhase.INITIAL_SYNC -> {
+                    lifecycle.assertCurrent(activation)
+                    check(lifecycle.snapshot().stage == SecureMessagingRuntimeStage.SYNCING_ROSTER) {
+                        "Initial secure-messaging revalidation changed activation stage"
+                    }
+                }
+                ReconciledIdentityRevalidationPhase.READY_SESSION -> {
+                    lifecycle.beginRosterSync(fence)
+                    lifecycle.finishActivation(fence)
+                }
+            }
         }
 
         suspend fun publishKeyBundle(
@@ -355,6 +480,21 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                     response,
                     context.currentDeviceId,
                 ),
+            )
+        }
+
+        internal suspend fun confirmLocalEnrollmentPublication(
+            engine: LibSignalSecureMessagingCryptoEngine,
+            status: KeyStatus,
+        ) {
+            check(status.owner === this) {
+                "Secure-messaging key status belongs to another transport session"
+            }
+            check(status.enrolled) { "Only an enrolled key status can confirm publication" }
+            engine.confirmLocalEnrollmentPublication(
+                activation = activation,
+                registrationId = checkNotNull(status.registrationId),
+                identityKeySha256 = checkNotNull(status.identityKeySha256),
             )
         }
 
@@ -1144,11 +1284,13 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             owner = this,
             issuanceIdentity = Any(),
             enrolled = checkNotNull(validated.enrolled),
+            enrollmentEpoch = checkNotNull(validated.enrollmentEpoch),
             signalDeviceId = validated.signalDeviceId,
             registrationId = validated.registrationId,
             identityKeySha256 = validated.identityKeySha256,
             signedPrekeyId = validated.signedPrekeyId,
             pqLastResortPrekeyId = validated.pqLastResortPrekeyId,
+            bundleVersion = validated.bundleVersion,
             availableOneTimePrekeys = checkNotNull(validated.availableOneTimePrekeys),
             availableEcOneTimePrekeys = checkNotNull(validated.availableEcOneTimePrekeys),
             availablePqOneTimePrekeys = checkNotNull(validated.availablePqOneTimePrekeys),
@@ -1498,7 +1640,6 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
 
         val capabilities = fencedCall(lifecycle, fence) { api.capabilities() }
         if (capabilities.features?.get(KitFeature.MESSAGING) != true) {
-            quarantineCapabilityMismatch(lifecycle, fence)
             throw SecureMessagingProtocolUnavailableException(
                 "Secure messaging is not enabled for this Kit Pay environment",
             )
@@ -1511,7 +1652,6 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 postQuantum = protocol?.postQuantum,
             )
         ) {
-            quarantineCapabilityMismatch(lifecycle, fence)
             throw SecureMessagingProtocolUnavailableException(
                 "The server has not enabled the reviewed secure-messaging protocol",
             )
@@ -1600,13 +1740,6 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
         lifecycle.assertCurrent(fence, readyRequired)
         return response
-    }
-
-    private fun quarantineCapabilityMismatch(
-        lifecycle: SecureMessagingLifecycleGuard,
-        fence: SecureMessagingSessionFence,
-    ) {
-        lifecycle.quarantine(fence, SecureMessagingQuarantineReason.CAPABILITY_MISMATCH)
     }
 
     private fun requireUuid(value: String, field: String) {

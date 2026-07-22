@@ -34,17 +34,22 @@ class SecureMessagingActiveSessionRegistry @Inject constructor(
 ) {
     private val lock = Any()
     private val mutableActiveSession = MutableStateFlow<SecureMessagingActiveSession?>(null)
+    private var retainedDuringRevalidation: SecureMessagingActiveSession? = null
 
     val activeSession: StateFlow<SecureMessagingActiveSession?> = mutableActiveSession.asStateFlow()
 
     init {
-        lifecycle.addReadinessInvalidationListener(::clear)
+        lifecycle.addReadinessInvalidationListener(::onLifecycleTransition)
     }
 
     fun currentOrNull(): SecureMessagingActiveSession? = synchronized(lock) {
         val active = mutableActiveSession.value ?: return@synchronized null
         if (!isCurrentAndReady(active)) {
-            clearLocked()
+            if (isCurrentTransientRevalidation(active)) {
+                retainLocked(active)
+            } else {
+                clearLocked()
+            }
             null
         } else {
             active
@@ -69,6 +74,12 @@ class SecureMessagingActiveSessionRegistry @Inject constructor(
             }
             return@synchronized existing
         }
+        retainedDuringRevalidation?.let { existing ->
+            check(existing.transport === transport && existing.fence === fence) {
+                "Another secure messaging session is retained during revalidation"
+            }
+            retainedDuringRevalidation = null
+        }
 
         val active = SecureMessagingActiveSession(transport, fence)
         mutableActiveSession.value = active
@@ -83,11 +94,27 @@ class SecureMessagingActiveSessionRegistry @Inject constructor(
     }
 
     internal fun clearIfOwnedBy(fence: SecureMessagingSessionFence) = synchronized(lock) {
-        if (mutableActiveSession.value?.fence === fence) clearLocked()
+        if (mutableActiveSession.value?.fence === fence ||
+            retainedDuringRevalidation?.fence === fence
+        ) {
+            clearLocked()
+        }
     }
 
     internal fun clear() = synchronized(lock) {
         clearLocked()
+    }
+
+    /** Returns the exact withdrawn handle while a self-lifecycle status check is retrying. */
+    internal fun retainedForRevalidation(
+        binding: SecureMessagingSessionBinding,
+    ): SecureMessagingActiveSession? = synchronized(lock) {
+        val retained = retainedDuringRevalidation ?: return@synchronized null
+        if (retained.binding != binding || !isCurrentTransientRevalidation(retained)) {
+            clearLocked()
+            return@synchronized null
+        }
+        retained
     }
 
     private fun isCurrentAndReady(active: SecureMessagingActiveSession): Boolean =
@@ -95,8 +122,48 @@ class SecureMessagingActiveSessionRegistry @Inject constructor(
             lifecycle.assertCurrent(active.fence, readyRequired = true)
         }.isSuccess
 
+    private fun isCurrentTransientRevalidation(active: SecureMessagingActiveSession): Boolean {
+        val snapshot = lifecycle.snapshot()
+        if (snapshot.stage !in TRANSIENT_REVALIDATION_STAGES ||
+            snapshot.binding != active.binding
+        ) {
+            return false
+        }
+        return runCatching { lifecycle.assertCurrent(active.fence) }.isSuccess
+    }
+
+    private fun onLifecycleTransition() = synchronized(lock) {
+        val active = mutableActiveSession.value
+        val retained = retainedDuringRevalidation
+        when {
+            active != null && isCurrentTransientRevalidation(active) -> retainLocked(active)
+            retained != null && isCurrentAndReady(retained) -> {
+                retainedDuringRevalidation = null
+                mutableActiveSession.value = retained
+            }
+            retained != null && !isCurrentTransientRevalidation(retained) -> clearLocked()
+            active != null && !isCurrentAndReady(active) -> clearLocked()
+        }
+    }
+
+    private fun retainLocked(active: SecureMessagingActiveSession) {
+        retainedDuringRevalidation?.let { existing ->
+            check(existing === active) { "Another secure messaging session is already retained" }
+        }
+        retainedDuringRevalidation = active
+        mutableActiveSession.value = null
+    }
+
     private fun clearLocked() {
         mutableActiveSession.value = null
+        retainedDuringRevalidation = null
+    }
+
+    private companion object {
+        val TRANSIENT_REVALIDATION_STAGES = setOf(
+            SecureMessagingRuntimeStage.PREPARING_KEYS,
+            SecureMessagingRuntimeStage.SYNCING_ROSTER,
+        )
     }
 }
 
@@ -167,6 +234,9 @@ class SecureMessagingActivationCoordinator @Inject constructor(
                 "Secure messaging must erase the active epoch before session replacement"
             }
             return@withLock active
+        }
+        sessions.retainedForRevalidation(binding)?.let { retained ->
+            return@withLock retained
         }
 
         val attempt = currentOrNewAttempt(binding)

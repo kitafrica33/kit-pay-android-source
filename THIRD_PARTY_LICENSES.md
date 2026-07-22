@@ -2,14 +2,14 @@
 
 Audit snapshot: 2026-07-22  
 Application ID: `com.kit.wallet`  
-Version name: `0.2.1`  
-Version code: `13`  
+Version name: `0.2.2`  
+Version code: `14`  
 Distribution clearance: `true`  
 Distribution review disposition: `CLEARED`  
 Distribution review record type: `INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL`  
 Distribution review recorded date: `2026-07-22`  
 Distribution review date: `2026-07-22`  
-Distribution review reference: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-003`  
+Distribution review reference: `KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-004`  
 Distribution review issue IDs: `GOOGLE_ANDROID_SDK_AGPL_COMPATIBILITY`  
 Distribution reviewer name: `Kit Pos Uganda Limited Software Engineering`  
 Distribution reviewer organization: `Kit Pos Uganda Limited`  
@@ -29,11 +29,11 @@ Applicable terms effective date: `2026-04-28`
 Applicable terms retrieval date: `2026-07-20`  
 Applicable terms URL: `https://developer.android.com/studio/terms`  
 Applicable terms SHA-256: `8bd88dc1144a7d12818687d680d6a9f9e8a2f1ee62c43a8e21f5c6a75f6977cd`  
-Decision document: `docs/google-fcm-agpl-clearance-decision-code13.md`  
-Decision document SHA-256: `94fb6ea6d9bf5fe46ae1b44f4c92e8ebe688f714554d96617abd279f6ef17d3e`  
+Decision document: `docs/google-fcm-agpl-clearance-decision-code14.md`  
+Decision document SHA-256: `4927ce4287dc0547e8a6b9c4d179e8e63ee1fbb71b1e44a64f9b582f2153a795`  
 Reviewed runtime inventory SHA-256: `4f63a48022e82f037a9c3e8de80d847f2a54b5948ce6f51be8a8863bd83ca330`  
 Reviewed runtime graph manifest SHA-256: `1602aeac63688c2dd85062b6b951aa58e7df1715b7da125b1f487efcf385a5a9`  
-Distribution conditions recorded: `8`  
+Distribution conditions recorded: `11`  
 Re-review triggers recorded: `7`  
 Unresolved issue IDs: `none`
 
@@ -58,13 +58,13 @@ The separate desugaring input is GPL-2.0 with the Classpath/assembly exceptions.
 ## Distribution clearance and continuing conditions
 
 The internal distribution clearance decision
-`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-003` records `CLEARED` for the
+`KIT-PAY-AGPL-GOOGLE-FCM-CLEARANCE-2026-0722-004` records `CLEARED` for the
 exact reviewed runtime. Kit Pos Uganda Limited Software Engineering recorded the
 candidate determination under the signed 2026-07-22 management policy. The record is
 classified as an internal distribution clearance approval; it is not described as an
 external-counsel opinion or a separate candidate signature by executive management.
 
-Under the approved Kit Pos Uganda Limited internal release policy, engineering verified that code 13 changes application behavior without adding or removing runtime dependencies, changing reviewed third-party licences, changing the FCM adapter boundary, changing the libsignal version or licence, or changing the AGPL corresponding-source distribution model. Distribution is approved under the candidate-specific conditions and re-review triggers.
+Under the approved Kit Pos Uganda Limited internal release policy, engineering verified that code 14 changes crash-safe exact-fingerprint secure-messaging enrollment recovery, valid-session preservation, and stale-target reauthentication behavior without adding or removing runtime dependencies, changing reviewed third-party licences, changing the FCM adapter boundary, changing the libsignal version or licence, or changing the AGPL corresponding-source distribution model. Distribution is approved under the candidate-specific conditions and re-review triggers.
 
 The recorded distribution conditions are:
 
@@ -75,7 +75,10 @@ The recorded distribution conditions are:
 5. The final release AAB dependency inventory must match the reviewed inventory.
 6. Any application-architecture change affecting third-party linking boundaries requires review.
 7. Encrypted attachment sends must remain gated to compatible code-13-or-later roster devices.
-8. Direct sideload publication requires exact-APK signing and physical-device installation and launch evidence.
+8. Remote-enrolled/local-missing recovery must durably bind the exact captured target to the authenticated session before transmission, atomically retain the proved resulting epoch through fenced local erasure and re-enrollment, preserve a valid session on success or transient failure, and never publish new keys until the backend proves that exact enrollment was removed and its epoch advanced; invalid-session, stale-target, corrupt-proof, or replacement-enrollment states require fresh sign-in.
+9. Historical self-invalidation events may be ignored only after exact current server epoch, registration, identity-key digest, and bundle-version revalidation; they must never authorize mutation of a replacement enrollment, and unverifiable states remain fail-closed.
+10. Retryable capability handling must not bypass the exact reviewed v2 post-quantum protocol gate.
+11. Direct sideload publication requires exact-APK signing and physical-device installation and launch evidence.
 
 The recorded re-review triggers are:
 

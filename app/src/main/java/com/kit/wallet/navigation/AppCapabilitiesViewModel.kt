@@ -107,11 +107,19 @@ class AppCapabilitiesViewModel @Inject constructor(
     val state = mutableState.asStateFlow()
     private var refreshJob: Job? = null
     private var refreshGeneration: Long = 0
+    private var observedSecureMessagingClientReady = chatRepository.readiness.value
 
     init {
         viewModelScope.launch {
             chatRepository.readiness.collectLatest { ready ->
+                val becameReady = ready && !observedSecureMessagingClientReady
+                observedSecureMessagingClientReady = ready
                 mutableState.update { it.copy(secureMessagingClientReady = ready) }
+                if (becameReady) {
+                    // Local activation has just passed its own fresh server capability check.
+                    // Replace any older UI discovery response from before a readiness rollout.
+                    startRefresh(cancelInFlight = true)
+                }
             }
         }
         refresh()

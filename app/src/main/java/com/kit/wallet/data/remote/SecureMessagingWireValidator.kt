@@ -39,6 +39,7 @@ object SecureMessagingWireValidator {
         requireWire(status.protocolVersion == SECURE_MESSAGING_PROTOCOL_VERSION, "key status protocol")
 
         val enrolled = required(status.enrolled, "key status enrollment")
+        requirePositiveLong(status.enrollmentEpoch, "messaging enrollment epoch")
         val available = requiredNonNegative(status.availableOneTimePrekeys, "available one-time prekeys")
         val availableEc = requiredNonNegative(
             status.availableEcOneTimePrekeys,
@@ -1059,6 +1060,12 @@ object SecureMessagingWireValidator {
         val version = required(value, field)
         requireWire(version > 0, field)
         return version
+    }
+
+    private fun requirePositiveLong(value: Long?, field: String): Long {
+        val result = required(value, field)
+        requireWire(result > 0L, field)
+        return result
     }
 
     private fun requiredNonNegative(value: Int?, field: String): Int {

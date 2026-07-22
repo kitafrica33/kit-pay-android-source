@@ -5,12 +5,16 @@ import com.kit.wallet.data.auth.AuthChallengeKind
 import com.kit.wallet.data.auth.DeviceIdentityProvider
 import com.kit.wallet.data.auth.RemoteAuthRepository
 import com.kit.wallet.data.auth.RemoteRevocationState
+import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
 import com.kit.wallet.data.notifications.PushMessagingTransport
 import com.kit.wallet.data.notifications.PushTokenCoordinator
 import com.kit.wallet.data.remote.ApiCallExecutor
+import com.kit.wallet.data.remote.AuthTokenRefresher
 import com.kit.wallet.data.remote.DeviceRegistrationDto
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.remote.SessionRefreshApi
+import com.kit.wallet.data.remote.SecureMessagingEnrollmentRecoveryApi
 import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.data.repository.WalletSyncResult
@@ -19,6 +23,7 @@ import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
 import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionInvalidatedException
+import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -42,6 +47,8 @@ import retrofit2.converter.moshi.MoshiConverterFactory
 class RemoteAuthRepositoryTest {
     private lateinit var server: MockWebServer
     private lateinit var api: KitWalletApi
+    private lateinit var messagingEnrollmentRecovery: SecureMessagingEnrollmentRecoveryApi
+    private lateinit var sessionRefreshApi: SessionRefreshApi
     private lateinit var apiCalls: ApiCallExecutor
 
     @Before
@@ -49,11 +56,14 @@ class RemoteAuthRepositoryTest {
         server = MockWebServer().apply { start() }
         val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
         apiCalls = ApiCallExecutor(moshi)
-        api = Retrofit.Builder()
+        val retrofit = Retrofit.Builder()
             .baseUrl(server.url("/"))
             .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
-            .create(KitWalletApi::class.java)
+        api = retrofit.create(KitWalletApi::class.java)
+        messagingEnrollmentRecovery =
+            retrofit.create(SecureMessagingEnrollmentRecoveryApi::class.java)
+        sessionRefreshApi = retrofit.create(SessionRefreshApi::class.java)
     }
 
     @After
@@ -79,6 +89,25 @@ class RemoteAuthRepositoryTest {
         val request = server.takeRequest()
         assertEquals("/api/kit-wallet/v1/auth/email/login", request.path)
         assertTrue(request.body.readUtf8().contains("\"installation_id\":\"installation-uuid\""))
+    }
+
+    @Test
+    fun `fresh authenticated session drops an older messaging reset fence`() = runTest {
+        server.enqueue(jsonResponse(AUTHENTICATED_JSON))
+        val sessions = FakeSessionStore().apply {
+            save(
+                TEST_SESSION.copy(
+                    sessionId = "older-session",
+                    messagingResetProof = RESET_PENDING,
+                ),
+            )
+        }
+
+        repository(sessions, FakeRefreshTrigger())
+            .loginWithEmail("amina@example.test", "secret")
+
+        assertEquals("session-uuid", sessions.current()?.sessionId)
+        assertNull(sessions.current()?.messagingResetProof)
     }
 
     @Test
@@ -243,6 +272,195 @@ class RemoteAuthRepositoryTest {
     }
 
     @Test
+    fun `messaging recovery resets exact enrollment and retains authenticated session`() = runTest {
+        server.enqueue(jsonResponse(RESET_APPLIED_JSON))
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+        val repository = repository(sessions, FakeRefreshTrigger())
+
+        repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+
+        val reset = server.takeRequest()
+        assertEquals("/api/kit-wallet/v1/messaging/enrollment/reset", reset.path)
+        assertEquals("Bearer ${TEST_SESSION.accessToken}", reset.getHeader("Authorization"))
+        assertEquals(TEST_SESSION.sessionId, reset.getHeader("X-Kit-Wallet-Session-ID"))
+        val body = reset.body.readUtf8()
+        assertTrue(body.contains("\"expected_enrollment_epoch\":7"))
+        assertTrue(body.contains("\"expected_registration_id\":42"))
+        assertTrue(body.contains("\"expected_identity_key_sha256\":\"${"1".repeat(64)}\""))
+        assertTrue(body.contains("\"expected_bundle_version\":3"))
+        assertEquals(TEST_SESSION.sessionId, sessions.current()?.sessionId)
+        assertEquals(8L, sessions.current()?.messagingResetProof?.resultingEnrollmentEpoch)
+    }
+
+    @Test
+    fun `messaging recovery retains session when reset is unconfirmed`() = runTest {
+        server.enqueue(
+            MockResponse().setResponseCode(503).setHeader("Content-Type", "application/json")
+                .setBody(API_UNAVAILABLE_JSON),
+        )
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+        val repository = repository(sessions, FakeRefreshTrigger())
+
+        val failure = runCatching {
+            repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+        }.exceptionOrNull()
+
+        assertTrue(failure is KitWalletApiException)
+        assertEquals(TEST_SESSION.sessionId, sessions.current()?.sessionId)
+    }
+
+    @Test
+    fun `messaging recovery persists its exact pending target before first HTTP`() = runTest {
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+        var pendingObservedByServer: SecureMessagingResetProofFence? = null
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                pendingObservedByServer = sessions.current()?.messagingResetProof
+                return MockResponse()
+                    .setResponseCode(503)
+                    .setHeader("Content-Type", "application/json")
+                    .setBody(API_UNAVAILABLE_JSON)
+            }
+        }
+
+        val failure = runCatching {
+            repository(sessions, FakeRefreshTrigger())
+                .recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+        }.exceptionOrNull()
+
+        assertTrue(failure is KitWalletApiException)
+        assertEquals(RESET_PENDING, pendingObservedByServer)
+        assertEquals(RESET_PENDING, sessions.current()?.messagingResetProof)
+    }
+
+    @Test
+    fun `restarted messaging recovery retries only its durable exact target`() = runTest {
+        server.enqueue(
+            MockResponse().setResponseCode(503).setHeader("Content-Type", "application/json")
+                .setBody(API_UNAVAILABLE_JSON),
+        )
+        server.enqueue(jsonResponse(RESET_REPLAY_JSON))
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+
+        val firstFailure = runCatching {
+            repository(sessions, FakeRefreshTrigger())
+                .recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+        }.exceptionOrNull()
+        assertTrue(firstFailure is KitWalletApiException)
+        assertEquals(RESET_PENDING, sessions.current()?.messagingResetProof)
+
+        repository(sessions, FakeRefreshTrigger())
+            .recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+
+        val first = server.takeRequest()
+        val retriedAfterRestart = server.takeRequest()
+        assertEquals(first.body.readUtf8(), retriedAfterRestart.body.readUtf8())
+        assertEquals(first.getHeader("Authorization"), retriedAfterRestart.getHeader("Authorization"))
+        assertEquals(TEST_SESSION.sessionId, retriedAfterRestart.getHeader("X-Kit-Wallet-Session-ID"))
+        assertEquals(8L, sessions.current()?.messagingResetProof?.resultingEnrollmentEpoch)
+    }
+
+    @Test
+    fun `messaging recovery accepts idempotent lost-response proof`() = runTest {
+        server.enqueue(jsonResponse(RESET_REPLAY_JSON))
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+        val repository = repository(sessions, FakeRefreshTrigger())
+
+        repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+
+        assertEquals(TEST_SESSION.sessionId, sessions.current()?.sessionId)
+    }
+
+    @Test
+    fun `messaging recovery refreshes the exact captured session after access expiry`() = runTest {
+        server.enqueue(
+            MockResponse().setResponseCode(401).setHeader("Content-Type", "application/json")
+                .setBody(
+                    """{"ok":false,"error":{"code":"ACCESS_TOKEN_EXPIRED","message":"Expired"}}""",
+                ),
+        )
+        server.enqueue(
+            jsonResponse(
+                AUTHENTICATED_JSON
+                    .replace("access-token", "refreshed-access-token")
+                    .replace("refresh-token", "refreshed-refresh-token"),
+            ),
+        )
+        server.enqueue(jsonResponse(RESET_APPLIED_JSON))
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+        val repository = repository(sessions, FakeRefreshTrigger())
+
+        repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+
+        val expiredReset = server.takeRequest()
+        assertEquals("Bearer ${TEST_SESSION.accessToken}", expiredReset.getHeader("Authorization"))
+        val refresh = server.takeRequest()
+        assertEquals("/api/kit-wallet/v1/auth/refresh", refresh.path)
+        assertEquals(TEST_SESSION.sessionId, refresh.getHeader("X-Kit-Wallet-Session-ID"))
+        val confirmedReset = server.takeRequest()
+        assertEquals(
+            "Bearer refreshed-access-token",
+            confirmedReset.getHeader("Authorization"),
+        )
+        assertEquals("refreshed-access-token", sessions.current()?.accessToken)
+    }
+
+    @Test
+    fun `messaging recovery never revokes or clears another local epoch`() = runTest {
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+        val repository = repository(sessions, FakeRefreshTrigger())
+
+        val failure = runCatching {
+            repository.recoverMissingSecureMessagingEnrollment("obsolete-session", RESET_TARGET)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SessionInvalidatedException)
+        assertEquals(TEST_SESSION.sessionId, sessions.current()?.sessionId)
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun `stale reset response clears only S1 and preserves a concurrently adopted S2`() = runTest {
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
+        var observedAuthorization: String? = null
+        var observedSessionId: String? = null
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse =
+                when (request.path) {
+                    "/api/kit-wallet/v1/messaging/enrollment/reset" -> {
+                        observedAuthorization = request.getHeader("Authorization")
+                        observedSessionId = request.getHeader("X-Kit-Wallet-Session-ID")
+                        runBlocking {
+                            sessions.save(
+                                TEST_SESSION.copy(
+                                    sessionId = "replacement-session",
+                                    accessToken = "replacement-access",
+                                    refreshToken = "replacement-refresh",
+                                ),
+                            )
+                        }
+                        MockResponse().setResponseCode(409)
+                            .setHeader("Content-Type", "application/json")
+                            .setBody(
+                                """{"ok":false,"error":{"code":"MESSAGING_ENROLLMENT_RESET_STALE","message":"Stale"}}""",
+                            )
+                    }
+                    else -> MockResponse().setResponseCode(404)
+                }
+        }
+        val repository = repository(sessions, FakeRefreshTrigger())
+
+        val failure = runCatching {
+            repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SessionInvalidatedException)
+        assertEquals("Bearer ${TEST_SESSION.accessToken}", observedAuthorization)
+        assertEquals(TEST_SESSION.sessionId, observedSessionId)
+        assertEquals("replacement-session", sessions.current()?.sessionId)
+    }
+
+    @Test
     fun `logout clears cached projections when secure local erasure reports a failure`() = runTest {
         server.enqueue(jsonResponse(PUSH_UNREGISTER_JSON))
         server.enqueue(jsonResponse(LOGOUT_JSON))
@@ -324,6 +542,8 @@ class RemoteAuthRepositoryTest {
     ) = RemoteAuthRepository(
         api = api,
         apiCalls = apiCalls,
+        messagingEnrollmentRecovery = messagingEnrollmentRecovery,
+        tokenRefresher = AuthTokenRefresher(dagger.Lazy { sessionRefreshApi }, apiCalls),
         sessions = sessions,
         deviceIdentity = FakeDeviceIdentity,
         walletSync = walletSync,
@@ -393,6 +613,37 @@ class RemoteAuthRepositoryTest {
             clear()
             return true
         }
+        override suspend fun recordMessagingResetProofIfCurrent(
+            expected: com.kit.wallet.data.session.SessionFence,
+            proof: com.kit.wallet.data.session.SecureMessagingResetProofFence,
+        ): Boolean {
+            val current = state.value ?: return false
+            if (current.fence() != expected) return false
+            save(current.copy(messagingResetProof = proof))
+            return true
+        }
+        override suspend fun recordMessagingResetPendingIfCurrent(
+            expected: com.kit.wallet.data.session.SessionFence,
+            pending: com.kit.wallet.data.session.SecureMessagingResetProofFence,
+        ): Boolean {
+            val current = state.value ?: return false
+            if (current.fence() != expected) return false
+            val existing = current.messagingResetProof
+            if (existing != null) {
+                return existing.copy(resultingEnrollmentEpoch = null) == pending
+            }
+            save(current.copy(messagingResetProof = pending))
+            return true
+        }
+        override suspend fun clearMessagingResetProofIfCurrent(
+            expected: com.kit.wallet.data.session.SessionFence,
+            proof: com.kit.wallet.data.session.SecureMessagingResetProofFence,
+        ): Boolean {
+            val current = state.value ?: return false
+            if (current.fence() != expected || current.messagingResetProof != proof) return false
+            save(current.copy(messagingResetProof = null))
+            return true
+        }
         override suspend fun clear() {
             state.value = null
             revision++
@@ -435,6 +686,31 @@ class RemoteAuthRepositoryTest {
             accessToken = "access-token",
             refreshToken = "refresh-token",
             sessionId = "session-uuid",
+        )
+
+        val RESET_TARGET = SecureMessagingEnrollmentResetTarget(
+            serverDeviceId = "22222222-2222-4222-8222-222222222222",
+            enrollmentEpoch = 7,
+            registrationId = 42,
+            identityKeySha256 = "1".repeat(64),
+            bundleVersion = 3,
+        )
+
+        val RESET_PENDING = SecureMessagingResetProofFence(
+            serverDeviceId = RESET_TARGET.serverDeviceId,
+            previousEnrollmentEpoch = RESET_TARGET.enrollmentEpoch,
+            previousRegistrationId = RESET_TARGET.registrationId,
+            previousIdentityKeySha256 = RESET_TARGET.identityKeySha256,
+            previousBundleVersion = RESET_TARGET.bundleVersion,
+        )
+
+        val RESET_APPLIED_JSON = """
+            {"ok":true,"data":{"device_id":"22222222-2222-4222-8222-222222222222","previous_enrollment_epoch":7,"enrollment_epoch":8,"enrolled":false,"reset_applied":true}}
+        """.trimIndent()
+
+        val RESET_REPLAY_JSON = RESET_APPLIED_JSON.replace(
+            "\"reset_applied\":true",
+            "\"reset_applied\":false",
         )
 
         val API_UNAVAILABLE_JSON = """

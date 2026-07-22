@@ -40,6 +40,7 @@ class SecureMessagingWireValidatorTest {
         )
         val unenrolled = MessagingKeyStatusDto(
             enrolled = false,
+            enrollmentEpoch = 1,
             protocolVersion = "v2",
             availableOneTimePrekeys = 0,
             availableEcOneTimePrekeys = 0,
@@ -84,6 +85,7 @@ class SecureMessagingWireValidatorTest {
             SecureMessagingWireValidator.validateKeyStatus(
                 MessagingKeyStatusDto(
                     enrolled = false,
+                    enrollmentEpoch = 1,
                     protocolVersion = "v2",
                     deviceId = CURRENT_DEVICE_ID,
                     availableOneTimePrekeys = 0,
@@ -531,6 +533,7 @@ class SecureMessagingWireValidatorTest {
         val pqLastResort = signalValue(8, 0x31, 1569)
         return MessagingKeyStatusDto(
             enrolled = true,
+            enrollmentEpoch = 1,
             deviceId = CURRENT_DEVICE_ID,
             signalDeviceId = 1,
             protocolVersion = "v2",

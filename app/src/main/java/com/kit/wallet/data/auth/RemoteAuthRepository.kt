@@ -3,6 +3,8 @@ package com.kit.wallet.data.auth
 import com.kit.wallet.data.notifications.PushTokenCoordinator
 import com.kit.wallet.data.remote.AuthChallengeDto
 import com.kit.wallet.data.remote.AuthResultDto
+import com.kit.wallet.data.remote.AuthTokenRefresher
+import com.kit.wallet.data.remote.AuthSessionRefreshCoordinator
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.EmailAddressRequest
 import com.kit.wallet.data.remote.EmailLoginRequest
@@ -14,7 +16,11 @@ import com.kit.wallet.data.remote.PhoneOtpRequest
 import com.kit.wallet.data.remote.PhoneOtpVerifyRequest
 import com.kit.wallet.data.remote.RequestAccountDeletionDto
 import com.kit.wallet.data.remote.RefreshSessionRequest
+import com.kit.wallet.data.remote.ResetMessagingEnrollmentDto
+import com.kit.wallet.data.remote.ResetMessagingEnrollmentRequest
 import com.kit.wallet.data.remote.ResetPasswordRequest
+import com.kit.wallet.data.remote.SecureMessagingEnrollmentRecoveryApi
+import com.kit.wallet.data.remote.SessionRefreshResult
 import com.kit.wallet.data.remote.TwoFactorVerifyRequest
 import com.kit.wallet.data.remote.VerifyIdentityTokenRequest
 import com.kit.wallet.data.repository.WalletRefreshTrigger
@@ -26,6 +32,7 @@ import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionSnapshot
+import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.kit.wallet.di.ApplicationScope
 import java.time.Instant
 import java.time.ZoneId
@@ -45,6 +52,9 @@ import kotlinx.coroutines.withContext
 class RemoteAuthRepository @Inject constructor(
     private val api: KitWalletApi,
     private val apiCalls: ApiCallExecutor,
+    private val messagingEnrollmentRecovery: SecureMessagingEnrollmentRecoveryApi,
+    private val tokenRefresher: AuthTokenRefresher,
+    private val refreshCoordinator: AuthSessionRefreshCoordinator = AuthSessionRefreshCoordinator(),
     private val sessions: SessionStore,
     private val deviceIdentity: DeviceIdentityProvider,
     private val walletSync: WalletSyncRepository,
@@ -247,6 +257,136 @@ class RemoteAuthRepository @Inject constructor(
         )
     }
 
+    override suspend fun recoverMissingSecureMessagingEnrollment(
+        expectedSessionEpoch: String,
+        target: SecureMessagingEnrollmentResetTarget,
+    ) {
+        var targetFence = sessions.current()?.fence() ?: throw SessionInvalidatedException()
+        if (targetFence.sessionId != expectedSessionEpoch) throw SessionInvalidatedException()
+        var targetSession = sessions.withCurrentSession(targetFence) { it }
+        var accessRefreshAttempted = false
+        val pendingReset = SecureMessagingResetProofFence(
+            serverDeviceId = target.serverDeviceId,
+            previousEnrollmentEpoch = target.enrollmentEpoch,
+            previousRegistrationId = target.registrationId,
+            previousIdentityKeySha256 = target.identityKeySha256,
+            previousBundleVersion = target.bundleVersion,
+        )
+        if (!sessions.recordMessagingResetPendingIfCurrent(targetFence, pendingReset)) {
+            throw SessionInvalidatedException()
+        }
+
+        // This client has explicit snapshotted credentials and no mutable-session interceptor or
+        // authenticator. An obsolete S1 request can therefore never be replayed as S2.
+        while (true) {
+            try {
+                val proof = apiCalls.execute {
+                    messagingEnrollmentRecovery.reset(
+                        authorization = "Bearer ${targetSession.accessToken}",
+                        sessionId = targetSession.sessionId,
+                        request = ResetMessagingEnrollmentRequest(
+                            expectedEnrollmentEpoch = target.enrollmentEpoch,
+                            expectedRegistrationId = target.registrationId,
+                            expectedIdentityKeySha256 = target.identityKeySha256,
+                            expectedBundleVersion = target.bundleVersion,
+                        ),
+                    )
+                }
+                val resetProof = requireEnrollmentResetProof(proof, target)
+                if (sessions.current()?.fence() != targetFence) throw SessionInvalidatedException()
+                if (!sessions.recordMessagingResetProofIfCurrent(targetFence, resetProof)) {
+                    throw SessionInvalidatedException()
+                }
+                return
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: KitWalletApiException) {
+                if (error.statusCode == 409 &&
+                    error.code == "MESSAGING_ENROLLMENT_RESET_STALE"
+                ) {
+                    requireFreshAuthentication(targetFence)
+                }
+                if (error.statusCode == 401 && !accessRefreshAttempted) {
+                    accessRefreshAttempted = true
+                    targetSession = refreshCoordinator.serialized {
+                        val latest = sessions.withCurrentSession(targetFence) { it }
+                        if (latest.accessToken != targetSession.accessToken ||
+                            latest.refreshToken != targetSession.refreshToken
+                        ) {
+                            return@serialized latest
+                        }
+                        when (val refresh = tokenRefresher.refresh(latest)) {
+                            is SessionRefreshResult.Refreshed -> {
+                                check(refresh.tokens.sessionId == latest.sessionId) {
+                                    "Session refresh changed secure-messaging recovery epoch"
+                                }
+                                if (!sessions.adoptRefreshedCredentialsIfCurrent(
+                                        latest,
+                                        refresh.tokens,
+                                    )
+                                ) {
+                                    throw SessionInvalidatedException()
+                                }
+                                refresh.tokens
+                            }
+                            is SessionRefreshResult.Rejected -> {
+                                requireFreshAuthentication(targetFence)
+                            }
+                        }
+                    }
+                    targetFence = targetSession.fence()
+                    continue
+                }
+                if (error.statusCode == 401) {
+                    requireFreshAuthentication(targetFence)
+                }
+                throw error
+            }
+        }
+    }
+
+    override suspend fun requireFreshAuthenticationForSecureMessagingRecovery(
+        expectedSessionEpoch: String,
+    ) {
+        val target = sessions.current()?.fence() ?: throw SessionInvalidatedException()
+        if (target.sessionId != expectedSessionEpoch) throw SessionInvalidatedException()
+        clearLocalUserData(target)
+    }
+
+    private suspend fun requireFreshAuthentication(target: SessionFence): Nothing {
+        clearLocalUserData(target)
+        throw SessionInvalidatedException()
+    }
+
+    private fun requireEnrollmentResetProof(
+        proof: ResetMessagingEnrollmentDto,
+        target: SecureMessagingEnrollmentResetTarget,
+    ): SecureMessagingResetProofFence {
+        check(proof.deviceId == target.serverDeviceId) {
+            "Messaging enrollment reset proof belongs to another device"
+        }
+        check(proof.previousEnrollmentEpoch == target.enrollmentEpoch) {
+            "Messaging enrollment reset proof has another previous epoch"
+        }
+        check(proof.enrollmentEpoch == target.enrollmentEpoch + 1L) {
+            "Messaging enrollment reset proof did not advance exactly one epoch"
+        }
+        check(proof.enrolled == false) {
+            "Messaging enrollment reset proof left the device enrolled"
+        }
+        checkNotNull(proof.resetApplied) {
+            "Messaging enrollment reset proof omitted idempotency state"
+        }
+        return SecureMessagingResetProofFence(
+            serverDeviceId = target.serverDeviceId,
+            previousEnrollmentEpoch = target.enrollmentEpoch,
+            resultingEnrollmentEpoch = checkNotNull(proof.enrollmentEpoch),
+            previousRegistrationId = target.registrationId,
+            previousIdentityKeySha256 = target.identityKeySha256,
+            previousBundleVersion = target.bundleVersion,
+        )
+    }
+
     override suspend fun accountDeletionPreflight(): AccountDeletionPreflight {
         val result = apiCalls.execute { api.accountDeletionPreflight() }
         check(result.state == "available" && result.canRequest == true) {
@@ -364,6 +504,11 @@ class RemoteAuthRepository @Inject constructor(
                     "${authenticatedUser.id}:${sessionDto.sessionId}"
                 },
                 profileSetupState = setupState,
+                messagingResetProof = if (sessionDto.sessionId == previousFence?.sessionId) {
+                    sessions.current()?.messagingResetProof
+                } else {
+                    null
+                },
             )
             if (!sessions.saveIfUnchanged(expected, tokens)) throw SessionInvalidatedException()
             walletRefreshTrigger.refreshNow()

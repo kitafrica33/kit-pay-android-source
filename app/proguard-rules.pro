@@ -4,6 +4,7 @@
 # DTOs use Moshi reflection; preserve their Kotlin metadata and serialized fields.
 -keep class com.kit.wallet.data.remote.** { *; }
 -keep class com.kit.wallet.data.session.SessionDiskPayload { *; }
+-keep class com.kit.wallet.data.session.SecureMessagingResetProofFence { *; }
 -keepattributes Signature,*Annotation*,InnerClasses,EnclosingMethod
 
 # Retrofit service method annotations are inspected at runtime.

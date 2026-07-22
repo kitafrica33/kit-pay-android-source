@@ -70,6 +70,7 @@ data class MessagingKeyTransparencyDto(
 @JsonClass(generateAdapter = false)
 data class MessagingKeyStatusDto(
     val enrolled: Boolean? = null,
+    @Json(name = "enrollment_epoch") val enrollmentEpoch: Long? = null,
     @Json(name = "device_id") val deviceId: String? = null,
     @Json(name = "signal_device_id") val signalDeviceId: Int? = null,
     @Json(name = "protocol_version") val protocolVersion: String? = null,
@@ -91,6 +92,23 @@ data class MessagingKeyStatusDto(
     @Json(name = "published_at") val publishedAt: String? = null,
     @Json(name = "rotated_at") val rotatedAt: String? = null,
     val transparency: MessagingKeyTransparencyDto? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class ResetMessagingEnrollmentRequest(
+    @Json(name = "expected_enrollment_epoch") val expectedEnrollmentEpoch: Long,
+    @Json(name = "expected_registration_id") val expectedRegistrationId: Int,
+    @Json(name = "expected_identity_key_sha256") val expectedIdentityKeySha256: String,
+    @Json(name = "expected_bundle_version") val expectedBundleVersion: Int,
+)
+
+@JsonClass(generateAdapter = false)
+data class ResetMessagingEnrollmentDto(
+    @Json(name = "device_id") val deviceId: String? = null,
+    @Json(name = "previous_enrollment_epoch") val previousEnrollmentEpoch: Long? = null,
+    @Json(name = "enrollment_epoch") val enrollmentEpoch: Long? = null,
+    val enrolled: Boolean? = null,
+    @Json(name = "reset_applied") val resetApplied: Boolean? = null,
 )
 
 @JsonClass(generateAdapter = false)

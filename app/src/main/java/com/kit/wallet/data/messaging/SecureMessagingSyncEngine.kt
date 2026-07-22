@@ -1,6 +1,8 @@
 package com.kit.wallet.data.messaging
 
+import com.kit.wallet.data.auth.AuthRepository
 import com.kit.wallet.data.auth.DeviceIdentityProvider
+import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.SecureMessagingTransportValidator
@@ -12,6 +14,8 @@ import javax.inject.Singleton
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -137,26 +141,151 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
     private val processor: SecureMessagingEventProcessor,
     private val sessions: SessionStore,
     private val sessionLifecycle: SecureMessagingSessionLifecycle,
+    private val authRepository: AuthRepository,
 ) : SecureMessagingSyncEngine {
+    private sealed interface PendingEnrollmentRecovery {
+        val sessionEpoch: String
+        val activationFence: SecureMessagingSessionFence
+
+        data class RemoteReset(
+            override val sessionEpoch: String,
+            override val activationFence: SecureMessagingSessionFence,
+            val target: SecureMessagingEnrollmentResetTarget,
+        ) : PendingEnrollmentRecovery
+
+        data class LocalReset(
+            override val sessionEpoch: String,
+            override val activationFence: SecureMessagingSessionFence,
+        ) : PendingEnrollmentRecovery
+
+        data class FreshAuthentication(
+            override val sessionEpoch: String,
+            override val activationFence: SecureMessagingSessionFence,
+        ) : PendingEnrollmentRecovery
+    }
+
+    private val synchronizationMutex = Mutex()
+    private var pendingEnrollmentRecovery: PendingEnrollmentRecovery? = null
+
     override val isReady: Boolean = true
 
-    override suspend fun synchronize() {
-        val sessionEpoch = bindingResolver.currentSessionEpoch()
-        awaitSecureMessagingStateAvailability(
-            expectedSessionEpoch = sessionEpoch,
-            stateAvailable = sessionLifecycle.stateAvailable,
-            sessions = sessions.session,
-        )
-        val binding = bindingResolver.resolve(sessionEpoch)
-        bindingResolver.assertCurrent(binding)
-        val active = activation.ensureActivated(binding)
-        check(active.binding == binding) {
-            "Secure-messaging activation returned another authentication epoch"
+    override suspend fun synchronize() = synchronizationMutex.withLock {
+        while (true) {
+            val sessionEpoch = bindingResolver.currentSessionEpoch()
+            pendingEnrollmentRecovery?.let { pending ->
+                if (pending.sessionEpoch == sessionEpoch) {
+                    completePendingEnrollmentRecovery(pending)
+                    pendingEnrollmentRecovery = null
+                    return@let
+                }
+                pendingEnrollmentRecovery = null
+            }
+            if (pendingEnrollmentRecovery == null) {
+                awaitSecureMessagingStateAvailability(
+                    expectedSessionEpoch = sessionEpoch,
+                    stateAvailable = sessionLifecycle.stateAvailable,
+                    sessions = sessions.session,
+                )
+            } else {
+                continue
+            }
+            val binding = bindingResolver.resolve(sessionEpoch)
+            bindingResolver.assertCurrent(binding)
+            val active = try {
+                activation.ensureActivated(binding)
+            } catch (required: SecureMessagingReauthenticationRequiredException) {
+                pendingEnrollmentRecovery = PendingEnrollmentRecovery.RemoteReset(
+                    sessionEpoch = binding.sessionEpoch,
+                    activationFence = required.activationFence,
+                    target = required.target,
+                )
+                continue
+            } catch (required: SecureMessagingLocalEnrollmentResetRequiredException) {
+                pendingEnrollmentRecovery = PendingEnrollmentRecovery.LocalReset(
+                    sessionEpoch = binding.sessionEpoch,
+                    activationFence = required.activationFence,
+                )
+                continue
+            } catch (required: SecureMessagingFreshAuthenticationRequiredException) {
+                pendingEnrollmentRecovery = PendingEnrollmentRecovery.FreshAuthentication(
+                    sessionEpoch = binding.sessionEpoch,
+                    activationFence = required.activationFence,
+                )
+                continue
+            }
+            check(active.binding == binding) {
+                "Secure-messaging activation returned another authentication epoch"
+            }
+            bindingResolver.assertCurrent(binding)
+            try {
+                processor.synchronize(active.transport)
+            } catch (required: SecureMessagingReauthenticationRequiredException) {
+                pendingEnrollmentRecovery = PendingEnrollmentRecovery.RemoteReset(
+                    sessionEpoch = binding.sessionEpoch,
+                    activationFence = required.activationFence,
+                    target = required.target,
+                )
+                continue
+            } catch (required: SecureMessagingLocalEnrollmentResetRequiredException) {
+                pendingEnrollmentRecovery = PendingEnrollmentRecovery.LocalReset(
+                    sessionEpoch = binding.sessionEpoch,
+                    activationFence = required.activationFence,
+                )
+                continue
+            } catch (required: SecureMessagingFreshAuthenticationRequiredException) {
+                pendingEnrollmentRecovery = PendingEnrollmentRecovery.FreshAuthentication(
+                    sessionEpoch = binding.sessionEpoch,
+                    activationFence = required.activationFence,
+                )
+                continue
+            }
+            bindingResolver.assertCurrent(binding)
+            processor.recoverPendingOutbox(active.transport)
+            bindingResolver.assertCurrent(binding)
+            return@withLock
         }
-        bindingResolver.assertCurrent(binding)
-        processor.synchronize(active.transport)
-        bindingResolver.assertCurrent(binding)
-        processor.recoverPendingOutbox(active.transport)
-        bindingResolver.assertCurrent(binding)
+    }
+
+    private suspend fun completePendingEnrollmentRecovery(
+        pending: PendingEnrollmentRecovery,
+    ) {
+        try {
+            when (pending) {
+                is PendingEnrollmentRecovery.LocalReset -> resetLocalState(pending)
+                is PendingEnrollmentRecovery.FreshAuthentication ->
+                    authRepository.requireFreshAuthenticationForSecureMessagingRecovery(
+                        pending.sessionEpoch,
+                    )
+                is PendingEnrollmentRecovery.RemoteReset -> {
+                    authRepository.recoverMissingSecureMessagingEnrollment(
+                        expectedSessionEpoch = pending.sessionEpoch,
+                        target = pending.target,
+                    )
+                    resetLocalState(pending)
+                }
+            }
+        } catch (error: Throwable) {
+            if (sessions.current()?.sessionId != pending.sessionEpoch) {
+                pendingEnrollmentRecovery = null
+                throw SecureMessagingAuthenticationEpochChangedException(
+                    "Authentication changed during secure-messaging recovery",
+                )
+            }
+            throw error
+        }
+    }
+
+    private suspend fun resetLocalState(pending: PendingEnrollmentRecovery) {
+        val expected = sessions.current()?.fence()
+            ?: throw SecureMessagingAuthenticationEpochChangedException(
+                "Authentication ended before secure-messaging recovery",
+            )
+        if (expected.sessionId != pending.sessionEpoch ||
+            !sessions.resetSecureMessagingStateIfCurrent(expected, pending.activationFence)
+        ) {
+            throw SecureMessagingAuthenticationEpochChangedException(
+                "Authentication changed before secure-messaging state reset",
+            )
+        }
     }
 }

@@ -9,6 +9,7 @@ import com.kit.wallet.data.messaging.OpaqueCryptoBytes
 import com.kit.wallet.data.messaging.RealSecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.SecureMessagingActivationCapability
+import com.kit.wallet.data.messaging.SecureMessagingActivationCoordinator
 import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
 import com.kit.wallet.data.messaging.SecureMessagingCommittedResult
 import com.kit.wallet.data.messaging.SecureMessagingCompanionStateIntent
@@ -27,6 +28,7 @@ import com.kit.wallet.data.messaging.SecureMessagingEnvelopeKind
 import com.kit.wallet.data.messaging.SecureMessagingEventProcessor
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotification
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotificationSink
+import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingNotificationPublicationException
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
@@ -34,6 +36,8 @@ import com.kit.wallet.data.messaging.SecureMessagingProvisioningPlan
 import com.kit.wallet.data.messaging.SecureMessagingRecord
 import com.kit.wallet.data.messaging.SecureMessagingRecordPage
 import com.kit.wallet.data.messaging.SecureMessagingRecordVersion
+import com.kit.wallet.data.messaging.SecureMessagingReauthenticationRequiredException
+import com.kit.wallet.data.messaging.SecureMessagingRevalidationRetryException
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
 import com.kit.wallet.data.messaging.SecureMessagingSessionEstablishmentRequest
 import com.kit.wallet.data.messaging.SecureMessagingSessionFence
@@ -73,13 +77,19 @@ import java.time.Instant
 import java.time.Clock
 import java.time.ZoneOffset
 import java.util.Base64
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -975,9 +985,10 @@ class SecureMessagingEventProcessorTest {
     }
 
     @Test
-    fun `current device revocation leaves ready cancels notifications and starts erasure`() =
+    fun `current device revocation requires pinned reset without direct erasure`() =
         runTest {
             val (session, lifecycle, fence) = openSyncingSession()
+            recordCurrentIdentity(session)
             lifecycle.finishActivation(fence)
             val stateStore = TestSecureMessagingStateStore()
             val crypto = PersistingDecryptionEngine(stateStore)
@@ -1001,20 +1012,197 @@ class SecureMessagingEventProcessorTest {
                 ),
                 "revoked_cursor",
             )
+            server.enqueue(unenrolledKeyStatusResponse())
 
             val failure = runCatching { processor.synchronize(session) }.exceptionOrNull()
 
-            assertTrue(failure is SecureMessagingCryptographicFailureException)
+            assertTrue(failure is SecureMessagingReauthenticationRequiredException)
+            val cryptographicFailure = failure?.cause as? SecureMessagingCryptographicFailureException
             assertEquals(
                 SecureMessagingQuarantineReason.CURRENT_DEVICE_REVOKED,
-                (failure as SecureMessagingCryptographicFailureException).quarantineReason,
+                cryptographicFailure?.quarantineReason,
             )
             assertEquals(SecureMessagingRuntimeStage.QUARANTINED, lifecycle.snapshot().stage)
             assertEquals(1, notifications.cancellations)
-            assertEquals(1, erasures)
+            assertEquals(0, erasures)
             assertTrue(crypto.retiredDevices.isEmpty())
             assertNull(SecureMessagingSyncCursorStore(stateStore).load())
         }
+
+    @Test
+    fun `historical self event revalidates in place during initial activation`() = runTest {
+        val lifecycle = SecureMessagingLifecycleGuard()
+        val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+        val stateStore = TestSecureMessagingStateStore()
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+        )
+        val coordinator = SecureMessagingActivationCoordinator(
+            transport = transport,
+            lifecycle = lifecycle,
+            sessions = registry,
+            keyActivation = SecureMessagingKeyActivation(::recordCurrentIdentity),
+            initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+        )
+        enqueueActivation()
+        enqueueSync(
+            listOf(
+                deviceLifecycleEvent(
+                    eventType = "device.revoked",
+                    userId = CURRENT.userId,
+                    deviceId = CURRENT.serverDeviceId,
+                ),
+            ),
+            "initial_historical_self_cursor",
+        )
+        enqueueCurrentKeyStatus()
+
+        val active = coordinator.ensureActivated(BINDING)
+
+        assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+        assertEquals(BINDING, active.binding)
+        assertNotNull(registry.currentOrNull())
+        assertEquals(
+            "initial_historical_self_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(
+                checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+            ),
+        )
+    }
+
+    @Test
+    fun `historical current-device revocation is ignored after fresh identity reconciliation`() =
+        runTest {
+            val (session, lifecycle, fence) = openSyncingSession()
+            recordCurrentIdentity(session)
+            lifecycle.finishActivation(fence)
+            val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+            registry.publish(session, fence)
+            val stateStore = TestSecureMessagingStateStore()
+            var erasures = 0
+            val processor = processor(
+                stateStore = stateStore,
+                crypto = PersistingDecryptionEngine(stateStore),
+                currentActivationRevocation = SecureMessagingCurrentActivationRevocation {
+                    erasures++
+                },
+            )
+            enqueueSync(
+                listOf(
+                    deviceLifecycleEvent(
+                        eventType = "device.revoked",
+                        userId = CURRENT.userId,
+                        deviceId = CURRENT.serverDeviceId,
+                    ),
+                ),
+                "historical_revocation_cursor",
+            )
+            enqueueCurrentKeyStatus()
+
+            processor.synchronize(session)
+
+            assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+            assertNotNull(registry.currentOrNull())
+            assertEquals(0, erasures)
+            assertEquals(
+                "historical_revocation_cursor" to 10L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+        }
+
+    @Test
+    fun `self lifecycle revalidation withdraws readiness until exact status matches`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        recordCurrentIdentity(session)
+        lifecycle.finishActivation(fence)
+        val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+        registry.publish(session, fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val processor = processor(stateStore, PersistingDecryptionEngine(stateStore))
+        val statusEntered = CountDownLatch(1)
+        val releaseStatus = CountDownLatch(1)
+        val syncResponse = syncResponse(
+            listOf(
+                deviceLifecycleEvent(
+                    eventType = "device.revoked",
+                    userId = CURRENT.userId,
+                    deviceId = CURRENT.serverDeviceId,
+                ),
+            ),
+            "suspended_revalidation_cursor",
+        )
+        val keyStatusResponse = currentKeyStatusResponse()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when {
+                request.path?.startsWith("/api/kit-wallet/v1/messaging/sync") == true -> syncResponse
+                request.path == "/api/kit-wallet/v1/messaging/keys/status" -> {
+                    statusEntered.countDown()
+                    check(releaseStatus.await(5, TimeUnit.SECONDS))
+                    keyStatusResponse
+                }
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+
+        val synchronization = backgroundScope.async(Dispatchers.IO) {
+            processor.synchronize(session)
+        }
+        try {
+            assertTrue(statusEntered.await(5, TimeUnit.SECONDS))
+            assertEquals(
+                SecureMessagingRuntimeStage.PREPARING_KEYS,
+                lifecycle.snapshot().stage,
+            )
+            assertNull(registry.currentOrNull())
+        } finally {
+            releaseStatus.countDown()
+        }
+        synchronization.await()
+
+        assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+        assertNotNull(registry.currentOrNull())
+    }
+
+    @Test
+    fun `unresolved self lifecycle status fails closed for server and transport failures`() =
+        runTest {
+            assertSelfLifecycleRevalidationRetries(
+                eventType = "device.revoked",
+                statusResponse = MockResponse()
+                    .setResponseCode(503)
+                    .setHeader("Content-Type", "application/json")
+                    .setBody(
+                        """{"ok":false,"error":{"code":"TEMPORARY_FAILURE","message":"retry"}}""",
+                    ),
+            )
+            assertSelfLifecycleRevalidationRetries(
+                eventType = "identity.changed",
+                statusResponse = currentKeyStatusResponse().setSocketPolicy(
+                    SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY,
+                ),
+            )
+        }
+
+    @Test
+    fun `authoritative mismatch rejects current device revocation`() = runTest {
+        assertSelfLifecycleEventRejected(
+            eventType = "device.revoked",
+            statusResponse = currentKeyStatusResponse(identityKeySha256 = "9".repeat(64)),
+            expectedReason = SecureMessagingQuarantineReason.CURRENT_DEVICE_REVOKED,
+        )
+    }
+
+    @Test
+    fun `authoritative unenrollment rejects current identity change`() = runTest {
+        assertSelfLifecycleEventRejected(
+            eventType = "identity.changed",
+            statusResponse = unenrolledKeyStatusResponse(),
+            expectedReason = SecureMessagingQuarantineReason.IDENTITY_CHANGED,
+        )
+    }
 
     @Test
     fun `peer revocation retires exact peer state before cursor confirmation`() = runTest {
@@ -1476,12 +1664,180 @@ class SecureMessagingEventProcessorTest {
     }
 
     private fun enqueueSync(events: List<MessagingSyncEventDto>, nextCursor: String) {
+        server.enqueue(syncResponse(events, nextCursor))
+    }
+
+    private fun syncResponse(
+        events: List<MessagingSyncEventDto>,
+        nextCursor: String,
+    ): MockResponse {
         val response = MessagingSyncDto(
             events = events,
             page = CursorPageDto(nextCursor = nextCursor, hasMore = false, limit = 50),
         )
         val encoded = moshi.adapter(MessagingSyncDto::class.java).toJson(response)
-        server.enqueue(jsonResponse("""{"ok":true,"data":$encoded}"""))
+        return jsonResponse("""{"ok":true,"data":$encoded}""")
+    }
+
+    private fun enqueueCurrentKeyStatus() {
+        server.enqueue(currentKeyStatusResponse())
+    }
+
+    private fun currentKeyStatusResponse(
+        identityKeySha256: String = CURRENT_IDENTITY_HASH,
+    ): MockResponse = jsonResponse(
+                """{"ok":true,"data":{
+                    "enrolled":true,"enrollment_epoch":1,
+                    "device_id":"$CURRENT_DEVICE_ID","signal_device_id":1,
+                    "protocol_version":"v2","registration_id":42,
+                    "identity_key_sha256":"$identityKeySha256","signed_prekey_id":1001,
+                    "signed_prekey_sha256":"$SIGNED_PREKEY_HASH",
+                    "pq_last_resort_prekey_id":2001,
+                    "pq_last_resort_prekey_sha256":"$PQ_PREKEY_HASH","bundle_version":2,
+                    "available_one_time_prekeys":100,"available_ec_one_time_prekeys":100,
+                    "available_pq_one_time_prekeys":100,"replenish_at":20,
+                    "needs_replenishment":false,"published_at":"$TIMESTAMP","rotated_at":null,
+                    "transparency":{"revision":"2","event_type":"device.enrolled",
+                    "protocol_version":"v2","event_hash":"$EVENT_HASH",
+                    "identity_key_sha256":"$identityKeySha256",
+                    "pq_last_resort_prekey_id":2001,
+                    "pq_last_resort_prekey_sha256":"$PQ_PREKEY_HASH",
+                    "occurred_at":"$TIMESTAMP"}}}
+                """.trimIndent(),
+            )
+
+    private fun unenrolledKeyStatusResponse(): MockResponse = jsonResponse(
+        """{"ok":true,"data":{"enrolled":false,"enrollment_epoch":2,"protocol_version":"v2",
+            "available_one_time_prekeys":0,"available_ec_one_time_prekeys":0,
+            "available_pq_one_time_prekeys":0,"replenish_at":20,
+            "needs_replenishment":true}}
+        """.trimIndent(),
+    )
+
+    private fun recordCurrentIdentity(session: RemoteSecureMessagingTransport.Session) {
+        session.recordReconciledKeyIdentity(
+            RemoteSecureMessagingTransport.Session.KeyStatus(
+                session,
+                Any(),
+                true,
+                1,
+                1,
+                42,
+                CURRENT_IDENTITY_HASH,
+                1_001,
+                2_001,
+                2,
+                100,
+                100,
+                100,
+                20,
+                false,
+            ),
+        )
+    }
+
+    private suspend fun assertSelfLifecycleEventRejected(
+        eventType: String,
+        statusResponse: MockResponse,
+        expectedReason: SecureMessagingQuarantineReason,
+    ) {
+        val (session, lifecycle, fence) = openSyncingSession()
+        recordCurrentIdentity(session)
+        lifecycle.finishActivation(fence)
+        val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+        registry.publish(session, fence)
+        val stateStore = TestSecureMessagingStateStore()
+        var erasures = 0
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+            currentActivationRevocation = SecureMessagingCurrentActivationRevocation {
+                erasures++
+            },
+        )
+        enqueueSync(
+            listOf(
+                deviceLifecycleEvent(
+                    eventType = eventType,
+                    userId = CURRENT.userId,
+                    deviceId = CURRENT.serverDeviceId,
+                ),
+            ),
+            "rejected_self_event_cursor",
+        )
+        server.enqueue(statusResponse)
+
+        val failure = runCatching { processor.synchronize(session) }.exceptionOrNull()
+
+        val recovery = failure as? SecureMessagingReauthenticationRequiredException
+        assertNotNull("Unexpected failure: $failure; cause=${failure?.cause}", recovery)
+        assertEquals(
+            com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget(
+                serverDeviceId = CURRENT_DEVICE_ID,
+                enrollmentEpoch = 1,
+                registrationId = 42,
+                identityKeySha256 = CURRENT_IDENTITY_HASH,
+                bundleVersion = 2,
+            ),
+            recovery?.target,
+        )
+        val cryptographicFailure = recovery?.cause as? SecureMessagingCryptographicFailureException
+        assertEquals(
+            expectedReason,
+            cryptographicFailure?.quarantineReason,
+        )
+        assertEquals(SecureMessagingRuntimeStage.QUARANTINED, lifecycle.snapshot().stage)
+        assertNull(registry.currentOrNull())
+        assertEquals(0, erasures)
+    }
+
+    private suspend fun assertSelfLifecycleRevalidationRetries(
+        eventType: String,
+        statusResponse: MockResponse,
+    ) {
+        val (session, lifecycle, fence) = openSyncingSession()
+        recordCurrentIdentity(session)
+        lifecycle.finishActivation(fence)
+        val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+        registry.publish(session, fence)
+        val stateStore = TestSecureMessagingStateStore()
+        var erasures = 0
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+            currentActivationRevocation = SecureMessagingCurrentActivationRevocation {
+                erasures++
+            },
+        )
+        enqueueSync(
+            listOf(
+                deviceLifecycleEvent(
+                    eventType = eventType,
+                    userId = CURRENT.userId,
+                    deviceId = CURRENT.serverDeviceId,
+                ),
+            ),
+            "retry_self_event_cursor",
+        )
+        server.enqueue(statusResponse)
+
+        val failure = runCatching { processor.synchronize(session) }.exceptionOrNull()
+
+        assertTrue(
+            "Unexpected revalidation failure for $eventType: $failure; cause=${failure?.cause}",
+            failure is SecureMessagingRevalidationRetryException,
+        )
+        assertEquals(SecureMessagingRuntimeStage.PREPARING_KEYS, lifecycle.snapshot().stage)
+        assertNull(registry.currentOrNull())
+        assertEquals(0, erasures)
+        assertNull(SecureMessagingSyncCursorStore(stateStore).load())
+
+        server.enqueue(currentKeyStatusResponse())
+        processor.synchronize(session)
+
+        assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+        assertNotNull(registry.currentOrNull())
+        assertEquals(0, erasures)
     }
 
     private fun enqueueDeliveryAcknowledgement() {
@@ -1536,6 +1892,11 @@ class SecureMessagingEventProcessorTest {
             protocolVersion = "v2",
             bundleVersion = 2,
             identityKeySha256 = "d".repeat(64),
+            previousIdentityKeySha256 = if (eventType == "identity.changed") {
+                "c".repeat(64)
+            } else {
+                null
+            },
             rosterRefreshRequired = true,
             transitionedAt = TIMESTAMP,
             transitionHash = "e".repeat(64),
@@ -2019,6 +2380,10 @@ class SecureMessagingEventProcessorTest {
         const val OUTBOUND_SERVER_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         const val SECOND_OUTBOUND_SERVER_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         const val TIMESTAMP = "2026-07-20T12:00:00Z"
+        val CURRENT_IDENTITY_HASH = "1".repeat(64)
+        val SIGNED_PREKEY_HASH = "2".repeat(64)
+        val PQ_PREKEY_HASH = "3".repeat(64)
+        val EVENT_HASH = "4".repeat(64)
         val CURRENT = SecureMessagingCryptoAddress(CURRENT_USER_ID, CURRENT_DEVICE_ID, 1)
         val PEER = SecureMessagingCryptoAddress(PEER_USER_ID, PEER_DEVICE_ID, 2)
         val BINDING = SecureMessagingSessionBinding(

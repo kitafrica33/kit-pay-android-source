@@ -511,6 +511,18 @@ class SecureMessagingSessionLifecycle @Inject internal constructor(
         mutableStateAvailable.value = true
     }
 
+    /** Exact-generation variant used after an enrollment reset proof or local revocation proof. */
+    internal suspend fun resetForRecovery(fence: SecureMessagingSessionFence) {
+        lifecycle.beginRecoveryErasure(fence)
+        mutableStateAvailable.value = false
+        runCatching { notifications.cancelAll() }
+        try {
+            eraser.eraseAll()
+        } finally {
+            lifecycle.finishErasure()
+        }
+    }
+
     private suspend fun eraseActivationState() {
         mutableStateAvailable.value = false
         // Revoke local tap grants before any suspension in cryptographic erasure.

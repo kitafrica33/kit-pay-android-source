@@ -159,7 +159,7 @@ class LibSignalSecureMessagingCryptoEngine @Inject constructor(
         return try {
             transactionGate.withLock {
                 provenance.assertCurrent()
-                val record = readProtocolRecord()
+                val record = readEnrollmentProtocolRecord()
                 if (record == null) {
                     provenance.assertCurrent()
                     return@withLock null
@@ -226,6 +226,82 @@ class LibSignalSecureMessagingCryptoEngine @Inject constructor(
         }
     }
 
+    /** Clears a crash-retry publication only after the server confirms the same enrollment. */
+    internal suspend fun confirmLocalEnrollmentPublication(
+        activation: SecureMessagingActivationCapability,
+        registrationId: Int,
+        identityKeySha256: String,
+    ) {
+        val provenance = SecureMessagingActivationProvenance.requireCurrent(activation)
+        try {
+            transactionGate.withLock {
+                provenance.assertCurrent()
+                val record = readProtocolRecord() ?: throw cryptographicFailure(
+                    SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                    "Confirmed server enrollment has no local protocol state",
+                )
+                var state: BoundLibSignalState? = null
+                try {
+                    val decoded = decodeBoundProtocolState(record.bytes)
+                    state = decoded
+                    if (decoded.binding != provenance.binding) {
+                        throw cryptographicFailure(
+                            SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+                            "Confirmed enrollment belongs to another authentication epoch",
+                        )
+                    }
+                    check(decoded.store.localRegistrationId == registrationId) {
+                        "Confirmed server registration differs from local state"
+                    }
+                    val identity = decoded.store.identityKeyPair.publicKey.serialize()
+                    try {
+                        check(sha256Hex(identity) == identityKeySha256) {
+                            "Confirmed server identity differs from local state"
+                        }
+                    } finally {
+                        identity.fill(0)
+                    }
+                    if (!decoded.clearPendingPublication()) {
+                        provenance.assertCurrent()
+                        return@withLock
+                    }
+                    val encoded = BoundLibSignalStateCodec.encode(decoded)
+                    try {
+                        provenance.assertCurrent()
+                        stateStore.write(
+                            namespace = PROTOCOL_NAMESPACE,
+                            recordKey = PROTOCOL_RECORD_KEY,
+                            expectedVersion = record.version,
+                            bytes = encoded,
+                        )
+                        provenance.assertCurrent()
+                    } finally {
+                        encoded.fill(0)
+                    }
+                } finally {
+                    state?.close()
+                    record.bytes.fill(0)
+                }
+            }
+        } catch (error: SecureMessagingCryptographicFailureException) {
+            runCatching { provenance.quarantine(error.quarantineReason) }
+                .exceptionOrNull()
+                ?.let(error::addSuppressed)
+            throw error
+        }
+    }
+
+    private suspend fun readEnrollmentProtocolRecord(): SecureMessagingRecord? = try {
+        stateStore.read(PROTOCOL_NAMESPACE, PROTOCOL_RECORD_KEY)
+    } catch (error: SecureMessagingStateUnavailableException) {
+        // This read does not decrypt messages or mutate ratchets. Let key activation revoke the
+        // server enrollment safely without permanently quarantining a retryable logout attempt.
+        throw SecureMessagingLocalEnrollmentUnavailableException(
+            "Secure messaging enrollment state is unavailable",
+            error,
+        )
+    }
+
     private suspend fun loadProtocolState(binding: SecureMessagingSessionBinding): LoadedProtocolState {
         val record = readProtocolRecord()
             ?: return LoadedProtocolState(
@@ -273,6 +349,12 @@ class LibSignalSecureMessagingCryptoEngine @Inject constructor(
         )
     }
 }
+
+/** A storage availability failure while reading only the local enrollment snapshot. */
+internal class SecureMessagingLocalEnrollmentUnavailableException(
+    message: String,
+    cause: Throwable,
+) : java.io.IOException(message, cause)
 
 internal class LibSignalLocalEnrollment(
     val registrationId: Int,
@@ -1477,6 +1559,13 @@ private class BoundLibSignalState(
         val replacement = bytes.copyOf()
         pendingPublicationBytes?.fill(0)
         pendingPublicationBytes = replacement
+    }
+
+    fun clearPendingPublication(): Boolean {
+        val pending = pendingPublicationBytes ?: return false
+        pending.fill(0)
+        pendingPublicationBytes = null
+        return true
     }
 
     override fun close() {

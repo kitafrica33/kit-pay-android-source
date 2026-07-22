@@ -25,7 +25,8 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     private val cursors: SecureMessagingSyncCursorStore,
     private val notifications: SecureMessagingIncomingNotificationSink =
         NoOpSecureMessagingIncomingNotificationSink,
-    private val currentActivationRevocation: SecureMessagingCurrentActivationRevocation =
+    @Suppress("UNUSED_PARAMETER")
+    currentActivationRevocation: SecureMessagingCurrentActivationRevocation =
         NoOpSecureMessagingCurrentActivationRevocation,
 ) {
     private class SessionState(
@@ -293,6 +294,29 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         val changesCurrentIdentity =
             event.eventType == IDENTITY_CHANGED_EVENT && targetsCurrentDevice
         if (revokesCurrentActivation || changesCurrentIdentity) {
+            // The sync stream is append-only and a fresh login starts without a cursor. It can
+            // therefore replay a revocation or identity event from an older enrollment epoch.
+            // Trust neither the historical hint nor its timestamps: re-fetch the current device
+            // enrollment and ignore the hint only when it still exactly matches the private
+            // identity reconciled for this activation. A real current revocation/change remains
+            // fail-closed.
+            val pinnedTarget = state.session.reconciledKeyIdentityResetTarget()
+            val revalidationPhase = state.session.beginReconciledKeyIdentityRevalidation()
+            val revalidation = try {
+                state.session.revalidateReconciledKeyIdentity()
+            } catch (cancelled: CancellationException) {
+                throw SecureMessagingRevalidationCancellationException(cancelled)
+            } catch (error: Throwable) {
+                // Only a successfully validated authoritative status may erase or reset state.
+                // Malformed, authorization, server and transport failures all remain withdrawn
+                // and retry this exact pinned activation without destructive recovery.
+                throw SecureMessagingRevalidationRetryException(error)
+            }
+            if (revalidation == ReconciledIdentityStatus.CURRENT) {
+                state.session.finishReconciledKeyIdentityRevalidation(revalidationPhase)
+                state.invalidateConversation(event.conversationId)
+                return
+            }
             val reason = if (revokesCurrentActivation) {
                 SecureMessagingQuarantineReason.CURRENT_DEVICE_REVOKED
             } else {
@@ -306,17 +330,13 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     "The active secure-messaging identity changed"
                 },
             )
-            // Invalidate READY synchronously before notification cancellation or disk erasure can
-            // suspend. The outer failure path cannot revive this transport generation.
-            state.session.quarantine(failure)
-            currentState = null
-            runCatching { notifications.cancelAll() }
-            try {
-                currentActivationRevocation.eraseSecureMessagingState()
-            } catch (erasureFailure: Throwable) {
-                failure.addSuppressed(erasureFailure)
+            when (revalidation) {
+                ReconciledIdentityStatus.UNENROLLED ->
+                    quarantineForPinnedReset(state, failure, pinnedTarget)
+                ReconciledIdentityStatus.MISMATCH ->
+                    quarantineForPinnedReset(state, failure, pinnedTarget)
+                ReconciledIdentityStatus.CURRENT -> error("Current identity returned early")
             }
-            throw failure
         }
 
         if (event.eventType in PEER_STATE_RETIREMENT_EVENTS) {
@@ -327,6 +347,44 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             )
         }
         state.invalidateConversation(event.conversationId)
+    }
+
+    private suspend fun quarantineCurrentActivation(
+        state: SessionState,
+        failure: SecureMessagingCryptographicFailureException,
+    ) {
+        // Withdraw READY synchronously. A lifecycle hint never authorizes local erasure or a
+        // reset of whatever enrollment may have replaced this activation on the server.
+        try {
+            state.session.quarantine(failure)
+        } catch (fenceFailure: Throwable) {
+            failure.addSuppressed(fenceFailure)
+            throw failure
+        }
+        currentState = null
+        withContext(NonCancellable) {
+            runCatching { notifications.cancelAll() }
+                .exceptionOrNull()
+                ?.let(failure::addSuppressed)
+        }
+        val cancellation = failure.cause as? CancellationException
+        if (cancellation != null) {
+            throw SecureMessagingRevalidationCancellationException(cancellation)
+        }
+    }
+
+    private suspend fun quarantineForPinnedReset(
+        state: SessionState,
+        failure: SecureMessagingCryptographicFailureException,
+        pinnedTarget: com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget,
+    ): Nothing {
+        quarantineCurrentActivation(state, failure)
+        throw SecureMessagingReauthenticationRequiredException(
+            target = pinnedTarget,
+            activationFence = state.session.activationFence(),
+            message = "The reconciled messaging enrollment changed during synchronization",
+            cause = failure,
+        )
     }
 
     private suspend fun processIncoming(

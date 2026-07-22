@@ -21,6 +21,7 @@ import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionSnapshot
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
+import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.io.IOException
@@ -29,6 +30,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Protocol
 import okhttp3.Request
@@ -93,6 +95,85 @@ class SessionNetworkingTest {
     }
 
     @Test
+    fun `refresh adoption retains proof metadata written while rotation is in flight`() {
+        val sessions = FakeSessionStore(OLD_SESSION)
+        val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
+        val api = FakeRefreshApi { _, _ ->
+            assertTrue(
+                sessions.recordMessagingResetPendingIfCurrent(
+                    OLD_SESSION.fence(),
+                    RESET_PENDING,
+                ),
+            )
+            successfulRefresh(REFRESHED_SESSION)
+        }
+
+        val retried = authenticator(sessions, cache, api)
+            .authenticate(null, unauthorizedResponse(OLD_SESSION))
+
+        assertNotNull(retried)
+        assertEquals(REFRESHED_SESSION.accessToken, sessions.current()?.accessToken)
+        assertEquals(REFRESHED_SESSION.refreshToken, sessions.current()?.refreshToken)
+        assertEquals(RESET_PENDING, sessions.current()?.messagingResetProof)
+    }
+
+    @Test
+    fun `in flight refresh retains concurrently completed profile setup`() {
+        val expected = OLD_SESSION.copy(profileSetupState = ProfileSetupState.REQUIRED)
+        val sessions = FakeSessionStore(expected)
+        val cache = FakeWalletCache(expected.cacheScopeId)
+        val refreshEntered = CountDownLatch(1)
+        val releaseRefresh = CountDownLatch(1)
+        val api = FakeRefreshApi { _, _ ->
+            refreshEntered.countDown()
+            check(releaseRefresh.await(5, TimeUnit.SECONDS))
+            successfulRefresh(REFRESHED_SESSION)
+        }
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            val refresh = executor.submit<Request?> {
+                authenticator(sessions, cache, api)
+                    .authenticate(null, unauthorizedResponse(expected))
+            }
+            assertTrue(refreshEntered.await(5, TimeUnit.SECONDS))
+            runBlocking {
+                assertTrue(
+                    sessions.updateProfileSetupState(
+                        expected.fence(),
+                        ProfileSetupState.COMPLETED,
+                    ),
+                )
+            }
+            releaseRefresh.countDown()
+
+            val retried = refresh.get(5, TimeUnit.SECONDS)
+
+            assertNotNull(retried)
+            assertEquals(REFRESHED_SESSION.accessToken, sessions.current()?.accessToken)
+            assertEquals(REFRESHED_SESSION.refreshToken, sessions.current()?.refreshToken)
+            assertEquals(ProfileSetupState.COMPLETED, sessions.current()?.profileSetupState)
+        } finally {
+            releaseRefresh.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `default refresh adoption cannot clobber a proof written between its reads`() {
+        val sessions = InterleavingDefaultSessionStore(OLD_SESSION, RESET_PENDING)
+
+        val adopted = runBlocking {
+            sessions.adoptRefreshedCredentialsIfCurrent(OLD_SESSION, REFRESHED_SESSION)
+        }
+
+        assertEquals(false, adopted)
+        assertEquals(OLD_SESSION.accessToken, sessions.current()?.accessToken)
+        assertEquals(OLD_SESSION.refreshToken, sessions.current()?.refreshToken)
+        assertEquals(RESET_PENDING, sessions.current()?.messagingResetProof)
+    }
+
+    @Test
     fun `request from an obsolete login is not replayed with a newer account`() {
         val sessions = FakeSessionStore(NEW_ACCOUNT_SESSION)
         val cache = FakeWalletCache(NEW_ACCOUNT_SESSION.cacheScopeId)
@@ -119,6 +200,26 @@ class SessionNetworkingTest {
             val sessions = FakeSessionStore(OLD_SESSION)
             val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
             val api = FakeRefreshApi { _, _ -> throw failure }
+
+            val retried = authenticator(sessions, cache, api)
+                .authenticate(null, unauthorizedResponse(OLD_SESSION))
+
+            assertNull(retried)
+            assertEquals(OLD_SESSION, sessions.current())
+            assertEquals(OLD_SESSION.cacheScopeId, cache.currentOwner)
+            assertTrue(cache.clearAttempts.isEmpty())
+        }
+    }
+
+    @Test
+    fun `blank rotated credentials are rejected without replacing the session`() {
+        listOf(
+            REFRESHED_SESSION.copy(accessToken = "  "),
+            REFRESHED_SESSION.copy(refreshToken = "\t"),
+        ).forEach { invalidRefresh ->
+            val sessions = FakeSessionStore(OLD_SESSION)
+            val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
+            val api = FakeRefreshApi { _, _ -> successfulRefresh(invalidRefresh) }
 
             val retried = authenticator(sessions, cache, api)
                 .authenticate(null, unauthorizedResponse(OLD_SESSION))
@@ -326,6 +427,90 @@ class SessionNetworkingTest {
             return true
         }
 
+        override suspend fun recordMessagingResetPendingIfCurrent(
+            expected: SessionFence,
+            pending: SecureMessagingResetProofFence,
+        ): Boolean {
+            val current = state.value ?: return false
+            if (current.fence() != expected) return false
+            val existing = current.messagingResetProof
+            if (existing != null) {
+                return existing.copy(resultingEnrollmentEpoch = null) == pending
+            }
+            save(current.copy(messagingResetProof = pending))
+            return true
+        }
+
+        override suspend fun clear() {
+            state.value = null
+            revision++
+        }
+    }
+
+    /** Exercises the interface default without inheriting the production store's mutex. */
+    private class InterleavingDefaultSessionStore(
+        initial: SessionTokens,
+        private val interleavedProof: SecureMessagingResetProofFence,
+    ) : SessionStore {
+        private val state = MutableStateFlow<SessionTokens?>(initial)
+        private var revision = 0L
+        private var interleaveNextCurrentRead = true
+        override val session: StateFlow<SessionTokens?> = state
+
+        override fun current(): SessionTokens? {
+            val observed = state.value
+            if (interleaveNextCurrentRead) {
+                interleaveNextCurrentRead = false
+                state.value = checkNotNull(observed).copy(messagingResetProof = interleavedProof)
+                revision++
+            }
+            return observed
+        }
+
+        override fun snapshot(): SessionSnapshot = SessionSnapshot(
+            revision = revision,
+            fence = state.value?.fence(),
+        )
+
+        override suspend fun save(tokens: SessionTokens) {
+            state.value = tokens
+            revision++
+        }
+
+        override suspend fun saveIfUnchanged(
+            expected: SessionSnapshot,
+            tokens: SessionTokens,
+        ): Boolean {
+            if (snapshot() != expected) return false
+            save(tokens)
+            return true
+        }
+
+        override suspend fun updateProfileSetupState(
+            expected: SessionFence,
+            state: ProfileSetupState,
+        ): Boolean {
+            val current = this.state.value ?: return false
+            if (current.fence() != expected) return false
+            save(current.copy(profileSetupState = state))
+            return true
+        }
+
+        override suspend fun <T> withCurrentSession(
+            expected: SessionFence,
+            block: suspend (SessionTokens) -> T,
+        ): T {
+            val current = state.value ?: throw SessionInvalidatedException()
+            if (current.fence() != expected) throw SessionInvalidatedException()
+            return block(current)
+        }
+
+        override suspend fun clearIfCurrent(expected: SessionFence): Boolean {
+            if (state.value?.fence() != expected) return false
+            clear()
+            return true
+        }
+
         override suspend fun clear() {
             state.value = null
             revision++
@@ -386,6 +571,13 @@ class SessionNetworkingTest {
         val REFRESHED_SESSION = OLD_SESSION.copy(
             accessToken = "access-new",
             refreshToken = "refresh-new",
+        )
+        val RESET_PENDING = SecureMessagingResetProofFence(
+            serverDeviceId = "device-1",
+            previousEnrollmentEpoch = 7,
+            previousRegistrationId = 42,
+            previousIdentityKeySha256 = "1".repeat(64),
+            previousBundleVersion = 3,
         )
         val NEW_ACCOUNT_SESSION = SessionTokens(
             accessToken = "access-account-2",

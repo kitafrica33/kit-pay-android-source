@@ -6,6 +6,7 @@ import com.kit.wallet.data.remote.SecureMessagingWireApi
 import com.kit.wallet.data.remote.SessionAuthenticator
 import com.kit.wallet.data.remote.SessionHeaderInterceptor
 import com.kit.wallet.data.remote.SessionRefreshApi
+import com.kit.wallet.data.remote.SecureMessagingEnrollmentRecoveryApi
 import com.squareup.moshi.Moshi
 import dagger.Module
 import dagger.Provides
@@ -81,6 +82,16 @@ object NetworkModule {
         moshi: Moshi,
         @RefreshHttpClient client: OkHttpClient,
     ): SessionRefreshApi = retrofit(baseUrl, moshi, client).create(SessionRefreshApi::class.java)
+
+    @Provides
+    @Singleton
+    internal fun provideSecureMessagingEnrollmentRecoveryApi(
+        baseUrl: HttpUrl,
+        moshi: Moshi,
+        @RefreshHttpClient client: OkHttpClient,
+    ): SecureMessagingEnrollmentRecoveryApi =
+        retrofit(baseUrl, moshi, client)
+            .create(SecureMessagingEnrollmentRecoveryApi::class.java)
 
     private fun baseClient(metadata: Interceptor): OkHttpClient.Builder {
         val logging = HttpLoggingInterceptor().apply {

@@ -92,6 +92,31 @@ class AppCapabilitiesViewModelTest {
         assertFalse(viewModel.state.value.messagingUsable)
     }
 
+    @Test
+    fun `local activation refreshes a stale pre-rollout capability snapshot`() = runTest {
+        val api = RolloutCapabilitiesApi()
+        val chatRepository = FakeChatRepository(initiallyReady = false)
+        val viewModel = AppCapabilitiesViewModel(
+            api = api.proxy,
+            apiCalls = ApiCallExecutor(
+                Moshi.Builder().add(KotlinJsonAdapterFactory()).build(),
+            ),
+            chatRepository = chatRepository,
+            pushMessagingTransport = FakePushMessagingTransport,
+        )
+
+        assertEquals(1, api.calls)
+        assertTrue(viewModel.state.value.messagingEntryVisible)
+        assertFalse(viewModel.state.value.messagingProtocolReady)
+        assertFalse(viewModel.state.value.messagingUsable)
+
+        chatRepository.readiness.value = true
+
+        assertEquals(2, api.calls)
+        assertTrue(viewModel.state.value.messagingProtocolReady)
+        assertTrue(viewModel.state.value.messagingUsable)
+    }
+
     private class ScriptedCapabilitiesApi {
         var calls: Int = 0
             private set
@@ -139,8 +164,29 @@ class AppCapabilitiesViewModelTest {
         }
     }
 
-    private class FakeChatRepository : ChatRepository {
-        override val readiness: StateFlow<Boolean> = MutableStateFlow(true)
+    private class RolloutCapabilitiesApi {
+        var calls: Int = 0
+            private set
+
+        val proxy: KitWalletApi = Proxy.newProxyInstance(
+            KitWalletApi::class.java.classLoader,
+            arrayOf(KitWalletApi::class.java),
+        ) { instance, method, arguments ->
+            when (method.name) {
+                "capabilities" -> envelope(
+                    enabled = true,
+                    protocolReady = ++calls > 1,
+                )
+                "toString" -> "RolloutCapabilitiesApi"
+                "hashCode" -> System.identityHashCode(instance)
+                "equals" -> instance === arguments?.firstOrNull()
+                else -> error("Unexpected API call: ${method.name}")
+            }
+        } as KitWalletApi
+    }
+
+    private class FakeChatRepository(initiallyReady: Boolean = true) : ChatRepository {
+        override val readiness = MutableStateFlow(initiallyReady)
         override val chats: StateFlow<List<ChatPreview>> = MutableStateFlow(emptyList())
 
         override fun chat(chatId: String): ChatPreview? = null
@@ -161,14 +207,17 @@ class AppCapabilitiesViewModelTest {
     }
 
     private companion object {
-        fun envelope(enabled: Boolean) = ApiEnvelope(
+        fun envelope(
+            enabled: Boolean,
+            protocolReady: Boolean = enabled,
+        ) = ApiEnvelope(
             ok = true,
             data = CapabilitiesDto(
                 currency = CurrencyDto(code = "UGX", scale = "2"),
                 features = mapOf(KitFeature.MESSAGING to enabled),
                 protocols = ProtocolsDto(
                     messaging = MessagingProtocolDto(
-                        ready = enabled,
+                        ready = protocolReady,
                         version = "v2",
                         suite = "signal-pqxdh-kyber1024-double-ratchet-v2",
                         postQuantum = true,

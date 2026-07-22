@@ -67,6 +67,15 @@ data class LogoutResult(
     val warning: String? = null,
 )
 
+/** Exact server enrollment that a fail-closed recovery request may reset. */
+data class SecureMessagingEnrollmentResetTarget(
+    val serverDeviceId: String,
+    val enrollmentEpoch: Long,
+    val registrationId: Int,
+    val identityKeySha256: String,
+    val bundleVersion: Int,
+)
+
 interface AuthRepository {
     val signedIn: StateFlow<Boolean>
     val profileSetupState: StateFlow<ProfileSetupState>
@@ -107,6 +116,20 @@ interface AuthRepository {
     suspend fun refreshSession(): AuthOutcome.Authenticated
 
     suspend fun logout(allDevices: Boolean = false): LogoutResult
+
+    /**
+     * Atomically resets only [target]. The caller erases the exact local activation only after
+     * this idempotent server proof, so a stale target cannot wipe a concurrent replacement.
+     */
+    suspend fun recoverMissingSecureMessagingEnrollment(
+        expectedSessionEpoch: String,
+        target: SecureMessagingEnrollmentResetTarget,
+    )
+
+    /** Clears only the stale authentication epoch after an unverifiable lifecycle transition. */
+    suspend fun requireFreshAuthenticationForSecureMessagingRecovery(
+        expectedSessionEpoch: String,
+    )
 
     suspend fun accountDeletionPreflight(): AccountDeletionPreflight
 

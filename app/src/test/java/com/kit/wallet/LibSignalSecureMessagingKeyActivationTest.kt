@@ -1,30 +1,60 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.auth.AuthRepository
+import com.kit.wallet.data.auth.DeviceIdentityProvider
+import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
 import com.kit.wallet.data.messaging.LibSignalSecureMessagingCryptoEngine
 import com.kit.wallet.data.messaging.LibSignalSecureMessagingKeyActivation
+import com.kit.wallet.data.messaging.RealSecureMessagingInitialSyncActivation
+import com.kit.wallet.data.messaging.RealSecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
+import com.kit.wallet.data.messaging.SecureMessagingActivationCoordinator
+import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
+import com.kit.wallet.data.messaging.SecureMessagingAuthBindingResolver
+import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
+import com.kit.wallet.data.messaging.SecureMessagingEventProcessor
+import com.kit.wallet.data.messaging.SecureMessagingFreshAuthenticationRequiredException
 import com.kit.wallet.data.messaging.SecureMessagingKeyReconciliationException
+import com.kit.wallet.data.messaging.SecureMessagingReauthenticationRequiredException
+import com.kit.wallet.data.messaging.SecureMessagingLocalEnrollmentUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
+import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
 import com.kit.wallet.data.messaging.SecureMessagingRecord
 import com.kit.wallet.data.messaging.SecureMessagingRecordPage
 import com.kit.wallet.data.messaging.SecureMessagingRecordVersion
+import com.kit.wallet.data.messaging.SecureMessagingRuntimeStage
+import com.kit.wallet.data.messaging.SecureMessagingSessionLifecycle
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
 import com.kit.wallet.data.messaging.SecureMessagingSessionFence
 import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingStateStore
+import com.kit.wallet.data.messaging.SecureMessagingStateUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingStateWrite
+import com.kit.wallet.data.messaging.SecureMessagingSyncCursorStore
 import com.kit.wallet.data.messaging.validateSecureMessagingNamespacePageRequest
 import com.kit.wallet.data.remote.ApiCallExecutor
+import com.kit.wallet.data.remote.DeviceRegistrationDto
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.MessagingKeyStatusDto
 import com.kit.wallet.data.remote.MessagingKeyTransparencyDto
 import com.kit.wallet.data.remote.PublishMessagingKeyBundleRequest
 import com.kit.wallet.data.remote.SecureMessagingWireApi
+import com.kit.wallet.data.session.ProfileSetupState
+import com.kit.wallet.data.session.SecureMessagingResetProofFence
+import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionInvalidatedException
+import com.kit.wallet.data.session.SessionSnapshot
+import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.data.session.SessionTokens
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import java.lang.reflect.Proxy
 import java.security.MessageDigest
 import java.util.Base64
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -32,7 +62,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -83,7 +113,7 @@ class LibSignalSecureMessagingKeyActivationTest {
         assertTrue(keyServer.requireStatus().enrolled == true)
         assertTrue(keyServer.requireStatus().needsReplenishment == false)
         val firstEnrollment = checkNotNull(active.session.localEnrollment(engine))
-        assertNotNull(firstEnrollment.pendingPublication)
+        assertNull(firstEnrollment.pendingPublication)
 
         activation.reconcile(active.session)
         assertEquals(1, keyServer.publishRequests().size)
@@ -101,6 +131,10 @@ class LibSignalSecureMessagingKeyActivationTest {
                 initial.pqLastResortPrekey.prekeyId,
         )
         assertTrue(keyServer.requireStatus().needsReplenishment == false)
+        assertEquals(
+            keyServer.requireStatus().bundleVersion,
+            active.session.reconciledKeyIdentityResetTarget().bundleVersion,
+        )
 
         // A reconstructed engine sees the same durable enrollment and does no extra publication.
         engine = LibSignalSecureMessagingCryptoEngine(stateStore)
@@ -141,30 +175,160 @@ class LibSignalSecureMessagingKeyActivationTest {
             val attempts = keyServer.publishRequests()
             assertEquals(4, attempts.size)
             assertTrue(attempts.all { it == attempts.first() })
-            assertEquals(committedVersion, stateStore.version(PROTOCOL_NAMESPACE, PROTOCOL_RECORD_KEY))
+            assertEquals(
+                committedVersion + 1L,
+                stateStore.version(PROTOCOL_NAMESPACE, PROTOCOL_RECORD_KEY),
+            )
+            assertNull(checkNotNull(active.session.localEnrollment(engine)).pendingPublication)
             assertTrue(keyServer.requireStatus().enrolled == true)
             assertTrue(keyServer.requireStatus().needsReplenishment == false)
         }
 
     @Test
-    fun `server identity and registration mismatches never overwrite local enrollment`() = runTest {
+    fun `server enrollment without its local private identity requires reauthentication`() =
+        runTest {
+            val active = openKeyPreparation()
+            LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
+            val publicationsBeforeErasure = keyServer.publishRequests().size
+
+            stateStore.eraseAll()
+            engine = LibSignalSecureMessagingCryptoEngine(stateStore)
+
+            val failure = runCatching {
+                LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
+            }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingReauthenticationRequiredException)
+            assertEquals(publicationsBeforeErasure, keyServer.publishRequests().size)
+        }
+
+    @Test
+    fun `unavailable local private enrollment with a server bundle requires reauthentication`() =
+        runTest {
+            val active = openKeyPreparation()
+            LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
+            val publicationsBeforeFailure = keyServer.publishRequests().size
+            stateStore.readsUnavailable = true
+
+            val failure = runCatching {
+                LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
+            }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingReauthenticationRequiredException)
+            assertTrue(failure?.cause is SecureMessagingLocalEnrollmentUnavailableException)
+            assertEquals(SecureMessagingRuntimeStage.PREPARING_KEYS, active.lifecycle.snapshot().stage)
+            assertEquals(publicationsBeforeFailure, keyServer.publishRequests().size)
+        }
+
+    @Test
+    fun `proved reset with no local state provisions at N plus one and clears proof`() = runTest {
+        keyServer.setEnrollmentEpoch(RESET_RESULT_EPOCH)
+        val sessions = ProofSessionStore(RESET_PROVED)
+        val active = openKeyPreparation()
+
+        LibSignalSecureMessagingKeyActivation(engine, sessions).reconcile(active.session)
+
+        assertEquals(1, keyServer.publishRequests().size)
+        assertEquals(RESET_RESULT_EPOCH, keyServer.requireStatus().enrollmentEpoch)
+        assertNull(sessions.current()?.messagingResetProof)
+        assertNull(checkNotNull(active.session.localEnrollment(engine)).pendingPublication)
+    }
+
+    @Test
+    fun `proved reset confirms matching lost-response publication and clears proof`() = runTest {
+        keyServer.setEnrollmentEpoch(RESET_RESULT_EPOCH)
+        keyServer.failNextPublications = 1
+        val sessions = ProofSessionStore(RESET_PROVED)
+        val active = openKeyPreparation()
+        val activation = LibSignalSecureMessagingKeyActivation(engine, sessions)
+
+        assertTrue(runCatching { activation.reconcile(active.session) }.isFailure)
+        assertEquals(RESET_PROVED, sessions.current()?.messagingResetProof)
+        assertTrue(checkNotNull(active.session.localEnrollment(engine)).pendingPublication != null)
+        keyServer.acceptLastPublication()
+
+        activation.reconcile(active.session)
+
+        assertEquals(1, keyServer.publishRequests().size)
+        assertNull(sessions.current()?.messagingResetProof)
+        assertNull(checkNotNull(active.session.localEnrollment(engine)).pendingPublication)
+    }
+
+    @Test
+    fun `proved reset rejects a replacement enrollment without clearing its proof`() = runTest {
+        keyServer.setEnrollmentEpoch(RESET_RESULT_EPOCH)
+        val sessions = ProofSessionStore(resetProof = null)
+        val active = openKeyPreparation()
+        val activation = LibSignalSecureMessagingKeyActivation(engine, sessions)
+        activation.reconcile(active.session)
+        val publicationsBefore = keyServer.publishRequests().size
+        sessions.setResetProof(RESET_PROVED)
+        val current = keyServer.requireStatus()
+        val replacementIdentity = "0".repeat(64)
+        keyServer.replaceStatus(
+            current.copy(
+                identityKeySha256 = replacementIdentity,
+                transparency = current.transparency?.copy(
+                    identityKeySha256 = replacementIdentity,
+                ),
+            ),
+        )
+
+        val failure = runCatching { activation.reconcile(active.session) }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingFreshAuthenticationRequiredException)
+        assertEquals(publicationsBefore, keyServer.publishRequests().size)
+        assertEquals(RESET_PROVED, sessions.current()?.messagingResetProof)
+    }
+
+    @Test
+    fun `pending T1 ignores concurrent T2 and requests only its exact pinned reset`() = runTest {
+        keyServer.setEnrollmentEpoch(RESET_RESULT_EPOCH + 1L)
+        val sessions = ProofSessionStore(resetProof = null)
+        val active = openKeyPreparation()
+        val activation = LibSignalSecureMessagingKeyActivation(engine, sessions)
+        activation.reconcile(active.session)
+        val publicationsBefore = keyServer.publishRequests().size
+        sessions.setResetProof(RESET_PENDING)
+        stateStore.readsUnavailable = true
+
+        val failure = runCatching { activation.reconcile(active.session) }.exceptionOrNull()
+            as? SecureMessagingReauthenticationRequiredException
+
+        assertEquals(RESET_TARGET, failure?.target)
+        assertEquals(publicationsBefore, keyServer.publishRequests().size)
+        assertEquals(RESET_PENDING, sessions.current()?.messagingResetProof)
+    }
+
+    @Test
+    fun `server identity registration and prekey mismatches require fresh authentication`() = runTest {
         val active = openKeyPreparation()
         val activation = LibSignalSecureMessagingKeyActivation(engine)
         activation.reconcile(active.session)
         val publicationsBefore = keyServer.publishRequests().size
         val valid = keyServer.requireStatus()
 
+        suspend fun assertMismatchRequiresFreshAuthentication(
+            status: MessagingKeyStatusDto,
+            reason: SecureMessagingQuarantineReason,
+        ) {
+            keyServer.replaceStatus(status)
+            val failure = runCatching { activation.reconcile(active.session) }.exceptionOrNull()
+                as? SecureMessagingFreshAuthenticationRequiredException
+            val mismatch = failure?.cause as? SecureMessagingKeyReconciliationException
+            assertTrue(failure?.activationFence === active.fence)
+            assertEquals(reason, mismatch?.quarantineReason)
+            assertEquals(publicationsBefore, keyServer.publishRequests().size)
+        }
+
         val wrongIdentity = "0".repeat(64)
-        keyServer.replaceStatus(
+        assertMismatchRequiresFreshAuthentication(
             valid.copy(
                 identityKeySha256 = wrongIdentity,
                 transparency = valid.transparency?.copy(identityKeySha256 = wrongIdentity),
             ),
+            SecureMessagingQuarantineReason.IDENTITY_CHANGED,
         )
-        val identityFailure = runCatching { activation.reconcile(active.session) }.exceptionOrNull()
-            as? SecureMessagingKeyReconciliationException
-        assertEquals(SecureMessagingQuarantineReason.IDENTITY_CHANGED, identityFailure?.quarantineReason)
-        assertEquals(publicationsBefore, keyServer.publishRequests().size)
 
         val validRegistration = checkNotNull(valid.registrationId)
         val wrongRegistration = if (validRegistration == 16_380) {
@@ -172,15 +336,125 @@ class LibSignalSecureMessagingKeyActivationTest {
         } else {
             validRegistration + 1
         }
-        keyServer.replaceStatus(valid.copy(registrationId = wrongRegistration))
-        val registrationFailure = runCatching { activation.reconcile(active.session) }.exceptionOrNull()
-            as? SecureMessagingKeyReconciliationException
-        assertEquals(
+        assertMismatchRequiresFreshAuthentication(
+            valid.copy(registrationId = wrongRegistration),
             SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
-            registrationFailure?.quarantineReason,
         )
-        assertEquals(publicationsBefore, keyServer.publishRequests().size)
+
+        assertMismatchRequiresFreshAuthentication(
+            valid.copy(signedPrekeyId = checkNotNull(valid.signedPrekeyId) + 1),
+            SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+        )
+
+        val wrongPqId = checkNotNull(valid.pqLastResortPrekeyId) + 1
+        assertMismatchRequiresFreshAuthentication(
+            valid.copy(
+                pqLastResortPrekeyId = wrongPqId,
+                transparency = valid.transparency?.copy(pqLastResortPrekeyId = wrongPqId),
+            ),
+            SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+        )
     }
+
+    @Test
+    fun `restarted sync clears authentication instead of quarantining a changed enrollment`() =
+        runTest {
+            val firstProcess = openKeyPreparation()
+            LibSignalSecureMessagingKeyActivation(engine).reconcile(firstProcess.session)
+            val enrolled = keyServer.requireStatus()
+            val replacementIdentity = "0".repeat(64)
+            keyServer.replaceStatus(
+                enrolled.copy(
+                    identityKeySha256 = replacementIdentity,
+                    transparency = enrolled.transparency?.copy(
+                        identityKeySha256 = replacementIdentity,
+                    ),
+                ),
+            )
+
+            // Reconstruct every process-local activation object. Only durable local libsignal
+            // state and the authenticated Kit session survive this simulated process death.
+            engine = LibSignalSecureMessagingCryptoEngine(stateStore)
+            val lifecycle = SecureMessagingLifecycleGuard()
+            val sessionLifecycle = SecureMessagingSessionLifecycle(stateStore, lifecycle)
+            sessionLifecycle.afterSessionSave()
+            val sessions = ProofSessionStore(
+                resetProof = null,
+                beforeClear = sessionLifecycle::beforeSessionClear,
+            )
+            val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+            val processor = SecureMessagingEventProcessor(
+                engine,
+                SecureMessagingProjectionStore(
+                    stateStore,
+                    LibSignalCompanionStateReader(stateStore),
+                ),
+                SecureMessagingSyncCursorStore(stateStore),
+            )
+            val coordinator = SecureMessagingActivationCoordinator(
+                transport = remote,
+                lifecycle = lifecycle,
+                sessions = registry,
+                keyActivation = LibSignalSecureMessagingKeyActivation(engine, sessions),
+                initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+            )
+            val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+            val retrofit = Retrofit.Builder()
+                .baseUrl(server.url("/"))
+                .addConverterFactory(MoshiConverterFactory.create(moshi))
+                .build()
+            val api = retrofit.create(KitWalletApi::class.java)
+            var freshAuthenticationCalls = 0
+            val authRepository = Proxy.newProxyInstance(
+                AuthRepository::class.java.classLoader,
+                arrayOf(AuthRepository::class.java),
+            ) { instance, method, arguments ->
+                when (method.name) {
+                    "requireFreshAuthenticationForSecureMessagingRecovery" -> {
+                        assertEquals(BINDING.sessionEpoch, arguments?.get(0))
+                        freshAuthenticationCalls++
+                        runBlocking {
+                            val expected = checkNotNull(sessions.current()).fence()
+                            assertTrue(sessions.clearIfCurrent(expected))
+                        }
+                    }
+                    "toString" -> "FreshAuthenticationAuthRepository"
+                    "hashCode" -> System.identityHashCode(instance)
+                    "equals" -> instance === arguments?.firstOrNull()
+                    else -> error("Unexpected auth repository call: ${method.name}")
+                }
+            } as AuthRepository
+            val sync = RealSecureMessagingSyncEngine(
+                bindingResolver = SecureMessagingAuthBindingResolver(
+                    sessions = sessions,
+                    api = api,
+                    apiCalls = ApiCallExecutor(moshi),
+                    deviceIdentity = object : DeviceIdentityProvider {
+                        override fun registration() = DeviceRegistrationDto(
+                            installationId = BINDING.installationId,
+                            name = "Test phone",
+                            appVersion = "1",
+                            osVersion = "1",
+                            model = "Test",
+                        )
+                    },
+                ),
+                activation = coordinator,
+                processor = processor,
+                sessions = sessions,
+                sessionLifecycle = sessionLifecycle,
+                authRepository = authRepository,
+            )
+
+            val failure = runCatching { sync.synchronize() }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingAuthenticationEpochChangedException)
+            assertEquals(1, freshAuthenticationCalls)
+            assertNull(sessions.current())
+            assertNull(registry.currentOrNull())
+            assertEquals(SecureMessagingRuntimeStage.NO_SESSION, lifecycle.snapshot().stage)
+            assertNull(stateStore.version(PROTOCOL_NAMESPACE, PROTOCOL_RECORD_KEY))
+        }
 
     private suspend fun openKeyPreparation(): ActiveRemoteSession {
         val lifecycle = SecureMessagingLifecycleGuard()
@@ -204,6 +478,7 @@ class LibSignalSecureMessagingKeyActivationTest {
         private val lock = Any()
         private val publications = mutableListOf<PublishMessagingKeyBundleRequest>()
         private var currentStatus: MessagingKeyStatusDto? = null
+        private var enrollmentEpoch = 1L
         private var revision = 0
         var failNextPublications: Int = 0
 
@@ -245,6 +520,16 @@ class LibSignalSecureMessagingKeyActivationTest {
             currentStatus = status
         }
 
+        fun setEnrollmentEpoch(epoch: Long) = synchronized(lock) {
+            require(epoch > 0L)
+            check(currentStatus == null) { "Set the enrollment epoch before creating status" }
+            enrollmentEpoch = epoch
+        }
+
+        fun acceptLastPublication() = synchronized(lock) {
+            currentStatus = enrolledStatus(publications.last())
+        }
+
         fun consumeAllOneTimeInventory() = synchronized(lock) {
             currentStatus = checkNotNull(currentStatus).copy(
                 availableOneTimePrekeys = 0,
@@ -266,6 +551,7 @@ class LibSignalSecureMessagingKeyActivationTest {
             val pqHash = digestBase64(publication.pqLastResortPrekey.publicKey)
             return MessagingKeyStatusDto(
                 enrolled = true,
+                enrollmentEpoch = enrollmentEpoch,
                 deviceId = CURRENT_DEVICE_ID,
                 signalDeviceId = 1,
                 protocolVersion = "v2",
@@ -298,6 +584,7 @@ class LibSignalSecureMessagingKeyActivationTest {
 
         private fun unenrolledStatus() = MessagingKeyStatusDto(
             enrolled = false,
+            enrollmentEpoch = enrollmentEpoch,
             protocolVersion = "v2",
             availableOneTimePrekeys = 0,
             availableEcOneTimePrekeys = 0,
@@ -328,9 +615,16 @@ class LibSignalSecureMessagingKeyActivationTest {
 
         private val records = mutableMapOf<Pair<String, String>, Stored>()
         private var clock = 1_000L
+        var readsUnavailable = false
 
-        override suspend fun read(namespace: String, recordKey: String): SecureMessagingRecord? =
-            records[namespace to recordKey]?.let { stored ->
+        override suspend fun read(namespace: String, recordKey: String): SecureMessagingRecord? {
+            if (readsUnavailable) {
+                throw SecureMessagingStateUnavailableException(
+                    "injected unavailable state",
+                    IllegalStateException("injected storage failure"),
+                )
+            }
+            return records[namespace to recordKey]?.let { stored ->
                 SecureMessagingRecord(
                     namespace,
                     recordKey,
@@ -339,6 +633,7 @@ class LibSignalSecureMessagingKeyActivationTest {
                     stored.updatedAt,
                 )
             }
+        }
 
         override suspend fun readNamespacePage(
             namespace: String,
@@ -413,12 +708,112 @@ class LibSignalSecureMessagingKeyActivationTest {
             records[namespace to recordKey]?.version
     }
 
+    private class ProofSessionStore(
+        resetProof: SecureMessagingResetProofFence?,
+        private val beforeClear: suspend () -> Unit = {},
+    ) : SessionStore {
+        private val mutableSession = MutableStateFlow<SessionTokens?>(
+            SessionTokens(
+                accessToken = "access",
+                refreshToken = "refresh",
+                sessionId = BINDING.sessionEpoch,
+                messagingResetProof = resetProof,
+            ),
+        )
+        private var revision = 0L
+
+        override val session: StateFlow<SessionTokens?> = mutableSession
+
+        override fun current(): SessionTokens? = mutableSession.value
+
+        override fun snapshot(): SessionSnapshot = SessionSnapshot(
+            revision = revision,
+            fence = current()?.fence(),
+        )
+
+        override suspend fun save(tokens: SessionTokens) {
+            mutableSession.value = tokens
+            revision++
+        }
+
+        override suspend fun saveIfUnchanged(
+            expected: SessionSnapshot,
+            tokens: SessionTokens,
+        ): Boolean {
+            if (snapshot() != expected) return false
+            save(tokens)
+            return true
+        }
+
+        override suspend fun updateProfileSetupState(
+            expected: SessionFence,
+            state: ProfileSetupState,
+        ): Boolean {
+            val current = current() ?: return false
+            if (current.fence() != expected) return false
+            save(current.copy(profileSetupState = state))
+            return true
+        }
+
+        override suspend fun <T> withCurrentSession(
+            expected: SessionFence,
+            block: suspend (SessionTokens) -> T,
+        ): T {
+            val current = current() ?: throw SessionInvalidatedException()
+            if (current.fence() != expected) throw SessionInvalidatedException()
+            return block(current)
+        }
+
+        override suspend fun clearIfCurrent(expected: SessionFence): Boolean {
+            if (current()?.fence() != expected) return false
+            clear()
+            return true
+        }
+
+        override suspend fun clearMessagingResetProofIfCurrent(
+            expected: SessionFence,
+            proof: SecureMessagingResetProofFence,
+        ): Boolean {
+            val current = current() ?: return false
+            if (current.fence() != expected || current.messagingResetProof != proof) return false
+            save(current.copy(messagingResetProof = null))
+            return true
+        }
+
+        override suspend fun clear() {
+            beforeClear()
+            mutableSession.value = null
+            revision++
+        }
+
+        fun setResetProof(proof: SecureMessagingResetProofFence) {
+            mutableSession.value = checkNotNull(current()).copy(messagingResetProof = proof)
+            revision++
+        }
+    }
+
     private companion object {
         const val CURRENT_USER_ID = "11111111-1111-4111-8111-111111111111"
         const val CURRENT_DEVICE_ID = "44444444-4444-4444-8444-444444444444"
         const val TIMESTAMP = "2026-07-20T08:00:00Z"
         const val PROTOCOL_NAMESPACE = "libsignal-v2"
         const val PROTOCOL_RECORD_KEY = "active-protocol-state"
+        const val RESET_RESULT_EPOCH = 8L
+        val RESET_TARGET = com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget(
+            serverDeviceId = CURRENT_DEVICE_ID,
+            enrollmentEpoch = RESET_RESULT_EPOCH - 1L,
+            registrationId = 42,
+            identityKeySha256 = "1".repeat(64),
+            bundleVersion = 3,
+        )
+        val RESET_PENDING = SecureMessagingResetProofFence(
+            serverDeviceId = RESET_TARGET.serverDeviceId,
+            previousEnrollmentEpoch = RESET_TARGET.enrollmentEpoch,
+            previousRegistrationId = RESET_TARGET.registrationId,
+            previousIdentityKeySha256 = RESET_TARGET.identityKeySha256,
+            previousBundleVersion = RESET_TARGET.bundleVersion,
+        )
+        val RESET_PROVED = RESET_PENDING.copy(resultingEnrollmentEpoch = RESET_RESULT_EPOCH)
         val BINDING = SecureMessagingSessionBinding(
             sessionEpoch = "key-activation-epoch",
             userId = CURRENT_USER_ID,
