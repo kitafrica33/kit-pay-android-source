@@ -75,6 +75,9 @@ fun ContactsScreen(
     val syncing by viewModel.syncing.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
     val openingContactId by viewModel.openingContactId.collectAsStateWithLifecycle()
+    val query by viewModel.query.collectAsStateWithLifecycle()
+    val tagResults by viewModel.tagResults.collectAsStateWithLifecycle()
+    val tagSearching by viewModel.tagSearching.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var contactSyncStage by rememberSaveable { mutableStateOf(ContactSyncStage.IDLE) }
     val contactPermission = rememberLauncherForActivityResult(
@@ -151,20 +154,45 @@ fun ContactsScreen(
         }
         runCatching { context.startActivity(intent) }
     }
+    // WhatsApp-style invite: prefills the person's SMS thread with a Kit Pay download link.
+    val onInvite: (Contact) -> Unit = { contact ->
+        val smsIntent = Intent(Intent.ACTION_SENDTO)
+            .setData(android.net.Uri.parse("smsto:${contact.phone}"))
+            .putExtra("sms_body", INVITE_MESSAGE)
+        runCatching { context.startActivity(smsIntent) }.recoverCatching {
+            context.startActivity(
+                Intent.createChooser(
+                    Intent(Intent.ACTION_SEND)
+                        .setType("text/plain")
+                        .putExtra(Intent.EXTRA_TEXT, INVITE_MESSAGE),
+                    "Invite to Kit Pay",
+                ),
+            )
+        }
+    }
     ContactsContent(
         allContacts = contacts,
         syncing = syncing,
         error = error,
         openingContactId = openingContactId,
         purpose = purpose,
+        query = query,
+        tagResults = tagResults,
+        tagSearching = tagSearching,
+        onQueryChange = viewModel::setQuery,
         onBack = onBack,
         onContact = { contact -> viewModel.openDirectConversation(contact, onContact) },
         onVoiceCall = onVoiceCall,
         onVideoCall = onVideoCall,
         onSync = requestSync,
         onManageContact = onManageContact,
+        onInvite = onInvite,
     )
 }
+
+/** The public direct-download link served from the Kit Pay production host. */
+private const val INVITE_MESSAGE =
+    "Let's chat and send money securely on Kit Pay! Download it here: https://pay.kit.africa/kit.apk"
 
 internal enum class ContactSyncStage { IDLE, DISCLOSURE, AWAITING_PERMISSION }
 
@@ -233,18 +261,27 @@ private fun ContactsContent(
     error: String?,
     openingContactId: String?,
     purpose: ContactPickerPurpose,
+    query: String = "",
+    tagResults: List<Contact> = emptyList(),
+    tagSearching: Boolean = false,
+    onQueryChange: (String) -> Unit = {},
     onBack: () -> Unit,
     onContact: (Contact) -> Unit,
     onVoiceCall: (String) -> Unit,
     onVideoCall: (String) -> Unit,
     onSync: () -> Unit,
     onManageContact: (Contact) -> Unit,
+    onInvite: (Contact) -> Unit = {},
 ) {
-    var query by rememberSaveable { mutableStateOf("") }
-    val contacts = allContacts
-        .filter { purpose != ContactPickerPurpose.CALL || it.isKitUser }
-        .filter { it.name.contains(query, true) || it.phone.contains(query) }
-        .sortedBy { it.name }
+    val tagMode = query.trim().startsWith("@")
+    val contacts = if (tagMode) {
+        tagResults
+    } else {
+        allContacts
+            .filter { purpose != ContactPickerPurpose.CALL || it.isKitUser }
+            .filter { it.name.contains(query, true) || it.phone.contains(query) }
+            .sortedBy { it.name }
+    }
 
     Scaffold(
         topBar = {
@@ -268,11 +305,11 @@ private fun ContactsContent(
             item {
                 OutlinedTextField(
                     value = query,
-                    onValueChange = { query = it },
+                    onValueChange = onQueryChange,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 20.dp),
-                    placeholder = { Text("Search contacts") },
+                    placeholder = { Text("Search contacts or @kittag") },
                     leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
                     singleLine = true,
                     shape = MaterialTheme.shapes.extraLarge,
@@ -295,8 +332,42 @@ private fun ContactsContent(
                     )
                 }
             }
-            item { SectionHeader(if (purpose == ContactPickerPurpose.CALL) "On Kit Pay" else "People") }
-            if (purpose == ContactPickerPurpose.CALL && contacts.isEmpty()) {
+            item {
+                SectionHeader(
+                    when {
+                        tagMode -> "On Kit Pay"
+                        purpose == ContactPickerPurpose.CALL -> "On Kit Pay"
+                        else -> "People"
+                    },
+                )
+            }
+            if (tagMode && tagSearching) {
+                item {
+                    Row(
+                        Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            "Searching Kit Pay members…",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            if (tagMode && !tagSearching && contacts.isEmpty()) {
+                item {
+                    Text(
+                        "No Kit Pay member matches that kit tag yet.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+                    )
+                }
+            }
+            if (!tagMode && purpose == ContactPickerPurpose.CALL && contacts.isEmpty()) {
                 item {
                     Text(
                         "No callable Kit Pay contacts yet. Sync your phone contacts to find people on Kit Pay.",
@@ -338,11 +409,13 @@ private fun ContactsContent(
                         )
                     } else {
                         if (!c.isKitUser) {
-                            Text(
-                                "Invite",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.secondary,
-                            )
+                            TextButton(onClick = { onInvite(c) }) {
+                                Text(
+                                    "Invite",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.secondary,
+                                )
+                            }
                         } else if (purpose == ContactPickerPurpose.CALL) {
                             IconButton(onClick = { onVoiceCall(c.id) }) {
                                 Icon(

@@ -38,7 +38,7 @@ object Dest {
     const val CONVERSATION = "chat/{chatId}"
     const val VOICE_CALL = "call/voice/{name}"
     const val VIDEO_CALL = "call/video/{name}"
-    const val INCOMING_CALL = "call/incoming/{callId}"
+    const val INCOMING_CALL = "call/incoming/{callId}?accept={accept}"
     const val SECURITY = "settings/security"
     const val PROFILE_EDIT = "settings/profile/edit"
 
@@ -47,6 +47,7 @@ object Dest {
     fun conversation(chatId: String) = "chat/${Uri.encode(chatId)}"
     fun voiceCall(name: String) = "call/voice/${Uri.encode(name)}"
     fun videoCall(name: String) = "call/video/${Uri.encode(name)}"
-    fun incomingCall(callId: String) = "call/incoming/${Uri.encode(callId)}"
+    fun incomingCall(callId: String, accept: Boolean = false) =
+        "call/incoming/${Uri.encode(callId)}?accept=${if (accept) "1" else "0"}"
     fun profileSetup(needsPin: Boolean) = "auth/profile/setup?needsPin=$needsPin"
 }

@@ -119,6 +119,26 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        // Answering from the banner opens the verified call screen and accepts once validated;
+        // declining is handled entirely in the background so the status bar stays usable.
+        val answerCall = PendingIntent.getActivity(
+            context,
+            call.callId.hashCode() + 1,
+            Intent(context, MainActivity::class.java)
+                .setData(Uri.parse(call.deepLinkUri(accept = true)))
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val declineCall = PendingIntent.getBroadcast(
+            context,
+            call.callId.hashCode() + 2,
+            CallActionReceiver.declineIntent(context, call.callId),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val caller = androidx.core.app.Person.Builder()
+            .setName(call.callerName)
+            .setImportant(true)
+            .build()
         manager.notify(
             callTag(call.callId),
             CALL_NOTIFICATION_ID,
@@ -132,7 +152,10 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
                 .setCategory(NotificationCompat.CATEGORY_CALL)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-                .setAutoCancel(true)
+                // The system call banner offers Answer and Decline directly from the status bar.
+                .setStyle(NotificationCompat.CallStyle.forIncomingCall(caller, declineCall, answerCall))
+                .addPerson(caller)
+                .setOngoing(true)
                 .setTimeoutAfter(timeoutMillis)
                 .setContentIntent(openCall)
                 // Surface the ringing call full-screen on a locked/backgrounded device. When the

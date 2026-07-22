@@ -25,6 +25,15 @@ data class ProfileEmailChallenge(
     val resendAfterSeconds: Long?,
 )
 
+/** A backend payment request created from inside a secure conversation. */
+data class ChatPaymentRequest(
+    val id: String,
+    val amountMinor: Long,
+    val currencyCode: String,
+    val currencyScale: Int,
+    val note: String?,
+)
+
 interface UserRepository {
     val profile: StateFlow<UserProfile>
 
@@ -55,6 +64,20 @@ interface WalletRepository {
     /** Records an outgoing payment request (no balance change). */
     suspend fun request(from: Contact, amountMinor: Long, note: String?)
 
+    /** Creates an idempotent, non-debit payment request addressed to a chat peer. */
+    suspend fun createChatPaymentRequest(
+        peerUserId: String,
+        amountMinor: Long,
+        note: String?,
+    ): ChatPaymentRequest = error("Payment requests are unavailable")
+
+    /** Pays a payment request received in chat; a PIN step-up authorizes the debit. */
+    suspend fun payChatPaymentRequest(
+        requestId: String,
+        amountMinor: Long,
+        paymentPin: String,
+    ): Unit = error("Payment requests are unavailable")
+
     suspend fun payBill(
         provider: BillProvider,
         account: String,
@@ -75,6 +98,9 @@ interface ContactRepository {
 
     suspend fun refresh()
     suspend fun syncDeviceContacts()
+
+    /** Finds Kit Pay members by their public @kittag; used when a search query starts with `@`. */
+    suspend fun searchByKitTag(query: String): List<Contact> = emptyList()
 }
 
 interface ChatRepository {

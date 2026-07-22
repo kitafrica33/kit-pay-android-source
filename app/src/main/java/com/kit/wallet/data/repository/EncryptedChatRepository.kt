@@ -1,6 +1,7 @@
 package com.kit.wallet.data.repository
 
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionRecord
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
@@ -902,7 +903,11 @@ class EncryptedChatRepository @Inject internal constructor(
                 name = conversation.peerName?.trim()?.takeIf(String::isNotEmpty)
                     ?: "Kit Pay contact",
                 lastMessage = last?.text?.let { text ->
-                    KitMediaMessage.parse(text)?.let { it.caption ?: "📷 Photo" } ?: text
+                    KitMediaMessage.parse(text)?.let { media -> media.caption ?: "📷 Photo" }
+                        ?: KitPaymentMessage.parse(text)?.let { payment ->
+                            if (payment.isRequest) "💰 Payment request" else "💸 Payment"
+                        }
+                        ?: text
                 }.orEmpty(),
                 time = last?.sentAt?.let(timeFormatter::format).orEmpty(),
                 peerUserId = conversation.peerUserId,
@@ -920,15 +925,33 @@ class EncryptedChatRepository @Inject internal constructor(
 
     private fun toUiMessage(projected: AuthenticatedProjectedText): Message {
         val media = KitMediaMessage.parse(projected.text)
+        val payment = if (media == null) KitPaymentMessage.parse(projected.text) else null
         return Message(
             id = projected.messageId,
-            text = media?.let { it.caption ?: "📷 Photo" } ?: projected.text,
+            text = when {
+                media != null -> media.caption ?: "📷 Photo"
+                payment != null -> payment.note.orEmpty()
+                else -> projected.text
+            },
             time = timeFormatter.format(projected.sentAt),
             fromMe = projected.fromCurrentUser,
             state = projected.deliveryState.toUiDeliveryState(),
-            kind = if (media != null) MessageKind.IMAGE else MessageKind.TEXT,
-            // The opaque authenticated descriptor; the UI passes it back to open the media.
-            mediaDescriptor = media?.let { projected.text },
+            kind = when {
+                media != null -> MessageKind.IMAGE
+                payment == null -> MessageKind.TEXT
+                payment.isRequest -> MessageKind.PAYMENT_REQUEST
+                else -> MessageKind.PAYMENT
+            },
+            // The opaque authenticated descriptor; the UI passes it back for follow-up actions.
+            mediaDescriptor = if (media != null || payment != null) projected.text else null,
+            amountMinor = when {
+                payment == null -> 0
+                // A completed payment reads "sent" for the payer and "received" for the requester.
+                !payment.isRequest && projected.fromCurrentUser -> -payment.amountMinor
+                else -> payment.amountMinor
+            },
+            paymentRequestId = payment?.paymentRequestId,
+            paymentNote = payment?.note,
         )
     }
 

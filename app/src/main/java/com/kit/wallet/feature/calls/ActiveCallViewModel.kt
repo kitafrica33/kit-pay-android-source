@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.notifications.CallActionReceiver
 import com.kit.wallet.data.notifications.CallLifecycleEvent
 import com.kit.wallet.data.notifications.CallLifecycleEventBus
 import com.kit.wallet.data.notifications.CallLifecycleKind
@@ -111,12 +112,18 @@ class ActiveCallViewModel @Inject constructor(
                         end("network_error")
                     }
                     is RoomEvent.TrackSubscribed -> if (!terminated && event.track is VideoTrack) {
+                        // A peer turning their camera on upgrades a voice call to the video layout.
                         mutableState.value = mutableState.value.copy(
                             remoteVideoTrack = event.track as VideoTrack,
+                            video = true,
                         )
                     }
                     is RoomEvent.TrackUnsubscribed -> if (event.track == mutableState.value.remoteVideoTrack) {
-                        mutableState.value = mutableState.value.copy(remoteVideoTrack = null)
+                        // With both cameras off the call settles back into the voice layout.
+                        mutableState.value = mutableState.value.copy(
+                            remoteVideoTrack = null,
+                            video = mutableState.value.cameraEnabled,
+                        )
                     }
                     is RoomEvent.Reconnecting -> if (!terminated) {
                         mutableState.value = mutableState.value.copy(phase = CallPhase.RECONNECTING)
@@ -255,6 +262,47 @@ class ActiveCallViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Upgrades the current voice call to video: publishes the camera and routes audio to the
+     * speaker. The peer's screen upgrades automatically when the video track arrives.
+     */
+    fun switchToVideo() {
+        if (mutableState.value.phase !in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)) return
+        viewModelScope.launch {
+            runCatching { room.localParticipant.setCameraEnabled(true) }
+                .onSuccess {
+                    val track = room.localParticipant
+                        .getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
+                    mutableState.value = mutableState.value.copy(
+                        video = true,
+                        cameraEnabled = true,
+                        localVideoTrack = track,
+                    )
+                    selectSpeaker(true)
+                }
+                .onFailure(::fail)
+        }
+    }
+
+    /**
+     * Drops this side of the call back to voice: unpublishes the camera and returns audio to the
+     * earpiece. The remote video keeps rendering if the peer still has their camera on.
+     */
+    fun switchToAudio() {
+        viewModelScope.launch {
+            runCatching { room.localParticipant.setCameraEnabled(false) }
+                .onSuccess {
+                    mutableState.value = mutableState.value.copy(
+                        video = mutableState.value.remoteVideoTrack != null,
+                        cameraEnabled = false,
+                        localVideoTrack = null,
+                    )
+                    if (mutableState.value.remoteVideoTrack == null) selectSpeaker(false)
+                }
+                .onFailure(::fail)
+        }
+    }
+
     fun flipCamera() {
         val track = room.localParticipant.getTrackPublication(Track.Source.CAMERA)
             ?.track as? LocalVideoTrack ?: return
@@ -284,6 +332,11 @@ class ActiveCallViewModel @Inject constructor(
     private fun validateIncomingCall() {
         val callId = incomingCallId ?: return
         if (validationJob?.isActive == true || terminated) return
+        // The ringing status-bar banner is owned by this screen once the user is looking at it.
+        context.getSystemService(android.app.NotificationManager::class.java)?.cancel(
+            CallActionReceiver.notificationTag(callId),
+            CallActionReceiver.NOTIFICATION_ID,
+        )
         mutableState.value = mutableState.value.copy(
             name = "Incoming Kit Pay call",
             video = false,

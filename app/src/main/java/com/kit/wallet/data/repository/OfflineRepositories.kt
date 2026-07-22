@@ -294,6 +294,66 @@ class OfflineWalletRepository @Inject constructor(
         }
     }
 
+    override suspend fun createChatPaymentRequest(
+        peerUserId: String,
+        amountMinor: Long,
+        note: String?,
+    ): ChatPaymentRequest {
+        require(amountMinor > 0) { "Amount must be positive" }
+        require(peerUserId.isNotBlank()) { "This conversation has no Kit Pay peer" }
+        val destination = requireSelectedWallet()
+        val created = apiCalls.execute {
+            api.createPaymentRequest(
+                idempotencyKey = "android-chat-request-${java.util.UUID.randomUUID()}",
+                request = CreatePaymentRequestDto(
+                    destinationWalletId = destination.uuid,
+                    requestedFromUserId = peerUserId,
+                    amount = DecimalMoney.fromMinor(amountMinor, destination.currencyScale),
+                    note = note?.trim()?.takeIf(String::isNotBlank),
+                ),
+            )
+        }
+        return ChatPaymentRequest(
+            id = created.id,
+            amountMinor = amountMinor,
+            currencyCode = destination.currencyCode,
+            currencyScale = destination.currencyScale,
+            note = created.note,
+        )
+    }
+
+    override suspend fun payChatPaymentRequest(
+        requestId: String,
+        amountMinor: Long,
+        paymentPin: String,
+    ) {
+        require(amountMinor > 0) { "The payment request amount is invalid" }
+        require(paymentPin.matches(Regex("^[0-9]{4}$"))) { "Enter the four-digit wallet PIN" }
+        val source = requireSelectedWallet()
+        val amount = DecimalMoney.fromMinor(amountMinor, source.currencyScale)
+        // The intent fields and their values must exactly match the backend's pay-time
+        // step-up intent hash: action, payment_request_id, source_wallet_id, amount, currency.
+        val intent = linkedMapOf<String, Any?>(
+            "action" to "pay",
+            "payment_request_id" to requestId,
+            "source_wallet_id" to source.uuid,
+            "amount" to amount,
+            "currency" to source.currencyCode,
+        )
+        val stepUpToken = paymentAuthorizer.authorize("payment_request", intent, paymentPin)
+        apiCalls.execute {
+            api.payPaymentRequest(
+                requestId = requestId,
+                idempotencyKey = "android-chat-pay-${java.util.UUID.randomUUID()}",
+                stepUpToken = stepUpToken,
+                request = com.kit.wallet.data.remote.PayPaymentRequestDto(
+                    sourceWalletId = source.uuid,
+                ),
+            )
+        }
+        walletSync.refresh()
+    }
+
     override suspend fun payBill(
         provider: BillProvider,
         account: String,

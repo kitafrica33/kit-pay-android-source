@@ -12,10 +12,13 @@ data class IncomingCallPayload(
     val callerName: String,
     val video: Boolean,
     val ringExpiresAt: String? = null,
+    /** True when the notification's Answer action asked the app to accept immediately. */
+    val acceptRequested: Boolean = false,
 ) {
-    fun deepLinkUri(): String = buildString {
+    fun deepLinkUri(accept: Boolean = false): String = buildString {
         append("kitwallet://call/incoming?call_id=")
         append(callId.urlEncode())
+        if (accept) append("&accept=1")
     }
 
     companion object {
@@ -56,7 +59,7 @@ data class IncomingCallPayload(
                 // Explicit activity intents are untrusted. The call endpoint supplies display data.
                 callerName = null,
                 video = false,
-            )
+            )?.copy(acceptRequested = query["accept"] == "1")
         }
 
         fun callId(data: Map<String, String>): String? = normalizedCallId(data["call_id"])

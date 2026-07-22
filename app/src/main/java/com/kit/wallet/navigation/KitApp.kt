@@ -164,7 +164,7 @@ fun KitApp(
                 }
                 if (capabilities.enabled(KitFeature.CALLS)) {
                     navController.navigate(
-                        Dest.incomingCall(incomingCall.callId),
+                        Dest.incomingCall(incomingCall.callId, incomingCall.acceptRequested),
                     ) { launchSingleTop = true }
                 }
                 onDeepLinkConsumed()
@@ -717,13 +717,18 @@ private fun KitNavHost(
             route = Dest.INCOMING_CALL,
             arguments = listOf(
                 navArgument("callId") { type = NavType.StringType },
+                navArgument("accept") {
+                    type = NavType.StringType
+                    defaultValue = "0"
+                },
             ),
-        ) {
+        ) { entry ->
             FeatureRouteContent(signedIn, capabilities, Dest.INCOMING_CALL) {
                 ActiveCallScreen(
                     name = "Incoming Kit Pay call",
                     video = false,
                     onEnd = { navController.popBackStack() },
+                    autoAccept = entry.arguments?.getString("accept") == "1",
                 )
             }
         }

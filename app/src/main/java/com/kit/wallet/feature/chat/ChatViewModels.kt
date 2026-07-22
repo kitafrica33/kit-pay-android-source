@@ -3,7 +3,9 @@ package com.kit.wallet.feature.chat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.repository.ChatRepository
+import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
@@ -40,6 +42,7 @@ class ChatsViewModel @Inject constructor(chatRepo: ChatRepository) : ViewModel()
 @HiltViewModel
 class ConversationViewModel @Inject constructor(
     private val chatRepo: ChatRepository,
+    private val walletRepo: WalletRepository,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
 
@@ -182,6 +185,84 @@ class ConversationViewModel @Inject constructor(
             retryingMessageId = message.id,
             onSuccess = onRetried,
         )
+    }
+
+    /**
+     * Creates an idempotent, non-debit backend payment request addressed to the chat peer, then
+     * shares it into the conversation as an end-to-end encrypted payment-request descriptor.
+     */
+    fun sendPaymentRequest(amountMinor: Long, note: String?, onSent: () -> Unit = {}) {
+        val selectedChat = chat.value ?: return
+        val peerUserId = selectedChat.peerUserId
+        if (!messagingAvailable.value || mutableSending.value) return
+        if (amountMinor <= 0) {
+            mutableError.value = "Enter an amount to request"
+            return
+        }
+        if (peerUserId == null) {
+            mutableError.value = "This conversation is not linked to a Kit Pay account"
+            return
+        }
+        viewModelScope.launch {
+            mutableSending.value = true
+            mutableError.value = null
+            try {
+                val created = walletRepo.createChatPaymentRequest(peerUserId, amountMinor, note)
+                val descriptor = KitPaymentMessage(
+                    action = KitPaymentMessage.ACTION_REQUEST,
+                    paymentRequestId = created.id,
+                    amountMinor = created.amountMinor,
+                    currencyCode = created.currencyCode,
+                    currencyScale = created.currencyScale,
+                    note = created.note?.takeIf(String::isNotBlank),
+                ).encode()
+                chatRepo.sendMessage(selectedChat.id, descriptor)
+                onSent()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message
+                    ?: "The payment request could not be sent"
+            } finally {
+                mutableSending.value = false
+            }
+        }
+    }
+
+    /** Pays a request received in this conversation, then confirms it in-chat once debited. */
+    fun payPaymentRequest(message: Message, paymentPin: String, onPaid: () -> Unit = {}) {
+        val selectedChat = chat.value ?: return
+        val descriptor = message.mediaDescriptor?.let(KitPaymentMessage::parse) ?: return
+        if (
+            !messagingAvailable.value || mutableSending.value ||
+            message.fromMe || !descriptor.isRequest
+        ) return
+        viewModelScope.launch {
+            mutableSending.value = true
+            mutableError.value = null
+            try {
+                walletRepo.payChatPaymentRequest(
+                    requestId = descriptor.paymentRequestId,
+                    amountMinor = descriptor.amountMinor,
+                    paymentPin = paymentPin,
+                )
+                // The paid confirmation is best-effort: the debit already completed above.
+                runCatching {
+                    chatRepo.sendMessage(
+                        selectedChat.id,
+                        descriptor.copy(action = KitPaymentMessage.ACTION_PAID).encode(),
+                    )
+                }
+                onPaid()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message
+                    ?: "The payment could not be completed"
+            } finally {
+                mutableSending.value = false
+            }
+        }
     }
 
     fun sendImage(bytes: ByteArray, mediaType: String, onSent: () -> Unit = {}) {

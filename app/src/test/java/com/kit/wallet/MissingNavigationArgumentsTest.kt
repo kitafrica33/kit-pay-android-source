@@ -75,6 +75,7 @@ class MissingNavigationArgumentsTest {
 
         val viewModel = ConversationViewModel(
             chatRepo = chats,
+            walletRepo = UnusedWalletRepository,
             savedStateHandle = SavedStateHandle(),
         )
 

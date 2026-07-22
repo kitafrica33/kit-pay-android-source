@@ -576,6 +576,24 @@ data class PaymentRequestDto(
 )
 
 @JsonClass(generateAdapter = false)
+data class PayPaymentRequestDto(
+    @Json(name = "source_wallet_id") val sourceWalletId: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class SearchResultsDto(
+    val items: List<SearchResultItemDto>? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class SearchResultItemDto(
+    val type: String,
+    val id: String,
+    val title: String? = null,
+    val subtitle: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
 data class CreateProviderQuoteRequest(
     val account: String,
     val amount: String,

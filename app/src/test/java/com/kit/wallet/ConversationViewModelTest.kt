@@ -3,13 +3,17 @@ package com.kit.wallet
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.repository.ChatRepository
+import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.feature.chat.ConversationViewModel
 import com.kit.wallet.feature.chat.retryableOutgoingMessageIds
+import com.kit.wallet.ui.model.Beneficiary
+import com.kit.wallet.ui.model.BillProvider
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
+import com.kit.wallet.ui.model.Transaction
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -466,8 +470,37 @@ class ConversationViewModelTest {
 
     private fun viewModel(repository: ChatRepository) = ConversationViewModel(
         chatRepo = repository,
+        walletRepo = FakeWalletRepository(),
         savedStateHandle = SavedStateHandle(mapOf("chatId" to CHAT_ID)),
     )
+
+    /** In-chat payments are exercised separately; these tests only need a compile-safe wallet. */
+    private class FakeWalletRepository : WalletRepository {
+        override val balanceMinor: StateFlow<Long> = MutableStateFlow(0L)
+        override val transactions: StateFlow<List<Transaction>> = MutableStateFlow(emptyList())
+        override val beneficiaries: StateFlow<List<Beneficiary>> = MutableStateFlow(emptyList())
+        override fun transaction(id: String): Transaction? = null
+        override suspend fun send(
+            recipient: Contact,
+            amountMinor: Long,
+            note: String?,
+            paymentPin: String,
+        ): Transaction = error("Unused in conversation tests")
+        override suspend fun request(from: Contact, amountMinor: Long, note: String?) =
+            error("Unused in conversation tests")
+        override suspend fun payBill(
+            provider: BillProvider,
+            account: String,
+            amountMinor: Long,
+            paymentPin: String,
+        ): Transaction = error("Unused in conversation tests")
+        override suspend fun buyAirtime(
+            productId: String,
+            phone: String,
+            amountMinor: Long,
+            paymentPin: String,
+        ): Transaction = error("Unused in conversation tests")
+    }
 
     private class FakeChatRepository(
         private val failure: Exception? = null,

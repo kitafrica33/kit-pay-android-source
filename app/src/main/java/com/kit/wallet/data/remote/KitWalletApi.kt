@@ -203,6 +203,21 @@ interface KitWalletApi {
         @Body request: CreatePaymentRequestDto,
     ): ApiEnvelope<PaymentRequestDto>
 
+    @POST("api/kit-wallet/v1/payments/requests/{requestId}/pay")
+    suspend fun payPaymentRequest(
+        @Path("requestId") requestId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: PayPaymentRequestDto,
+    ): ApiEnvelope<PaymentRequestDto>
+
+    @GET("api/kit-wallet/v1/search")
+    suspend fun search(
+        @Query("q") query: String,
+        @Query("types[]") types: List<String>,
+        @Query("limit") limit: Int,
+    ): ApiEnvelope<SearchResultsDto>
+
     @POST("api/kit-wallet/v1/providers/products/{productId}/quotes")
     suspend fun createProviderQuote(
         @Path("productId") productId: String,

@@ -51,7 +51,7 @@ data class Transaction(
 )
 
 enum class DeliveryState { SENDING, SENT, DELIVERED, READ, RETRY_REQUIRED, FAILED }
-enum class MessageKind { TEXT, PAYMENT, VOICE_NOTE, IMAGE }
+enum class MessageKind { TEXT, PAYMENT, PAYMENT_REQUEST, VOICE_NOTE, IMAGE }
 
 data class Message(
     val id: String,
@@ -61,10 +61,14 @@ data class Message(
     val senderName: String? = null,
     val state: DeliveryState = DeliveryState.READ,
     val kind: MessageKind = MessageKind.TEXT,
-    /** For IMAGE messages: the opaque end-to-end media descriptor used to fetch and decrypt. */
+    /** For IMAGE and payment messages: the opaque end-to-end descriptor for follow-up actions. */
     val mediaDescriptor: String? = null,
     /** For PAYMENT messages: signed minor units. */
     val amountMinor: Long = 0,
+    /** For payment messages: the backend payment-request identifier this bubble refers to. */
+    val paymentRequestId: String? = null,
+    /** For payment messages: an optional sender note carried inside the encrypted descriptor. */
+    val paymentNote: String? = null,
     val reactions: List<String> = emptyList(),
     val replyToText: String? = null,
     val durationSec: Int = 0,

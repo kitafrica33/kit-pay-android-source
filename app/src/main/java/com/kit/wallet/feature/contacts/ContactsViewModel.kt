@@ -8,8 +8,11 @@ import com.kit.wallet.ui.model.Contact
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.launch
 
 @HiltViewModel
@@ -28,8 +31,19 @@ class ContactsViewModel @Inject constructor(
     private val mutableOpeningContactId = MutableStateFlow<String?>(null)
     val openingContactId = mutableOpeningContactId.asStateFlow()
 
+    private val mutableQuery = MutableStateFlow("")
+    val query = mutableQuery.asStateFlow()
+
+    /** Kit Pay members found for an `@kittag` query; empty for device-contact queries. */
+    private val mutableTagResults = MutableStateFlow<List<Contact>>(emptyList())
+    val tagResults = mutableTagResults.asStateFlow()
+
+    private val mutableTagSearching = MutableStateFlow(false)
+    val tagSearching = mutableTagSearching.asStateFlow()
+
     init {
         refresh()
+        observeTagQueries()
     }
 
     fun refresh() = run { launchSync(deviceContacts = false) }
@@ -38,6 +52,42 @@ class ContactsViewModel @Inject constructor(
 
     fun clearError() {
         mutableError.value = null
+    }
+
+    /**
+     * A query starting with `@` searches the Kit Pay member directory by kit tag; anything else
+     * filters the device/synced contact list locally.
+     */
+    fun setQuery(value: String) {
+        mutableQuery.value = value
+        if (!value.trim().startsWith("@")) {
+            mutableTagResults.value = emptyList()
+            mutableTagSearching.value = false
+        }
+    }
+
+    @OptIn(FlowPreview::class)
+    private fun observeTagQueries() {
+        viewModelScope.launch {
+            mutableQuery.debounce(TAG_SEARCH_DEBOUNCE_MILLIS).collectLatest { raw ->
+                val value = raw.trim()
+                if (!value.startsWith("@") || value.removePrefix("@").trim().length < 2) {
+                    mutableTagResults.value = emptyList()
+                    return@collectLatest
+                }
+                mutableTagSearching.value = true
+                try {
+                    mutableTagResults.value = contactRepo.searchByKitTag(value)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // Directory search is best-effort; the local list stays usable either way.
+                    mutableTagResults.value = emptyList()
+                } finally {
+                    mutableTagSearching.value = false
+                }
+            }
+        }
     }
 
     fun openDirectConversation(contact: Contact, onOpened: (String) -> Unit) {
@@ -80,5 +130,9 @@ class ContactsViewModel @Inject constructor(
                 mutableSyncing.value = false
             }
         }
+    }
+
+    private companion object {
+        const val TAG_SEARCH_DEBOUNCE_MILLIS = 350L
     }
 }

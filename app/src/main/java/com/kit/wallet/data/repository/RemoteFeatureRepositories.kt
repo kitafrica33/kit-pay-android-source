@@ -72,8 +72,90 @@ class RemoteContactRepository @Inject constructor(
 
     override suspend fun refresh() {
         val deviceNames = deviceContactNames()
-        mutableContacts.value = apiCalls.execute { api.contacts() }.items.orEmpty()
+        val registered = apiCalls.execute { api.contacts() }.items.orEmpty()
             .map { it.toUiModel(deviceNames) }
+        mutableContacts.value = withLocalOnlyDeviceContacts(registered, deviceNames)
+    }
+
+    /**
+     * WhatsApp-style full address book: device contacts that are not yet known to Kit Pay are
+     * appended locally as invitable rows. This is a read-only, on-device merge — nothing is
+     * uploaded until the user completes the explicit contact-sync disclosure flow.
+     */
+    private fun withLocalOnlyDeviceContacts(
+        registered: List<Contact>,
+        deviceNames: Map<String, String>,
+    ): List<Contact> {
+        if (deviceNames.isEmpty()) return registered
+        val knownNumbers = registered.mapTo(mutableSetOf()) { contactNumberKey(it.phone) }
+        val deviceNumbers = deviceContactNumbers()
+        val localOnly = deviceNames.mapNotNull { (key, name) ->
+            val phone = deviceNumbers[key] ?: return@mapNotNull null
+            if (key.isEmpty() || key in knownNumbers) return@mapNotNull null
+            Contact(
+                id = "device:$key",
+                name = name,
+                phone = phone,
+                isKitUser = false,
+                favorite = false,
+                status = "",
+                receivingWalletId = null,
+                registeredName = null,
+                savedInDevice = true,
+            )
+        }
+        return registered + localOnly
+    }
+
+    /** Best-effort display phone numbers keyed like [deviceContactNames]; empty without permission. */
+    private fun deviceContactNumbers(): Map<String, String> {
+        if (
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return emptyMap()
+        }
+        val projection = arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER)
+        return buildMap {
+            runCatching {
+                context.contentResolver.query(
+                    ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                    projection,
+                    null,
+                    null,
+                    null,
+                )?.use { cursor ->
+                    val numberIndex = cursor.getColumnIndexOrThrow(projection[0])
+                    while (cursor.moveToNext() && size < MAX_CONTACTS) {
+                        val phone = cursor.getString(numberIndex)?.trim().orEmpty()
+                        val key = contactNumberKey(phone)
+                        if (phone.isNotEmpty() && key.isNotEmpty()) putIfAbsent(key, phone)
+                    }
+                }
+            }
+        }
+    }
+
+    override suspend fun searchByKitTag(query: String): List<Contact> {
+        val tag = query.trim().removePrefix("@").trim()
+        if (tag.length < 2) return emptyList()
+        return apiCalls.execute {
+            api.search(query = tag, types = listOf("users"), limit = 25)
+        }.items.orEmpty()
+            .filter { it.type == "users" }
+            .map { result ->
+                Contact(
+                    id = result.id,
+                    name = result.title?.takeIf(String::isNotBlank) ?: "Kit Pay member",
+                    phone = "",
+                    isKitUser = true,
+                    favorite = false,
+                    status = result.subtitle.orEmpty(),
+                    receivingWalletId = null,
+                    registeredName = result.title,
+                    savedInDevice = false,
+                )
+            }
     }
 
     override suspend fun syncDeviceContacts() {
@@ -110,9 +192,10 @@ class RemoteContactRepository @Inject constructor(
             }
         }
         val deviceNames = localContacts.associate { contactNumberKey(it.phone) to it.name }
-        mutableContacts.value = apiCalls.execute {
+        val registered = apiCalls.execute {
             api.syncContacts(ContactSyncRequest(localContacts))
         }.items.orEmpty().map { it.toUiModel(deviceNames) }
+        mutableContacts.value = withLocalOnlyDeviceContacts(registered, deviceNames)
     }
 
     /**

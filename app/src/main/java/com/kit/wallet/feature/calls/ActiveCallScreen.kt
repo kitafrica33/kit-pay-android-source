@@ -6,8 +6,15 @@ import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +24,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -41,15 +49,23 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -62,12 +78,14 @@ import com.kit.wallet.ui.theme.KitGreen700
 import com.kit.wallet.ui.theme.KitNavy600
 import com.kit.wallet.ui.theme.KitNavy700
 import com.kit.wallet.ui.theme.KitNavy900
+import kotlin.math.roundToInt
 
 @Composable
 fun ActiveCallScreen(
     name: String,
     video: Boolean,
     onEnd: () -> Unit,
+    autoAccept: Boolean = false,
     viewModel: ActiveCallViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -100,6 +118,12 @@ fun ActiveCallScreen(
         }
         else viewModel.permissionDenied()
     }
+    // Mid-call upgrade to video only needs the camera; audio permission already exists.
+    val cameraSwitchRequest = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) viewModel.switchToVideo()
+    }
 
     val connectCall = {
         val missing = permissions.filter {
@@ -119,12 +143,50 @@ fun ActiveCallScreen(
     LaunchedEffect(state.phase) {
         if (state.phase == CallPhase.ENDED) onEnd()
     }
+    // Answering from the notification skips the in-app Accept tap once the call is verified.
+    var autoAcceptConsumed by remember { mutableStateOf(false) }
+    LaunchedEffect(state.incomingVerified, state.phase) {
+        if (
+            autoAccept && !autoAcceptConsumed && state.incoming &&
+            state.incomingVerified && state.phase == CallPhase.INCOMING
+        ) {
+            autoAcceptConsumed = true
+            connectCall()
+        }
+    }
     // Ring and vibrate for the callee only while the verified call is still ringing. Accepting,
     // declining, connecting or any error immediately flips this off and disposes the ringer.
     val ringing = state.incoming && state.phase == CallPhase.INCOMING
     DisposableEffect(ringing) {
         val ringer = if (ringing) CallRinger(context).also { it.start() } else null
         onDispose { ringer?.stop() }
+    }
+    // Standard telephony progress sounds for the caller: ringback while the peer's device rings
+    // and a short disconnect burst when an active or ringing call terminates.
+    val tones = remember { CallTonePlayer() }
+    val outgoingRinging = !state.incoming && state.phase == CallPhase.RINGING
+    DisposableEffect(outgoingRinging) {
+        if (outgoingRinging) tones.startRingback()
+        onDispose { tones.stopRingback() }
+    }
+    var previousPhase by remember { mutableStateOf(state.phase) }
+    LaunchedEffect(state.phase) {
+        val was = previousPhase
+        previousPhase = state.phase
+        if (
+            state.phase in setOf(CallPhase.ENDING, CallPhase.ENDED) &&
+            was in setOf(
+                CallPhase.CONNECTING,
+                CallPhase.RINGING,
+                CallPhase.CONNECTED,
+                CallPhase.RECONNECTING,
+            )
+        ) {
+            tones.playDisconnect()
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose { tones.release() }
     }
     BackHandler { viewModel.end("cancelled") }
 
@@ -135,6 +197,17 @@ fun ActiveCallScreen(
         onSpeaker = viewModel::toggleSpeaker,
         onCamera = viewModel::toggleCamera,
         onFlip = viewModel::flipCamera,
+        onSwitchToVideo = {
+            if (
+                ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                viewModel.switchToVideo()
+            } else {
+                cameraSwitchRequest.launch(Manifest.permission.CAMERA)
+            }
+        },
+        onSwitchToAudio = viewModel::switchToAudio,
         onAccept = connectCall,
         onDecline = viewModel::decline,
         onRetry = {
@@ -161,6 +234,8 @@ private fun ActiveCallContent(
     onSpeaker: () -> Unit,
     onCamera: () -> Unit,
     onFlip: () -> Unit,
+    onSwitchToVideo: () -> Unit,
+    onSwitchToAudio: () -> Unit,
     onAccept: () -> Unit,
     onDecline: () -> Unit,
     onRetry: () -> Unit,
@@ -245,6 +320,7 @@ private fun ActiveCallContent(
                     CallPhase.RECONNECTING,
                 )
             ) {
+                val connected = state.phase in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)
                 Surface(
                     color = if (state.video) Color(0xFF081524).copy(alpha = 0.62f) else Color.Transparent,
                     shape = MaterialTheme.shapes.extraLarge,
@@ -252,7 +328,7 @@ private fun ActiveCallContent(
                 ) {
                     Row(
                         Modifier.padding(horizontal = 16.dp, vertical = if (state.video) 16.dp else 0.dp),
-                        horizontalArrangement = Arrangement.spacedBy(20.dp),
+                        horizontalArrangement = Arrangement.spacedBy(if (state.video) 14.dp else 20.dp),
                     ) {
                         if (state.phase == CallPhase.INCOMING) {
                             CallControl(
@@ -280,7 +356,7 @@ private fun ActiveCallContent(
                                 active = !state.cameraEnabled,
                                 onClick = onCamera,
                             )
-                            CallControl(Icons.Rounded.Cameraswitch, "Flip", onClick = onFlip)
+                            CallControl(Icons.Rounded.Call, "Audio", onClick = onSwitchToAudio)
                         } else {
                             CallControl(
                                 Icons.AutoMirrored.Rounded.VolumeUp,
@@ -288,6 +364,9 @@ private fun ActiveCallContent(
                                 active = state.speakerEnabled,
                                 onClick = onSpeaker,
                             )
+                            if (connected) {
+                                CallControl(Icons.Rounded.Videocam, "Video", onClick = onSwitchToVideo)
+                            }
                             CallControl(
                                 if (state.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
                                 "Mute",
@@ -309,13 +388,19 @@ private fun ColumnScope.VideoCallBody(
     room: io.livekit.android.room.Room,
     onFlip: () -> Unit,
 ) {
-    Row(
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    var previewSize by remember { mutableStateOf(IntSize.Zero) }
+    // The self-view floats over the call and can be dragged anywhere inside the safe area.
+    // The offset is relative to its top-end anchor and clamped so it can never leave the screen.
+    var previewOffset by remember { mutableStateOf(Offset.Zero) }
+    Box(
         Modifier
             .fillMaxSize()
             .weight(1f)
-            .padding(20.dp),
+            .padding(20.dp)
+            .onSizeChanged { containerSize = it },
     ) {
-        Column {
+        Column(Modifier.align(Alignment.TopStart)) {
             Text(state.name, style = MaterialTheme.typography.titleLarge, color = Color.White)
             Text(
                 state.statusText(),
@@ -323,10 +408,23 @@ private fun ColumnScope.VideoCallBody(
                 color = Color.White.copy(alpha = 0.75f),
             )
         }
-        Spacer(Modifier.weight(1f))
         Box(
             Modifier
+                .align(Alignment.TopEnd)
+                .offset { IntOffset(previewOffset.x.roundToInt(), previewOffset.y.roundToInt()) }
                 .size(width = 108.dp, height = 150.dp)
+                .onSizeChanged { previewSize = it }
+                .pointerInput(containerSize) {
+                    detectDragGestures { change, dragAmount ->
+                        change.consume()
+                        val maxLeft = (containerSize.width - previewSize.width).coerceAtLeast(0)
+                        val maxDown = (containerSize.height - previewSize.height).coerceAtLeast(0)
+                        previewOffset = Offset(
+                            (previewOffset.x + dragAmount.x).coerceIn(-maxLeft.toFloat(), 0f),
+                            (previewOffset.y + dragAmount.y).coerceIn(0f, maxDown.toFloat()),
+                        )
+                    }
+                }
                 .clip(MaterialTheme.shapes.medium)
                 .background(Color(0xFF2B4A66)),
         ) {
@@ -354,17 +452,66 @@ private fun ColumnScope.VideoCallBody(
 
 @Composable
 private fun ColumnScope.VoiceCallBody(state: ActiveCallUiState) {
+    // A calm breathing pulse: the halo rings expand and brighten together like a heartbeat
+    // while the call is active, and rest still once the call leaves its live phases.
+    val live = state.phase in setOf(
+        CallPhase.INCOMING,
+        CallPhase.CONNECTING,
+        CallPhase.RINGING,
+        CallPhase.CONNECTED,
+        CallPhase.RECONNECTING,
+    )
+    val breathing = rememberInfiniteTransition(label = "voice-call-breathing")
+    val outerScale by breathing.animateFloat(
+        initialValue = 1f,
+        targetValue = if (live) 1.09f else 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1_150, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "outer-ring-scale",
+    )
+    val innerScale by breathing.animateFloat(
+        initialValue = 1f,
+        targetValue = if (live) 1.05f else 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1_150, delayMillis = 120, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "inner-ring-scale",
+    )
+    val haloAlpha by breathing.animateFloat(
+        initialValue = 0.05f,
+        targetValue = if (live) 0.12f else 0.05f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1_150, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "halo-alpha",
+    )
     Column(
         Modifier.weight(1f),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
         Box(
-            Modifier.size(204.dp).background(KitGreen500.copy(alpha = 0.05f), CircleShape),
+            Modifier
+                .size(204.dp)
+                .graphicsLayer {
+                    scaleX = outerScale
+                    scaleY = outerScale
+                }
+                .background(KitGreen500.copy(alpha = haloAlpha), CircleShape),
             contentAlignment = Alignment.Center,
         ) {
             Box(
-                Modifier.size(168.dp).background(KitGreen500.copy(alpha = 0.12f), CircleShape),
+                Modifier
+                    .size(168.dp)
+                    .graphicsLayer {
+                        scaleX = innerScale
+                        scaleY = innerScale
+                    }
+                    .background(KitGreen500.copy(alpha = 0.12f), CircleShape),
                 contentAlignment = Alignment.Center,
             ) {
                 Box(

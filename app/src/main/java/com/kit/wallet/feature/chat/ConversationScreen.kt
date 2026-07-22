@@ -25,6 +25,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Send
@@ -34,17 +35,21 @@ import androidx.compose.material.icons.rounded.Done
 import androidx.compose.material.icons.rounded.DoneAll
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.Payments
 import androidx.compose.material.icons.rounded.Photo
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Videocam
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
@@ -66,6 +71,8 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -187,6 +194,8 @@ fun ConversationScreen(
         onClearError = viewModel::clearError,
         onSend = viewModel::send,
         onRetry = viewModel::retry,
+        onSendPaymentRequest = viewModel::sendPaymentRequest,
+        onPayRequest = viewModel::payPaymentRequest,
         onAttach = {
             // Dormant-feature guard: the composer hides the affordance, and this keeps even a
             // stale composition from opening the picker while the release profile is text-only.
@@ -290,6 +299,8 @@ private fun ConversationContent(
     onClearError: () -> Unit,
     onSend: (String, () -> Unit) -> Unit,
     onRetry: (Message, () -> Unit) -> Unit,
+    onSendPaymentRequest: (Long, String?, () -> Unit) -> Unit = { _, _, done -> done() },
+    onPayRequest: (Message, String, () -> Unit) -> Unit = { _, _, done -> done() },
     onAttach: () -> Unit = {},
     mediaEnabled: Boolean = false,
     mediaBytes: Map<String, ByteArray> = emptyMap(),
@@ -301,8 +312,30 @@ private fun ConversationContent(
     // Message plaintext must not enter the Activity saved-instance-state bundle. A rotation or
     // process death deliberately discards this in-memory draft until an encrypted draft store exists.
     var draft by remember { mutableStateOf("") }
+    var showRequestDialog by remember { mutableStateOf(false) }
+    var payTarget by remember { mutableStateOf<Message?>(null) }
     val retryableMessageIds = remember(messages) {
         retryableOutgoingMessageIds(messages)
+    }
+
+    if (showRequestDialog) {
+        PaymentRequestDialog(
+            sending = sending,
+            onDismiss = { showRequestDialog = false },
+            onRequest = { amountMinor, note ->
+                onSendPaymentRequest(amountMinor, note) { showRequestDialog = false }
+            },
+        )
+    }
+    payTarget?.let { target ->
+        PaymentPinDialog(
+            amountMinor = target.amountMinor,
+            sending = sending,
+            onDismiss = { payTarget = null },
+            onConfirm = { pin ->
+                onPayRequest(target, pin) { payTarget = null }
+            },
+        )
     }
 
     Scaffold(
@@ -366,6 +399,10 @@ private fun ConversationContent(
                     onSend = { onSend(draft) { draft = "" } },
                     onAttach = onAttach,
                     mediaEnabled = mediaEnabled,
+                    onRequestPayment = {
+                        if (error != null) onClearError()
+                        showRequestDialog = true
+                    },
                 )
             }
         },
@@ -435,6 +472,7 @@ private fun ConversationContent(
                     mediaError = mediaErrors[message.id],
                     onOpenMedia = { onOpenMedia(message) },
                     onRetryMedia = { onRetryMedia(message) },
+                    onPayRequest = { payTarget = message },
                 )
             }
             item { Spacer(Modifier.height(8.dp)) }
@@ -454,6 +492,7 @@ internal fun MessageBubble(
     mediaError: String? = null,
     onOpenMedia: () -> Unit = {},
     onRetryMedia: () -> Unit = {},
+    onPayRequest: () -> Unit = {},
 ) {
     val colors = KitTheme.colors
     val bubbleColor = if (msg.fromMe) colors.chatBubbleMe else colors.chatBubbleOther
@@ -490,6 +529,11 @@ internal fun MessageBubble(
                     }
                     when (msg.kind) {
                         MessageKind.PAYMENT -> PaymentChatCard(msg)
+                        MessageKind.PAYMENT_REQUEST -> PaymentRequestChatCard(
+                            msg = msg,
+                            payEnabled = !operationInFlight,
+                            onPay = onPayRequest,
+                        )
                         MessageKind.VOICE_NOTE -> VoiceNoteRow(msg)
                         MessageKind.IMAGE -> SecureImageContent(
                             msg = msg,
@@ -688,6 +732,177 @@ private fun PaymentChatCard(msg: Message) {
     }
 }
 
+/**
+ * A payment request shared inside the conversation. The requester sees a summary; the payer sees
+ * a Pay action that opens the wallet-PIN confirmation before any debit happens.
+ */
+@Composable
+private fun PaymentRequestChatCard(
+    msg: Message,
+    payEnabled: Boolean,
+    onPay: () -> Unit,
+) {
+    val colors = KitTheme.colors
+    Column(
+        Modifier
+            .background(
+                Brush.linearGradient(listOf(colors.balanceCardStart, colors.balanceCardEnd)),
+                MaterialTheme.shapes.medium,
+            )
+            .padding(14.dp)
+            .widthIn(min = 210.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier
+                    .size(34.dp)
+                    .background(Color.White.copy(alpha = 0.14f), MaterialTheme.shapes.small),
+                contentAlignment = Alignment.Center,
+            ) {
+                Image(
+                    painter = painterResource(R.drawable.ic_kit_mark_white),
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    if (msg.fromMe) "Payment request sent" else "Payment request",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White.copy(alpha = 0.75f),
+                )
+                Text(
+                    Money.format(abs(msg.amountMinor)),
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                )
+            }
+        }
+        msg.paymentNote?.takeIf(String::isNotBlank)?.let { note ->
+            Spacer(Modifier.height(6.dp))
+            Text(
+                note,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.85f),
+            )
+        }
+        if (!msg.fromMe) {
+            Spacer(Modifier.height(10.dp))
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .background(KitGreen300, MaterialTheme.shapes.small)
+                    .clickable(enabled = payEnabled, onClick = onPay)
+                    .padding(vertical = 9.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "Pay ${Money.format(abs(msg.amountMinor))}",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF0B2B1A),
+                )
+            }
+        }
+    }
+}
+
+/** Collects the amount and optional note for an in-chat payment request. */
+@Composable
+private fun PaymentRequestDialog(
+    sending: Boolean,
+    onDismiss: () -> Unit,
+    onRequest: (Long, String?) -> Unit,
+) {
+    var amountText by remember { mutableStateOf("") }
+    var note by remember { mutableStateOf("") }
+    val amountMinor = Money.parseMinor(amountText)
+    AlertDialog(
+        onDismissRequest = { if (!sending) onDismiss() },
+        title = { Text("Request a payment") },
+        text = {
+            Column {
+                Text(
+                    "The request is shared securely in this chat. Money moves only when they approve it.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = amountText,
+                    onValueChange = { amountText = it },
+                    enabled = !sending,
+                    label = { Text("Amount (${Money.SYMBOL})") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = note,
+                    onValueChange = { note = it.take(140) },
+                    enabled = !sending,
+                    label = { Text("Note (optional)") },
+                    singleLine = true,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !sending && (amountMinor ?: 0L) > 0L,
+                onClick = { onRequest(checkNotNull(amountMinor), note.trim().ifBlank { null }) },
+            ) { Text(if (sending) "Sending…" else "Request") }
+        },
+        dismissButton = {
+            TextButton(enabled = !sending, onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
+/** Confirms an in-chat payment with the four-digit wallet PIN before the debit is authorized. */
+@Composable
+private fun PaymentPinDialog(
+    amountMinor: Long,
+    sending: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var pin by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = { if (!sending) onDismiss() },
+        title = { Text("Pay ${Money.format(abs(amountMinor))}") },
+        text = {
+            Column {
+                Text(
+                    "Enter your wallet PIN to approve this payment.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { value -> pin = value.filter(Char::isDigit).take(4) },
+                    enabled = !sending,
+                    label = { Text("Wallet PIN") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !sending && pin.length == 4,
+                onClick = { onConfirm(pin) },
+            ) { Text(if (sending) "Paying…" else "Pay") }
+        },
+        dismissButton = {
+            TextButton(enabled = !sending, onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
 @Composable
 private fun VoiceNoteRow(msg: Message) {
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -865,6 +1080,7 @@ private fun Composer(
     onSend: () -> Unit,
     onAttach: () -> Unit = {},
     mediaEnabled: Boolean = false,
+    onRequestPayment: () -> Unit = {},
 ) {
     Row(
         Modifier
@@ -903,6 +1119,13 @@ private fun Composer(
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                }
+                IconButton(onClick = onRequestPayment, enabled = !sending) {
+                    Icon(
+                        Icons.Rounded.Payments,
+                        contentDescription = "Request a payment",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         }
