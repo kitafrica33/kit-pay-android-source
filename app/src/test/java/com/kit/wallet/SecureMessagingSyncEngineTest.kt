@@ -3,6 +3,7 @@ package com.kit.wallet
 import com.kit.wallet.data.auth.AuthRepository
 import com.kit.wallet.data.auth.DeviceIdentityProvider
 import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
+import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
 import com.kit.wallet.data.messaging.SecureMessagingAuthBindingResolver
 import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
 import com.kit.wallet.data.messaging.RealSecureMessagingInitialSyncActivation
@@ -17,9 +18,11 @@ import com.kit.wallet.data.messaging.SecureMessagingEventProcessor
 import com.kit.wallet.data.messaging.SecureMessagingFreshAuthenticationRequiredException
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
+import com.kit.wallet.data.messaging.SecureMessagingLegacyStateUnreadableException
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingReauthenticationRequiredException
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
+import com.kit.wallet.data.messaging.SecureMessagingRecordAuthenticationFailedException
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyTemporarilyUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingRecordVersion
 import com.kit.wallet.data.messaging.SecureMessagingRevalidationRetryException
@@ -670,7 +673,7 @@ class SecureMessagingSyncEngineTest {
     }
 
     @Test
-    fun `missing enrollment retries exact reset then reactivates in the advanced epoch`() =
+    fun `legacy unreadable state bypasses snapshot after exact reset and reactivates`() =
         runTest {
             val server = MockWebServer().apply { start() }
             try {
@@ -697,6 +700,11 @@ class SecureMessagingSyncEngineTest {
                     SecureMessagingSyncCursorStore(stateStore),
                 )
                 var activationAttempts = 0
+                val legacyUnreadable = SecureMessagingLegacyStateUnreadableException(
+                    SecureMessagingRecordAuthenticationFailedException(
+                        IllegalStateException("legacy projection has another at-rest key"),
+                    ),
+                )
                 val coordinator = SecureMessagingActivationCoordinator(
                     transport = transport,
                     lifecycle = guard,
@@ -707,6 +715,7 @@ class SecureMessagingSyncEngineTest {
                                 target = RESET_TARGET,
                                 activationFence = session.activationFence(),
                                 message = "missing private key",
+                                cause = legacyUnreadable,
                             )
                         }
                     },
@@ -722,6 +731,7 @@ class SecureMessagingSyncEngineTest {
                 }
                 val recoveredEpochs = mutableListOf<String>()
                 var recoveryAttempts = 0
+                var snapshotAttempts = 0
                 val retryableResetFailure = IllegalStateException("reset unavailable")
                 val engine = RealSecureMessagingSyncEngine(
                     bindingResolver = SecureMessagingAuthBindingResolver(
@@ -738,6 +748,18 @@ class SecureMessagingSyncEngineTest {
                         recoveredEpochs += epoch
                         assertEquals(RESET_TARGET, target)
                         if (recoveryAttempts++ == 0) throw retryableResetFailure
+                    },
+                    messageHistory = object : AccountMessageHistoryRetention {
+                        override suspend fun snapshotActiveHistory(
+                            target: com.kit.wallet.data.session.SessionFence,
+                        ) {
+                            snapshotAttempts++
+                            throw legacyUnreadable
+                        }
+
+                        override suspend fun eraseAccount(
+                            target: com.kit.wallet.data.session.SessionFence,
+                        ) = Unit
                     },
                 )
                 server.dispatcher = object : Dispatcher() {
@@ -756,13 +778,14 @@ class SecureMessagingSyncEngineTest {
 
                 assertEquals(retryableResetFailure, retryable)
                 assertEquals(
-                    com.kit.wallet.data.messaging.SecureMessagingRuntimeStage.PREPARING_KEYS,
+                    com.kit.wallet.data.messaging.SecureMessagingRuntimeStage.QUARANTINED,
                     guard.snapshot().stage,
                 )
 
                 engine.synchronize()
 
                 assertEquals(listOf(TOKENS.sessionId, TOKENS.sessionId), recoveredEpochs)
+                assertEquals(1, snapshotAttempts)
                 assertEquals(1, localResets)
                 assertEquals(com.kit.wallet.data.messaging.SecureMessagingRuntimeStage.READY, guard.snapshot().stage)
             } finally {
@@ -999,7 +1022,7 @@ class SecureMessagingSyncEngineTest {
             } catch (error: Throwable) {
                 if (!allowPermanentlyUnavailableSnapshot ||
                     !com.kit.wallet.data.messaging
-                        .isPermanentlyMissingSecureMessagingRecordKey(error)
+                        .isRecoverableSecureMessagingStateLoss(error)
                 ) {
                     throw error
                 }

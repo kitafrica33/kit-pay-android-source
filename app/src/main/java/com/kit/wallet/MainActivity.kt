@@ -24,8 +24,14 @@ import androidx.lifecycle.lifecycleScope
 import com.kit.wallet.data.messaging.ACTION_OPEN_AUTHORIZED_SECURE_MESSAGE
 import com.kit.wallet.data.messaging.EXTRA_SECURE_MESSAGE_AUTHORIZATION
 import com.kit.wallet.data.messaging.SecureMessageNavigationAuthorizer
+import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
+import com.kit.wallet.data.messaging.SecureMessagingCryptographicFailureException
+import com.kit.wallet.data.messaging.SecureMessagingProtocolUnavailableException
+import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
+import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
 import com.kit.wallet.data.notifications.IncomingCallPayload
+import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.feature.chat.ACTION_OPEN_TEXT_SHARE
@@ -37,8 +43,10 @@ import com.kit.wallet.ui.theme.KitWalletTheme
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import com.kit.wallet.worker.scheduleAuthenticatedMessagingCatchUp
 import dagger.hilt.android.AndroidEntryPoint
+import java.io.IOException
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -48,6 +56,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
@@ -156,7 +165,11 @@ class MainActivity : ComponentActivity() {
                 currentSession = { sessions.current()?.fence() },
                 engineReady = messagingSyncEngine.isReady,
                 schedule = messagingSyncScheduler::schedule,
-                synchronize = messagingSyncEngine::synchronize,
+                synchronize = {
+                    withContext(Dispatchers.IO) {
+                        messagingSyncEngine.synchronize()
+                    }
+                },
                 waitBeforeNextAttempt = { delay(it) },
             )
         }
@@ -275,6 +288,7 @@ private const val SESSION_RESTORE_ATTEMPTS = 3
 private const val SESSION_RESTORE_RETRY_DELAY_MILLIS = 250L
 private const val FOREGROUND_MESSAGING_SYNC_ATTEMPTS = 4
 private const val FOREGROUND_MESSAGING_SYNC_RETRY_DELAY_MILLIS = 5_000L
+private const val FOREGROUND_MESSAGING_SYNC_MAX_COOLDOWN_MILLIS = 60_000L
 
 @VisibleForTesting
 internal suspend fun restoreRetainedSessionWithRetries(
@@ -363,20 +377,60 @@ internal suspend fun synchronizeForegroundSecureMessagingWithRetries(
     require(attempts > 0)
     if (expectedSession == null || !engineReady) return false
 
-    repeat(attempts) { attempt ->
+    var failedAttempts = 0
+    var cycleCooldownMillis = FOREGROUND_MESSAGING_SYNC_RETRY_DELAY_MILLIS
+    while (currentSession() == expectedSession) {
         if (currentSession() != expectedSession) return false
         try {
             synchronize()
             return currentSession() == expectedSession
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (_: Exception) {
+        } catch (error: Exception) {
             if (currentSession() != expectedSession) return false
-            if (attempt == attempts - 1) return false
-            waitBeforeNextAttempt(FOREGROUND_MESSAGING_SYNC_RETRY_DELAY_MILLIS)
+            failedAttempts++
+            if (failedAttempts >= attempts &&
+                !isRetryableForegroundSecureMessagingFailure(error)
+            ) {
+                return false
+            }
+            val retryDelay = if (failedAttempts >= attempts) {
+                cycleCooldownMillis.also {
+                    cycleCooldownMillis = (cycleCooldownMillis * 2)
+                        .coerceAtMost(FOREGROUND_MESSAGING_SYNC_MAX_COOLDOWN_MILLIS)
+                }
+            } else {
+                FOREGROUND_MESSAGING_SYNC_RETRY_DELAY_MILLIS
+            }
+            // collectLatest/onStop cancellation ends this loop immediately. While the same login
+            // remains foregrounded, Android 9 recovery must not depend on delayed OEM WorkManager.
+            waitBeforeNextAttempt(retryDelay)
         }
     }
     return false
+}
+
+@VisibleForTesting
+internal fun isRetryableForegroundSecureMessagingFailure(error: Throwable): Boolean {
+    if (error is SecureMessagingCryptographicFailureException ||
+        error is SecureMessagingProtocolUnavailableException ||
+        error is SecureMessagingAuthenticationEpochChangedException
+    ) {
+        return false
+    }
+    if (isRetryableSecureMessagingStateFailure(error)) return true
+    return when (error) {
+        is IOException,
+        is SecureMessagingStateConflictException,
+        -> true
+        is KitWalletApiException ->
+            error.statusCode == null ||
+                error.statusCode == 408 ||
+                error.statusCode == 425 ||
+                error.statusCode == 429 ||
+                error.statusCode >= 500
+        else -> false
+    }
 }
 
 private data class PendingSecureMessageRoute(

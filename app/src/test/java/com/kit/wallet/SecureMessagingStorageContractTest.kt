@@ -16,6 +16,8 @@ import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingE
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyUnrecoverableException
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyMissState
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyResolution
+import com.kit.wallet.data.messaging.SecureMessagingLegacyStateUnreadableException
+import com.kit.wallet.data.messaging.SecureMessagingRecordAuthenticationFailedException
 import com.kit.wallet.data.messaging.SecureMessagingStateEraser
 import com.kit.wallet.data.messaging.SecureMessagingStateRetryableException
 import com.kit.wallet.data.messaging.SecureMessagingStateUnavailableException
@@ -26,7 +28,9 @@ import com.kit.wallet.data.messaging.completeKeystoreCipherOperation
 import com.kit.wallet.data.messaging.deleteKeystoreAliasAndVerifyAbsent
 import com.kit.wallet.data.messaging.eraseMessagingKeyAndRecords
 import com.kit.wallet.data.messaging.isPermanentlyMissingSecureMessagingRecordKey
+import com.kit.wallet.data.messaging.isRecoverableSecureMessagingStateLoss
 import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
+import com.kit.wallet.data.messaging.isSecureMessagingRecordAuthenticationFailure
 import com.kit.wallet.data.messaging.isTransientSecureMessagingRecordKeyFailure
 import com.kit.wallet.data.messaging.observeSecureMessagingRecordKeyMiss
 import com.kit.wallet.data.messaging.resolveSecureMessagingRecordKey
@@ -37,6 +41,7 @@ import com.kit.wallet.data.session.eraseMessagingThenClearSession
 import java.security.InvalidKeyException
 import java.security.ProviderException
 import java.security.UnrecoverableKeyException
+import javax.crypto.AEADBadTagException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
@@ -446,6 +451,25 @@ class SecureMessagingStorageContractTest {
     }
 
     @Test
+    fun `only migration-fenced unreadable legacy state authorizes recovery`() {
+        val authenticationFailure = SecureMessagingRecordAuthenticationFailedException(
+            AEADBadTagException("Android 9 used a replacement key"),
+        )
+        val unavailable = SecureMessagingStateUnavailableException(
+            "authenticated decryption failed",
+            authenticationFailure,
+        )
+
+        assertTrue(isSecureMessagingRecordAuthenticationFailure(unavailable))
+        assertFalse(isPermanentlyMissingSecureMessagingRecordKey(unavailable))
+        assertFalse(isRecoverableSecureMessagingStateLoss(unavailable))
+
+        val legacyUnreadable = SecureMessagingLegacyStateUnreadableException(unavailable)
+        assertTrue(isRecoverableSecureMessagingStateLoss(legacyUnreadable))
+        assertFalse(isRetryableSecureMessagingStateFailure(legacyUnreadable))
+    }
+
+    @Test
     fun `state write consumes and wipes its retained plaintext exactly once`() {
         val callerBytes = byteArrayOf(11, 22, 33, 44)
         val write = SecureMessagingStateWrite(
@@ -528,6 +552,58 @@ class SecureMessagingStorageContractTest {
         assertEquals(2, erasures)
         assertEquals(1, activations)
         assertEquals(2, notificationCancellations)
+    }
+
+    @Test
+    fun `session replacement snapshots before its crash fence and messaging erasure`() = runTest {
+        val events = mutableListOf<String>()
+        val lifecycle = SecureMessagingSessionLifecycle(
+            eraser = object : SecureMessagingStateEraser {
+                override suspend fun eraseAll() {
+                    events += "erase"
+                }
+            },
+            lifecycle = SecureMessagingLifecycleGuard(),
+        )
+        lifecycle.afterSessionSave()
+
+        lifecycle.beforeSessionSave(
+            isSameSession = false,
+            finalSnapshot = { events += "snapshot" },
+            beforeErasure = { events += "crash-fence" },
+        )
+
+        assertEquals(listOf("snapshot", "crash-fence", "erase"), events)
+        assertFalse(lifecycle.stateAvailable.value)
+    }
+
+    @Test
+    fun `failed session replacement snapshot retains active messaging state`() = runTest {
+        val failure = IllegalStateException("archive unavailable")
+        var crashFenced = false
+        var erased = false
+        val lifecycle = SecureMessagingSessionLifecycle(
+            eraser = object : SecureMessagingStateEraser {
+                override suspend fun eraseAll() {
+                    erased = true
+                }
+            },
+            lifecycle = SecureMessagingLifecycleGuard(),
+        )
+        lifecycle.afterSessionSave()
+
+        val observed = runCatching {
+            lifecycle.beforeSessionSave(
+                isSameSession = false,
+                finalSnapshot = { throw failure },
+                beforeErasure = { crashFenced = true },
+            )
+        }.exceptionOrNull()
+
+        assertSame(failure, observed)
+        assertFalse(crashFenced)
+        assertFalse(erased)
+        assertTrue(lifecycle.stateAvailable.value)
     }
 
     @Test
@@ -735,6 +811,40 @@ class SecureMessagingStorageContractTest {
             finalSnapshot = {
                 events += "snapshot"
                 throw SecureMessagingRecordKeyPermanentlyMissingException()
+            },
+            beforeErasure = { events += "crash-fence" },
+        )
+
+        assertEquals(listOf("snapshot", "crash-fence", "erase"), events)
+        assertEquals(SecureMessagingRuntimeStage.NO_SESSION, guard.snapshot().stage)
+    }
+
+    @Test
+    fun `migration-fenced unreadable state bypasses its final snapshot`() = runTest {
+        val events = mutableListOf<String>()
+        val guard = SecureMessagingLifecycleGuard()
+        val lifecycle = SecureMessagingSessionLifecycle(
+            eraser = object : SecureMessagingStateEraser {
+                override suspend fun eraseAll() {
+                    events += "erase"
+                }
+            },
+            lifecycle = guard,
+        )
+        lifecycle.afterSessionSave()
+        val fence = openRecoveryActivation(guard)
+        val unreadable = SecureMessagingLegacyStateUnreadableException(
+            SecureMessagingRecordAuthenticationFailedException(
+                AEADBadTagException("legacy projection used the replaced key"),
+            ),
+        )
+
+        lifecycle.resetForRecovery(
+            fence = fence,
+            allowPermanentlyUnavailableSnapshot = true,
+            finalSnapshot = {
+                events += "snapshot"
+                throw unreadable
             },
             beforeErasure = { events += "crash-fence" },
         )

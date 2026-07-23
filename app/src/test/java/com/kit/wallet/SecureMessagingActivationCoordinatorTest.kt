@@ -8,10 +8,13 @@ import com.kit.wallet.data.messaging.SecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingKeyReconciliationException
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
+import com.kit.wallet.data.messaging.SecureMessagingLegacyStateUnreadableException
+import com.kit.wallet.data.messaging.SecureMessagingLegacyStateValidator
 import com.kit.wallet.data.messaging.SecureMessagingLocalEnrollmentResetRequiredException
 import com.kit.wallet.data.messaging.SecureMessagingProtocolUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
+import com.kit.wallet.data.messaging.SecureMessagingRecordAuthenticationFailedException
 import com.kit.wallet.data.messaging.SecureMessagingRuntimeStage
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
 import com.kit.wallet.data.remote.ApiCallExecutor
@@ -230,6 +233,38 @@ class SecureMessagingActivationCoordinatorTest {
         }
 
     @Test
+    fun `migration-fenced unreadable state is reset before activation can write`() = runTest {
+        var keyCalls = 0
+        var syncCalls = 0
+        val unreadable = SecureMessagingLegacyStateUnreadableException(
+            SecureMessagingRecordAuthenticationFailedException(
+                IllegalStateException("legacy rows failed AES-GCM authentication"),
+            ),
+        )
+        val coordinator = coordinator(
+            keys = { keyCalls++ },
+            initialSync = { syncCalls++ },
+            legacyValidation = { throw unreadable },
+        )
+
+        val failure = runCatching {
+            coordinator.ensureActivated(BINDING)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingLocalEnrollmentResetRequiredException)
+        assertSame(unreadable, failure?.cause)
+        assertEquals(0, keyCalls)
+        assertEquals(0, syncCalls)
+        assertEquals(0, server.requestCount)
+        assertEquals(SecureMessagingRuntimeStage.QUARANTINED, lifecycle.snapshot().stage)
+        assertEquals(
+            SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+            lifecycle.snapshot().quarantineReason,
+        )
+        assertNull(registry.currentOrNull())
+    }
+
+    @Test
     fun `server readiness rollout retries the same fenced activation`() = runTest {
         var keyCalls = 0
         var syncCalls = 0
@@ -343,12 +378,14 @@ class SecureMessagingActivationCoordinatorTest {
     private fun coordinator(
         keys: suspend (RemoteSecureMessagingTransport.Session) -> Unit = {},
         initialSync: suspend (RemoteSecureMessagingTransport.Session) -> Unit = {},
+        legacyValidation: suspend () -> Unit = {},
     ) = SecureMessagingActivationCoordinator(
         transport = transport,
         lifecycle = lifecycle,
         sessions = registry,
         keyActivation = SecureMessagingKeyActivation(keys),
         initialSyncActivation = SecureMessagingInitialSyncActivation(initialSync),
+        legacyStateValidator = SecureMessagingLegacyStateValidator(legacyValidation),
     )
 
     private fun enqueueRemoteActivation() {

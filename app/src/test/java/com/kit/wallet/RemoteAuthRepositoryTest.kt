@@ -3,6 +3,7 @@ package com.kit.wallet
 import com.kit.wallet.data.auth.AuthOutcome
 import com.kit.wallet.data.auth.AuthChallengeKind
 import com.kit.wallet.data.auth.DeviceIdentityProvider
+import com.kit.wallet.data.auth.PendingAuthChallenge
 import com.kit.wallet.data.auth.RemoteAuthRepository
 import com.kit.wallet.data.auth.RemoteRevocationState
 import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
@@ -27,6 +28,7 @@ import com.kit.wallet.data.repository.WalletSyncResult
 import com.kit.wallet.data.repository.PaymentAuthorizer
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SecureMessagingResetProofFence
@@ -98,6 +100,62 @@ class RemoteAuthRepositoryTest {
         assertEquals("/api/kit-wallet/v1/auth/email/login", request.path)
         assertTrue(request.body.readUtf8().contains("\"installation_id\":\"installation-uuid\""))
     }
+
+    @Test
+    fun `authenticated login snapshots old history before saving a replacement session`() =
+        runTest {
+            server.enqueue(jsonResponse(AUTHENTICATED_JSON))
+            val events = mutableListOf<String>()
+            val oldSession = TEST_SESSION.copy(
+                sessionId = "old-session",
+                accountId = "11111111-1111-4111-8111-111111111111",
+            )
+            val sessions = FakeSessionStore(replacementEvents = events).apply { save(oldSession) }
+            val history = FakeMessageHistoryRetention(snapshotEvents = events)
+            val repository = repository(
+                sessions = sessions,
+                refresh = FakeRefreshTrigger(),
+                messageHistory = history,
+            )
+
+            repository.loginWithEmail("amina@example.test", "secret")
+
+            assertEquals(listOf("snapshot", "save-replacement"), events)
+            assertEquals(listOf(oldSession.fence()), history.snapshotTargets)
+            assertEquals("session-uuid", sessions.current()?.sessionId)
+        }
+
+    @Test
+    fun `failed replacement snapshot retains the old session and skips wallet refresh`() =
+        runTest {
+            server.enqueue(jsonResponse(AUTHENTICATED_JSON))
+            val failure = IllegalStateException("message archive unavailable")
+            val events = mutableListOf<String>()
+            val oldSession = TEST_SESSION.copy(
+                sessionId = "old-session",
+                accountId = "11111111-1111-4111-8111-111111111111",
+            )
+            val sessions = FakeSessionStore(replacementEvents = events).apply { save(oldSession) }
+            val history = FakeMessageHistoryRetention(
+                snapshotFailure = failure,
+                snapshotEvents = events,
+            )
+            val refresh = FakeRefreshTrigger()
+            val repository = repository(
+                sessions = sessions,
+                refresh = refresh,
+                messageHistory = history,
+            )
+
+            val observed = runCatching {
+                repository.loginWithEmail("amina@example.test", "secret")
+            }.exceptionOrNull()
+
+            assertSame(failure, observed)
+            assertEquals(oldSession, sessions.current())
+            assertEquals(listOf("snapshot"), events)
+            assertEquals(0, refresh.calls)
+        }
 
     @Test
     fun `fresh authenticated session drops an older messaging reset fence`() = runTest {
@@ -346,6 +404,48 @@ class RemoteAuthRepositoryTest {
         assertEquals(AuthChallengeKind.TWO_FACTOR, challenge.kind)
         assertEquals("totp", challenge.method)
         assertEquals("Authenticator app", challenge.destination)
+    }
+
+    @Test
+    fun `phone OTP and two factor authentication both snapshot a replaced session`() = runTest {
+        server.enqueue(jsonResponse(AUTHENTICATED_JSON))
+        server.enqueue(jsonResponse(AUTHENTICATED_JSON))
+        val oldSession = TEST_SESSION.copy(
+            sessionId = "old-session",
+            accountId = "11111111-1111-4111-8111-111111111111",
+        )
+
+        suspend fun authenticate(kind: AuthChallengeKind): List<SessionFence> {
+            val sessions = FakeSessionStore().apply { save(oldSession) }
+            val history = FakeMessageHistoryRetention()
+            val repository = repository(
+                sessions = sessions,
+                refresh = FakeRefreshTrigger(),
+                messageHistory = history,
+            )
+            val challenge = PendingAuthChallenge(
+                id = "challenge-uuid",
+                kind = kind,
+                expectedSession = sessions.snapshot(),
+            )
+            when (kind) {
+                AuthChallengeKind.PHONE_OTP -> repository.verifyPhoneOtp(
+                    challenge = challenge,
+                    phone = "+256772345678",
+                    code = "123456",
+                )
+                AuthChallengeKind.TWO_FACTOR -> repository.verifyTwoFactor(
+                    challenge = challenge,
+                    code = "123456",
+                )
+            }
+            return history.snapshotTargets
+        }
+
+        assertEquals(listOf(oldSession.fence()), authenticate(AuthChallengeKind.PHONE_OTP))
+        assertEquals(listOf(oldSession.fence()), authenticate(AuthChallengeKind.TWO_FACTOR))
+        assertEquals("/api/kit-wallet/v1/auth/otp/verify", server.takeRequest().path)
+        assertEquals("/api/kit-wallet/v1/auth/2fa/verify", server.takeRequest().path)
     }
 
     @Test
@@ -986,6 +1086,7 @@ class RemoteAuthRepositoryTest {
 
     private class FakeSessionStore(
         private val clearFailure: Exception? = null,
+        private val replacementEvents: MutableList<String>? = null,
     ) : SessionStore {
         private val state = MutableStateFlow<SessionTokens?>(null)
         private var revision = 0L
@@ -1004,6 +1105,20 @@ class RemoteAuthRepositoryTest {
             tokens: SessionTokens,
         ): Boolean {
             if (snapshot() != expected) return false
+            save(tokens)
+            return true
+        }
+        override suspend fun replaceIfUnchangedAfterFinalMessagingSnapshot(
+            expected: com.kit.wallet.data.session.SessionSnapshot,
+            tokens: SessionTokens,
+            finalMessagingSnapshot: suspend (com.kit.wallet.data.session.SessionFence) -> Unit,
+        ): Boolean {
+            if (snapshot() != expected) return false
+            val previous = current()?.fence()
+            if (previous != null && previous != tokens.fence()) {
+                finalMessagingSnapshot(previous)
+            }
+            replacementEvents?.add("save-replacement")
             save(tokens)
             return true
         }
@@ -1105,6 +1220,7 @@ class RemoteAuthRepositoryTest {
         private val snapshotFailure: Exception? = null,
         private val failSnapshotCall: Int = 1,
         private val eraseFailure: Exception? = null,
+        private val snapshotEvents: MutableList<String>? = null,
     ) : AccountMessageHistoryRetention {
         val snapshotTargets = mutableListOf<com.kit.wallet.data.session.SessionFence>()
         val eraseTargets = mutableListOf<com.kit.wallet.data.session.SessionFence>()
@@ -1114,6 +1230,7 @@ class RemoteAuthRepositoryTest {
             target: com.kit.wallet.data.session.SessionFence,
         ) {
             snapshotTargets += target
+            snapshotEvents?.add("snapshot")
             if (snapshotTargets.size == failSnapshotCall) snapshotFailure?.let { throw it }
         }
 

@@ -4,6 +4,9 @@ import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
+internal const val SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_KEY = "legacy_key_continuity"
+internal const val SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_VALUE = "pending"
+
 @Entity(tableName = "profile")
 data class ProfileEntity(
     @PrimaryKey val singletonId: Int = SINGLETON_ID,
@@ -80,6 +83,17 @@ data class SecureMessagingRecordEntity(
     val iv: ByteArray,
     val ciphertext: ByteArray,
     val updatedAtEpochMillis: Long,
+)
+
+/**
+ * Non-secret lifecycle metadata for encrypted secure-messaging state. Values in this table may
+ * describe migration/recovery work only; keys, ciphertext, and message content remain in their
+ * dedicated encrypted stores.
+ */
+@Entity(tableName = "secure_messaging_metadata")
+data class SecureMessagingMetadataEntity(
+    @PrimaryKey val key: String,
+    val value: String,
 )
 
 /**

@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.room.Room
 import com.kit.wallet.data.local.KitWalletDatabase
 import com.kit.wallet.data.local.ProfileDao
+import com.kit.wallet.data.local.SecureMessagingMetadataDao
 import com.kit.wallet.data.local.SyncStateDao
 import com.kit.wallet.data.local.WalletDao
 import com.kit.wallet.data.local.WalletTransactionDao
@@ -23,6 +24,7 @@ import com.kit.wallet.data.messaging.RoomAccountMessageArchiveStore
 import com.kit.wallet.data.messaging.SecureMessagingCryptoEngine
 import com.kit.wallet.data.messaging.SecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
+import com.kit.wallet.data.messaging.SecureMessagingLegacyStateValidator
 import com.kit.wallet.data.messaging.SecureMessagingRecordCipher
 import com.kit.wallet.data.messaging.SecureMessagingStateEraser
 import com.kit.wallet.data.messaging.SecureMessagingStateStore
@@ -82,6 +84,12 @@ internal abstract class SecureMessagingStorageModule {
 
     @Binds
     @Singleton
+    abstract fun bindSecureMessagingLegacyStateValidator(
+        implementation: RoomSecureMessagingStateStore,
+    ): SecureMessagingLegacyStateValidator
+
+    @Binds
+    @Singleton
     abstract fun bindSecureMessagingCryptoEngine(
         implementation: LibSignalSecureMessagingCryptoEngine,
     ): SecureMessagingCryptoEngine
@@ -117,6 +125,7 @@ object StorageModule {
                 KitWalletDatabase.MIGRATION_2_3,
                 KitWalletDatabase.MIGRATION_3_4,
                 KitWalletDatabase.MIGRATION_4_5,
+                KitWalletDatabase.MIGRATION_5_6,
             )
             .fallbackToDestructiveMigrationOnDowngrade()
             .build()
@@ -133,6 +142,11 @@ object StorageModule {
 
     @Provides
     fun provideSyncStateDao(database: KitWalletDatabase): SyncStateDao = database.syncStateDao()
+
+    @Provides
+    fun provideSecureMessagingMetadataDao(
+        database: KitWalletDatabase,
+    ): SecureMessagingMetadataDao = database.secureMessagingMetadataDao()
 
     @Provides
     @Singleton

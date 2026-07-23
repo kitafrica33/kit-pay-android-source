@@ -709,7 +709,14 @@ class RemoteAuthRepository @Inject constructor(
                     null
                 },
             )
-            if (!sessions.saveIfUnchanged(expected, tokens)) throw SessionInvalidatedException()
+            val sessionAdopted = sessions.replaceIfUnchangedAfterFinalMessagingSnapshot(
+                expected = expected,
+                tokens = tokens,
+                finalMessagingSnapshot = messageHistory::snapshotActiveHistory,
+            )
+            if (!sessionAdopted) {
+                throw SessionInvalidatedException()
+            }
             walletRefreshTrigger.refreshNow()
             return AuthOutcome.Authenticated(
                 authenticatedUser.toAuthenticatedUser(setupState, profileName),

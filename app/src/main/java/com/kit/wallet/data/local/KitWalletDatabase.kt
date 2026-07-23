@@ -12,9 +12,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         WalletTransactionEntity::class,
         SyncStateEntity::class,
         SecureMessagingRecordEntity::class,
+        SecureMessagingMetadataEntity::class,
         AccountMessageArchiveEntity::class,
     ],
-    version = 5,
+    version = 6,
     exportSchema = true,
 )
 abstract class KitWalletDatabase : RoomDatabase() {
@@ -23,6 +24,7 @@ abstract class KitWalletDatabase : RoomDatabase() {
     abstract fun walletTransactionDao(): WalletTransactionDao
     abstract fun syncStateDao(): SyncStateDao
     abstract fun secureMessagingRecordDao(): SecureMessagingRecordDao
+    abstract fun secureMessagingMetadataDao(): SecureMessagingMetadataDao
     abstract fun accountMessageArchiveDao(): AccountMessageArchiveDao
 
     companion object {
@@ -88,6 +90,23 @@ abstract class KitWalletDatabase : RoomDatabase() {
                     "CREATE INDEX IF NOT EXISTS " +
                         "index_account_message_archive_ownerAccountId_installationId " +
                         "ON account_message_archive(ownerAccountId, installationId)",
+                )
+            }
+        }
+
+        val MIGRATION_5_6: Migration = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS secure_messaging_metadata (" +
+                        "`key` TEXT NOT NULL, " +
+                        "value TEXT NOT NULL, " +
+                        "PRIMARY KEY(`key`))",
+                )
+                db.execSQL(
+                    "INSERT INTO secure_messaging_metadata (`key`, value) " +
+                        "SELECT '$SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_KEY', " +
+                        "'$SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_VALUE' " +
+                        "WHERE EXISTS (SELECT 1 FROM secure_messaging_records LIMIT 1)",
                 )
             }
         }

@@ -239,6 +239,8 @@ class SecureMessagingActivationCoordinator @Inject constructor(
     private val sessions: SecureMessagingActiveSessionRegistry,
     private val keyActivation: SecureMessagingKeyActivation,
     private val initialSyncActivation: SecureMessagingInitialSyncActivation,
+    private val legacyStateValidator: SecureMessagingLegacyStateValidator =
+        NoOpSecureMessagingLegacyStateValidator,
 ) {
     private data class Attempt(
         val binding: SecureMessagingSessionBinding,
@@ -277,12 +279,11 @@ class SecureMessagingActivationCoordinator @Inject constructor(
             pendingAttempt = null
             active
         } catch (error: Throwable) {
-            val permanentlyMissingRecordKey =
-                isPermanentlyMissingSecureMessagingRecordKey(error)
-            if (permanentlyMissingRecordKey) {
-                // Initial roster/projection recovery can discover the same lost Android-Keystore
-                // alias after key reconciliation. Convert that exact storage failure into the
-                // fenced local-reset path instead of leaving this login quarantined forever.
+            val recoverableStateLoss = isRecoverableSecureMessagingStateLoss(error)
+            if (recoverableStateLoss) {
+                // Initial roster/projection recovery can discover a lost Android-Keystore alias or
+                // migration-fenced unreadable pre-code-19 state after key reconciliation. Convert
+                // only those bounded failures into fenced local reset instead of stranding login.
                 runCatching {
                     lifecycle.quarantine(
                         attempt.fence,
@@ -297,14 +298,14 @@ class SecureMessagingActivationCoordinator @Inject constructor(
             sessions.clearIfOwnedBy(attempt.fence)
             if (!isCurrent(attempt)) pendingAttempt = null
             if (
-                permanentlyMissingRecordKey &&
+                recoverableStateLoss &&
                 error !is SecureMessagingReauthenticationRequiredException &&
                 error !is SecureMessagingLocalEnrollmentResetRequiredException &&
                 error !is SecureMessagingFreshAuthenticationRequiredException
             ) {
                 throw SecureMessagingLocalEnrollmentResetRequiredException(
                     activationFence = attempt.fence,
-                    message = "The secure messaging record key is permanently unavailable",
+                    message = "The secure messaging state is permanently unavailable",
                     cause = error,
                 )
             }
@@ -331,6 +332,10 @@ class SecureMessagingActivationCoordinator @Inject constructor(
     }
 
     private suspend fun advance(attempt: Attempt): SecureMessagingActiveSession {
+        lifecycle.assertCurrent(attempt.fence)
+        // Code 15/16 could replace a temporarily hidden Android 9 key and leave unreadable rows.
+        // Validate every migration-marked row before activation can commit any new state.
+        legacyStateValidator.validateAndRetireLegacyKeyContinuity()
         lifecycle.assertCurrent(attempt.fence)
         var stage = lifecycle.snapshot().stage
 

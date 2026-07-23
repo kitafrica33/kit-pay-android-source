@@ -22,7 +22,7 @@ import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingSyncCompletionSignal
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
-import com.kit.wallet.data.messaging.isPermanentlyMissingSecureMessagingRecordKey
+import com.kit.wallet.data.messaging.isRecoverableSecureMessagingStateLoss
 import com.kit.wallet.data.messaging.requireDurablyCommittedSessions
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.di.ApplicationScope
@@ -150,7 +150,7 @@ internal interface SecureMessagingChatRuntime {
         publication: () -> Unit,
     ): Boolean
 
-    /** Routes only a proved lost Android-Keystore record key through fenced local recovery. */
+    /** Routes only proved key loss or migration-fenced unreadable state through local recovery. */
     suspend fun recoverPermanentlyUnavailableState(error: Throwable): Boolean = false
 
     suspend fun directConversations(
@@ -288,12 +288,12 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     }
 
     override suspend fun recoverPermanentlyUnavailableState(error: Throwable): Boolean {
-        if (!isPermanentlyMissingSecureMessagingRecordKey(error) || !syncEngine.isReady) {
+        if (!isRecoverableSecureMessagingStateLoss(error) || !syncEngine.isReady) {
             return false
         }
         val previous = sessions.currentOrNull() ?: return false
         // Quarantine temporarily removes the active handle, which cancels collectLatest. Finish
-        // the already-proved local-key recovery so that cancellation cannot strand the login in
+        // the already-authorized fenced recovery so cancellation cannot strand the login in
         // QUARANTINED before the fresh activation is published.
         try {
             withContext(NonCancellable) {
@@ -1030,7 +1030,7 @@ class EncryptedChatRepository @Inject internal constructor(
                 }
                 if (
                     !permanentRecoveryAttempted &&
-                    isPermanentlyMissingSecureMessagingRecordKey(error)
+                    isRecoverableSecureMessagingStateLoss(error)
                 ) {
                     permanentRecoveryAttempted = true
                     val recovered = try {
@@ -1072,7 +1072,7 @@ class EncryptedChatRepository @Inject internal constructor(
     }
 
     private fun isRetryableProjectionBaselineFailure(error: Throwable): Boolean {
-        if (isPermanentlyMissingSecureMessagingRecordKey(error)) return false
+        if (isRecoverableSecureMessagingStateLoss(error)) return false
         return when (error) {
             is IOException,
             is SecureMessagingStateConflictException,

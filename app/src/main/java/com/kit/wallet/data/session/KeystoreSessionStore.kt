@@ -142,6 +142,24 @@ class KeystoreSessionStore @Inject constructor(
         }
     }
 
+    override suspend fun replaceIfUnchangedAfterFinalMessagingSnapshot(
+        expected: SessionSnapshot,
+        tokens: SessionTokens,
+        finalMessagingSnapshot: suspend (SessionFence) -> Unit,
+    ): Boolean {
+        tokens.requireValidCredentials()
+        return mutex.withLock {
+            if (sessionSnapshot != expected) return@withLock false
+            val previous = _session.value?.fence()
+            persistLocked(tokens) {
+                if (previous != null && previous != tokens.fence()) {
+                    finalMessagingSnapshot(previous)
+                }
+            }
+            true
+        }
+    }
+
     override suspend fun adoptRefreshedCredentialsIfCurrent(
         expectedCredentials: SessionTokens,
         refreshedCredentials: SessionTokens,
@@ -422,7 +440,10 @@ class KeystoreSessionStore @Inject constructor(
         }
     }
 
-    private suspend fun persistLocked(tokens: SessionTokens) {
+    private suspend fun persistLocked(
+        tokens: SessionTokens,
+        finalMessagingSnapshot: suspend () -> Unit = {},
+    ) {
         val existing = _session.value
         val isSameSession = existing?.fence() == tokens.fence()
         val allowKeyCreation = sessionKeyCreationAllowed(
@@ -430,11 +451,20 @@ class KeystoreSessionStore @Inject constructor(
             hasCurrentSession = existing != null,
         )
         if (!isSameSession) {
-            markMessagingErasurePending()
+            var erasureFenced = false
             try {
-                messagingLifecycle.beforeSessionSave(isSameSession = false)
+                messagingLifecycle.beforeSessionSave(
+                    isSameSession = false,
+                    finalSnapshot = finalMessagingSnapshot,
+                    beforeErasure = {
+                        markMessagingErasurePending()
+                        erasureFenced = true
+                    },
+                )
             } catch (error: Throwable) {
-                abandonSessionDuringPendingMessagingErasure()
+                // Snapshot/marker failure happens before state erasure and retains the old owner.
+                // Once fenced, cleanup may have started, so the old credential must not survive.
+                if (erasureFenced) abandonSessionDuringPendingMessagingErasure()
                 throw error
             }
         }

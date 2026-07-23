@@ -9,6 +9,8 @@ import android.security.keystore.UserNotAuthenticatedException
 import androidx.annotation.VisibleForTesting
 import androidx.room.withTransaction
 import com.kit.wallet.data.local.KitWalletDatabase
+import com.kit.wallet.data.local.SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_KEY
+import com.kit.wallet.data.local.SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_VALUE
 import com.kit.wallet.data.local.SecureMessagingRecordEntity
 import com.kit.wallet.data.session.CoroutineOwnedMutex
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -18,6 +20,8 @@ import java.security.KeyStore
 import java.security.KeyStoreException
 import java.security.ProviderException
 import java.security.UnrecoverableKeyException
+import javax.crypto.AEADBadTagException
+import javax.crypto.BadPaddingException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -25,8 +29,10 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 
 data class SecureMessagingRecord(
     val namespace: String,
@@ -126,6 +132,38 @@ internal class SecureMessagingStateRetryableException(
     message: String,
     cause: Throwable,
 ) : java.io.IOException(message, cause)
+
+/** AES-GCM rejected one locally persisted record after Android Keystore resolved a key handle. */
+@VisibleForTesting
+internal class SecureMessagingRecordAuthenticationFailedException(
+    cause: Throwable,
+) : java.security.GeneralSecurityException(
+    "Secure messaging at-rest record authentication failed",
+    cause,
+)
+
+/**
+ * An affected pre-code-19 install contains a record that cannot be authenticated with the
+ * retained Android Keystore key. This type is issued only while the migration marker proves that
+ * the unreadable row predates the code-19 validation boundary; AES-GCM cannot distinguish a
+ * replaced legacy key from legacy ciphertext corruption.
+ */
+@VisibleForTesting
+internal class SecureMessagingLegacyStateUnreadableException(
+    cause: Throwable,
+) : IllegalStateException(
+    "Legacy secure messaging state cannot be authenticated",
+    cause,
+)
+
+/** Validates every pre-fix encrypted record before activation can write any new state. */
+fun interface SecureMessagingLegacyStateValidator {
+    suspend fun validateAndRetireLegacyKeyContinuity()
+}
+
+internal object NoOpSecureMessagingLegacyStateValidator : SecureMessagingLegacyStateValidator {
+    override suspend fun validateAndRetireLegacyKeyContinuity() = Unit
+}
 
 interface SecureMessagingStateStore : SecureMessagingStateEraser {
     suspend fun read(namespace: String, recordKey: String): SecureMessagingRecord?
@@ -287,9 +325,14 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
             onSuccess = ::clearKeyFailureObservations,
         )
     } catch (error: Exception) {
+        val classified = if (error.hasGcmAuthenticationFailure()) {
+            SecureMessagingRecordAuthenticationFailedException(error)
+        } else {
+            error
+        }
         throw secureMessagingStateAccessFailure(
             "Secure messaging state failed authenticated decryption",
-            error,
+            classified,
         )
     }
 
@@ -512,9 +555,65 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
 class RoomSecureMessagingStateStore @Inject constructor(
     private val database: KitWalletDatabase,
     private val cipher: SecureMessagingRecordCipher,
-) : SecureMessagingStateStore {
+) : SecureMessagingStateStore, SecureMessagingLegacyStateValidator {
     private val records get() = database.secureMessagingRecordDao()
+    private val metadata get() = database.secureMessagingMetadataDao()
     private val lifecycleGate = SecureMessagingLifecycleGate()
+
+    override suspend fun validateAndRetireLegacyKeyContinuity() =
+        withContext(Dispatchers.IO) {
+            lifecycleGate.withOperation {
+                if (!legacyKeyContinuityPending()) return@withOperation
+
+                var afterNamespace: String? = null
+                var afterRecordKey: String? = null
+                var validatedRecords = 0
+                while (true) {
+                    val encryptedRows = records.globalPage(
+                        afterNamespace = afterNamespace,
+                        afterRecordKey = afterRecordKey,
+                        limit = LEGACY_KEY_VALIDATION_PAGE_SIZE,
+                    )
+                    try {
+                        if (encryptedRows.isEmpty()) break
+                        encryptedRows.forEach { stored ->
+                            validateRecordAddress(stored.namespace, stored.recordKey)
+                            require(stored.version > 0 && stored.updatedAtEpochMillis > 0) {
+                                "Legacy secure messaging validation found invalid record metadata"
+                            }
+                            val previousNamespace = afterNamespace
+                            val previousRecordKey = afterRecordKey
+                            require(
+                                previousNamespace == null ||
+                                    stored.namespace > previousNamespace ||
+                                    (
+                                        stored.namespace == previousNamespace &&
+                                            previousRecordKey != null &&
+                                            stored.recordKey > previousRecordKey
+                                        ),
+                            ) { "Legacy secure messaging validation is not strictly ordered" }
+
+                            val plaintext = decryptStoredRecord(stored)
+                            plaintext.fill(0)
+                            afterNamespace = stored.namespace
+                            afterRecordKey = stored.recordKey
+                            validatedRecords++
+                            check(validatedRecords <= MAX_LEGACY_KEY_VALIDATION_RECORDS) {
+                                "Legacy secure messaging state exceeds the validation bound"
+                            }
+                        }
+                        if (encryptedRows.size < LEGACY_KEY_VALIDATION_PAGE_SIZE) break
+                    } finally {
+                        encryptedRows.forEach { it.wipeEncryptedBytes() }
+                    }
+                }
+
+                // Only a complete, authenticated scan retires migration recovery authority. A
+                // crash or provider failure leaves the marker durable and retries before the next
+                // write.
+                metadata.remove(SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_KEY)
+            }
+        }
 
     override suspend fun read(
         namespace: String,
@@ -529,10 +628,7 @@ class RoomSecureMessagingStateStore @Inject constructor(
                     stored.version > 0 &&
                     stored.updatedAtEpochMillis > 0,
             ) { "Secure messaging record query returned invalid metadata" }
-            cipher.decrypt(
-                messagingRecordAad(namespace, recordKey, stored.version),
-                EncryptedMessagingRecord(stored.iv, stored.ciphertext),
-            )
+            decryptStoredRecord(stored)
         } finally {
             stored.iv.fill(0)
             stored.ciphertext.fill(0)
@@ -584,10 +680,7 @@ class RoomSecureMessagingStateStore @Inject constructor(
                 previousKey = stored.recordKey
             }
             selectedRows.forEach { stored ->
-                val bytes = cipher.decrypt(
-                    messagingRecordAad(stored.namespace, stored.recordKey, stored.version),
-                    EncryptedMessagingRecord(stored.iv, stored.ciphertext),
-                )
+                val bytes = decryptStoredRecord(stored)
                 try {
                     decrypted += SecureMessagingRecord(
                         namespace = stored.namespace,
@@ -774,12 +867,48 @@ class RoomSecureMessagingStateStore @Inject constructor(
         lifecycleGate.eraseAfterFinalSnapshot(finalSnapshot) {
             eraseMessagingKeyAndRecords(
                 eraseKey = cipher::eraseKey,
-                eraseRecords = records::deleteAll,
+                eraseRecords = {
+                    records.deleteAll()
+                    metadata.remove(SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_KEY)
+                },
             )
         }
 
     override suspend fun allowForActiveSession() {
         lifecycleGate.open()
+    }
+
+    private suspend fun decryptStoredRecord(stored: SecureMessagingRecordEntity): ByteArray {
+        val aad = messagingRecordAad(stored.namespace, stored.recordKey, stored.version)
+        return try {
+            cipher.decrypt(
+                aad,
+                EncryptedMessagingRecord(stored.iv, stored.ciphertext),
+            )
+        } catch (error: Exception) {
+            if (isSecureMessagingRecordAuthenticationFailure(error) &&
+                legacyKeyContinuityPending()
+            ) {
+                throw SecureMessagingLegacyStateUnreadableException(error)
+            }
+            throw error
+        } finally {
+            aad.fill(0)
+        }
+    }
+
+    private suspend fun legacyKeyContinuityPending(): Boolean =
+        metadata.get(SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_KEY) ==
+            SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_VALUE
+
+    private fun SecureMessagingRecordEntity.wipeEncryptedBytes() {
+        iv.fill(0)
+        ciphertext.fill(0)
+    }
+
+    private companion object {
+        const val LEGACY_KEY_VALIDATION_PAGE_SIZE = 100
+        const val MAX_LEGACY_KEY_VALIDATION_RECORDS = 100_000
     }
 }
 
@@ -793,8 +922,17 @@ class SecureMessagingSessionLifecycle @Inject internal constructor(
     private val mutableStateAvailable = MutableStateFlow(false)
     val stateAvailable = mutableStateAvailable.asStateFlow()
 
-    suspend fun beforeSessionSave(isSameSession: Boolean) {
-        if (!isSameSession) eraseActivationState()
+    suspend fun beforeSessionSave(
+        isSameSession: Boolean,
+        finalSnapshot: suspend () -> Unit = {},
+        beforeErasure: () -> Unit = {},
+    ) {
+        if (!isSameSession) {
+            eraseActivationState(
+                finalSnapshot = finalSnapshot,
+                beforeErasure = beforeErasure,
+            )
+        }
     }
 
     suspend fun beforeSessionClear(
@@ -881,7 +1019,7 @@ class SecureMessagingSessionLifecycle @Inject internal constructor(
             throw cancelled
         } catch (error: Throwable) {
             if (!allowPermanentlyUnavailableSnapshot ||
-                !isPermanentlyMissingSecureMessagingRecordKey(error)
+                !isRecoverableSecureMessagingStateLoss(error)
             ) {
                 throw error
             }
@@ -1209,6 +1347,17 @@ private fun Throwable.hasUnrecoverableSecureMessagingRecordKeyCause(): Boolean =
 private fun Throwable.hasPermanentlyInvalidatedSecureMessagingRecordKey(): Boolean =
     generateSequence(this) { it.cause }.any { it is KeyPermanentlyInvalidatedException }
 
+/** Marks only AES-GCM authentication failures produced by this local at-rest cipher. */
+private fun Throwable.hasGcmAuthenticationFailure(): Boolean =
+    generateSequence(this) { it.cause }.any {
+        it is AEADBadTagException || it is BadPaddingException
+    }
+
+@VisibleForTesting
+internal fun isSecureMessagingRecordAuthenticationFailure(error: Throwable): Boolean =
+    generateSequence(error) { it.cause }
+        .any { it is SecureMessagingRecordAuthenticationFailedException }
+
 /** True only for the explicit Android-Keystore alias observation used by bounded local retries. */
 @VisibleForTesting
 internal fun isTransientSecureMessagingRecordKeyFailure(error: Throwable): Boolean {
@@ -1229,6 +1378,17 @@ internal fun isPermanentlyMissingSecureMessagingRecordKey(error: Throwable): Boo
                 it is SecureMessagingRecordKeyPermanentlyUnrecoverableException ||
                 it is KeyPermanentlyInvalidatedException
         }
+
+/**
+ * Recovery authority is limited to a proved missing/unusable alias or migration-fenced unreadable
+ * pre-code-19 state. Once a complete authenticated scan retires that marker, ordinary corruption
+ * remains fail closed.
+ */
+@VisibleForTesting
+internal fun isRecoverableSecureMessagingStateLoss(error: Throwable): Boolean =
+    isPermanentlyMissingSecureMessagingRecordKey(error) ||
+        generateSequence(error) { it.cause }
+            .any { it is SecureMessagingLegacyStateUnreadableException }
 
 /** Keeps transient Android 9/OEM provider failures retryable while corruption stays fail-closed. */
 @VisibleForTesting

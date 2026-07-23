@@ -126,6 +126,20 @@ interface SecureMessagingRecordDao {
         limit: Int,
     ): List<SecureMessagingRecordEntity>
 
+    @Query(
+        "SELECT * FROM secure_messaging_records " +
+            "WHERE (:afterNamespace IS NULL OR " +
+            "namespace COLLATE BINARY > :afterNamespace COLLATE BINARY OR " +
+            "(namespace = :afterNamespace AND " +
+            "recordKey COLLATE BINARY > :afterRecordKey COLLATE BINARY)) " +
+            "ORDER BY namespace COLLATE BINARY ASC, recordKey COLLATE BINARY ASC LIMIT :limit",
+    )
+    suspend fun globalPage(
+        afterNamespace: String?,
+        afterRecordKey: String?,
+        limit: Int,
+    ): List<SecureMessagingRecordEntity>
+
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insert(record: SecureMessagingRecordEntity)
 
@@ -150,6 +164,21 @@ interface SecureMessagingRecordDao {
 
     @Query("DELETE FROM secure_messaging_records")
     suspend fun deleteAll()
+}
+
+@Dao
+interface SecureMessagingMetadataDao {
+    @Query("SELECT value FROM secure_messaging_metadata WHERE `key` = :key")
+    suspend fun get(key: String): String?
+
+    @Upsert
+    suspend fun put(metadata: SecureMessagingMetadataEntity)
+
+    @Query("DELETE FROM secure_messaging_metadata WHERE `key` = :key")
+    suspend fun remove(key: String)
+
+    @Query("DELETE FROM secure_messaging_metadata")
+    suspend fun clear()
 }
 
 @Dao

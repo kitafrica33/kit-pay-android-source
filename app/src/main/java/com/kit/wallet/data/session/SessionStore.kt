@@ -1,7 +1,7 @@
 package com.kit.wallet.data.session
 
 import com.kit.wallet.data.messaging.SecureMessagingSessionFence
-import com.kit.wallet.data.messaging.isPermanentlyMissingSecureMessagingRecordKey
+import com.kit.wallet.data.messaging.isRecoverableSecureMessagingStateLoss
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.StateFlow
@@ -133,6 +133,20 @@ interface SessionStore {
      */
     suspend fun saveIfUnchanged(expected: SessionSnapshot, tokens: SessionTokens): Boolean
 
+    /**
+     * Atomically adopts [tokens] only if [expected] is still current. When that adoption replaces
+     * an authenticated messaging owner, production storage drains active messaging commits, runs
+     * [finalMessagingSnapshot] for the old owner, and only then writes the erasure crash fence.
+     * A failed snapshot therefore leaves both the old session and its messaging state intact.
+     */
+    suspend fun replaceIfUnchangedAfterFinalMessagingSnapshot(
+        expected: SessionSnapshot,
+        tokens: SessionTokens,
+        finalMessagingSnapshot: suspend (SessionFence) -> Unit,
+    ): Boolean = throw UnsupportedOperationException(
+        "This session store cannot atomically replace an authenticated messaging owner",
+    )
+
     /** Adopts rotated credentials while merging metadata written during the refresh request. */
     suspend fun adoptRefreshedCredentialsIfCurrent(
         expectedCredentials: SessionTokens,
@@ -217,7 +231,7 @@ interface SessionStore {
             throw cancelled
         } catch (error: Throwable) {
             if (!allowPermanentlyUnavailableSnapshot ||
-                !isPermanentlyMissingSecureMessagingRecordKey(error)
+                !isRecoverableSecureMessagingStateLoss(error)
             ) {
                 throw error
             }
@@ -266,8 +280,9 @@ interface SessionStore {
      * Crash-safely erases and reopens messaging state only while [expected] and the exact
      * messaging activation generation still own this session. Production storage runs
      * [finalMessagingSnapshot] under the same exclusive messaging-state lease and writes its
-     * crash fence only after that snapshot succeeds. A proved-permanently-unavailable record key
-     * may bypass only its own snapshot failure because no retained record can then be decrypted.
+     * crash fence only after that snapshot succeeds. Proved key loss or migration-fenced
+     * unreadable legacy state may bypass only its own snapshot failure because that state cannot
+     * be safely retained through recovery.
      */
     suspend fun resetSecureMessagingStateIfCurrent(
         expected: SessionFence,

@@ -239,7 +239,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            if (isPermanentlyMissingSecureMessagingRecordKey(error)) throw error
+            if (isRecoverableSecureMessagingStateLoss(error)) throw error
             return@withLock
         }
         pending.forEach { task ->
@@ -268,7 +268,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 // Retry every other remote failure on a later sync. The ordinary stream and
                 // outbox have already completed before this best-effort stage begins.
             } catch (error: Exception) {
-                if (isPermanentlyMissingSecureMessagingRecordKey(error)) throw error
+                if (isRecoverableSecureMessagingStateLoss(error)) throw error
                 // Malformed retained history, target-only crypto failures, state contention and
                 // transport validation are isolated to this durable task and retried later.
             }
@@ -288,7 +288,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            if (isPermanentlyMissingSecureMessagingRecordKey(error)) throw error
+            if (isRecoverableSecureMessagingStateLoss(error)) throw error
             // A later synchronization re-reads the still-durable task.
         }
     }

@@ -386,13 +386,11 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                     continue
                 }
                 val active = activeForLostKeyRecovery
-                if (active != null &&
-                    isPermanentlyMissingSecureMessagingRecordKey(error)
-                ) {
-                    // A ready session can lose its Android-Keystore alias after activation. The
-                    // storage failure may arrive directly or through the crypto boundary. Always
-                    // quarantine it before routing through local erasure; normal activation then
-                    // obtains and resets the pinned server epoch.
+                if (active != null && isRecoverableSecureMessagingStateLoss(error)) {
+                    // A ready session can lose its Android-Keystore alias after activation or
+                    // expose migration-fenced unreadable pre-code-19 state. The storage failure
+                    // may arrive directly or through the crypto boundary. Quarantine before
+                    // fenced erasure; normal activation then obtains and resets the pinned epoch.
                     val quarantineFailure = if (
                         error is SecureMessagingCryptographicFailureException
                     ) {
@@ -400,7 +398,7 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                     } else {
                         SecureMessagingCryptographicFailureException(
                             quarantineReason = SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
-                            message = "The secure messaging record key is permanently unavailable",
+                            message = "The secure messaging state is permanently unavailable",
                             cause = error,
                         )
                     }
@@ -638,7 +636,7 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
         } catch (error: Throwable) {
             if (pending.snapshotPolicy == RecoverySnapshotPolicy.REQUIRE_READABLE_STATE &&
                 sessions.current()?.fence() == pending.session &&
-                isPermanentlyMissingSecureMessagingRecordKey(error)
+                isRecoverableSecureMessagingStateLoss(error)
             ) {
                 val promoted = PendingEnrollmentRecovery.LocalReset(
                     session = pending.session,
@@ -674,7 +672,7 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
     }
 
     private fun Throwable.recoverySnapshotPolicy(): RecoverySnapshotPolicy =
-        if (isPermanentlyMissingSecureMessagingRecordKey(this)) {
+        if (isRecoverableSecureMessagingStateLoss(this)) {
             RecoverySnapshotPolicy.ALLOW_PROVEN_PERMANENTLY_UNAVAILABLE_STATE
         } else {
             RecoverySnapshotPolicy.REQUIRE_READABLE_STATE

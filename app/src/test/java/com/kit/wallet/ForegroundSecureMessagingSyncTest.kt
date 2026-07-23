@@ -1,5 +1,8 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.messaging.SecureMessagingCryptographicFailureException
+import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
+import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.session.SessionFence
 import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
@@ -160,6 +163,102 @@ class ForegroundSecureMessagingSyncTest {
         assertTrue(synchronized)
         assertEquals(4, synchronizeCalls)
         assertEquals(15_000L, testScheduler.currentTime)
+    }
+
+    @Test
+    fun `foreground Android 9 recovery continues beyond the first retry cycle`() = runTest {
+        var synchronizeCalls = 0
+
+        val synchronized = synchronizeForegroundSecureMessagingWithRetries(
+            expectedSession = SESSION_A,
+            currentSession = { SESSION_A },
+            engineReady = true,
+            synchronize = {
+                synchronizeCalls++
+                if (synchronizeCalls < 5) {
+                    throw IOException("Android 9 provider remains temporarily unavailable")
+                }
+            },
+            waitBeforeNextAttempt = { delay(it) },
+        )
+
+        assertTrue(synchronized)
+        assertEquals(5, synchronizeCalls)
+        assertEquals(20_000L, testScheduler.currentTime)
+    }
+
+    @Test
+    fun `permanent foreground failure stops after the bounded first cycle`() = runTest {
+        var synchronizeCalls = 0
+
+        val synchronized = synchronizeForegroundSecureMessagingWithRetries(
+            expectedSession = SESSION_A,
+            currentSession = { SESSION_A },
+            engineReady = true,
+            synchronize = {
+                synchronizeCalls++
+                throw IllegalStateException("permanent protocol invariant")
+            },
+            waitBeforeNextAttempt = { delay(it) },
+        )
+
+        assertFalse(synchronized)
+        assertEquals(4, synchronizeCalls)
+        assertEquals(15_000L, testScheduler.currentTime)
+    }
+
+    @Test
+    fun `retryable foreground failures back off exponentially after the first cycle`() = runTest {
+        var synchronizeCalls = 0
+
+        val synchronized = synchronizeForegroundSecureMessagingWithRetries(
+            expectedSession = SESSION_A,
+            currentSession = { SESSION_A },
+            engineReady = true,
+            synchronize = {
+                synchronizeCalls++
+                if (synchronizeCalls < 7) throw IOException("temporary provider outage")
+            },
+            waitBeforeNextAttempt = { delay(it) },
+        )
+
+        assertTrue(synchronized)
+        assertEquals(7, synchronizeCalls)
+        assertEquals(50_000L, testScheduler.currentTime)
+    }
+
+    @Test
+    fun `foreground retry classification excludes permanent API and invariant failures`() {
+        assertTrue(isRetryableForegroundSecureMessagingFailure(IOException("offline")))
+        assertTrue(
+            isRetryableForegroundSecureMessagingFailure(
+                KitWalletApiException("BUSY", "busy", statusCode = 429),
+            ),
+        )
+        assertTrue(
+            isRetryableForegroundSecureMessagingFailure(
+                KitWalletApiException("UPSTREAM", "upstream", statusCode = 503),
+            ),
+        )
+        assertFalse(
+            isRetryableForegroundSecureMessagingFailure(
+                KitWalletApiException("INVALID", "invalid", statusCode = 400),
+            ),
+        )
+        assertFalse(
+            isRetryableForegroundSecureMessagingFailure(
+                IllegalArgumentException("malformed state"),
+            ),
+        )
+        assertFalse(
+            isRetryableForegroundSecureMessagingFailure(
+                SecureMessagingCryptographicFailureException(
+                    quarantineReason = SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                    message = "authenticated state failed",
+                    cause = IOException("nested transport-looking cause"),
+                ),
+            ),
+        )
     }
 
     @Test
