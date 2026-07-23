@@ -16,6 +16,7 @@ import com.kit.wallet.data.repository.CallConnection
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.initialCallPresentation
+import com.kit.wallet.data.repository.resolveRoomParticipantName
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.ui.model.Contact
 import com.twilio.audioswitch.AudioDevice
@@ -478,13 +479,18 @@ class ActiveCallViewModel @Inject constructor(
     private fun syncRemoteParticipants() {
         if (terminated) return
         val participants = room.remoteParticipants.values.map { participant ->
+            val identity = participant.identity?.value
             val video = participant.videoTrackPublications
                 .asSequence()
                 .mapNotNull { (_, track) -> track as? VideoTrack }
                 .firstOrNull()
             RemoteCallParticipant(
-                id = participant.identity?.value ?: participant.hashCode().toString(),
-                name = participant.name?.takeIf { it.isNotBlank() } ?: "Participant",
+                id = identity ?: participant.hashCode().toString(),
+                name = resolveRoomParticipantName(
+                    identity = identity,
+                    serverName = participant.name,
+                    contacts = contacts.contacts.value,
+                ),
                 videoTrack = video,
                 speaking = participant.isSpeaking,
             )
@@ -570,7 +576,8 @@ class ActiveCallViewModel @Inject constructor(
 
     private suspend fun resolveRecipient(): String {
         val raw = requireNotNull(target) { "Choose a contact before starting a call" }
-        val uuid = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+        // Laravel emits UUIDv7 identifiers; accept every RFC 9562 version supported by the API.
+        val uuid = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
         if (raw.matches(uuid)) return raw
 
         var contact = contacts.contacts.value.firstOrNull { it.name.equals(raw, ignoreCase = true) }

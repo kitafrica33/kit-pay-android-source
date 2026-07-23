@@ -104,6 +104,9 @@ interface SyncStateDao {
 
 @Dao
 interface SecureMessagingRecordDao {
+    @Query("SELECT COUNT(*) FROM secure_messaging_records")
+    suspend fun count(): Int
+
     @Query(
         "SELECT * FROM secure_messaging_records " +
             "WHERE namespace = :namespace AND recordKey = :recordKey",

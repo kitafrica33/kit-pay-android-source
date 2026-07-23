@@ -1,13 +1,18 @@
 package com.kit.wallet.data.messaging
 
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
+import android.security.keystore.UserNotAuthenticatedException
 import androidx.annotation.VisibleForTesting
 import androidx.room.withTransaction
 import com.kit.wallet.data.local.KitWalletDatabase
 import com.kit.wallet.data.local.SecureMessagingRecordEntity
 import java.nio.ByteBuffer
 import java.security.KeyStore
+import java.security.KeyStoreException
+import java.security.ProviderException
+import java.security.UnrecoverableKeyException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -112,6 +117,12 @@ class SecureMessagingStateUnavailableException(
     cause: Throwable,
 ) : IllegalStateException(message, cause)
 
+/** A provider/lock-state failure that may recover without replacing or erasing encrypted state. */
+internal class SecureMessagingStateRetryableException(
+    message: String,
+    cause: Throwable,
+) : java.io.IOException(message, cause)
+
 interface SecureMessagingStateStore : SecureMessagingStateEraser {
     suspend fun read(namespace: String, recordKey: String): SecureMessagingRecord?
 
@@ -154,23 +165,32 @@ data class EncryptedMessagingRecord(
 )
 
 interface SecureMessagingRecordCipher {
-    fun encrypt(aad: ByteArray, plaintext: ByteArray): EncryptedMessagingRecord
+    fun encrypt(
+        aad: ByteArray,
+        plaintext: ByteArray,
+        allowKeyCreation: Boolean,
+    ): EncryptedMessagingRecord
+
     fun decrypt(aad: ByteArray, record: EncryptedMessagingRecord): ByteArray
     fun eraseKey()
 }
 
 @Singleton
 class AndroidKeystoreMessagingRecordCipher @Inject constructor() : SecureMessagingRecordCipher {
-    override fun encrypt(aad: ByteArray, plaintext: ByteArray): EncryptedMessagingRecord = try {
+    override fun encrypt(
+        aad: ByteArray,
+        plaintext: ByteArray,
+        allowKeyCreation: Boolean,
+    ): EncryptedMessagingRecord = try {
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
+        cipher.init(Cipher.ENCRYPT_MODE, recordKey(allowKeyCreation))
         cipher.updateAAD(aad)
         EncryptedMessagingRecord(
             iv = cipher.iv.copyOf(),
             ciphertext = cipher.doFinal(plaintext),
         )
     } catch (error: Exception) {
-        throw SecureMessagingStateUnavailableException(
+        throw secureMessagingStateAccessFailure(
             "Secure messaging state could not be encrypted",
             error,
         )
@@ -182,13 +202,16 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor() : SecureMessagi
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(
             Cipher.DECRYPT_MODE,
-            getOrCreateKey(),
+            // Never manufacture a replacement key while ciphertext is present. Some Android 9
+            // Keystore providers briefly hide an existing alias while locked or recovering; a
+            // replacement would make every retained messaging record permanently undecryptable.
+            recordKey(allowCreation = false),
             GCMParameterSpec(GCM_TAG_BITS, record.iv),
         )
         cipher.updateAAD(aad)
         cipher.doFinal(record.ciphertext)
     } catch (error: Exception) {
-        throw SecureMessagingStateUnavailableException(
+        throw secureMessagingStateAccessFailure(
             "Secure messaging state failed authenticated decryption",
             error,
         )
@@ -207,8 +230,17 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor() : SecureMessagi
         }
     }
 
+    private fun recordKey(allowCreation: Boolean): SecretKey = resolveSecureMessagingRecordKey(
+        allowCreation = allowCreation,
+        loadExisting = {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            keyStore.getKey(KEY_ALIAS, null) as? SecretKey
+        },
+        createNew = ::generateKey,
+    )
+
     @Synchronized
-    private fun getOrCreateKey(): SecretKey {
+    private fun generateKey(): SecretKey {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
         (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
 
@@ -386,7 +418,8 @@ class RoomSecureMessagingStateStore @Inject constructor(
                 }
 
                 database.withTransaction {
-                    snapshots.map { write ->
+                    val existingRecordCount = records.count()
+                    snapshots.mapIndexed { writeIndex, write ->
                         val current = records.get(write.namespace, write.recordKey)
                         try {
                             val newVersion = when {
@@ -411,7 +444,14 @@ class RoomSecureMessagingStateStore @Inject constructor(
                                 newVersion,
                             )
                             val encrypted = try {
-                                cipher.encrypt(aad, write.bytes)
+                                cipher.encrypt(
+                                    aad = aad,
+                                    plaintext = write.bytes,
+                                    allowKeyCreation = secureMessagingKeyCreationAllowed(
+                                        existingRecordCount = existingRecordCount,
+                                        writeIndex = writeIndex,
+                                    ),
+                                )
                             } finally {
                                 aad.fill(0)
                             }
@@ -599,6 +639,63 @@ internal suspend fun eraseMessagingKeyAndRecords(
     }
 
     keyFailure?.let { throw it }
+}
+
+/** A decrypt/update path must never replace an alias that Android 9 temporarily cannot expose. */
+@VisibleForTesting
+internal fun <T : Any> resolveSecureMessagingRecordKey(
+    allowCreation: Boolean,
+    loadExisting: () -> T?,
+    createNew: () -> T,
+): T {
+    loadExisting()?.let { return it }
+    if (!allowCreation) throw SecureMessagingRecordKeyTemporarilyUnavailableException()
+    return createNew()
+}
+
+/** Only the first encryption in a genuinely empty store may bootstrap a new at-rest key. */
+@VisibleForTesting
+internal fun secureMessagingKeyCreationAllowed(
+    existingRecordCount: Int,
+    writeIndex: Int,
+): Boolean {
+    require(existingRecordCount >= 0) { "Secure messaging record count cannot be negative" }
+    require(writeIndex >= 0) { "Secure messaging write index cannot be negative" }
+    return existingRecordCount == 0 && writeIndex == 0
+}
+
+@VisibleForTesting
+internal class SecureMessagingRecordKeyTemporarilyUnavailableException(
+    cause: Throwable? = null,
+) : IllegalStateException("The secure messaging record key is temporarily unavailable", cause)
+
+/**
+ * Provider/lock-state failures retry without resetting the server enrollment. Authenticated
+ * corruption and permanently invalidated keys continue through the fenced enrollment recovery.
+ */
+@VisibleForTesting
+internal fun isRetryableSecureMessagingStateFailure(error: Throwable): Boolean {
+    val causes = generateSequence(error) { it.cause }.toList()
+    if (causes.any { it is KeyPermanentlyInvalidatedException }) return false
+    return causes.any { cause ->
+        cause is SecureMessagingRecordKeyTemporarilyUnavailableException ||
+            cause is UserNotAuthenticatedException ||
+            cause.javaClass.name == "android.security.KeyStoreException" ||
+            cause is KeyStoreException ||
+            cause is UnrecoverableKeyException ||
+            cause is ProviderException
+    }
+}
+
+/** Keeps transient Android 9/OEM provider failures retryable while corruption stays fail-closed. */
+@VisibleForTesting
+internal fun secureMessagingStateAccessFailure(
+    message: String,
+    cause: Exception,
+): Exception = if (isRetryableSecureMessagingStateFailure(cause)) {
+    SecureMessagingStateRetryableException(message, cause)
+} else {
+    SecureMessagingStateUnavailableException(message, cause)
 }
 
 @VisibleForTesting

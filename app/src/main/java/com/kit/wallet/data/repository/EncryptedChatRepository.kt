@@ -903,7 +903,7 @@ class EncryptedChatRepository @Inject internal constructor(
         }
         val savedNames = localContacts.asSequence()
             .filter { it.isKitUser && it.savedInDevice }
-            .associate { it.id to it.name.trim() }
+            .associate { it.id.lowercase() to it.name.trim() }
         mutableChats.value = conversations.sortedWith(
             compareByDescending<AuthenticatedDirectConversation> { conversation ->
                 latestByConversation[conversation.id]?.sentAt?.toEpochMilli() ?: Long.MIN_VALUE
@@ -912,7 +912,7 @@ class EncryptedChatRepository @Inject internal constructor(
             val last = latestByConversation[conversation.id]
             ChatPreview(
                 id = conversation.id,
-                name = savedNames[conversation.peerUserId]?.takeIf(String::isNotEmpty)
+                name = savedNames[conversation.peerUserId.lowercase()]?.takeIf(String::isNotEmpty)
                     ?: conversation.peerName?.trim()?.takeIf(String::isNotEmpty)
                     ?: "Kit Pay contact",
                 lastMessage = last?.text?.let { text ->

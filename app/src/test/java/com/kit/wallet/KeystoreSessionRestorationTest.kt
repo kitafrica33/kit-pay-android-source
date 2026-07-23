@@ -7,6 +7,7 @@ import com.kit.wallet.data.session.fenceThenEraseMessagingAndClearSession
 import com.kit.wallet.data.session.resolveSessionKey
 import com.kit.wallet.data.session.restoreRetainingEncryptedSession
 import com.kit.wallet.data.session.retryRetainedEncryptedSession
+import com.kit.wallet.data.session.sessionKeyCreationAllowed
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -258,11 +259,46 @@ class KeystoreSessionRestorationTest {
     }
 
     @Test
-    fun `encrypt key lookup may create an alias only when none exists`() {
+    fun `same session refresh never replaces a temporarily hidden Android 9 key`() {
+        var creations = 0
+
+        val failure = runCatching {
+            resolveSessionKey(
+                allowCreation = sessionKeyCreationAllowed(
+                    hasEncryptedSession = true,
+                    hasCurrentSession = true,
+                ),
+                loadExisting = { null },
+                createNew = {
+                    creations++
+                    "replacement-key"
+                },
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is SessionKeyTemporarilyUnavailableException)
+        assertEquals(0, creations)
+    }
+
+    @Test
+    fun `retained ciphertext without a restored session never permits key replacement`() {
+        assertFalse(
+            sessionKeyCreationAllowed(
+                hasEncryptedSession = true,
+                hasCurrentSession = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `genuinely new login may create a session key`() {
         var creations = 0
 
         val key = resolveSessionKey(
-            allowCreation = true,
+            allowCreation = sessionKeyCreationAllowed(
+                hasEncryptedSession = false,
+                hasCurrentSession = false,
+            ),
             loadExisting = { null },
             createNew = {
                 creations++

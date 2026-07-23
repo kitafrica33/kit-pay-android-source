@@ -84,6 +84,9 @@ class LibSignalSecureMessagingKeyActivation @Inject constructor(
         val local = try {
             session.localEnrollment(engine)
         } catch (error: SecureMessagingLocalEnrollmentUnavailableException) {
+            if (isRetryableSecureMessagingStateFailure(error)) {
+                throw SecureMessagingRevalidationRetryException(error)
+            }
             if (resetProof != null) {
                 throw proofRecoveryException(session, remote, resetProof, error)
             }

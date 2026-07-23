@@ -210,7 +210,7 @@ class EncryptedChatRepositoryTest {
         val localContacts = MutableStateFlow(
             listOf(
                 Contact(
-                    id = USER_ONE,
+                    id = USER_ONE.uppercase(),
                     name = "Flora from my phone",
                     phone = "+256761146015",
                     isKitUser = true,

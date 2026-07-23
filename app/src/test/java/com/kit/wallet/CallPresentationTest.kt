@@ -2,6 +2,7 @@ package com.kit.wallet
 
 import com.kit.wallet.data.repository.initialCallPresentation
 import com.kit.wallet.data.repository.resolveCallPresentation
+import com.kit.wallet.data.repository.resolveRoomParticipantName
 import com.kit.wallet.ui.model.Contact
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -38,6 +39,17 @@ class CallPresentationTest {
     }
 
     @Test
+    fun `Laravel UUIDv7 is never rendered while an outgoing call starts`() {
+        val presentation = initialCallPresentation(
+            "019f8c6f-cc57-720c-9a55-0d1cdf434d62",
+            contacts = emptyList(),
+        )
+
+        assertEquals("Kit Pay contact", presentation.name)
+        assertNull(presentation.phone)
+    }
+
+    @Test
     fun `loaded contact name is available before the call API responds`() {
         assertEquals(
             "Flora from my contacts",
@@ -65,6 +77,18 @@ class CallPresentationTest {
                 participantUserIds = listOf(floraId, secondId),
                 contacts = listOf(second, flora),
             ).name,
+        )
+    }
+
+    @Test
+    fun `LiveKit participant identity uses the locally saved contact name`() {
+        assertEquals(
+            "Flora from my contacts",
+            resolveRoomParticipantName(
+                identity = "$floraId:server-device-id",
+                serverName = "Flora Registered",
+                contacts = listOf(flora),
+            ),
         )
     }
 }

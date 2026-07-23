@@ -338,6 +338,7 @@ internal fun telecomAddress(phone: String?): Uri {
 }
 
 private val CANONICAL_UUID = Regex(
-    "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    // Laravel's HasUuids emits UUIDv7; RFC 9562 reserves versions through 8.
+    "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     RegexOption.IGNORE_CASE,
 )

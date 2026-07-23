@@ -34,10 +34,7 @@ class HomeDashboardComposeTest {
         val snackbar = SnackbarHostState()
         val callbacks = mutableListOf<String>()
         setDashboard(
-            capabilities = AppCapabilities(
-                features = mapOf(KitFeature.WALLETS to true),
-                loaded = true,
-            ),
+            capabilities = AppCapabilities(loaded = true),
             snackbar = snackbar,
             callbacks = callbacks,
             favorites = emptyList(),
@@ -49,6 +46,7 @@ class HomeDashboardComposeTest {
             HomeAction.SEND_MONEY,
             HomeAction.RECEIVE_MONEY,
             HomeAction.REQUEST_MONEY,
+            HomeAction.VERIFY_IDENTITY,
             HomeAction.PAY_BILLS,
             HomeAction.BUY_AIRTIME,
             HomeAction.BANK,

@@ -49,6 +49,23 @@ internal fun initialCallPresentation(target: String?, contacts: List<Contact>): 
     }
 }
 
+/** Resolves LiveKit's `public-user-uuid:device-id` identity without displaying either UUID. */
+internal fun resolveRoomParticipantName(
+    identity: String?,
+    serverName: String?,
+    contacts: List<Contact>,
+): String {
+    val publicUserId = identity
+        ?.substringBefore(':')
+        ?.trim()
+        ?.takeIf(CANONICAL_USER_ID::matches)
+    return resolveCallPresentation(
+        serverName = serverName,
+        participantUserIds = listOfNotNull(publicUserId),
+        contacts = contacts,
+    ).name
+}
+
 internal fun String?.toCallDisplayName(): String =
     this.safeCallDisplayText() ?: DEFAULT_CALL_DISPLAY_NAME
 
@@ -62,6 +79,6 @@ private fun String?.safeCallDisplayText(): String? = this
 private const val DEFAULT_CALL_DISPLAY_NAME = "Kit Pay contact"
 private const val MAX_CALL_DISPLAY_NAME_LENGTH = 160
 private val CANONICAL_USER_ID = Regex(
-    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-" +
+    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-" +
         "[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
 )

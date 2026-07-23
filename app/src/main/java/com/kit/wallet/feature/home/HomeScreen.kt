@@ -236,35 +236,17 @@ private fun HomeContent(
             }
 
             item {
-                if (walletEnabled) {
-                    BalanceCard(
-                        balanceMinor = balanceMinor,
-                        onSend = onSend,
-                        onReceive = onReceive,
-                        onRequest = onRequest,
-                        modifier = Modifier.padding(horizontal = 20.dp),
-                    )
-                } else {
-                    Surface(
-                        shape = MaterialTheme.shapes.extraLarge,
-                        color = MaterialTheme.colorScheme.surfaceContainer,
-                        modifier = Modifier.padding(horizontal = 20.dp),
-                    ) {
-                        Text(
-                            when {
-                                !capabilities.loaded -> "Checking wallet service availability…"
-                                capabilities.loadFailed ->
-                                    "Wallet services are hidden because availability could not be verified."
-                                else -> "Wallet services are currently unavailable."
-                            },
-                            modifier = Modifier.padding(22.dp),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
+                BalanceCard(
+                    balanceMinor = balanceMinor,
+                    balanceAvailable = walletEnabled,
+                    onSend = onSend,
+                    onReceive = onReceive,
+                    onRequest = onRequest,
+                    modifier = Modifier.padding(horizontal = 20.dp),
+                )
             }
 
-            if (shouldPromptForIdentityVerification(capabilities, profile.kycLabel)) {
+            if (shouldPromptForIdentityVerification(profile.kycLabel)) {
                 item {
                     Surface(
                         shape = MaterialTheme.shapes.large,
@@ -335,7 +317,7 @@ private fun HomeContent(
                 }
             }
 
-            if (capabilities.allEnabled(KitFeature.WALLETS, KitFeature.INTERNAL_TRANSFERS)) {
+            if (favorites.isNotEmpty()) {
                 item {
                     SectionHeader("Favorites")
                     Row(
@@ -363,25 +345,23 @@ private fun HomeContent(
                 }
             }
 
-            if (walletEnabled) {
-                item {
-                    SectionHeader(
-                        "Recent activity",
-                        actionLabel = "See all",
-                        onAction = onAllTransactions,
-                        modifier = Modifier.padding(top = 10.dp),
-                    )
-                }
+            item {
+                SectionHeader(
+                    "Recent activity",
+                    actionLabel = "See all",
+                    onAction = onAllTransactions,
+                    modifier = Modifier.padding(top = 10.dp),
+                )
+            }
 
-                items(recent.size) { i ->
-                    TransactionRow(
-                        tx = recent[i],
-                        onClick = { onTransaction(recent[i].id) },
-                        modifier = Modifier.testTag(
-                            "${HomeAction.TRANSACTION_DETAIL.testTag}-${recent[i].id}",
-                        ),
-                    )
-                }
+            items(recent.size) { i ->
+                TransactionRow(
+                    tx = recent[i],
+                    onClick = { onTransaction(recent[i].id) },
+                    modifier = Modifier.testTag(
+                        "${HomeAction.TRANSACTION_DETAIL.testTag}-${recent[i].id}",
+                    ),
+                )
             }
 
             item { Spacer(Modifier.height(20.dp)) }
@@ -389,15 +369,13 @@ private fun HomeContent(
     }
 }
 
-internal fun shouldPromptForIdentityVerification(
-    capabilities: AppCapabilities,
-    status: String,
-): Boolean = capabilities.enabled(KitFeature.KYC) &&
+internal fun shouldPromptForIdentityVerification(status: String): Boolean =
     status.trim().lowercase() !in setOf("verified", "approved", "kyc verified")
 
 @Composable
 private fun BalanceCard(
     balanceMinor: Long,
+    balanceAvailable: Boolean,
     onSend: () -> Unit,
     onReceive: () -> Unit,
     onRequest: () -> Unit,
@@ -426,7 +404,11 @@ private fun BalanceCard(
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    if (hidden) "••••••••" else Money.format(balanceMinor),
+                    when {
+                        !balanceAvailable -> "—"
+                        hidden -> "••••••••"
+                        else -> Money.format(balanceMinor)
+                    },
                     style = MaterialTheme.typography.displaySmall,
                     color = Color.White,
                 )

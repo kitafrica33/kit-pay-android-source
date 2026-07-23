@@ -400,7 +400,6 @@ class RemoteCallRepository @Inject constructor(
     override suspend fun incoming(callId: String): IncomingCallDetails {
         val call = apiCalls.execute { api.call(callId) }
         check(call.id == callId) { "The call lookup returned an unexpected call" }
-        refreshContactPresentation()
         val participantIds = call.participantUserIds.orEmpty()
         val presentation = resolveCallPresentation(call.name, participantIds, contacts.contacts.value)
         return IncomingCallDetails(
@@ -430,7 +429,11 @@ class RemoteCallRepository @Inject constructor(
                 ),
             )
         }
-        refreshContactPresentation()
+        // The recipient came from the already-loaded contact graph. Refreshing contacts here
+        // uploads the entire address book through the separately throttled /contacts/sync route
+        // for every redial, even though starting calls themselves is intentionally unthrottled.
+        // Reuse the current presentation and leave explicit contact/history refreshes responsible
+        // for discovering address-book changes.
         runCatching { refreshCallList() }
         return session.toConnection(recipientUserId)
     }
@@ -443,25 +446,22 @@ class RemoteCallRepository @Inject constructor(
                 com.kit.wallet.data.remote.InviteCallRequest(recipientUserIds),
             )
         }
-        refresh()
+        refreshCallList()
     }
 
     override suspend fun accept(callId: String): CallConnection {
         val session = apiCalls.execute { api.acceptCall(callId) }
-        refreshContactPresentation()
         runCatching { refreshCallList() }
         return session.toConnection()
     }
 
     override suspend fun decline(callId: String) {
         apiCalls.execute { api.declineCall(callId) }
-        refreshContactPresentation()
         runCatching { refreshCallList() }
     }
 
     override suspend fun end(callId: String, reason: String) {
         apiCalls.execute { api.endCall(callId, EndCallRequest(reason)) }
-        refreshContactPresentation()
         runCatching { refreshCallList() }
     }
 
@@ -487,7 +487,7 @@ class RemoteCallRepository @Inject constructor(
         )
     }
 
-    /** Exactly one fresh address-book/server-contact merge per public call operation. */
+    /** Refresh address-book presentation only for an explicit call-history refresh, not call I/O. */
     private suspend fun refreshContactPresentation() {
         runCatching { contacts.refresh() }
     }

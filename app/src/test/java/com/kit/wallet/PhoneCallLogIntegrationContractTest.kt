@@ -25,6 +25,8 @@ class PhoneCallLogIntegrationContractTest {
         assertTrue(bridge.contains("PhoneAccount.CAPABILITY_SELF_MANAGED"))
         assertTrue(bridge.contains("Manifest.permission.MANAGE_OWN_CALLS"))
         assertTrue(bridge.contains("catch (_: SecurityException)"))
+        assertTrue(bridge.contains("[1-8]"))
+        assertTrue(bridge.contains("Laravel's HasUuids emits UUIDv7"))
     }
 
     private fun repositoryRoot(): File {

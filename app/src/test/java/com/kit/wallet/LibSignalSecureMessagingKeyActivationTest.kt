@@ -21,8 +21,10 @@ import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
 import com.kit.wallet.data.messaging.SecureMessagingRecord
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyTemporarilyUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingRecordPage
 import com.kit.wallet.data.messaging.SecureMessagingRecordVersion
+import com.kit.wallet.data.messaging.SecureMessagingRevalidationRetryException
 import com.kit.wallet.data.messaging.SecureMessagingRuntimeStage
 import com.kit.wallet.data.messaging.SecureMessagingSessionLifecycle
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
@@ -218,6 +220,26 @@ class LibSignalSecureMessagingKeyActivationTest {
             assertTrue(failure?.cause is SecureMessagingLocalEnrollmentUnavailableException)
             assertEquals(SecureMessagingRuntimeStage.PREPARING_KEYS, active.lifecycle.snapshot().stage)
             assertEquals(publicationsBeforeFailure, keyServer.publishRequests().size)
+        }
+
+    @Test
+    fun `temporarily hidden Android 9 record key retries without resetting server enrollment`() =
+        runTest {
+            val active = openKeyPreparation()
+            LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
+            val publicationsBeforeFailure = keyServer.publishRequests().size
+            val statusBeforeFailure = keyServer.requireStatus()
+            stateStore.unavailableCause = SecureMessagingRecordKeyTemporarilyUnavailableException()
+            stateStore.readsUnavailable = true
+
+            val failure = runCatching {
+                LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
+            }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingRevalidationRetryException)
+            assertEquals(publicationsBeforeFailure, keyServer.publishRequests().size)
+            assertEquals(statusBeforeFailure, keyServer.requireStatus())
+            assertEquals(SecureMessagingRuntimeStage.PREPARING_KEYS, active.lifecycle.snapshot().stage)
         }
 
     @Test
@@ -616,12 +638,13 @@ class LibSignalSecureMessagingKeyActivationTest {
         private val records = mutableMapOf<Pair<String, String>, Stored>()
         private var clock = 1_000L
         var readsUnavailable = false
+        var unavailableCause: Throwable = IllegalStateException("injected storage failure")
 
         override suspend fun read(namespace: String, recordKey: String): SecureMessagingRecord? {
             if (readsUnavailable) {
                 throw SecureMessagingStateUnavailableException(
                     "injected unavailable state",
-                    IllegalStateException("injected storage failure"),
+                    unavailableCause,
                 )
             }
             return records[namespace to recordKey]?.let { stored ->

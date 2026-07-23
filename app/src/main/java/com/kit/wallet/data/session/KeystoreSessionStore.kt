@@ -313,6 +313,10 @@ class KeystoreSessionStore @Inject constructor(
     private suspend fun persistLocked(tokens: SessionTokens) {
         val existing = _session.value
         val isSameSession = existing?.fence() == tokens.fence()
+        val allowKeyCreation = sessionKeyCreationAllowed(
+            hasEncryptedSession = preferences.getString(KEY_SESSION, null) != null,
+            hasCurrentSession = existing != null,
+        )
         if (!isSameSession) {
             markMessagingErasurePending()
             try {
@@ -324,7 +328,7 @@ class KeystoreSessionStore @Inject constructor(
         }
         val json = adapter.toJson(tokens.toDiskPayload())
         val encryptedSession = try {
-            encrypt(json)
+            encrypt(json, allowKeyCreation = allowKeyCreation)
         } catch (error: Throwable) {
             if (!isSameSession) abandonSessionDuringPendingMessagingErasure()
             throw error
@@ -435,7 +439,7 @@ class KeystoreSessionStore @Inject constructor(
 
     private fun encrypt(
         plainText: String,
-        allowKeyCreation: Boolean = true,
+        allowKeyCreation: Boolean,
     ): String {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, sessionKey(allowCreation = allowKeyCreation))
@@ -586,6 +590,13 @@ internal fun <T : Any> resolveSessionKey(
     if (!allowCreation) throw SessionKeyTemporarilyUnavailableException()
     return createNew()
 }
+
+/** Retained credentials must never be rebound to a replacement Android Keystore alias. */
+@VisibleForTesting
+internal fun sessionKeyCreationAllowed(
+    hasEncryptedSession: Boolean,
+    hasCurrentSession: Boolean,
+): Boolean = !hasEncryptedSession && !hasCurrentSession
 
 /** A missing decrypt alias may be temporarily hidden by Android 9/OEM Keystore providers. */
 @VisibleForTesting

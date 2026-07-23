@@ -7,9 +7,16 @@ import com.kit.wallet.data.messaging.SecureMessagingLifecycleGate
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotification
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotificationSink
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyTemporarilyUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingStateEraser
+import com.kit.wallet.data.messaging.SecureMessagingStateRetryableException
+import com.kit.wallet.data.messaging.SecureMessagingStateUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingStateWrite
 import com.kit.wallet.data.messaging.eraseMessagingKeyAndRecords
+import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
+import com.kit.wallet.data.messaging.resolveSecureMessagingRecordKey
+import com.kit.wallet.data.messaging.secureMessagingStateAccessFailure
+import com.kit.wallet.data.messaging.secureMessagingKeyCreationAllowed
 import com.kit.wallet.data.session.eraseMessagingThenClearSession
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -24,6 +31,89 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SecureMessagingStorageContractTest {
+    @Test
+    fun `retained ciphertext never permits a replacement messaging key`() {
+        var creations = 0
+
+        val failure = runCatching {
+            resolveSecureMessagingRecordKey(
+                allowCreation = secureMessagingKeyCreationAllowed(
+                    existingRecordCount = 1,
+                    writeIndex = 0,
+                ),
+                loadExisting = { null },
+                createNew = {
+                    creations++
+                    "replacement-key"
+                },
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingRecordKeyTemporarilyUnavailableException)
+        assertTrue(isRetryableSecureMessagingStateFailure(checkNotNull(failure)))
+        assertEquals(0, creations)
+    }
+
+    @Test
+    fun `empty multi-record batch can bootstrap a key only for its first encryption`() {
+        var creations = 0
+
+        val firstKey = resolveSecureMessagingRecordKey(
+            allowCreation = secureMessagingKeyCreationAllowed(
+                existingRecordCount = 0,
+                writeIndex = 0,
+            ),
+            loadExisting = { null },
+            createNew = {
+                creations++
+                "initial-key"
+            },
+        )
+        val secondFailure = runCatching {
+            // Simulate an Android 9 provider hiding the alias after row one was encrypted.
+            resolveSecureMessagingRecordKey(
+                allowCreation = secureMessagingKeyCreationAllowed(
+                    existingRecordCount = 0,
+                    writeIndex = 1,
+                ),
+                loadExisting = { null },
+                createNew = {
+                    creations++
+                    "replacement-key"
+                },
+            )
+        }.exceptionOrNull()
+
+        assertEquals("initial-key", firstKey)
+        assertTrue(secondFailure is SecureMessagingRecordKeyTemporarilyUnavailableException)
+        assertEquals(1, creations)
+    }
+
+    @Test
+    fun `transient provider failure remains retryable for a ready session`() {
+        val failure = secureMessagingStateAccessFailure(
+            message = "state read failed",
+            cause = SecureMessagingRecordKeyTemporarilyUnavailableException(),
+        )
+
+        assertTrue(failure is SecureMessagingStateRetryableException)
+        assertTrue(failure is java.io.IOException)
+        assertFalse(failure is SecureMessagingStateUnavailableException)
+    }
+
+    @Test
+    fun `authenticated record corruption is not a retryable keystore failure`() {
+        val corruption = IllegalArgumentException("bad authenticated tag")
+        val failure = secureMessagingStateAccessFailure(
+            message = "authenticated decryption failed",
+            cause = corruption,
+        )
+
+        assertFalse(isRetryableSecureMessagingStateFailure(corruption))
+        assertTrue(failure is SecureMessagingStateUnavailableException)
+        assertFalse(failure is SecureMessagingStateRetryableException)
+    }
+
     @Test
     fun `state write consumes and wipes its retained plaintext exactly once`() {
         val callerBytes = byteArrayOf(11, 22, 33, 44)
