@@ -40,6 +40,58 @@ import kotlinx.coroutines.withContext
 /** Process-wide receive gate: navigation must not overlap bounded download/decrypt buffer sets. */
 private val secureMediaOpenMutex = Mutex()
 
+internal data class ConversationSoundDecision(
+    val playReceived: Boolean = false,
+    val playPaymentReceived: Boolean = false,
+    val playSent: Boolean = false,
+)
+
+/**
+ * Tracks the visible-conversation sound baseline across messaging epoch recovery. Projections
+ * published while readiness is closed establish a silent baseline; only later deltas may sound.
+ */
+internal class ConversationSoundBaseline {
+    private var knownIncomingIds: Set<String>? = null
+    private var previousOutgoingStates: Map<String, DeliveryState>? = null
+
+    fun observe(
+        messagingReady: Boolean,
+        projected: List<Message>,
+    ): ConversationSoundDecision {
+        val incoming = projected.filter { !it.fromMe }
+        val incomingIds = incoming.mapTo(mutableSetOf()) { it.id }
+        val outgoingStates = projected.asSequence()
+            .filter { it.fromMe }
+            .associate { it.id to it.state }
+        val previousIncoming = knownIncomingIds
+        val previousOutgoing = previousOutgoingStates
+
+        // Readiness loss clears repository projections before the replacement epoch publishes its
+        // baseline. Preserve the last non-empty identity set across that gap; StateFlow may
+        // conflate the intermediate restored-while-not-ready emission with the ready transition.
+        if (!messagingReady && projected.isEmpty()) return ConversationSoundDecision()
+
+        val arrived = if (messagingReady && previousIncoming != null) {
+            incoming.filter { it.id !in previousIncoming }
+        } else {
+            emptyList()
+        }
+        val reachedFirstTick = messagingReady && previousOutgoing != null &&
+            outgoingStates.any { (id, state) ->
+                state == DeliveryState.SENT && previousOutgoing[id] == DeliveryState.SENDING
+            }
+
+        knownIncomingIds = incomingIds
+        previousOutgoingStates = outgoingStates
+        val paymentArrived = arrived.any { it.kind == MessageKind.PAYMENT }
+        return ConversationSoundDecision(
+            playReceived = arrived.isNotEmpty() && !paymentArrived,
+            playPaymentReceived = paymentArrived,
+            playSent = reachedFirstTick,
+        )
+    }
+}
+
 @HiltViewModel
 class ChatsViewModel @Inject constructor(chatRepo: ChatRepository) : ViewModel() {
     val messagingAvailable = chatRepo.readiness
@@ -161,34 +213,19 @@ class ConversationViewModel @Inject constructor(
             //    knock tone;
             //  - an outgoing message plays the water-drop tone when it reaches its first tick.
             viewModelScope.launch {
-                var knownIncomingIds: Set<String>? = null
-                var previousOutgoingStates: Map<String, DeliveryState>? = null
-                conversationMessages.collect { projected ->
+                val soundBaseline = ConversationSoundBaseline()
+                combine(messagingAvailable, conversationMessages) { ready, projected ->
+                    ready to projected
+                }.collect { (ready, projected) ->
                     val visible = mutableConversationVisible.value
-
-                    val incoming = projected.filter { !it.fromMe }
-                    val previousIncoming = knownIncomingIds
-                    if (previousIncoming != null && visible) {
-                        val arrived = incoming.filter { it.id !in previousIncoming }
-                        if (arrived.any { it.kind == MessageKind.PAYMENT }) {
-                            messageSounds.playPaymentReceived()
-                        } else if (arrived.isNotEmpty()) {
-                            messageSounds.playReceived()
+                    val decision = soundBaseline.observe(ready, projected)
+                    if (visible) {
+                        when {
+                            decision.playPaymentReceived -> messageSounds.playPaymentReceived()
+                            decision.playReceived -> messageSounds.playReceived()
                         }
+                        if (decision.playSent) messageSounds.playSent()
                     }
-                    knownIncomingIds = incoming.mapTo(mutableSetOf()) { it.id }
-
-                    val outgoingStates = projected.asSequence()
-                        .filter { it.fromMe }
-                        .associate { it.id to it.state }
-                    val previousOutgoing = previousOutgoingStates
-                    if (previousOutgoing != null && visible) {
-                        val reachedFirstTick = outgoingStates.any { (id, state) ->
-                            state == DeliveryState.SENT && previousOutgoing[id] == DeliveryState.SENDING
-                        }
-                        if (reachedFirstTick) messageSounds.playSent()
-                    }
-                    previousOutgoingStates = outgoingStates
                 }
             }
         }

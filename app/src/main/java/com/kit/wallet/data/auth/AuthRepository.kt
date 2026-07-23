@@ -2,7 +2,9 @@ package com.kit.wallet.data.auth
 
 import com.kit.wallet.data.remote.DeviceDto
 import com.kit.wallet.data.remote.DeviceRegistrationDto
+import com.kit.wallet.data.messaging.SecureMessagingSessionFence
 import com.kit.wallet.data.session.ProfileSetupState
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionSnapshot
 import kotlinx.coroutines.flow.StateFlow
 
@@ -122,13 +124,15 @@ interface AuthRepository {
      * this idempotent server proof, so a stale target cannot wipe a concurrent replacement.
      */
     suspend fun recoverMissingSecureMessagingEnrollment(
-        expectedSessionEpoch: String,
+        expectedSession: SessionFence,
+        activationFence: SecureMessagingSessionFence,
         target: SecureMessagingEnrollmentResetTarget,
     )
 
-    /** Clears only the stale authentication epoch after an unverifiable lifecycle transition. */
+    /** Clears only the exact stale session owner after an unverifiable lifecycle transition. */
     suspend fun requireFreshAuthenticationForSecureMessagingRecovery(
-        expectedSessionEpoch: String,
+        expectedSession: SessionFence,
+        activationFence: SecureMessagingSessionFence,
     )
 
     suspend fun accountDeletionPreflight(): AccountDeletionPreflight

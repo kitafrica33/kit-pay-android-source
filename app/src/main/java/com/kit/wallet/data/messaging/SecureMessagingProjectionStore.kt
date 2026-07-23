@@ -1,5 +1,6 @@
 package com.kit.wallet.data.messaging
 
+import com.kit.wallet.data.session.SessionFence
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -9,6 +10,7 @@ import java.nio.charset.CodingErrorAction
 import java.time.Instant
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -60,9 +62,33 @@ internal class SecureMessagingProjectionPage(
 internal class SecureMessagingProjectionStore @Inject constructor(
     private val stateStore: SecureMessagingStateStore,
     private val companionReader: LibSignalCompanionStateReader,
+    private val historyArchive: AccountMessageHistoryAccess = NoOpAccountMessageHistoryAccess,
 ) {
     private val mutableChanges = MutableStateFlow(0L)
     val changes: StateFlow<Long> = mutableChanges.asStateFlow()
+
+    suspend fun <T> withActivationLease(
+        activation: SecureMessagingActivationCapability,
+        readyRequired: Boolean = false,
+        operation: suspend SecureMessagingProjectionStore.() -> T,
+    ): T = stateStore.withActivationLease(activation, readyRequired) {
+        operation(this)
+    }
+
+    /** Caller must already hold the exact authenticated SessionStore owner. */
+    suspend fun <T> withStateLease(
+        operation: suspend SecureMessagingProjectionStore.() -> T,
+    ): T = stateStore.withStateLease {
+        operation(this)
+    }
+
+    fun captureHistoryArchive(
+        expectedOwnerAccountId: String,
+        expectedSessionFence: SessionFence? = null,
+    ): CapturedAccountMessageHistory = historyArchive.capture(
+        expectedOwnerAccountId,
+        expectedSessionFence,
+    )
 
     fun outboundIntent(clientMessageId: String): SecureMessagingCompanionStateIntent =
         SecureMessagingCompanionStateIntent.outbound(
@@ -294,6 +320,29 @@ internal class SecureMessagingProjectionStore @Inject constructor(
     suspend fun readPage(
         afterRecordKey: String? = null,
         limit: Int,
+    ): SecureMessagingProjectionPage = readProjectionPage(
+        afterRecordKey = afterRecordKey,
+        limit = limit,
+    )
+
+    /** Reads activation-scoped state, releases its lease, then writes the captured account archive. */
+    suspend fun readPageAndArchive(
+        activation: SecureMessagingActivationCapability,
+        expectedOwnerAccountId: String,
+        afterRecordKey: String? = null,
+        limit: Int,
+    ): SecureMessagingProjectionPage {
+        val archive = captureHistoryArchive(expectedOwnerAccountId)
+        val page = withActivationLease(activation, readyRequired = true) {
+            readPage(afterRecordKey, limit)
+        }
+        archiveProjectionPage(archive, page)
+        return page
+    }
+
+    private suspend fun readProjectionPage(
+        afterRecordKey: String?,
+        limit: Int,
     ): SecureMessagingProjectionPage {
         val companionPage = companionReader.readPage(
             namespace = COMPANION_NAMESPACE,
@@ -326,6 +375,85 @@ internal class SecureMessagingProjectionStore @Inject constructor(
             )
         }
         return SecureMessagingProjectionPage(messages, companionPage.nextAfterRecordKey)
+    }
+
+    suspend fun archiveProjectionPage(
+        archive: CapturedAccountMessageHistory,
+        page: SecureMessagingProjectionPage,
+        requireSuccess: Boolean = false,
+    ) {
+        // Archiving is deliberately best-effort for live traffic: a temporarily unavailable
+        // archive key must not block authenticated messaging. The next projection pass retries.
+        page.messages().forEach { projected ->
+            try {
+                archive.archive(projected)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (requireSuccess) throw error
+                // Display and authenticated transport state remain available. A final logout
+                // snapshot surfaces archive failures instead of silently losing accepted history.
+            }
+        }
+    }
+
+    /** Caller owns the captured SessionStore fence and generic state lease for the full export. */
+    suspend fun archiveAcceptedHistory(archive: CapturedAccountMessageHistory) {
+        var afterRecordKey: String? = null
+        repeat(MAX_ARCHIVE_EXPORT_PAGES) {
+            val page = readProjectionPage(
+                afterRecordKey = afterRecordKey,
+                limit = ARCHIVE_EXPORT_PAGE_SIZE,
+            )
+            archiveProjectionPage(archive, page, requireSuccess = true)
+            val next = page.nextAfterRecordKey ?: return
+            check(afterRecordKey == null || next > afterRecordKey!!) {
+                "Secure-message archive export pagination did not advance"
+            }
+            afterRecordKey = next
+        }
+        error("Secure-message history exceeds the supported archive export bound")
+    }
+
+    /**
+     * Rehydrates only sanitized display history after the new Signal epoch is ready. The server's
+     * current direct-conversation IDs are the allow-list; archive rows never create conversations,
+     * notifications, pending sends, ratchets, or ciphertext fanout.
+     */
+    suspend fun restoreArchivedHistory(
+        activation: SecureMessagingActivationCapability,
+        currentUserId: String,
+        allowedConversationIds: Set<String>,
+    ) {
+        require(isCanonicalUuid(currentUserId)) { "Invalid archive restoration account ID" }
+        require(allowedConversationIds.all(::isCanonicalUuid)) {
+            "Invalid archive restoration conversation ID"
+        }
+        // Archive ownership is resolved and released before entering activation-scoped state. A
+        // replacement after this read makes the activation lease fail before any state write.
+        val archivedHistory = historyArchive.capture(currentUserId).readAll()
+        withActivationLease(activation, readyRequired = true) {
+            archivedHistory
+                .asSequence()
+                .filter { it.conversationId in allowedConversationIds }
+                .sortedWith(
+                    compareBy<AccountArchivedMessage> { it.sentAt }
+                        .thenBy { it.serverMessageId },
+                )
+                .forEach { archived ->
+                    val retained = retainedHistorySource(
+                        messageId = archived.serverMessageId,
+                        clientMessageId = archived.clientMessageId,
+                    )
+                    val durable = retained?.durableRecord
+                        ?: recordRecoveredHistory(archived.toAuthenticatedHistory())
+                    recordArchivedMetadata(
+                        durable = durable,
+                        archived = archived,
+                        fromCurrentUser = archived.sender.userId == currentUserId,
+                    )
+                }
+        }
     }
 
     suspend fun recordInbound(
@@ -977,6 +1105,44 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         return true
     }
 
+    private suspend fun recordArchivedMetadata(
+        durable: LibSignalCompanionRecord,
+        archived: AccountArchivedMessage,
+        fromCurrentUser: Boolean,
+    ) {
+        validateArchivedDurableMatch(durable, archived)
+        val desired = archivedProjectionMetadata(durable, archived, fromCurrentUser)
+        repeat(MAX_PROJECTION_WRITE_ATTEMPTS) { attempt ->
+            val existing = readMetadataRecord(durable.recordKey)
+            if (existing != null) {
+                validateMetadataMatches(existing.metadata, durable)
+                if (
+                    existing.metadata.deliveryState ==
+                    SecureMessagingProjectionDeliveryState.INBOUND_SUPPRESSED
+                ) {
+                    return // Never resurrect a message-local authenticated rejection.
+                }
+                if (isAcceptedProjectionState(existing.metadata.deliveryState)) {
+                    check(existing.metadata.copy(deliveryState = desired.deliveryState) == desired) {
+                        "Archived projection metadata changed immutable message history"
+                    }
+                }
+                if (archivedProjectionRank(existing.metadata.deliveryState) >=
+                    archivedProjectionRank(desired.deliveryState)
+                ) {
+                    return
+                }
+            }
+            try {
+                writeMetadata(durable.recordKey, desired, existing?.version)
+                return
+            } catch (conflict: SecureMessagingStateConflictException) {
+                if (attempt == MAX_PROJECTION_WRITE_ATTEMPTS - 1) throw conflict
+            }
+        }
+        error("Archived projection metadata retry bound was exhausted")
+    }
+
     private fun validateIdempotentMetadata(
         existing: ProjectionMetadata,
         expected: ProjectionMetadata,
@@ -1329,5 +1495,103 @@ private val INBOUND_DELIVERY_STATES = setOf(
     SecureMessagingProjectionDeliveryState.INBOUND_SUPPRESSED,
 )
 
+private fun validateArchivedInboundState(
+    state: SecureMessagingProjectionDeliveryState,
+    fromCurrentUser: Boolean,
+) {
+    val allowed = if (fromCurrentUser) {
+        setOf(
+            SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED,
+            SecureMessagingProjectionDeliveryState.INBOUND_SELF_DELIVERED,
+            SecureMessagingProjectionDeliveryState.INBOUND_SELF_READ,
+        )
+    } else {
+        setOf(
+            SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED,
+            SecureMessagingProjectionDeliveryState.INBOUND_READ,
+        )
+    }
+    check(state in allowed) { "Archived delivery state disagrees with message authorship" }
+}
+
+private fun validateArchivedDurableMatch(
+    durable: LibSignalCompanionRecord,
+    archived: AccountArchivedMessage,
+) {
+    check(
+        durable.clientMessageId == archived.clientMessageId &&
+            durable.conversationId == archived.conversationId &&
+            durable.sender == archived.sender &&
+            durable.rosterRevision == archived.rosterRevision &&
+            durable.replyToMessageId == archived.replyToMessageId &&
+            durable.authenticatedText == archived.text &&
+            (durable.direction != LibSignalCompanionDirection.INBOUND ||
+                durable.messageId == archived.serverMessageId),
+    ) { "Retained secure-message history differs from its account archive" }
+}
+
+private fun archivedProjectionMetadata(
+    durable: LibSignalCompanionRecord,
+    archived: AccountArchivedMessage,
+    fromCurrentUser: Boolean,
+): ProjectionMetadata {
+    val deliveryState = when (durable.direction) {
+        LibSignalCompanionDirection.INBOUND -> archived.deliveryState.also {
+            validateArchivedInboundState(it, fromCurrentUser)
+        }
+        LibSignalCompanionDirection.OUTBOUND -> {
+            check(fromCurrentUser) { "Retained outbound archive belongs to another account" }
+            when (archived.deliveryState) {
+                SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED ->
+                    SecureMessagingProjectionDeliveryState.OUTBOUND_SENT
+                SecureMessagingProjectionDeliveryState.INBOUND_SELF_DELIVERED ->
+                    SecureMessagingProjectionDeliveryState.OUTBOUND_DELIVERED
+                SecureMessagingProjectionDeliveryState.INBOUND_SELF_READ ->
+                    SecureMessagingProjectionDeliveryState.OUTBOUND_READ
+                else -> error("Peer-authored receipt state cannot restore an outbound projection")
+            }
+        }
+    }
+    return ProjectionMetadata(
+        direction = durable.direction,
+        conversationId = durable.conversationId,
+        clientMessageId = durable.clientMessageId,
+        serverMessageId = archived.serverMessageId,
+        sentAtEpochMillis = requireTimestamp(archived.sentAt),
+        deliveryState = deliveryState,
+    )
+}
+
+private fun isAcceptedProjectionState(state: SecureMessagingProjectionDeliveryState): Boolean =
+    state in setOf(
+        SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED,
+        SecureMessagingProjectionDeliveryState.INBOUND_READ,
+        SecureMessagingProjectionDeliveryState.INBOUND_SELF_DELIVERED,
+        SecureMessagingProjectionDeliveryState.INBOUND_SELF_READ,
+        SecureMessagingProjectionDeliveryState.OUTBOUND_SENT,
+        SecureMessagingProjectionDeliveryState.OUTBOUND_DELIVERED,
+        SecureMessagingProjectionDeliveryState.OUTBOUND_READ,
+    )
+
+private fun archivedProjectionRank(state: SecureMessagingProjectionDeliveryState): Int = when (state) {
+    SecureMessagingProjectionDeliveryState.OUTBOUND_PENDING,
+    SecureMessagingProjectionDeliveryState.OUTBOUND_RETRY_REQUIRED,
+    SecureMessagingProjectionDeliveryState.OUTBOUND_PERMANENT_FAILURE,
+    -> 0
+    SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED -> 1
+    SecureMessagingProjectionDeliveryState.OUTBOUND_SENT -> 1
+    SecureMessagingProjectionDeliveryState.INBOUND_READ,
+    SecureMessagingProjectionDeliveryState.INBOUND_SELF_DELIVERED,
+    SecureMessagingProjectionDeliveryState.OUTBOUND_DELIVERED,
+    -> 2
+    SecureMessagingProjectionDeliveryState.INBOUND_SELF_READ,
+    SecureMessagingProjectionDeliveryState.OUTBOUND_READ,
+    -> 3
+    SecureMessagingProjectionDeliveryState.INBOUND_SUPPRESSED ->
+        error("Suppressed projections cannot be restored from account history")
+}
+
 private const val READ_MARKER_PAGE_SIZE = 100
+private const val ARCHIVE_EXPORT_PAGE_SIZE = 100
+private const val MAX_ARCHIVE_EXPORT_PAGES = 100
 private const val MAX_PROJECTION_WRITE_ATTEMPTS = 3

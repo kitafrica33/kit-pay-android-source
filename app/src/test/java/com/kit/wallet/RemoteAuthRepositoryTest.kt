@@ -6,6 +6,12 @@ import com.kit.wallet.data.auth.DeviceIdentityProvider
 import com.kit.wallet.data.auth.RemoteAuthRepository
 import com.kit.wallet.data.auth.RemoteRevocationState
 import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
+import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
+import com.kit.wallet.data.messaging.AccountMessageArchivePurgeNotDurableException
+import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
+import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
+import com.kit.wallet.data.messaging.SecureMessagingSessionFence
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
 import com.kit.wallet.data.notifications.PushMessagingTransport
 import com.kit.wallet.data.notifications.PushTokenCoordinator
 import com.kit.wallet.data.remote.ApiCallExecutor
@@ -39,6 +45,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
@@ -285,6 +292,38 @@ class RemoteAuthRepositoryTest {
     }
 
     @Test
+    fun `terminal refresh rejection retains session when final history snapshot fails`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(401)
+                .setHeader("Content-Type", "application/json")
+                .setBody(
+                    """{"ok":false,"error":{"code":"REFRESH_TOKEN_REUSED","message":"Reused"}}""",
+                ),
+        )
+        val failure = IllegalStateException("final refresh-rejection snapshot failed")
+        val history = FakeMessageHistoryRetention(snapshotFailure = failure)
+        val targetSession = TEST_SESSION.copy(
+            accountId = "11111111-1111-4111-8111-111111111111",
+        )
+        val sessions = FakeSessionStore().apply { save(targetSession) }
+        val walletSync = FakeWalletSync()
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            walletSync = walletSync,
+            messageHistory = history,
+        )
+
+        val observed = runCatching { repository.refreshSession() }.exceptionOrNull()
+
+        assertEquals(failure, observed)
+        assertEquals(targetSession, sessions.current())
+        assertEquals(listOf(targetSession.fence()), history.snapshotTargets)
+        assertEquals(0, walletSync.clearCalls)
+    }
+
+    @Test
     fun `phone OTP challenge retains destination for navigation state`() = runTest {
         server.enqueue(jsonResponse(CHALLENGE_JSON))
         val repository = repository(FakeSessionStore(), FakeRefreshTrigger())
@@ -340,6 +379,56 @@ class RemoteAuthRepositoryTest {
     }
 
     @Test
+    fun `all device logout retains session when archive purge cannot be made durable`() = runTest {
+        val failure = AccountMessageArchivePurgeNotDurableException(
+            IllegalStateException("purge marker unavailable"),
+        )
+        val history = FakeMessageHistoryRetention(eraseFailure = failure)
+        val targetSession = TEST_SESSION.copy(
+            accountId = "11111111-1111-4111-8111-111111111111",
+        )
+        val sessions = FakeSessionStore().apply { save(targetSession) }
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            messageHistory = history,
+        )
+
+        val observed = runCatching { repository.logout(allDevices = true) }.exceptionOrNull()
+
+        assertEquals(failure, observed)
+        assertEquals(targetSession, sessions.current())
+        assertEquals(listOf(targetSession.fence()), history.scheduleTargets)
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun `all device logout clears session and retains retry marker on purge failure`() = runTest {
+        server.enqueue(jsonResponse(PUSH_UNREGISTER_JSON))
+        server.enqueue(jsonResponse(LOGOUT_JSON))
+        val history = FakeMessageHistoryRetention(
+            eraseFailure = IllegalStateException("archive key temporarily unavailable"),
+        )
+        val targetSession = TEST_SESSION.copy(
+            accountId = "11111111-1111-4111-8111-111111111111",
+        )
+        val sessions = FakeSessionStore().apply { save(targetSession) }
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            messageHistory = history,
+        )
+
+        val result = repository.logout(allDevices = true)
+
+        assertNull(sessions.current())
+        assertTrue(result.retryRecommended)
+        assertTrue(result.warning.orEmpty().contains("message-history cleanup"))
+        assertEquals(listOf(targetSession.fence()), history.scheduleTargets)
+        assertEquals(listOf(targetSession.fence()), history.eraseTargets)
+    }
+
+    @Test
     fun `logout erases local state and reports retry when server revocation is unconfirmed`() = runTest {
         server.enqueue(jsonResponse(PUSH_UNREGISTER_JSON))
         server.enqueue(
@@ -356,6 +445,59 @@ class RemoteAuthRepositoryTest {
         assertTrue(result.localSessionCleared)
         assertTrue(result.retryRecommended)
         assertNotNull(result.warning)
+    }
+
+    @Test
+    fun `normal logout aborts before revocation when archive preflight snapshot fails`() =
+        runTest {
+            val failure = IllegalStateException("final archive snapshot failed")
+            val history = FakeMessageHistoryRetention(snapshotFailure = failure)
+            val targetSession = TEST_SESSION.copy(
+                accountId = "11111111-1111-4111-8111-111111111111",
+            )
+            val sessions = FakeSessionStore().apply { save(targetSession) }
+            val repository = repository(
+                sessions = sessions,
+                refresh = FakeRefreshTrigger(),
+                messageHistory = history,
+            )
+
+            val observed = runCatching { repository.logout(allDevices = false) }.exceptionOrNull()
+
+            assertEquals(failure, observed)
+            assertEquals(targetSession, sessions.current())
+            assertEquals(targetSession.fence(), history.snapshotTargets.single())
+            assertEquals(0, server.requestCount)
+        }
+
+    @Test
+    fun `normal logout retains session when state exclusive final snapshot fails`() = runTest {
+        server.enqueue(jsonResponse(PUSH_UNREGISTER_JSON))
+        server.enqueue(jsonResponse(LOGOUT_JSON))
+        val failure = IllegalStateException("exclusive final snapshot failed")
+        val history = FakeMessageHistoryRetention(
+            snapshotFailure = failure,
+            failSnapshotCall = 2,
+        )
+        val targetSession = TEST_SESSION.copy(
+            accountId = "11111111-1111-4111-8111-111111111111",
+        )
+        val sessions = FakeSessionStore().apply { save(targetSession) }
+        val walletSync = FakeWalletSync()
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            walletSync = walletSync,
+            messageHistory = history,
+        )
+
+        val observed = runCatching { repository.logout(allDevices = false) }.exceptionOrNull()
+
+        assertEquals(failure, observed)
+        assertEquals(targetSession, sessions.current())
+        assertEquals(listOf(targetSession.fence(), targetSession.fence()), history.snapshotTargets)
+        assertEquals(0, walletSync.clearCalls)
+        assertEquals(2, server.requestCount)
     }
 
     @Test
@@ -379,7 +521,11 @@ class RemoteAuthRepositoryTest {
         val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
         val repository = repository(sessions, FakeRefreshTrigger())
 
-        repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+        repository.recoverMissingSecureMessagingEnrollment(
+            TEST_SESSION.fence(),
+            unusedActivationFence(),
+            RESET_TARGET,
+        )
 
         val reset = server.takeRequest()
         assertEquals("/api/kit-wallet/v1/messaging/enrollment/reset", reset.path)
@@ -395,6 +541,77 @@ class RemoteAuthRepositoryTest {
     }
 
     @Test
+    fun `fresh authentication recovery snapshots history before clearing exact session`() = runTest {
+        val targetSession = TEST_SESSION.copy(
+            accountId = "11111111-1111-4111-8111-111111111111",
+        )
+        val sessions = FakeSessionStore().apply { save(targetSession) }
+        val history = FakeMessageHistoryRetention()
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            messageHistory = history,
+        )
+
+        repository.requireFreshAuthenticationForSecureMessagingRecovery(
+            expectedSession = targetSession.fence(),
+            activationFence = unusedActivationFence(),
+        )
+
+        assertEquals(listOf(targetSession.fence()), history.snapshotTargets)
+        assertNull(sessions.current())
+    }
+
+    @Test
+    fun `fresh authentication recovery bypasses only proved unreadable history`() = runTest {
+        val targetSession = TEST_SESSION.copy(
+            accountId = "11111111-1111-4111-8111-111111111111",
+        )
+        val sessions = FakeSessionStore().apply { save(targetSession) }
+        val history = FakeMessageHistoryRetention(
+            snapshotFailure = SecureMessagingRecordKeyPermanentlyMissingException(),
+        )
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            messageHistory = history,
+        )
+
+        repository.requireFreshAuthenticationForSecureMessagingRecovery(
+            expectedSession = targetSession.fence(),
+            activationFence = unusedActivationFence(),
+        )
+
+        assertEquals(listOf(targetSession.fence()), history.snapshotTargets)
+        assertNull(sessions.current())
+    }
+
+    @Test
+    fun `fresh authentication recovery retains session on ordinary snapshot failure`() = runTest {
+        val targetSession = TEST_SESSION.copy(
+            accountId = "11111111-1111-4111-8111-111111111111",
+        )
+        val sessions = FakeSessionStore().apply { save(targetSession) }
+        val failure = IllegalStateException("archive temporarily unavailable")
+        val history = FakeMessageHistoryRetention(snapshotFailure = failure)
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            messageHistory = history,
+        )
+
+        val observed = runCatching {
+            repository.requireFreshAuthenticationForSecureMessagingRecovery(
+                expectedSession = targetSession.fence(),
+                activationFence = unusedActivationFence(),
+            )
+        }.exceptionOrNull()
+
+        assertSame(failure, observed)
+        assertEquals(targetSession, sessions.current())
+    }
+
+    @Test
     fun `messaging recovery retains session when reset is unconfirmed`() = runTest {
         server.enqueue(
             MockResponse().setResponseCode(503).setHeader("Content-Type", "application/json")
@@ -404,7 +621,11 @@ class RemoteAuthRepositoryTest {
         val repository = repository(sessions, FakeRefreshTrigger())
 
         val failure = runCatching {
-            repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+            repository.recoverMissingSecureMessagingEnrollment(
+                TEST_SESSION.fence(),
+                unusedActivationFence(),
+                RESET_TARGET,
+            )
         }.exceptionOrNull()
 
         assertTrue(failure is KitWalletApiException)
@@ -427,7 +648,11 @@ class RemoteAuthRepositoryTest {
 
         val failure = runCatching {
             repository(sessions, FakeRefreshTrigger())
-                .recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+                .recoverMissingSecureMessagingEnrollment(
+                    TEST_SESSION.fence(),
+                    unusedActivationFence(),
+                    RESET_TARGET,
+                )
         }.exceptionOrNull()
 
         assertTrue(failure is KitWalletApiException)
@@ -446,13 +671,21 @@ class RemoteAuthRepositoryTest {
 
         val firstFailure = runCatching {
             repository(sessions, FakeRefreshTrigger())
-                .recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+                .recoverMissingSecureMessagingEnrollment(
+                    TEST_SESSION.fence(),
+                    unusedActivationFence(),
+                    RESET_TARGET,
+                )
         }.exceptionOrNull()
         assertTrue(firstFailure is KitWalletApiException)
         assertEquals(RESET_PENDING, sessions.current()?.messagingResetProof)
 
         repository(sessions, FakeRefreshTrigger())
-            .recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+            .recoverMissingSecureMessagingEnrollment(
+                TEST_SESSION.fence(),
+                unusedActivationFence(),
+                RESET_TARGET,
+            )
 
         val first = server.takeRequest()
         val retriedAfterRestart = server.takeRequest()
@@ -468,7 +701,11 @@ class RemoteAuthRepositoryTest {
         val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
         val repository = repository(sessions, FakeRefreshTrigger())
 
-        repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+        repository.recoverMissingSecureMessagingEnrollment(
+            TEST_SESSION.fence(),
+            unusedActivationFence(),
+            RESET_TARGET,
+        )
 
         assertEquals(TEST_SESSION.sessionId, sessions.current()?.sessionId)
     }
@@ -492,7 +729,11 @@ class RemoteAuthRepositoryTest {
         val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
         val repository = repository(sessions, FakeRefreshTrigger())
 
-        repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+        repository.recoverMissingSecureMessagingEnrollment(
+            TEST_SESSION.fence(),
+            unusedActivationFence(),
+            RESET_TARGET,
+        )
 
         val expiredReset = server.takeRequest()
         assertEquals("Bearer ${TEST_SESSION.accessToken}", expiredReset.getHeader("Authorization"))
@@ -530,7 +771,11 @@ class RemoteAuthRepositoryTest {
         val repository = repository(sessions, FakeRefreshTrigger())
 
         val failure = runCatching {
-            repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+            repository.recoverMissingSecureMessagingEnrollment(
+                TEST_SESSION.fence(),
+                unusedActivationFence(),
+                RESET_TARGET,
+            )
         }.exceptionOrNull()
 
         assertTrue(failure is KitWalletApiException)
@@ -545,7 +790,11 @@ class RemoteAuthRepositoryTest {
         val repository = repository(sessions, FakeRefreshTrigger())
 
         val failure = runCatching {
-            repository.recoverMissingSecureMessagingEnrollment("obsolete-session", RESET_TARGET)
+            repository.recoverMissingSecureMessagingEnrollment(
+                TEST_SESSION.fence().copy(sessionId = "obsolete-session"),
+                unusedActivationFence(),
+                RESET_TARGET,
+            )
         }.exceptionOrNull()
 
         assertTrue(failure is SessionInvalidatedException)
@@ -585,7 +834,11 @@ class RemoteAuthRepositoryTest {
         val repository = repository(sessions, FakeRefreshTrigger())
 
         val failure = runCatching {
-            repository.recoverMissingSecureMessagingEnrollment(TEST_SESSION.sessionId, RESET_TARGET)
+            repository.recoverMissingSecureMessagingEnrollment(
+                TEST_SESSION.fence(),
+                unusedActivationFence(),
+                RESET_TARGET,
+            )
         }.exceptionOrNull()
 
         assertTrue(failure is SessionInvalidatedException)
@@ -647,6 +900,37 @@ class RemoteAuthRepositoryTest {
     }
 
     @Test
+    fun `accepted account deletion retains cleanup authority when purge is not durable`() = runTest {
+        server.enqueue(jsonResponse(ACCOUNT_DELETION_PREFLIGHT_JSON))
+        server.enqueue(jsonResponse(ACCOUNT_DELETION_CHALLENGE_JSON))
+        server.enqueue(jsonResponse(ACCOUNT_DELETION_VERIFICATION_JSON))
+        server.enqueue(jsonResponse(ACCOUNT_DELETION_ACCEPTED_JSON))
+        val failure = AccountMessageArchivePurgeNotDurableException(
+            IllegalStateException("purge marker unavailable"),
+        )
+        val history = FakeMessageHistoryRetention(eraseFailure = failure)
+        val targetSession = TEST_SESSION.copy(
+            accountId = "11111111-1111-4111-8111-111111111111",
+        )
+        val sessions = FakeSessionStore().apply { save(targetSession) }
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            messageHistory = history,
+        )
+
+        val preflight = repository.accountDeletionPreflight()
+        val observed = runCatching {
+            repository.requestAccountDeletion(preflight, "DELETE", "2580")
+        }.exceptionOrNull()
+
+        assertEquals(failure, observed)
+        assertEquals(targetSession, sessions.current())
+        assertEquals(listOf(targetSession.fence()), history.scheduleTargets)
+        assertEquals(4, server.requestCount)
+    }
+
+    @Test
     fun `account deletion keeps the local session when acceptance is not confirmed`() = runTest {
         server.enqueue(jsonResponse(ACCOUNT_DELETION_PREFLIGHT_JSON))
         server.enqueue(jsonResponse(ACCOUNT_DELETION_CHALLENGE_JSON))
@@ -673,6 +957,7 @@ class RemoteAuthRepositoryTest {
         sessions: FakeSessionStore,
         refresh: FakeRefreshTrigger,
         walletSync: WalletSyncRepository = FakeWalletSync(),
+        messageHistory: AccountMessageHistoryRetention = NoOpAccountMessageHistoryRetention,
     ) = RemoteAuthRepository(
         api = api,
         apiCalls = apiCalls,
@@ -690,6 +975,7 @@ class RemoteAuthRepositoryTest {
             backgroundScope,
         ),
         paymentAuthorizer = PaymentAuthorizer(api, apiCalls),
+        messageHistory = messageHistory,
         applicationScope = backgroundScope,
     )
 
@@ -814,6 +1100,46 @@ class RemoteAuthRepositoryTest {
             clearCalls++
         }
     }
+
+    private class FakeMessageHistoryRetention(
+        private val snapshotFailure: Exception? = null,
+        private val failSnapshotCall: Int = 1,
+        private val eraseFailure: Exception? = null,
+    ) : AccountMessageHistoryRetention {
+        val snapshotTargets = mutableListOf<com.kit.wallet.data.session.SessionFence>()
+        val eraseTargets = mutableListOf<com.kit.wallet.data.session.SessionFence>()
+        val scheduleTargets = mutableListOf<com.kit.wallet.data.session.SessionFence>()
+
+        override suspend fun snapshotActiveHistory(
+            target: com.kit.wallet.data.session.SessionFence,
+        ) {
+            snapshotTargets += target
+            if (snapshotTargets.size == failSnapshotCall) snapshotFailure?.let { throw it }
+        }
+
+        override suspend fun eraseAccount(target: com.kit.wallet.data.session.SessionFence) {
+            eraseTargets += target
+            eraseFailure?.let { throw it }
+        }
+
+        override suspend fun scheduleAccountErasure(
+            target: com.kit.wallet.data.session.SessionFence,
+        ) {
+            scheduleTargets += target
+            if (eraseFailure is AccountMessageArchivePurgeNotDurableException) throw eraseFailure
+        }
+    }
+
+    private fun unusedActivationFence(): SecureMessagingSessionFence =
+        SecureMessagingSessionFence(
+            binding = SecureMessagingSessionBinding(
+                sessionEpoch = TEST_SESSION.sessionId,
+                userId = "11111111-1111-4111-8111-111111111111",
+                serverDeviceId = RESET_TARGET.serverDeviceId,
+                installationId = "33333333-3333-4333-8333-333333333333",
+            ),
+            activationIdentity = Any(),
+        )
 
     private companion object {
         val TEST_SESSION = SessionTokens(

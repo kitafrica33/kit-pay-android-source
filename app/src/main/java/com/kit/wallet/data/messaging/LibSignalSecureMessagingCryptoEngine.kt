@@ -63,9 +63,10 @@ class LibSignalSecureMessagingCryptoEngine @Inject constructor(
         transactionGate.lock()
         var loaded: LoadedProtocolState? = null
         try {
-            provenance.assertCurrent()
-            val transactionState = loadProtocolState(provenance.binding)
-            loaded = transactionState
+            stateStore.withActivationLease(activation) {
+                loaded = loadProtocolState(provenance.binding)
+            }
+            val transactionState = checkNotNull(loaded)
             provenance.assertCurrent()
             val transaction = LibSignalTransaction(
                 activation = activation,
@@ -103,44 +104,47 @@ class LibSignalSecureMessagingCryptoEngine @Inject constructor(
         val provenance = SecureMessagingActivationProvenance.requireCurrent(activation)
         try {
             transactionGate.withLock {
-                provenance.assertCurrent()
-                val record = readProtocolRecord() ?: return@withLock
-                var state: BoundLibSignalState? = null
-                try {
-                    val decoded = decodeBoundProtocolState(record.bytes)
-                    state = decoded
-                    if (decoded.binding != provenance.binding) {
-                        throw cryptographicFailure(
-                            SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
-                            "Secure messaging protocol state belongs to another authentication epoch",
-                        )
-                    }
-                    if (decoded.retireRemoteDevices(affectedUserId, affectedServerDeviceId) == 0) {
-                        provenance.assertCurrent()
-                        return@withLock
-                    }
-                    val encoded = BoundLibSignalStateCodec.encode(decoded)
+                stateStore.withActivationLease(activation) {
+                    val record = readProtocolRecord() ?: return@withActivationLease
+                    var state: BoundLibSignalState? = null
                     try {
-                        provenance.assertCurrent()
-                        stateStore.write(
-                            namespace = PROTOCOL_NAMESPACE,
-                            recordKey = PROTOCOL_RECORD_KEY,
-                            expectedVersion = record.version,
-                            bytes = encoded,
-                        )
-                        provenance.assertCurrent()
-                    } catch (error: SecureMessagingStateUnavailableException) {
-                        throw cryptographicFailure(
-                            SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
-                            "Retired secure-messaging peer state could not be committed",
-                            error,
-                        )
+                        val decoded = decodeBoundProtocolState(record.bytes)
+                        state = decoded
+                        if (decoded.binding != provenance.binding) {
+                            throw cryptographicFailure(
+                                SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+                                "Secure messaging protocol state belongs to another authentication epoch",
+                            )
+                        }
+                        if (
+                            decoded.retireRemoteDevices(
+                                affectedUserId,
+                                affectedServerDeviceId,
+                            ) == 0
+                        ) {
+                            return@withActivationLease
+                        }
+                        val encoded = BoundLibSignalStateCodec.encode(decoded)
+                        try {
+                            stateStore.write(
+                                namespace = PROTOCOL_NAMESPACE,
+                                recordKey = PROTOCOL_RECORD_KEY,
+                                expectedVersion = record.version,
+                                bytes = encoded,
+                            )
+                        } catch (error: SecureMessagingStateUnavailableException) {
+                            throw cryptographicFailure(
+                                SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                                "Retired secure-messaging peer state could not be committed",
+                                error,
+                            )
+                        } finally {
+                            encoded.fill(0)
+                        }
                     } finally {
-                        encoded.fill(0)
+                        state?.close()
+                        record.bytes.fill(0)
                     }
-                } finally {
-                    state?.close()
-                    record.bytes.fill(0)
                 }
             }
         } catch (error: SecureMessagingCryptographicFailureException) {
@@ -158,64 +162,60 @@ class LibSignalSecureMessagingCryptoEngine @Inject constructor(
         val provenance = SecureMessagingActivationProvenance.requireCurrent(activation)
         return try {
             transactionGate.withLock {
-                provenance.assertCurrent()
-                val record = readEnrollmentProtocolRecord()
-                if (record == null) {
-                    provenance.assertCurrent()
-                    return@withLock null
-                }
-                var state: BoundLibSignalState? = null
-                try {
-                    val decoded = decodeBoundProtocolState(record.bytes)
-                    state = decoded
-                    if (decoded.binding != provenance.binding) {
-                        throw cryptographicFailure(
-                            SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
-                            "Secure messaging protocol state belongs to another authentication epoch",
-                        )
-                    }
-                    val identity = decoded.store.identityKeyPair.publicKey.serialize()
-                    val snapshot = decoded.store.snapshot()
+                stateStore.withActivationLease(activation) {
+                    val record = readEnrollmentProtocolRecord()
+                        ?: return@withActivationLease null
+                    var state: BoundLibSignalState? = null
                     try {
-                        val pendingBytes = decoded.copyPendingPublicationBytes()
-                        val pendingPublication = try {
-                            pendingBytes?.let { encoded ->
-                                val pending = try {
-                                    PendingLibSignalPublicationCodec.decode(encoded)
-                                } catch (error: Exception) {
-                                    throw cryptographicFailure(
-                                        SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
-                                        "Pending key publication state is corrupt",
-                                        error,
+                        val decoded = decodeBoundProtocolState(record.bytes)
+                        state = decoded
+                        if (decoded.binding != provenance.binding) {
+                            throw cryptographicFailure(
+                                SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+                                "Secure messaging protocol state belongs to another authentication epoch",
+                            )
+                        }
+                        val identity = decoded.store.identityKeyPair.publicKey.serialize()
+                        val snapshot = decoded.store.snapshot()
+                        try {
+                            val pendingBytes = decoded.copyPendingPublicationBytes()
+                            val pendingPublication = try {
+                                pendingBytes?.let { encoded ->
+                                    val pending = try {
+                                        PendingLibSignalPublicationCodec.decode(encoded)
+                                    } catch (error: Exception) {
+                                        throw cryptographicFailure(
+                                            SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+                                            "Pending key publication state is corrupt",
+                                            error,
+                                        )
+                                    }
+                                    SecureMessagingCryptoWireMapper.publicationFromDurableBundle(
+                                        bundle = pending.bundle,
+                                        identityKeyChange = pending.identityKeyChange,
+                                        activation = activation,
                                     )
                                 }
-                                SecureMessagingCryptoWireMapper.publicationFromDurableBundle(
-                                    bundle = pending.bundle,
-                                    identityKeyChange = pending.identityKeyChange,
-                                    activation = activation,
-                                )
+                            } finally {
+                                pendingBytes?.fill(0)
                             }
+                            LibSignalLocalEnrollment(
+                                registrationId = decoded.store.localRegistrationId,
+                                identityKeySha256 = sha256Hex(identity),
+                                ecOneTimePrekeyIds = snapshot.preKeys.keys,
+                                signedPrekeyIds = snapshot.signedPreKeys.keys,
+                                pqPrekeyIds = snapshot.kyberPreKeys.keys,
+                                pqLastResortPrekeyIds = snapshot.lastResortKyberPreKeyIds,
+                                pendingPublication = pendingPublication,
+                            )
                         } finally {
-                            pendingBytes?.fill(0)
+                            identity.fill(0)
+                            snapshot.close()
                         }
-                        val enrollment = LibSignalLocalEnrollment(
-                            registrationId = decoded.store.localRegistrationId,
-                            identityKeySha256 = sha256Hex(identity),
-                            ecOneTimePrekeyIds = snapshot.preKeys.keys,
-                            signedPrekeyIds = snapshot.signedPreKeys.keys,
-                            pqPrekeyIds = snapshot.kyberPreKeys.keys,
-                            pqLastResortPrekeyIds = snapshot.lastResortKyberPreKeyIds,
-                            pendingPublication = pendingPublication,
-                        )
-                        provenance.assertCurrent()
-                        enrollment
                     } finally {
-                        identity.fill(0)
-                        snapshot.close()
+                        state?.close()
+                        record.bytes.fill(0)
                     }
-                } finally {
-                    state?.close()
-                    record.bytes.fill(0)
                 }
             }
         } catch (error: SecureMessagingCryptographicFailureException) {
@@ -235,52 +235,50 @@ class LibSignalSecureMessagingCryptoEngine @Inject constructor(
         val provenance = SecureMessagingActivationProvenance.requireCurrent(activation)
         try {
             transactionGate.withLock {
-                provenance.assertCurrent()
-                val record = readProtocolRecord() ?: throw cryptographicFailure(
-                    SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
-                    "Confirmed server enrollment has no local protocol state",
-                )
-                var state: BoundLibSignalState? = null
-                try {
-                    val decoded = decodeBoundProtocolState(record.bytes)
-                    state = decoded
-                    if (decoded.binding != provenance.binding) {
-                        throw cryptographicFailure(
-                            SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
-                            "Confirmed enrollment belongs to another authentication epoch",
-                        )
-                    }
-                    check(decoded.store.localRegistrationId == registrationId) {
-                        "Confirmed server registration differs from local state"
-                    }
-                    val identity = decoded.store.identityKeyPair.publicKey.serialize()
+                stateStore.withActivationLease(activation) {
+                    val record = readProtocolRecord() ?: throw cryptographicFailure(
+                        SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                        "Confirmed server enrollment has no local protocol state",
+                    )
+                    var state: BoundLibSignalState? = null
                     try {
-                        check(sha256Hex(identity) == identityKeySha256) {
-                            "Confirmed server identity differs from local state"
+                        val decoded = decodeBoundProtocolState(record.bytes)
+                        state = decoded
+                        if (decoded.binding != provenance.binding) {
+                            throw cryptographicFailure(
+                                SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+                                "Confirmed enrollment belongs to another authentication epoch",
+                            )
+                        }
+                        check(decoded.store.localRegistrationId == registrationId) {
+                            "Confirmed server registration differs from local state"
+                        }
+                        val identity = decoded.store.identityKeyPair.publicKey.serialize()
+                        try {
+                            check(sha256Hex(identity) == identityKeySha256) {
+                                "Confirmed server identity differs from local state"
+                            }
+                        } finally {
+                            identity.fill(0)
+                        }
+                        if (!decoded.clearPendingPublication()) {
+                            return@withActivationLease
+                        }
+                        val encoded = BoundLibSignalStateCodec.encode(decoded)
+                        try {
+                            stateStore.write(
+                                namespace = PROTOCOL_NAMESPACE,
+                                recordKey = PROTOCOL_RECORD_KEY,
+                                expectedVersion = record.version,
+                                bytes = encoded,
+                            )
+                        } finally {
+                            encoded.fill(0)
                         }
                     } finally {
-                        identity.fill(0)
+                        state?.close()
+                        record.bytes.fill(0)
                     }
-                    if (!decoded.clearPendingPublication()) {
-                        provenance.assertCurrent()
-                        return@withLock
-                    }
-                    val encoded = BoundLibSignalStateCodec.encode(decoded)
-                    try {
-                        provenance.assertCurrent()
-                        stateStore.write(
-                            namespace = PROTOCOL_NAMESPACE,
-                            recordKey = PROTOCOL_RECORD_KEY,
-                            expectedVersion = record.version,
-                            bytes = encoded,
-                        )
-                        provenance.assertCurrent()
-                    } finally {
-                        encoded.fill(0)
-                    }
-                } finally {
-                    state?.close()
-                    record.bytes.fill(0)
                 }
             }
         } catch (error: SecureMessagingCryptographicFailureException) {
@@ -601,7 +599,7 @@ private data class LoadedProtocolState(
 )
 
 private class LibSignalTransaction(
-    activation: SecureMessagingActivationCapability,
+    private val activation: SecureMessagingActivationCapability,
     private val stateStore: SecureMessagingStateStore,
     loaded: LoadedProtocolState,
     private val releaseGate: () -> Unit,
@@ -801,13 +799,19 @@ private class LibSignalTransaction(
                 }
             }
             try {
-                stateStore.writeBatch(writes)
+                stateStore.withActivationLease(activation) {
+                    stateStore.writeBatch(writes)
+                }
             } catch (error: SecureMessagingStateUnavailableException) {
                 throw cryptographicFailure(
                     SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
                     "Secure messaging state could not be committed",
                     error,
                 )
+            } finally {
+                // A stale activation can be rejected before writeBatch takes ownership. Wipe the
+                // staged copies here as well; SecureMessagingStateWrite cleanup is idempotent.
+                writes.forEach(SecureMessagingStateWrite::wipeBytes)
             }
         } finally {
             stateBytes.fill(0)

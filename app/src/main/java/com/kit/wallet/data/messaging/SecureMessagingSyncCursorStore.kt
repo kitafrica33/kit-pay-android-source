@@ -60,6 +60,13 @@ internal fun requireSecureMessagingSyncResumePosition(
 internal class SecureMessagingSyncCursorStore @Inject constructor(
     private val stateStore: SecureMessagingStateStore,
 ) {
+    suspend fun <T> withActivationLease(
+        activation: SecureMessagingActivationCapability,
+        operation: suspend SecureMessagingSyncCursorStore.() -> T,
+    ): T = stateStore.withActivationLease(activation) {
+        operation(this)
+    }
+
     suspend fun load(): LoadedSecureMessagingSyncResumePosition? {
         val record = try {
             stateStore.read(NAMESPACE, RECORD_KEY)

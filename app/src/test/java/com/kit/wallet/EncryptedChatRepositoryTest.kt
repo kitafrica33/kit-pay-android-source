@@ -1,12 +1,14 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
 import com.kit.wallet.data.repository.AuthenticatedDirectConversation
 import com.kit.wallet.data.repository.AuthenticatedProjectedText
 import com.kit.wallet.data.repository.AuthenticatedProjectionPage
 import com.kit.wallet.data.repository.AuthenticatedTextDeliveryState
-import com.kit.wallet.data.repository.EncryptedChatRepository
 import com.kit.wallet.data.repository.ContactRepository
+import com.kit.wallet.data.repository.EncryptedChatRepository
+import com.kit.wallet.data.repository.SecureMessagingChatSession
 import com.kit.wallet.data.repository.SecureMessagingChatRuntime
 import com.kit.wallet.data.repository.projectionIsFromCurrentUser
 import com.kit.wallet.ui.model.Contact
@@ -15,9 +17,15 @@ import java.io.IOException
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -53,19 +61,317 @@ class EncryptedChatRepositoryTest {
         }
         val repository = repository(runtime)
 
-        runtime.sessionEpoch.value = "session-one"
+        runtime.activate("session-one")
         runCurrent()
 
         assertTrue(repository.readiness.value)
         assertEquals(listOf(CONVERSATION_ONE), repository.chats.value.map { it.id })
         assertEquals("hello", repository.conversation(CONVERSATION_ONE).value.single().text)
 
-        runtime.sessionEpoch.value = null
+        runtime.activate(null)
         runCurrent()
 
         assertFalse(repository.readiness.value)
         assertTrue(repository.chats.value.isEmpty())
         assertTrue(repository.conversation(CONVERSATION_ONE).value.isEmpty())
+    }
+
+    @Test
+    fun `new epoch readiness waits until its projection baseline is published`() = runTest {
+        val baselineGate = CompletableDeferred<Unit>()
+        val runtime = FakeRuntime(epoch = null, baselineGate = baselineGate).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+            projected += message("in:restored", CONVERSATION_ONE, "restored", fromMe = false)
+        }
+        val repository = repository(runtime)
+
+        runtime.activate("session-restored")
+        runCurrent()
+        assertFalse(repository.readiness.value)
+        assertTrue(repository.conversation(CONVERSATION_ONE).value.isEmpty())
+
+        baselineGate.complete(Unit)
+        runCurrent()
+        assertTrue(repository.readiness.value)
+        assertEquals("restored", repository.conversation(CONVERSATION_ONE).value.single().text)
+    }
+
+    @Test
+    fun `new epoch baseline retries three times at five second intervals before readiness`() =
+        runTest {
+            val runtime = FakeRuntime(epoch = null, baselineFailures = 3).apply {
+                conversations += conversation(CONVERSATION_ONE, "Grace")
+                projected += message("in:restored", CONVERSATION_ONE, "restored", fromMe = false)
+            }
+            val repository = repository(runtime)
+
+            runtime.activate("session-retry")
+            runCurrent()
+            assertEquals(1, runtime.baselineAttempts)
+            assertFalse(repository.readiness.value)
+
+            advanceTimeBy(4_999L)
+            runCurrent()
+            assertEquals(1, runtime.baselineAttempts)
+            assertFalse(repository.readiness.value)
+
+            advanceTimeBy(1L)
+            runCurrent()
+            assertEquals(2, runtime.baselineAttempts)
+            assertFalse(repository.readiness.value)
+
+            repeat(2) {
+                advanceTimeBy(5_000L)
+                runCurrent()
+            }
+            assertEquals(4, runtime.baselineAttempts)
+            assertTrue(repository.readiness.value)
+            assertEquals("restored", repository.conversation(CONVERSATION_ONE).value.single().text)
+        }
+
+    @Test
+    fun `exhausted retryable baseline recovers after cooldown without another emission`() = runTest {
+        val runtime = FakeRuntime(epoch = null, baselineFailures = Int.MAX_VALUE).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val repository = repository(runtime)
+
+        runtime.activate("session-failing")
+        runCurrent()
+        advanceTimeBy(15_000L)
+        runCurrent()
+
+        assertEquals(4, runtime.baselineAttempts)
+        assertFalse(repository.readiness.value)
+        runtime.clearBaselineFailures()
+
+        advanceTimeBy(29_999L)
+        runCurrent()
+        assertEquals(4, runtime.baselineAttempts)
+        advanceTimeBy(1L)
+        runCurrent()
+
+        assertEquals(5, runtime.baselineAttempts)
+        assertTrue(repository.readiness.value)
+    }
+
+    @Test
+    fun `successful sync retries an exhausted baseline for the same active identity`() = runTest {
+        val runtime = FakeRuntime(epoch = null, baselineFailures = 4).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val repository = repository(runtime)
+
+        runtime.activate("session-recovered-provider")
+        runCurrent()
+        advanceTimeBy(15_000L)
+        runCurrent()
+
+        val active = checkNotNull(runtime.activeSession.value)
+        assertEquals(4, runtime.baselineAttempts)
+        assertFalse(repository.readiness.value)
+
+        runtime.completeSuccessfulSync(active)
+        runCurrent()
+
+        assertTrue(runtime.activeSession.value === active)
+        assertEquals(5, runtime.baselineAttempts)
+        assertTrue(repository.readiness.value)
+    }
+
+    @Test
+    fun `proved missing record key is recovered once before a fresh baseline cycle`() = runTest {
+        val runtime = FakeRuntime(
+            epoch = null,
+            baselineFailures = 4,
+            permanentBaselineFailureAttempt = 4,
+            recoverPermanentBaselineFailure = true,
+        ).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+            projected += message("in:restored", CONVERSATION_ONE, "restored", fromMe = false)
+        }
+        val repository = repository(runtime)
+
+        runtime.activate("session-recover")
+        runCurrent()
+        advanceTimeBy(15_000L)
+        runCurrent()
+
+        assertEquals(1, runtime.permanentRecoveryAttempts)
+        assertEquals(5, runtime.baselineAttempts)
+        assertTrue(repository.readiness.value)
+        assertEquals("restored", repository.conversation(CONVERSATION_ONE).value.single().text)
+
+        advanceTimeBy(60_000L)
+        runCurrent()
+        assertEquals(1, runtime.permanentRecoveryAttempts)
+        assertEquals(5, runtime.baselineAttempts)
+    }
+
+    @Test
+    fun `same login reactivation identity restarts an exhausted baseline`() = runTest {
+        val runtime = FakeRuntime(epoch = null, baselineFailures = 4).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val repository = repository(runtime)
+
+        runtime.activate("session-same-login")
+        runCurrent()
+        advanceTimeBy(15_000L)
+        runCurrent()
+        assertEquals(4, runtime.baselineAttempts)
+        assertFalse(repository.readiness.value)
+
+        runtime.reactivate()
+        runCurrent()
+
+        assertEquals(5, runtime.baselineAttempts)
+        assertEquals(List(5) { "session-same-login" }, runtime.baselineAttemptEpochs)
+        assertTrue(repository.readiness.value)
+    }
+
+    @Test
+    fun `later worker reactivation recovers after foreground key recovery fails`() = runTest {
+        val runtime = FakeRuntime(
+            epoch = null,
+            baselineFailures = 4,
+            permanentBaselineFailureAttempt = 4,
+            recoverPermanentBaselineFailure = true,
+            permanentRecoveryError = IOException("recovery network unavailable"),
+        ).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val repository = repository(runtime)
+
+        runtime.activate("session-worker-retry")
+        runCurrent()
+        advanceTimeBy(15_000L)
+        runCurrent()
+
+        assertEquals(1, runtime.permanentRecoveryAttempts)
+        assertEquals(4, runtime.baselineAttempts)
+        assertFalse(repository.readiness.value)
+
+        runtime.reactivate()
+        runCurrent()
+
+        assertEquals(5, runtime.baselineAttempts)
+        assertTrue(repository.readiness.value)
+    }
+
+    @Test
+    fun `epoch replacement cancels an obsolete baseline retry delay`() = runTest {
+        val runtime = FakeRuntime(epoch = null, baselineFailures = 1).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val repository = repository(runtime)
+
+        runtime.activate("session-obsolete")
+        runCurrent()
+        assertEquals(1, runtime.baselineAttempts)
+        assertFalse(repository.readiness.value)
+
+        runtime.activate("session-current")
+        runCurrent()
+        assertEquals(
+            listOf("session-obsolete", "session-current"),
+            runtime.baselineAttemptEpochs,
+        )
+        assertTrue(repository.readiness.value)
+
+        advanceTimeBy(10_000L)
+        runCurrent()
+        assertEquals(2, runtime.baselineAttempts)
+        assertEquals("session-current", runtime.baselineAttemptEpochs.last())
+        assertTrue(repository.readiness.value)
+    }
+
+    @Test
+    fun `replacement during exhausted cooldown never retries or publishes obsolete session`() =
+        runTest {
+            val runtime = FakeRuntime(epoch = null, baselineFailures = Int.MAX_VALUE).apply {
+                conversations += conversation(CONVERSATION_ONE, "Grace")
+            }
+            val repository = repository(runtime)
+
+            runtime.activate("session-obsolete")
+            runCurrent()
+            advanceTimeBy(15_000L)
+            runCurrent()
+            assertEquals(4, runtime.baselineAttempts)
+            assertFalse(repository.readiness.value)
+
+            runtime.clearBaselineFailures()
+            val replacementGate = CompletableDeferred<Unit>()
+            runtime.activate("session-current", replacementGate)
+            runCurrent()
+            assertEquals(5, runtime.baselineAttempts)
+            assertEquals("session-current", runtime.baselineAttemptEpochs.last())
+            assertFalse(repository.readiness.value)
+
+            advanceTimeBy(60_000L)
+            runCurrent()
+            assertEquals(5, runtime.baselineAttempts)
+            assertFalse(repository.readiness.value)
+
+            replacementGate.complete(Unit)
+            runCurrent()
+            assertEquals(5, runtime.baselineAttempts)
+            assertTrue(repository.readiness.value)
+        }
+
+    @Test
+    fun `obsolete projection cannot publish across an activation replacement`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+            projected += message("in:old", CONVERSATION_ONE, "old A", fromMe = false)
+        }
+        val repository = repository(runtime)
+        val observedTexts = mutableListOf<List<String>>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            repository.conversation(CONVERSATION_ONE).collect { messages ->
+                observedTexts += messages.map { it.text }
+            }
+        }
+        runCurrent()
+        assertTrue(repository.readiness.value)
+        assertEquals(listOf("old A"), repository.conversation(CONVERSATION_ONE).value.map { it.text })
+
+        val replacementBaseline = CompletableDeferred<Unit>()
+        runtime.replaceAtNextPublicationBoundary("session-two", replacementBaseline)
+        runtime.projected.clear()
+        runtime.projected += message("in:stale", CONVERSATION_ONE, "stale A", fromMe = false)
+        runtime.projectionChanges.value++
+        runCurrent()
+
+        assertEquals("session-two", runtime.activeSession.value?.sessionEpoch)
+        assertFalse(repository.readiness.value)
+        assertTrue(repository.chats.value.isEmpty())
+        assertTrue(repository.conversation(CONVERSATION_ONE).value.isEmpty())
+        assertFalse(observedTexts.any { "stale A" in it })
+    }
+
+    @Test
+    fun `stale ready projection cannot redirect an action to a replacement session`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val repository = repository(runtime)
+        runCurrent()
+        assertTrue(repository.readiness.value)
+
+        runtime.replaceAuthorityWithoutExposure("session-two")
+        val failure = runCatching {
+            repository.openDirectConversation(
+                Contact(USER_TWO, "New peer", "+256700000002", isKitUser = true),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalStateException)
+        assertTrue(repository.readiness.value)
+        assertEquals("session-one", runtime.activeSession.value?.sessionEpoch)
+        assertEquals("session-two", runtime.authoritativeEpoch())
+        assertTrue(runtime.createdPeers.isEmpty())
     }
 
     @Test
@@ -185,6 +491,7 @@ class EncryptedChatRepositoryTest {
         val runtime = FakeRuntime()
         val repository = repository(runtime)
         val onKit = Contact(USER_ONE, "Grace", "+256700000001", isKitUser = true)
+        runCurrent()
 
         val conversationId = repository.openDirectConversation(onKit)
 
@@ -232,6 +539,7 @@ class EncryptedChatRepositoryTest {
             conversations += conversation(CONVERSATION_ONE, "Grace")
         }
         val repository = repository(runtime)
+        runCurrent()
 
         val firstFailure = runCatching {
             repository.sendMessage(CONVERSATION_ONE, "  hello securely  ")
@@ -258,6 +566,7 @@ class EncryptedChatRepositoryTest {
             conversations += conversation(CONVERSATION_ONE, "Grace")
         }
         val repository = repository(runtime)
+        runCurrent()
 
         assertTrue(
             runCatching { repository.sendMessage(CONVERSATION_ONE, "same text") }
@@ -279,6 +588,7 @@ class EncryptedChatRepositoryTest {
             conversations += conversation(CONVERSATION_ONE, "Grace")
         }
         val repository = repository(runtime)
+        runCurrent()
 
         repository.sendMessage(CONVERSATION_ONE, "identical")
         repository.sendMessage(CONVERSATION_ONE, "identical")
@@ -309,22 +619,139 @@ class EncryptedChatRepositoryTest {
     private class FakeRuntime(
         epoch: String? = "session-one",
         private val sendScenario: SendScenario = SendScenario.NORMAL,
+        private val baselineGate: CompletableDeferred<Unit>? = null,
+        baselineFailures: Int = 0,
+        private val permanentBaselineFailureAttempt: Int? = null,
+        private val recoverPermanentBaselineFailure: Boolean = false,
+        private val permanentRecoveryError: Exception? = null,
     ) : SecureMessagingChatRuntime {
-        override val sessionEpoch = MutableStateFlow(epoch)
+        private val authorityLock = Any()
+        private val initialSession = epoch?.let(::newSession)
+        private var authoritativeSession = initialSession
+        private var boundaryReplacement: SecureMessagingChatSession? = null
+        private var boundaryReplacementArmed = false
+        private val sessionBaselineGates =
+            mutableMapOf<SecureMessagingChatSession, CompletableDeferred<Unit>>()
+        private var remainingBaselineFailures = baselineFailures
+        override val activeSession = MutableStateFlow(initialSession)
         override val projectionChanges = MutableStateFlow(0L)
+        private val mutableBaselineRetrySessions =
+            MutableSharedFlow<SecureMessagingChatSession>(extraBufferCapacity = 1)
+        override val baselineRetrySessions = mutableBaselineRetrySessions
         val conversations = mutableListOf<AuthenticatedDirectConversation>()
         val projected = mutableListOf<AuthenticatedProjectedText>()
         val createdPeers = mutableListOf<String>()
         val sendAttempts = mutableListOf<Triple<String, String, String?>>()
         val pageRequests = mutableListOf<String?>()
+        var baselineAttempts = 0
+            private set
+        val baselineAttemptEpochs = mutableListOf<String?>()
+        var permanentRecoveryAttempts = 0
+            private set
+
+        fun activate(
+            epoch: String?,
+            sessionBaselineGate: CompletableDeferred<Unit>? = null,
+        ) {
+            val activated = epoch?.let(::newSession)
+            synchronized(authorityLock) {
+                if (activated != null && sessionBaselineGate != null) {
+                    sessionBaselineGates[activated] = sessionBaselineGate
+                }
+                authoritativeSession = activated
+                activeSession.value = activated
+            }
+        }
+
+        fun clearBaselineFailures() {
+            remainingBaselineFailures = 0
+        }
+
+        fun replaceAtNextPublicationBoundary(
+            epoch: String,
+            baselineGate: CompletableDeferred<Unit>,
+        ) {
+            synchronized(authorityLock) {
+                check(boundaryReplacement == null)
+                newSession(epoch).also { replacement ->
+                    boundaryReplacement = replacement
+                    sessionBaselineGates[replacement] = baselineGate
+                }
+            }
+        }
+
+        fun replaceAuthorityWithoutExposure(epoch: String) {
+            synchronized(authorityLock) {
+                authoritativeSession = newSession(epoch)
+            }
+        }
+
+        fun authoritativeEpoch(): String? =
+            synchronized(authorityLock) { authoritativeSession?.sessionEpoch }
+
+        override fun isCurrent(session: SecureMessagingChatSession): Boolean =
+            synchronized(authorityLock) {
+                val wasCurrent = authoritativeSession === session
+                if (wasCurrent && boundaryReplacementArmed) {
+                    applyBoundaryReplacementLocked()
+                }
+                wasCurrent
+            }
+
+        override fun publishIfCurrent(
+            session: SecureMessagingChatSession?,
+            publication: () -> Unit,
+        ): Boolean = synchronized(authorityLock) {
+            if (boundaryReplacementArmed) applyBoundaryReplacementLocked()
+            if (authoritativeSession !== session) return@synchronized false
+            publication()
+            authoritativeSession === session
+        }
+
+        fun completeSuccessfulSync(session: SecureMessagingChatSession) {
+            check(mutableBaselineRetrySessions.tryEmit(session))
+        }
+
+        fun reactivate() {
+            activate(checkNotNull(activeSession.value).sessionEpoch)
+        }
+
+        override suspend fun recoverPermanentlyUnavailableState(error: Throwable): Boolean {
+            if (!recoverPermanentBaselineFailure) return false
+            permanentRecoveryAttempts++
+            remainingBaselineFailures = 0
+            permanentRecoveryError?.let { throw it }
+            return true
+        }
 
         override suspend fun directConversations(
+            session: SecureMessagingChatSession,
             forceRefresh: Boolean,
-        ): List<AuthenticatedDirectConversation> = conversations.toList()
+        ): List<AuthenticatedDirectConversation> {
+            requireCurrent(session)
+            baselineAttempts++
+            baselineAttemptEpochs += session.sessionEpoch
+            if (remainingBaselineFailures > 0) {
+                remainingBaselineFailures--
+                if (baselineAttempts == permanentBaselineFailureAttempt) {
+                    throw IOException(
+                        "projection baseline record key is permanently unavailable",
+                        SecureMessagingRecordKeyPermanentlyMissingException(),
+                    )
+                }
+                throw IOException("projection baseline temporarily unavailable")
+            }
+            synchronized(authorityLock) { sessionBaselineGates[session] }?.await()
+            baselineGate?.await()
+            requireCurrent(session)
+            return conversations.toList()
+        }
 
         override suspend fun createDirectConversation(
+            session: SecureMessagingChatSession,
             peerUserId: String,
         ): AuthenticatedDirectConversation {
+            requireCurrent(session)
             createdPeers += peerUserId
             return AuthenticatedDirectConversation(
                 id = "conversation:$peerUserId",
@@ -334,9 +761,11 @@ class EncryptedChatRepositoryTest {
         }
 
         override suspend fun projectionPage(
+            session: SecureMessagingChatSession,
             afterRecordKey: String?,
             limit: Int,
         ): AuthenticatedProjectionPage {
+            requireCurrent(session)
             pageRequests += afterRecordKey
             val remaining = projected.sortedBy { it.recordKey }
                 .filter { afterRecordKey == null || it.recordKey > afterRecordKey }
@@ -345,14 +774,22 @@ class EncryptedChatRepositoryTest {
                 messages = page,
                 nextAfterRecordKey = page.lastOrNull()?.recordKey
                     ?.takeIf { page.size < remaining.size },
-            )
+            ).also { result ->
+                if (result.nextAfterRecordKey == null) {
+                    synchronized(authorityLock) {
+                        if (boundaryReplacement != null) boundaryReplacementArmed = true
+                    }
+                }
+            }
         }
 
         override suspend fun sendText(
+            session: SecureMessagingChatSession,
             conversationId: String,
             text: String,
             retryClientMessageId: String?,
         ) {
+            requireCurrent(session)
             sendAttempts += Triple(conversationId, text, retryClientMessageId)
             when (sendScenario) {
                 SendScenario.NORMAL -> recordNormalSend(conversationId, text)
@@ -371,7 +808,11 @@ class EncryptedChatRepositoryTest {
             }
         }
 
-        override suspend fun markConversationRead(conversationId: String) {
+        override suspend fun markConversationRead(
+            session: SecureMessagingChatSession,
+            conversationId: String,
+        ) {
+            requireCurrent(session)
             var changed = false
             projected.indices.forEach { index ->
                 val message = projected[index]
@@ -388,7 +829,26 @@ class EncryptedChatRepositoryTest {
             if (changed) projectionChanges.value++
         }
 
-        override suspend fun synchronizeConversation(conversationId: String) = Unit
+        override suspend fun synchronizeConversation(
+            session: SecureMessagingChatSession,
+            conversationId: String,
+        ) {
+            requireCurrent(session)
+        }
+
+        private fun requireCurrent(session: SecureMessagingChatSession) {
+            check(synchronized(authorityLock) { authoritativeSession === session }) {
+                "The requested secure messaging activation is no longer current"
+            }
+        }
+
+        private fun applyBoundaryReplacementLocked() {
+            val replacement = checkNotNull(boundaryReplacement)
+            boundaryReplacement = null
+            boundaryReplacementArmed = false
+            authoritativeSession = replacement
+            activeSession.value = replacement
+        }
 
         private fun retryScenario(
             conversationId: String,
@@ -443,6 +903,8 @@ class EncryptedChatRepositoryTest {
             )
             projectionChanges.value++
         }
+
+        private fun newSession(epoch: String) = SecureMessagingChatSession(epoch, Any())
     }
 
     private companion object {

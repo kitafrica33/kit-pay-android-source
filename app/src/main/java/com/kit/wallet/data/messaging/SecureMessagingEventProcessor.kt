@@ -3,6 +3,7 @@ package com.kit.wallet.data.messaging
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
 import com.kit.wallet.data.remote.KitWalletApiException
+import java.time.Instant
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
@@ -34,6 +35,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         var checkpoint: RemoteSecureMessagingTransport.Session.SyncCheckpoint,
         var cursorRecordVersion: Long?,
     ) {
+        val activation: SecureMessagingActivationCapability = session.activationCapability()
         var batch: RemoteSecureMessagingTransport.Session.SyncBatch? = null
         var events: List<RemoteSecureMessagingTransport.Session.SyncEvent> = emptyList()
         var eventIndex: Int = 0
@@ -87,6 +89,22 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     private val mutex = Mutex()
     private var currentState: SessionState? = null
 
+    private suspend fun <T> RemoteSecureMessagingTransport.Session.withProjectionLease(
+        operation: suspend SecureMessagingProjectionStore.() -> T,
+    ): T = projections.withActivationLease(activationCapability(), operation = operation)
+
+    private suspend fun <T> SessionState.withProjectionLease(
+        operation: suspend SecureMessagingProjectionStore.() -> T,
+    ): T = projections.withActivationLease(activation, operation = operation)
+
+    private suspend fun <T> RemoteSecureMessagingTransport.Session.withCursorLease(
+        operation: suspend SecureMessagingSyncCursorStore.() -> T,
+    ): T = cursors.withActivationLease(activationCapability(), operation)
+
+    private suspend fun <T> SessionState.withCursorLease(
+        operation: suspend SecureMessagingSyncCursorStore.() -> T,
+    ): T = cursors.withActivationLease(activation, operation)
+
     suspend fun synchronize(session: RemoteSecureMessagingTransport.Session) = mutex.withLock {
         try {
             val state = stateFor(session)
@@ -122,7 +140,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         session: RemoteSecureMessagingTransport.Session,
     ) = mutex.withLock {
         try {
-            val pending = pendingOutboundRecords()
+            val pending = pendingOutboundRecords(session)
             if (pending.isEmpty()) return@withLock
 
             val conversations = session.directConversations().associateBy { it.conversationId }
@@ -138,7 +156,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 }
                 val conversation = conversations[durable.conversationId]
                 if (conversation == null) {
-                    projections.markOutboundRetryRequired(durable)
+                    session.withProjectionLease { markOutboundRetryRequired(durable) }
                     return@forEach
                 }
                 val plan = plans.getOrPut(durable.conversationId) {
@@ -155,7 +173,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                         durable.sender == planSnapshot.sender &&
                         durableRecipients == planSnapshot.recipients.addressSet()
                 if (!stillAuthoritative) {
-                    projections.markOutboundRetryRequired(durable)
+                    session.withProjectionLease { markOutboundRetryRequired(durable) }
                     return@forEach
                 }
 
@@ -183,7 +201,9 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                             // An unclaimed blob expires after 24 hours, and a handle claimed by
                             // another accepted message can never be reused. Retire only this
                             // durable media fanout so it cannot starve later outbox entries.
-                            projections.markOutboundPermanentFailure(durable)
+                            session.withProjectionLease {
+                                markOutboundPermanentFailure(durable)
+                            }
                             return@forEach
                         }
                         if (error.isAttachmentCompatibilityFailure()) {
@@ -191,13 +211,13 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                             // temporarily disabled content profile cannot accept it today. Stop
                             // automatic recovery from wedging later text; retain explicit retry
                             // for after every device/server profile supports attachments.
-                            projections.markOutboundRetryRequired(durable)
+                            session.withProjectionLease { markOutboundRetryRequired(durable) }
                             return@forEach
                         }
                     }
                     throw error
                 }
-                projections.markOutboundSent(durable, receipt)
+                session.withProjectionLease { markOutboundSent(durable, receipt) }
             }
         } catch (error: SecureMessagingCryptographicFailureException) {
             runCatching { session.quarantine(error) }
@@ -215,10 +235,11 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         session: RemoteSecureMessagingTransport.Session,
     ) = mutex.withLock {
         val pending = try {
-            projections.pendingHistoryBackfills(MAX_HISTORY_TASKS_PER_RUN)
+            session.withProjectionLease { pendingHistoryBackfills(MAX_HISTORY_TASKS_PER_RUN) }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            if (isPermanentlyMissingSecureMessagingRecordKey(error)) throw error
             return@withLock
         }
         pending.forEach { task ->
@@ -230,13 +251,24 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 throw changed
             } catch (error: KitWalletApiException) {
                 if (error.code in TERMINAL_HISTORY_TASK_CODES) {
-                    updateHistoryTaskBestEffort(task, nextCursor = null, completed = true)
+                    updateHistoryTaskBestEffort(
+                        session,
+                        task,
+                        nextCursor = null,
+                        completed = true,
+                    )
                 } else if (error.code == HISTORY_CURSOR_INVALID) {
-                    updateHistoryTaskBestEffort(task, nextCursor = null, completed = false)
+                    updateHistoryTaskBestEffort(
+                        session,
+                        task,
+                        nextCursor = null,
+                        completed = false,
+                    )
                 }
                 // Retry every other remote failure on a later sync. The ordinary stream and
                 // outbox have already completed before this best-effort stage begins.
-            } catch (_: Exception) {
+            } catch (error: Exception) {
+                if (isPermanentlyMissingSecureMessagingRecordKey(error)) throw error
                 // Malformed retained history, target-only crypto failures, state contention and
                 // transport validation are isolated to this durable task and retried later.
             }
@@ -244,24 +276,30 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     }
 
     private suspend fun updateHistoryTaskBestEffort(
+        session: RemoteSecureMessagingTransport.Session,
         task: SecureMessagingHistoryBackfillTask,
         nextCursor: String?,
         completed: Boolean,
     ) {
         try {
-            projections.updateHistoryBackfill(task, nextCursor, completed)
+            session.withProjectionLease {
+                updateHistoryBackfill(task, nextCursor, completed)
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            if (isPermanentlyMissingSecureMessagingRecordKey(error)) throw error
             // A later synchronization re-reads the still-durable task.
         }
     }
 
-    private suspend fun pendingOutboundRecords(): List<LibSignalCompanionRecord> {
+    private suspend fun pendingOutboundRecords(
+        session: RemoteSecureMessagingTransport.Session,
+    ): List<LibSignalCompanionRecord> = session.withProjectionLease {
         val pending = mutableListOf<LibSignalCompanionRecord>()
         var after: String? = null
         repeat(MAX_OUTBOX_PAGES) {
-            val page = projections.readPage(afterRecordKey = after, limit = OUTBOX_PAGE_SIZE)
+            val page = readPage(afterRecordKey = after, limit = OUTBOX_PAGE_SIZE)
             page.messages().forEach { projected ->
                 if (projected.deliveryState ==
                     SecureMessagingProjectionDeliveryState.OUTBOUND_PENDING
@@ -276,7 +314,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     pending += durable
                 }
             }
-            val next = page.nextAfterRecordKey ?: return pending
+            val next = page.nextAfterRecordKey ?: return@withProjectionLease pending
             check(after == null || next > after!!) {
                 "Secure-message outbox pagination did not advance"
             }
@@ -301,7 +339,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         session: RemoteSecureMessagingTransport.Session,
     ): SessionState {
         currentState?.takeIf { it.session === session }?.let { return it }
-        val restored = cursors.load()
+        val restored = session.withCursorLease { load() }
         return SessionState(
             session = session,
             checkpoint = session.initialSyncCheckpoint(restored?.position),
@@ -315,7 +353,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 is RemoteSecureMessagingTransport.Session.IncomingEnvelope ->
                     processIncoming(state, event)
                 is RemoteSecureMessagingTransport.Session.OutboundEvent ->
-                    processOutbound(event)
+                    processOutbound(state, event)
                 is RemoteSecureMessagingTransport.Session.DeliveryReceiptEvent ->
                     processDeliveryReceipt(state, event)
                 is RemoteSecureMessagingTransport.Session.ReadReceiptEvent ->
@@ -404,11 +442,13 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             event.affectedDeviceId != binding.serverDeviceId &&
             event.affectedEnrollmentEpoch != null
         ) {
-            projections.enqueueHistoryBackfill(
-                conversationId = event.conversationId,
-                targetDeviceId = event.affectedDeviceId,
-                targetEnrollmentEpoch = event.affectedEnrollmentEpoch,
-            )
+            state.withProjectionLease {
+                enqueueHistoryBackfill(
+                    conversationId = event.conversationId,
+                    targetDeviceId = event.affectedDeviceId,
+                    targetEnrollmentEpoch = event.affectedEnrollmentEpoch,
+                )
+            }
         }
     }
 
@@ -420,7 +460,9 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             .associateBy(RemoteSecureMessagingTransport.Session.DirectConversation::conversationId)
         val conversation = conversations[initialTask.conversationId]
         if (conversation == null) {
-            projections.updateHistoryBackfill(initialTask, nextCursor = null, completed = true)
+            session.withProjectionLease {
+                updateHistoryBackfill(initialTask, nextCursor = null, completed = true)
+            }
             return
         }
         val roster = session.roster(conversation)
@@ -436,10 +478,12 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             )
             val plan = session.historyBackfillEncryptionPlan(conversation, roster, page)
             page.candidates().forEach { candidate ->
-                val projected = projections.retainedHistorySource(
-                    messageId = candidate.messageId,
-                    clientMessageId = candidate.clientMessageId,
-                ) ?: return@forEach
+                val projected = session.withProjectionLease {
+                    retainedHistorySource(
+                        messageId = candidate.messageId,
+                        clientMessageId = candidate.clientMessageId,
+                    )
+                } ?: return@forEach
                 val transferId = SecureMessagingHistoryBackfillCodec.deterministicTransferId(
                     messageId = candidate.messageId,
                     targetDeviceId = task.targetDeviceId,
@@ -450,7 +494,9 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                         .enrollmentEpoch,
                     transferRosterRevision = page.rosterRevision,
                 )
-                val encrypted = projections.readHistoryOutbound(transferId)?.let { durable ->
+                val encrypted = session.withProjectionLease {
+                    readHistoryOutbound(transferId)
+                }?.let { durable ->
                     SecureMessagingCryptoWireMapper.retryEncryption(durable, plan)
                 } ?: run {
                     val descriptor = try {
@@ -485,7 +531,9 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 )
             }
             if (!page.hasMore) {
-                projections.updateHistoryBackfill(task, nextCursor = null, completed = true)
+                session.withProjectionLease {
+                    updateHistoryBackfill(task, nextCursor = null, completed = true)
+                }
                 return
             }
             val next = checkNotNull(page.nextAfter) {
@@ -494,7 +542,9 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             check(task.nextCursor == null || next != task.nextCursor) {
                 "History candidate pagination did not advance"
             }
-            task = projections.updateHistoryBackfill(task, nextCursor = next, completed = false)
+            task = session.withProjectionLease {
+                updateHistoryBackfill(task, nextCursor = next, completed = false)
+            }
         }
     }
 
@@ -600,7 +650,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             processIncomingHistory(state, envelope)
             return
         }
-        var durable = projections.readInbound(envelope.messageId)
+        var durable = state.withProjectionLease { readInbound(envelope.messageId) }
         var decrypted: SecureMessagingCommittedResult.Decrypted? = null
         try {
             if (durable == null) {
@@ -626,7 +676,9 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     intent = projections.inboundIntent(envelope.messageId),
                 )
                 state.pendingDecryption = null
-                durable = checkNotNull(projections.readInbound(envelope.messageId)) {
+                durable = checkNotNull(state.withProjectionLease {
+                    readInbound(envelope.messageId)
+                }) {
                     "Committed incoming message omitted its durable projection"
                 }
             }
@@ -641,7 +693,9 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 // Commit the tombstone before acknowledgement/cursor advance. If this write is
                 // interrupted, replay sees the companion commit, revalidates the same binding,
                 // and retries suppression without re-running the ratchet.
-                projections.recordInboundSuppressed(persisted, envelope.sentAt)
+                state.withProjectionLease {
+                    recordInboundSuppressed(persisted, envelope.sentAt)
+                }
                 val token = if (decrypted != null) {
                     state.session.deliveryToken(envelope, decrypted)
                 } else {
@@ -650,25 +704,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 state.deliveryTokens += token
                 return
             }
-            if (!projections.isInboundPublicationRecorded(persisted, envelope.sentAt)) {
-                // The companion record is already durable, but projection metadata is committed
-                // only after publication. A failure therefore leaves retryable work, while the
-                // stable message ID lets the sink replace an ambiguously published notification.
-                try {
-                    notifications.publish(
-                        SecureMessagingIncomingNotification(
-                            messageId = persisted.messageId,
-                            conversationId = persisted.conversationId,
-                            sessionEpoch = state.session.binding.sessionEpoch,
-                        ),
-                    )
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Exception) {
-                    throw SecureMessagingNotificationPublicationException(error)
-                }
-            }
-            projections.recordInbound(persisted, envelope.sentAt)
+            publishInboundProjection(state, persisted, envelope.sentAt)
             val token = if (decrypted != null) {
                 state.session.deliveryToken(envelope, decrypted)
             } else {
@@ -687,7 +723,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         val transferId = checkNotNull(envelope.transferClientMessageId) {
             "Validated history envelope omitted its transfer ID"
         }
-        var wrapper = projections.readHistoryInbound(transferId)
+        var wrapper = state.withProjectionLease { readHistoryInbound(transferId) }
         var decrypted: SecureMessagingCommittedResult.Decrypted? = null
         try {
             if (wrapper == null) {
@@ -713,7 +749,9 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     intent = projections.historyInboundIntent(transferId),
                 )
                 state.pendingDecryption = null
-                wrapper = checkNotNull(projections.readHistoryInbound(transferId)) {
+                wrapper = checkNotNull(state.withProjectionLease {
+                    readHistoryInbound(transferId)
+                }) {
                     "Committed history wrapper omitted its durable crypto state"
                 }
             }
@@ -747,19 +785,18 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 return
             }
 
-            val recovered = try {
-                projections.recordRecoveredHistory(authenticated)
-            } catch (unavailable: SecureMessagingStateUnavailableException) {
-                throw unavailable
-            } catch (_: IllegalArgumentException) {
-                state.deliveryTokens += historyDeliveryToken(
-                    state,
-                    envelope,
-                    decrypted,
-                    durableWrapper,
-                )
-                return
-            } catch (_: IllegalStateException) {
+            val recovered = state.withProjectionLease {
+                try {
+                    recordRecoveredHistory(authenticated)
+                } catch (unavailable: SecureMessagingStateUnavailableException) {
+                    throw unavailable
+                } catch (_: IllegalArgumentException) {
+                    null
+                } catch (_: IllegalStateException) {
+                    null
+                }
+            }
+            if (recovered == null) {
                 state.deliveryTokens += historyDeliveryToken(
                     state,
                     envelope,
@@ -768,12 +805,33 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 )
                 return
             }
-            if (!projections.isInboundPublicationRecorded(recovered, authenticated.sentAt)) {
+            publishInboundProjection(state, recovered, authenticated.sentAt)
+            state.deliveryTokens += historyDeliveryToken(
+                state,
+                envelope,
+                decrypted,
+                durableWrapper,
+            )
+        } finally {
+            decrypted?.close()
+        }
+    }
+
+    private suspend fun publishInboundProjection(
+        state: SessionState,
+        durable: LibSignalCompanionRecord,
+        sentAt: Instant,
+    ) {
+        // Publication is synchronous and must remain in the same local lease as its durable
+        // idempotency marker. Erasure drains this phase before cancelAll, so an obsolete activation
+        // cannot publish again after notifications were cleared for logout or replacement.
+        state.withProjectionLease {
+            if (!isInboundPublicationRecorded(durable, sentAt)) {
                 try {
                     notifications.publish(
                         SecureMessagingIncomingNotification(
-                            messageId = authenticated.messageId,
-                            conversationId = authenticated.conversationId,
+                            messageId = durable.messageId,
+                            conversationId = durable.conversationId,
                             sessionEpoch = state.session.binding.sessionEpoch,
                         ),
                     )
@@ -783,15 +841,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     throw SecureMessagingNotificationPublicationException(error)
                 }
             }
-            projections.recordInbound(recovered, authenticated.sentAt)
-            state.deliveryTokens += historyDeliveryToken(
-                state,
-                envelope,
-                decrypted,
-                durableWrapper,
-            )
-        } finally {
-            decrypted?.close()
+            recordInbound(durable, sentAt)
         }
     }
 
@@ -843,22 +893,27 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     }
 
     private suspend fun processOutbound(
+        state: SessionState,
         event: RemoteSecureMessagingTransport.Session.OutboundEvent,
     ) {
-        val durable = projections.readOutbound(event.clientMessageId) ?: return
-        projections.markOutboundSent(durable, event)
+        state.withProjectionLease {
+            val durable = readOutbound(event.clientMessageId) ?: return@withProjectionLease
+            markOutboundSent(durable, event)
+        }
     }
 
     private suspend fun processDeliveryReceipt(
         state: SessionState,
         event: RemoteSecureMessagingTransport.Session.DeliveryReceiptEvent,
     ) {
-        projections.markAuthoredDelivered(
-            conversationId = event.conversationId,
-            messageId = event.messageId,
-            currentUserId = state.session.binding.userId,
-            deliveredAt = event.deliveredAt,
-        )
+        state.withProjectionLease {
+            markAuthoredDelivered(
+                conversationId = event.conversationId,
+                messageId = event.messageId,
+                currentUserId = state.session.binding.userId,
+                deliveredAt = event.deliveredAt,
+            )
+        }
     }
 
     private suspend fun processReadReceipt(
@@ -875,23 +930,27 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             // The backend broadcasts this account's marker to every enrolled device. It is not
             // peer-read evidence for self-authored bubbles, but it does clear authenticated inbound
             // messages from the direct peer on this account's other devices.
-            projections.markInboundReadThroughCanonicalIfKnown(
-                conversationId = event.conversationId,
-                peerUserId = conversation.peerUserId,
-                canonicalLastReadMessageId = event.lastReadMessageId,
-                canonicalReadAt = event.readAt,
-            )
+            state.withProjectionLease {
+                markInboundReadThroughCanonicalIfKnown(
+                    conversationId = event.conversationId,
+                    peerUserId = conversation.peerUserId,
+                    canonicalLastReadMessageId = event.lastReadMessageId,
+                    canonicalReadAt = event.readAt,
+                )
+            }
             return
         }
         check(conversation.peerUserId == event.readerUserId) {
             "Read receipt actor is not the authenticated direct peer"
         }
-        projections.markAuthoredReadThrough(
-            conversationId = event.conversationId,
-            lastReadMessageId = event.lastReadMessageId,
-            currentUserId = state.session.binding.userId,
-            readAt = event.readAt,
-        )
+        state.withProjectionLease {
+            markAuthoredReadThrough(
+                conversationId = event.conversationId,
+                lastReadMessageId = event.lastReadMessageId,
+                currentUserId = state.session.binding.userId,
+                readAt = event.readAt,
+            )
+        }
     }
 
     private suspend fun historicalPlan(
@@ -929,19 +988,21 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     ): SecureMessagingSyncResumePosition {
         state.persistedBatchPosition?.let { return it }
         val position = state.session.resumePositionAfter(batch)
-        val version = try {
-            cursors.save(position, state.cursorRecordVersion)
-        } catch (writeFailure: Throwable) {
-            val loaded = try {
-                cursors.load()
-            } catch (loadFailure: Throwable) {
-                writeFailure.addSuppressed(loadFailure)
-                throw writeFailure
+        val version = state.withCursorLease {
+            try {
+                save(position, state.cursorRecordVersion)
+            } catch (writeFailure: Throwable) {
+                val loaded = try {
+                    load()
+                } catch (loadFailure: Throwable) {
+                    writeFailure.addSuppressed(loadFailure)
+                    throw writeFailure
+                }
+                val expected = requireSecureMessagingSyncResumePosition(position)
+                val actual = loaded?.let { requireSecureMessagingSyncResumePosition(it.position) }
+                if (loaded == null || actual != expected) throw writeFailure
+                loaded.recordVersion
             }
-            val expected = requireSecureMessagingSyncResumePosition(position)
-            val actual = loaded?.let { requireSecureMessagingSyncResumePosition(it.position) }
-            if (loaded == null || actual != expected) throw writeFailure
-            loaded.recordVersion
         }
         state.cursorRecordVersion = version
         state.persistedBatchPosition = position

@@ -29,6 +29,8 @@ import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.RealSecureMessagingSyncEngine
+import com.kit.wallet.data.messaging.AccountMessageHistoryCoordinator
+import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
 import com.kit.wallet.feature.chat.AndroidMessageSoundPlayer
 import com.kit.wallet.feature.chat.MessageSoundPlayer
 import com.kit.wallet.data.local.RoomWalletCache
@@ -94,6 +96,12 @@ abstract class RepositoryBindingsModule {
     abstract fun bindSecureMessagingSyncEngine(
         implementation: RealSecureMessagingSyncEngine,
     ): SecureMessagingSyncEngine
+
+    @Binds
+    @Singleton
+    abstract fun bindAccountMessageHistoryRetention(
+        implementation: AccountMessageHistoryCoordinator,
+    ): AccountMessageHistoryRetention
 
     @Binds
     @Singleton

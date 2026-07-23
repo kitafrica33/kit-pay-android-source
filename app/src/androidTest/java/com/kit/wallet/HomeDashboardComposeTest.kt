@@ -4,12 +4,15 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.hasScrollAction
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import com.kit.wallet.data.remote.KitFeature
 import com.kit.wallet.feature.home.HomeAction
 import com.kit.wallet.feature.home.HomeDashboard
@@ -127,8 +130,11 @@ class HomeDashboardComposeTest {
             .assertIsEnabled()
             .assertHasClickAction()
             .performClick()
-        compose.onNodeWithTag("${HomeAction.TRANSACTION_DETAIL.testTag}-${transaction.id}")
-            .performScrollTo()
+        val transactionTag = "${HomeAction.TRANSACTION_DETAIL.testTag}-${transaction.id}"
+        // LazyColumn does not materialize every off-screen row. Ask the scroll container to bring
+        // the matching item into composition before querying the row itself.
+        compose.onNode(hasScrollAction()).performScrollToNode(hasTestTag(transactionTag))
+        compose.onNodeWithTag(transactionTag)
             .assertIsEnabled()
             .assertHasClickAction()
             .performClick()

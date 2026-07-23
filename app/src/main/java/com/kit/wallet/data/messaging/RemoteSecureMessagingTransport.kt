@@ -402,6 +402,9 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
 
         internal fun activationFence(): SecureMessagingSessionFence = fence
 
+        /** Opaque authority for activation-scoped local durable state operations. */
+        internal fun activationCapability(): SecureMessagingActivationCapability = activation
+
         internal fun quarantine(error: SecureMessagingCryptographicFailureException) {
             lifecycle.quarantine(fence, error.quarantineReason)
         }

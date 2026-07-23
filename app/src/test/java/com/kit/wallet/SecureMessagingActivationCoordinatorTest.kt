@@ -3,12 +3,15 @@ package com.kit.wallet
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.SecureMessagingActivationCoordinator
 import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
+import com.kit.wallet.data.messaging.SecureMessagingCryptographicFailureException
 import com.kit.wallet.data.messaging.SecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingKeyReconciliationException
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
+import com.kit.wallet.data.messaging.SecureMessagingLocalEnrollmentResetRequiredException
 import com.kit.wallet.data.messaging.SecureMessagingProtocolUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
 import com.kit.wallet.data.messaging.SecureMessagingRuntimeStage
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
 import com.kit.wallet.data.remote.ApiCallExecutor
@@ -16,6 +19,9 @@ import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.SecureMessagingWireApi
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
@@ -24,6 +30,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
@@ -89,6 +96,57 @@ class SecureMessagingActivationCoordinatorTest {
     }
 
     @Test
+    fun `projection publication is atomic against leaving ready`() = runTest {
+        val coordinator = coordinator()
+        enqueueRemoteActivation()
+        val active = coordinator.ensureActivated(BINDING)
+        val publicationEntered = CountDownLatch(1)
+        val releasePublication = CountDownLatch(1)
+        val erasureAttempted = CountDownLatch(1)
+        val publicationCompleted = AtomicBoolean(false)
+        val publicationAccepted = AtomicBoolean(false)
+        val erasureCompleted = AtomicBoolean(false)
+
+        val publisher = thread(start = true, name = "secure-publication-test") {
+            publicationAccepted.set(
+                registry.publishIfCurrent(active) {
+                    publicationEntered.countDown()
+                    releasePublication.await()
+                    publicationCompleted.set(true)
+                },
+            )
+        }
+        publicationEntered.await()
+        val eraser = thread(start = true, name = "secure-erasure-test") {
+            erasureAttempted.countDown()
+            lifecycle.beginErasure()
+            erasureCompleted.set(true)
+        }
+        erasureAttempted.await()
+        try {
+            val deadline = System.nanoTime() + 1_000_000_000L
+            while (eraser.state != Thread.State.BLOCKED &&
+                eraser.isAlive &&
+                System.nanoTime() < deadline
+            ) {
+                Thread.yield()
+            }
+            assertEquals(Thread.State.BLOCKED, eraser.state)
+            assertFalse(erasureCompleted.get())
+        } finally {
+            releasePublication.countDown()
+            publisher.join()
+            eraser.join()
+        }
+
+        assertTrue(publicationAccepted.get())
+        assertTrue(publicationCompleted.get())
+        assertTrue(erasureCompleted.get())
+        assertNull(registry.currentOrNull())
+        lifecycle.finishErasure()
+    }
+
+    @Test
     fun `key failure retains the fenced transport and retries only incomplete stages`() = runTest {
         var keyCalls = 0
         var syncCalls = 0
@@ -140,6 +198,36 @@ class SecureMessagingActivationCoordinatorTest {
         assertEquals(3, server.requestCount)
         assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
     }
+
+    @Test
+    fun `permanently missing record key during initial sync requests fenced local recovery`() =
+        runTest {
+            val coordinator = coordinator(
+                initialSync = {
+                    throw SecureMessagingCryptographicFailureException(
+                        quarantineReason = SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                        message = "encrypted state cannot be opened",
+                        cause = SecureMessagingRecordKeyPermanentlyMissingException(),
+                    )
+                },
+            )
+            enqueueRemoteActivation()
+
+            val failure = runCatching {
+                coordinator.ensureActivated(BINDING)
+            }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingLocalEnrollmentResetRequiredException)
+            assertTrue(
+                failure?.cause is SecureMessagingCryptographicFailureException,
+            )
+            assertEquals(SecureMessagingRuntimeStage.QUARANTINED, lifecycle.snapshot().stage)
+            assertEquals(
+                SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                lifecycle.snapshot().quarantineReason,
+            )
+            assertNull(registry.currentOrNull())
+        }
 
     @Test
     fun `server readiness rollout retries the same fenced activation`() = runTest {

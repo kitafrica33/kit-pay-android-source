@@ -12,8 +12,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         WalletTransactionEntity::class,
         SyncStateEntity::class,
         SecureMessagingRecordEntity::class,
+        AccountMessageArchiveEntity::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 abstract class KitWalletDatabase : RoomDatabase() {
@@ -22,6 +23,7 @@ abstract class KitWalletDatabase : RoomDatabase() {
     abstract fun walletTransactionDao(): WalletTransactionDao
     abstract fun syncStateDao(): SyncStateDao
     abstract fun secureMessagingRecordDao(): SecureMessagingRecordDao
+    abstract fun accountMessageArchiveDao(): AccountMessageArchiveDao
 
     companion object {
         val MIGRATION_1_2: Migration = object : Migration(1, 2) {
@@ -65,6 +67,27 @@ abstract class KitWalletDatabase : RoomDatabase() {
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS index_secure_messaging_records_namespace " +
                         "ON secure_messaging_records(namespace)",
+                )
+            }
+        }
+
+        val MIGRATION_4_5: Migration = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS account_message_archive (" +
+                        "ownerAccountId TEXT NOT NULL, " +
+                        "installationId TEXT NOT NULL, " +
+                        "recordKey TEXT NOT NULL, " +
+                        "version INTEGER NOT NULL, " +
+                        "iv BLOB NOT NULL, " +
+                        "ciphertext BLOB NOT NULL, " +
+                        "updatedAtEpochMillis INTEGER NOT NULL, " +
+                        "PRIMARY KEY(ownerAccountId, installationId, recordKey))",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS " +
+                        "index_account_message_archive_ownerAccountId_installationId " +
+                        "ON account_message_archive(ownerAccountId, installationId)",
                 )
             }
         }

@@ -8,6 +8,7 @@ import android.util.Base64
 import androidx.annotation.VisibleForTesting
 import com.kit.wallet.data.messaging.SecureMessagingSessionFence
 import com.kit.wallet.data.messaging.SecureMessagingSessionLifecycle
+import com.kit.wallet.data.messaging.deleteKeystoreAliasAndVerifyAbsent
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import com.squareup.moshi.JsonClass
@@ -28,9 +29,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * Persists the device session as one AES-GCM authenticated blob. The non-exportable
@@ -47,7 +51,7 @@ class KeystoreSessionStore @Inject constructor(
 
     private val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
     private val adapter = moshi.adapter(SessionDiskPayload::class.java)
-    private val mutex = Mutex()
+    private val mutex = CoroutineOwnedMutex()
     private val initialRestore = readRetainingFailure()
     private val _session = MutableStateFlow(initialRestore.tokens)
     private val _restorationPending = MutableStateFlow(initialRestore.pending)
@@ -75,10 +79,11 @@ class KeystoreSessionStore @Inject constructor(
     override fun snapshot(): SessionSnapshot = sessionSnapshot
 
     override suspend fun retryRestore(): Boolean = mutex.withLock {
-        if (_session.value != null) {
-            _restorationPending.value = false
-            _restorationRetryable.value = false
-            return@withLock true
+        _session.value?.let { published ->
+            if (!_restorationPending.value && messagingLifecycle.stateAvailable.value) {
+                return@withLock true
+            }
+            return@withLock activatePublishedMessagingForRestoreLocked(published)
         }
         val encrypted = preferences.getString(KEY_SESSION, null)
         val attempt = retryRetainedEncryptedSession(
@@ -105,18 +110,17 @@ class KeystoreSessionStore @Inject constructor(
             return@withLock false
         }
         publishSessionLocked(restored)
-        try {
-            messagingLifecycle.afterSessionSave()
-        } catch (_: Throwable) {
-            // Messaging readiness is independent from the authenticated Kit session. Its worker
-            // can retry without logging out a valid account.
-        }
-        runCatching { messagingSyncScheduler.get().schedule() }
-        true
+        activatePublishedMessagingForRestoreLocked(restored)
     }
 
     override suspend fun discardPendingRestoration() = mutex.withLock {
-        if (_session.value != null || !_restorationPending.value) return@withLock
+        if (pendingRestorationDiscardTarget(
+                restorationPending = _restorationPending.value,
+                sessionPublished = _session.value != null,
+            ) == PendingRestorationDiscardTarget.NONE
+        ) {
+            return@withLock
+        }
         clearLocked()
     }
 
@@ -194,9 +198,51 @@ class KeystoreSessionStore @Inject constructor(
         block(current)
     }
 
+    override suspend fun <T> withUnchangedSession(
+        expected: SessionSnapshot,
+        block: suspend (SessionTokens?) -> T,
+    ): T = mutex.withLock {
+        if (sessionSnapshot != expected) throw SessionInvalidatedException()
+        block(_session.value)
+    }
+
     override suspend fun clearIfCurrent(expected: SessionFence): Boolean = mutex.withLock {
         if (_session.value?.fence() != expected) return@withLock false
         clearLocked()
+        true
+    }
+
+    override suspend fun prepareClearIfCurrent(expected: SessionFence): Boolean = mutex.withLock {
+        if (_session.value?.fence() != expected) return@withLock false
+        markMessagingErasurePending()
+        true
+    }
+
+    override suspend fun clearIfCurrentAfterFinalMessagingSnapshot(
+        expected: SessionFence,
+        allowPermanentlyUnavailableSnapshot: Boolean,
+        finalMessagingSnapshot: suspend () -> Unit,
+    ): Boolean = mutex.withLock {
+        if (_session.value?.fence() != expected) return@withLock false
+        clearLocked(
+            finalMessagingSnapshot = finalMessagingSnapshot,
+            allowPermanentlyUnavailableSnapshot = allowPermanentlyUnavailableSnapshot,
+        )
+        true
+    }
+
+    override suspend fun clearIfCurrentForSecureMessagingRecovery(
+        expected: SessionFence,
+        activationFence: SecureMessagingSessionFence,
+        allowPermanentlyUnavailableSnapshot: Boolean,
+        finalMessagingSnapshot: suspend () -> Unit,
+    ): Boolean = mutex.withLock {
+        if (_session.value?.fence() != expected) return@withLock false
+        clearLocked(
+            finalMessagingSnapshot = finalMessagingSnapshot,
+            allowPermanentlyUnavailableSnapshot = allowPermanentlyUnavailableSnapshot,
+            recoveryActivationFence = activationFence,
+        )
         true
     }
 
@@ -208,17 +254,44 @@ class KeystoreSessionStore @Inject constructor(
             true
         }
 
+    override suspend fun clearIfCredentialsCurrentAfterFinalMessagingSnapshot(
+        expected: SessionTokens,
+        allowPermanentlyUnavailableSnapshot: Boolean,
+        finalMessagingSnapshot: suspend () -> Unit,
+    ): Boolean = mutex.withLock {
+        val latest = _session.value ?: return@withLock false
+        if (!latest.hasSameRefreshCredential(expected)) return@withLock false
+        clearLocked(
+            finalMessagingSnapshot = finalMessagingSnapshot,
+            allowPermanentlyUnavailableSnapshot = allowPermanentlyUnavailableSnapshot,
+        )
+        true
+    }
+
     override suspend fun resetSecureMessagingStateIfCurrent(
         expected: SessionFence,
         activationFence: SecureMessagingSessionFence,
+        allowPermanentlyUnavailableSnapshot: Boolean,
+        finalMessagingSnapshot: suspend () -> Unit,
     ): Boolean = mutex.withLock {
         if (_session.value?.fence() != expected) return@withLock false
 
-        markMessagingErasurePending()
+        var erasureFenced = false
         try {
-            messagingLifecycle.resetForRecovery(activationFence)
+            messagingLifecycle.resetForRecovery(
+                fence = activationFence,
+                allowPermanentlyUnavailableSnapshot =
+                    allowPermanentlyUnavailableSnapshot,
+                finalSnapshot = finalMessagingSnapshot,
+                beforeErasure = {
+                    markMessagingErasurePending()
+                    erasureFenced = true
+                },
+            )
         } catch (error: Throwable) {
-            abandonSessionDuringPendingMessagingErasure()
+            // Before the fence is durable, both the authenticated owner and readable messaging
+            // state remain intact so a transient archive/Keystore failure can be retried.
+            if (erasureFenced) abandonSessionDuringPendingMessagingErasure()
             throw error
         }
 
@@ -227,12 +300,19 @@ class KeystoreSessionStore @Inject constructor(
             error("The secure messaging erasure marker could not be cleared")
         }
         try {
-            messagingLifecycle.afterSessionSave()
+            val current = _session.value
+                ?.takeIf { it.fence() == expected }
+                ?: throw SessionInvalidatedException()
+            check(activatePublishedMessagingLocked(current)) {
+                "Secure messaging recovery lost its authenticated session"
+            }
         } catch (error: Throwable) {
-            runCatching { markMessagingErasurePending() }
-                .exceptionOrNull()
-                ?.let(error::addSuppressed)
-            abandonSessionDuringPendingMessagingErasure()
+            // The reset and durable marker removal already completed. Keep the exact authenticated
+            // session behind the restoration gate and retry reopening; resurrecting the erasure
+            // marker here would make process restart destroy a successfully reset session.
+            if (_restorationPending.value && _session.value?.fence() == expected) {
+                retryPublishedMessagingActivation(expected)
+            }
             throw error
         }
         runCatching { messagingSyncScheduler.get().schedule() }
@@ -286,14 +366,46 @@ class KeystoreSessionStore @Inject constructor(
         mutex.withLock { clearLocked() }
     }
 
-    private suspend fun clearLocked() {
+    private suspend fun clearLocked(
+        finalMessagingSnapshot: (suspend () -> Unit)? = null,
+        allowPermanentlyUnavailableSnapshot: Boolean = false,
+        recoveryActivationFence: SecureMessagingSessionFence? = null,
+    ) {
         // Never cross the first suspending erasure boundary unless the durable fence exists.
         // If this commit fails, abort with the still-readable session intact so process death
         // cannot resurrect credentials after their messaging state was already destroyed.
-        fenceThenEraseMessagingAndClearSession(
-            persistErasureFence = ::markMessagingErasurePending,
-            eraseMessaging = messagingLifecycle::beforeSessionClear,
-            clearSession = { erasureSucceeded ->
+        var erasureFenced = false
+        var erasureSucceeded = false
+        try {
+            val snapshot: suspend () -> Unit = {
+                finalMessagingSnapshot?.invoke()
+                Unit
+            }
+            val fenceErasure: () -> Unit = {
+                // The exclusive messaging-state lease is still held. Persist the crash fence
+                // after a successful snapshot but before lifecycle invalidation or key erasure.
+                markMessagingErasurePending()
+                erasureFenced = true
+            }
+            if (recoveryActivationFence == null) {
+                messagingLifecycle.beforeSessionClear(
+                    allowPermanentlyUnavailableSnapshot =
+                        allowPermanentlyUnavailableSnapshot,
+                    finalSnapshot = snapshot,
+                    beforeErasure = fenceErasure,
+                )
+            } else {
+                messagingLifecycle.resetForRecovery(
+                    fence = recoveryActivationFence,
+                    allowPermanentlyUnavailableSnapshot =
+                        allowPermanentlyUnavailableSnapshot,
+                    finalSnapshot = snapshot,
+                    beforeErasure = fenceErasure,
+                )
+            }
+            erasureSucceeded = true
+        } finally {
+            if (erasureFenced) {
                 val removed = preferences.edit()
                     .remove(KEY_SESSION)
                     .putBoolean(KEY_MESSAGING_ERASURE_PENDING, !erasureSucceeded)
@@ -306,8 +418,8 @@ class KeystoreSessionStore @Inject constructor(
                 }
                 publishSessionLocked(null)
                 invalidationFailure?.let { throw it }
-            },
-        )
+            }
+        }
     }
 
     private suspend fun persistLocked(tokens: SessionTokens) {
@@ -333,17 +445,27 @@ class KeystoreSessionStore @Inject constructor(
             if (!isSameSession) abandonSessionDuringPendingMessagingErasure()
             throw error
         }
-        val persisted = preferences.edit()
-            .putString(KEY_SESSION, encryptedSession)
-            .remove(KEY_MESSAGING_ERASURE_PENDING)
-            .commit()
+        val persistence = preferences.edit().putString(KEY_SESSION, encryptedSession)
+        if (!isSameSession) {
+            persistence.remove(KEY_MESSAGING_ERASURE_PENDING)
+        }
+        val persisted = persistence.commit()
         if (!persisted) {
             if (!isSameSession) abandonSessionDuringPendingMessagingErasure()
             error("The secure session could not be persisted")
         }
         publishSessionLocked(tokens)
-        messagingLifecycle.afterSessionSave()
-        runCatching { messagingSyncScheduler.get().schedule() }
+        try {
+            val messagingActivated = activatePublishedMessagingLocked(tokens)
+            if (messagingActivated) {
+                runCatching { messagingSyncScheduler.get().schedule() }
+            }
+        } catch (error: Throwable) {
+            if (_restorationPending.value && _session.value?.fence() == tokens.fence()) {
+                retryPublishedMessagingActivation(tokens.fence())
+            }
+            throw error
+        }
     }
 
     private fun readRetainingFailure(): InitialSessionRestore {
@@ -424,16 +546,69 @@ class KeystoreSessionStore @Inject constructor(
 
     private fun invalidateSessionKey() {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-        if (keyStore.containsAlias(KEY_ALIAS)) keyStore.deleteEntry(KEY_ALIAS)
+        deleteKeystoreAliasAndVerifyAbsent(
+            deleteEntry = { keyStore.deleteEntry(KEY_ALIAS) },
+            aliasExists = { keyStore.containsAlias(KEY_ALIAS) },
+        )
     }
 
     private fun activateRestoredMessagingSession() {
+        val expected = _session.value?.fence() ?: return
         applicationScope.launch {
             mutex.withLock {
-                if (_session.value == null) return@withLock
-                runCatching { messagingLifecycle.afterSessionSave() }
-                    .onSuccess { runCatching { messagingSyncScheduler.get().schedule() } }
+                val current = _session.value
+                    ?.takeIf { it.fence() == expected }
+                    ?: return@withLock
+                val activated = activatePublishedMessagingForRestoreLocked(current)
+                if (!activated) retryPublishedMessagingActivation(expected)
             }
+        }
+    }
+
+    private suspend fun activatePublishedMessagingForRestoreLocked(
+        tokens: SessionTokens,
+    ): Boolean = try {
+        val activated = activatePublishedMessagingLocked(tokens)
+        if (activated) runCatching { messagingSyncScheduler.get().schedule() }
+        activated
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        // Keep the published credential behind the restoration gate and retry its exact fence;
+        // foreground/UI retries must not mistake an authenticated-but-closed state for readiness.
+        false
+    }
+
+    private suspend fun activatePublishedMessagingLocked(tokens: SessionTokens): Boolean =
+        activateMessagingForPublishedSession(
+            expected = tokens.fence(),
+            currentSession = { _session.value?.fence() },
+            activate = {
+                messagingLifecycle.afterSessionSave()
+                _restorationPending.value = false
+                _restorationRetryable.value = false
+            },
+            onActivationFailure = {
+                _restorationPending.value = true
+                _restorationRetryable.value = true
+            },
+        )
+
+    private fun retryPublishedMessagingActivation(expected: SessionFence) {
+        applicationScope.launch {
+            retryPublishedMessagingActivationWithRetries(
+                attempts = MESSAGING_ACTIVATION_RETRY_ATTEMPTS,
+                retryDelayMillis = MESSAGING_ACTIVATION_RETRY_DELAY_MILLIS,
+                attemptActivation = {
+                    mutex.withLock {
+                        val current = _session.value
+                            ?.takeIf { it.fence() == expected }
+                            ?: return@withLock null
+                        activatePublishedMessagingForRestoreLocked(current)
+                    }
+                },
+                waitBeforeNextAttempt = { delay(it) },
+            )
         }
     }
 
@@ -501,6 +676,8 @@ class KeystoreSessionStore @Inject constructor(
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val GCM_TAG_BITS = 128
         const val SEPARATOR = "."
+        const val MESSAGING_ACTIVATION_RETRY_ATTEMPTS = 3
+        const val MESSAGING_ACTIVATION_RETRY_DELAY_MILLIS = 250L
     }
 }
 
@@ -597,6 +774,87 @@ internal fun sessionKeyCreationAllowed(
     hasEncryptedSession: Boolean,
     hasCurrentSession: Boolean,
 ): Boolean = !hasEncryptedSession && !hasCurrentSession
+
+/**
+ * Opens secure-messaging state for the exact session that was just published. Session-store
+ * callers hold their session mutex across this operation, so logout/replacement cannot interleave
+ * between the fence check and activation. Cancellation is restored only after activation has had
+ * an uncancellable opportunity to open both the lifecycle gate and its observable readiness flow.
+ */
+@VisibleForTesting
+internal suspend fun activateMessagingForPublishedSession(
+    expected: SessionFence,
+    currentSession: () -> SessionFence?,
+    activate: suspend () -> Unit,
+    onActivationFailure: (Throwable) -> Unit = {},
+): Boolean {
+    val callerContext = currentCoroutineContext()
+    val activation = withContext(NonCancellable) {
+        if (currentSession() != expected) {
+            Result.success(false)
+        } else {
+            try {
+                activate()
+                Result.success(true)
+            } catch (error: Throwable) {
+                // Transport the exact failure out of withContext so coroutine stack-trace
+                // recovery cannot replace it before cancellation precedence is decided.
+                onActivationFailure(error)
+                Result.failure(error)
+            }
+        }
+    }
+
+    try {
+        callerContext.ensureActive()
+    } catch (cancelled: CancellationException) {
+        activation.exceptionOrNull()
+            ?.takeIf { it !== cancelled }
+            ?.let(cancelled::addSuppressed)
+        throw cancelled
+    }
+    return activation.getOrThrow()
+}
+
+/** Bounded exact-session gate retries used after a published session fails to reopen messaging. */
+@VisibleForTesting
+internal suspend fun retryPublishedMessagingActivationWithRetries(
+    attempts: Int,
+    retryDelayMillis: Long,
+    attemptActivation: suspend () -> Boolean?,
+    waitBeforeNextAttempt: suspend (Long) -> Unit,
+): Boolean {
+    require(attempts > 0)
+    require(retryDelayMillis >= 0L)
+    repeat(attempts) { attempt ->
+        when (attemptActivation()) {
+            true -> return true
+            null -> return false
+            false -> if (attempt < attempts - 1) {
+                waitBeforeNextAttempt(retryDelayMillis * (attempt + 1L))
+            }
+        }
+    }
+    return false
+}
+
+@VisibleForTesting
+internal enum class PendingRestorationDiscardTarget {
+    NONE,
+    RETAINED_CREDENTIAL,
+    PUBLISHED_CREDENTIAL,
+}
+
+/** Both an unreadable credential and a published session whose messaging gate failed are discardable. */
+@VisibleForTesting
+internal fun pendingRestorationDiscardTarget(
+    restorationPending: Boolean,
+    sessionPublished: Boolean,
+): PendingRestorationDiscardTarget = when {
+    !restorationPending -> PendingRestorationDiscardTarget.NONE
+    sessionPublished -> PendingRestorationDiscardTarget.PUBLISHED_CREDENTIAL
+    else -> PendingRestorationDiscardTarget.RETAINED_CREDENTIAL
+}
 
 /** A missing decrypt alias may be temporarily hidden by Android 9/OEM Keystore providers. */
 @VisibleForTesting

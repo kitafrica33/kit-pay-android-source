@@ -4,6 +4,8 @@ import com.kit.wallet.data.local.ProfileEntity
 import com.kit.wallet.data.local.WalletCache
 import com.kit.wallet.data.local.WalletEntity
 import com.kit.wallet.data.local.WalletTransactionEntity
+import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
+import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.ApiEnvelope
 import com.kit.wallet.data.remote.ApiErrorDto
@@ -354,6 +356,31 @@ class SessionNetworkingTest {
     }
 
     @Test
+    fun `definitive authenticator rejection retains session when final history snapshot fails`() {
+        val sessions = FakeSessionStore(OLD_SESSION)
+        val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
+        val api = FakeRefreshApi { _, _ -> throw httpFailure(401, "SESSION_REVOKED") }
+        val failure = IllegalStateException("final history snapshot failed")
+        val history = object : AccountMessageHistoryRetention {
+            override suspend fun snapshotActiveHistory(target: SessionFence) {
+                throw failure
+            }
+
+            override suspend fun eraseAccount(target: SessionFence) = Unit
+        }
+
+        val observed = runCatching {
+            authenticator(sessions, cache, api, history)
+                .authenticate(null, unauthorizedResponse(OLD_SESSION))
+        }.exceptionOrNull()
+
+        assertEquals(failure, observed)
+        assertEquals(OLD_SESSION, sessions.current())
+        assertEquals(OLD_SESSION.cacheScopeId, cache.currentOwner)
+        assertTrue(cache.clearAttempts.isEmpty())
+    }
+
+    @Test
     fun `refresh response for a different account preserves the matching owner`() {
         val sessions = FakeSessionStore(OLD_SESSION)
         val cache = FakeWalletCache(OLD_SESSION.cacheScopeId)
@@ -439,12 +466,18 @@ class SessionNetworkingTest {
         sessions: FakeSessionStore,
         cache: FakeWalletCache,
         api: FakeRefreshApi,
+        messageHistory: AccountMessageHistoryRetention = NoOpAccountMessageHistoryRetention,
     ): SessionAuthenticator {
         val apiCalls = ApiCallExecutor(
             Moshi.Builder().add(KotlinJsonAdapterFactory()).build(),
         )
         val refresher = AuthTokenRefresher(dagger.Lazy { api }, apiCalls)
-        return SessionAuthenticator(sessions, dagger.Lazy { refresher }, cache)
+        return SessionAuthenticator(
+            sessions = sessions,
+            tokenRefresher = dagger.Lazy { refresher },
+            walletCache = cache,
+            messageHistory = messageHistory,
+        )
     }
 
     private fun unauthorizedResponse(session: SessionTokens): Response {

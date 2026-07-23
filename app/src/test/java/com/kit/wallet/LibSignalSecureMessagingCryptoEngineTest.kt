@@ -15,6 +15,8 @@ import com.kit.wallet.data.messaging.SecureMessagingEncryptionPlan
 import com.kit.wallet.data.messaging.SecureMessagingEncryptionRequest
 import com.kit.wallet.data.messaging.SecureMessagingEnvelopeKind
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
+import com.kit.wallet.data.messaging.SecureMessagingLifecycleGate
+import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
 import com.kit.wallet.data.messaging.SecureMessagingRuntimeStage
 import com.kit.wallet.data.messaging.SecureMessagingProvisioningPlan
@@ -42,7 +44,10 @@ import com.kit.wallet.data.remote.MessagingSignedPrekeyDto
 import com.kit.wallet.data.remote.SecureMessagingWireValidator
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.Base64
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -553,6 +558,176 @@ class LibSignalSecureMessagingCryptoEngineTest {
         assertEquals(SecureMessagingRuntimeStage.QUARANTINED, published.lifecycle.snapshot().stage)
     }
 
+    @Test
+    fun `stale activation cannot commit projection metadata after erase and reopen`() = runTest {
+        val fixture = provisionedPair()
+        establish(fixture.alice, fixture.bob)
+        encrypt(fixture.alice, CLIENT_MESSAGE_ONE, "stale projection", replyTo = null)
+        val durable = checkNotNull(
+            LibSignalCompanionStateReader(fixture.alice.stateStore)
+                .read("outbox", CLIENT_MESSAGE_ONE),
+        )
+        val projections = SecureMessagingProjectionStore(
+            fixture.alice.stateStore,
+            LibSignalCompanionStateReader(fixture.alice.stateStore),
+        )
+        val leaseBlock = fixture.alice.stateStore.blockBeforeNextActivationLease()
+        val staleCommit = async {
+            runCatching {
+                projections.withActivationLease(fixture.alice.activation) {
+                    recordOutboundPending(durable, Instant.ofEpochMilli(2_000L))
+                }
+            }.exceptionOrNull()
+        }
+
+        leaseBlock.awaitEntered()
+        try {
+            reopenReplacement(fixture.alice, "alice-projection-replacement")
+        } finally {
+            leaseBlock.release()
+        }
+
+        assertTrue(staleCommit.await() is IllegalStateException)
+        assertTrue(fixture.alice.stateStore.isEmpty())
+    }
+
+    @Test
+    fun `crypto commit paused after precheck cannot write into replacement activation`() = runTest {
+        val active = publish(
+            activeDevice(
+                userId = ALICE_USER_ID,
+                deviceId = ALICE_DEVICE_ID,
+                signalDeviceId = 1,
+                epoch = "stale-crypto-epoch",
+            ),
+        )
+        val enrollment = checkNotNull(active.engine.localEnrollment(active.activation))
+        val transaction = active.engine.openTransaction(active.activation)
+        transaction.stageProvisioning(enrollment.replenishmentPlan(1, 1))
+        val leaseBlock = active.stateStore.blockBeforeNextActivationLease()
+        val staleCommit = async {
+            runCatching { transaction.commit() }.exceptionOrNull()
+        }
+
+        leaseBlock.awaitEntered()
+        try {
+            reopenReplacement(active, "crypto-commit-replacement")
+        } finally {
+            leaseBlock.release()
+        }
+
+        assertTrue(staleCommit.await() is IllegalStateException)
+        assertEquals(SecureMessagingCryptoTransactionState.FAULTED, transaction.state.value)
+        assertTrue(active.stateStore.isEmpty())
+    }
+
+    @Test
+    fun `stale protocol retirement cannot write into replacement activation`() = runTest {
+        val fixture = provisionedPair()
+        establish(fixture.alice, fixture.bob)
+        val leaseBlock = fixture.alice.stateStore.blockBeforeNextActivationLease()
+        val staleRetirement = async {
+            runCatching {
+                fixture.alice.engine.retireRemoteDevices(
+                    activation = fixture.alice.activation,
+                    affectedUserId = fixture.bob.userId,
+                    affectedServerDeviceId = fixture.bob.deviceId,
+                )
+            }.exceptionOrNull()
+        }
+
+        leaseBlock.awaitEntered()
+        try {
+            reopenReplacement(fixture.alice, "retirement-replacement")
+        } finally {
+            leaseBlock.release()
+        }
+
+        assertTrue(staleRetirement.await() is IllegalStateException)
+        assertTrue(fixture.alice.stateStore.isEmpty())
+    }
+
+    @Test
+    fun `stale enrollment confirmation cannot write into replacement activation`() = runTest {
+        val active = publish(
+            activeDevice(
+                userId = ALICE_USER_ID,
+                deviceId = ALICE_DEVICE_ID,
+                signalDeviceId = 1,
+                epoch = "stale-confirmation-epoch",
+            ),
+        )
+        val leaseBlock = active.stateStore.blockBeforeNextActivationLease()
+        val staleConfirmation = async {
+            runCatching {
+                active.engine.confirmLocalEnrollmentPublication(
+                    activation = active.activation,
+                    registrationId = active.publication.registrationId,
+                    identityKeySha256 = identityDigest(active.publication),
+                )
+            }.exceptionOrNull()
+        }
+
+        leaseBlock.awaitEntered()
+        try {
+            reopenReplacement(active, "confirmation-replacement")
+        } finally {
+            leaseBlock.release()
+        }
+
+        assertTrue(staleConfirmation.await() is IllegalStateException)
+        assertTrue(active.stateStore.isEmpty())
+    }
+
+    @Test
+    fun `stale protocol loaders cannot observe replacement activation`() = runTest {
+        val enrollmentDevice = publish(
+            activeDevice(
+                userId = ALICE_USER_ID,
+                deviceId = ALICE_DEVICE_ID,
+                signalDeviceId = 1,
+                epoch = "stale-enrollment-read-epoch",
+            ),
+        )
+        val enrollmentLease = enrollmentDevice.stateStore.blockBeforeNextActivationLease()
+        val staleEnrollment = async {
+            runCatching {
+                enrollmentDevice.engine.localEnrollment(enrollmentDevice.activation)
+            }.exceptionOrNull()
+        }
+        enrollmentLease.awaitEntered()
+        try {
+            reopenReplacement(enrollmentDevice, "enrollment-read-replacement")
+        } finally {
+            enrollmentLease.release()
+        }
+        assertTrue(staleEnrollment.await() is IllegalStateException)
+        assertTrue(enrollmentDevice.stateStore.isEmpty())
+
+        val transactionDevice = publish(
+            activeDevice(
+                userId = ALICE_USER_ID,
+                deviceId = ALICE_DEVICE_ID,
+                signalDeviceId = 1,
+                epoch = "stale-transaction-read-epoch",
+            ),
+        )
+        val transactionLease = transactionDevice.stateStore.blockBeforeNextActivationLease()
+        val staleTransaction = async {
+            runCatching {
+                transactionDevice.engine.openTransaction(transactionDevice.activation)
+            }.exceptionOrNull()
+        }
+        transactionLease.awaitEntered()
+        try {
+            reopenReplacement(transactionDevice, "transaction-read-replacement")
+        } finally {
+            transactionLease.release()
+        }
+        assertTrue(staleTransaction.await() is IllegalStateException)
+        assertTrue(transactionDevice.stateStore.isEmpty())
+    }
+
     private suspend fun assertEngineRejects(
         sender: PublishedDevice,
         recipient: PublishedDevice,
@@ -609,7 +784,7 @@ class LibSignalSecureMessagingCryptoEngineTest {
         return PairFixture(publishedAlice, publishedBob, entries)
     }
 
-    private fun activeDevice(
+    private suspend fun activeDevice(
         userId: String,
         deviceId: String,
         signalDeviceId: Int,
@@ -624,6 +799,7 @@ class LibSignalSecureMessagingCryptoEngineTest {
             installationId = "$epoch-installation",
         )
         val fence = lifecycle.beginSession(binding)
+        stateStore.allowForActiveSession()
         return ActiveDevice(
             userId,
             deviceId,
@@ -632,6 +808,27 @@ class LibSignalSecureMessagingCryptoEngineTest {
             LibSignalSecureMessagingCryptoEngine(stateStore),
             lifecycle.activationCapability(fence),
             lifecycle,
+        )
+    }
+
+    private suspend fun reopenReplacement(
+        device: PublishedDevice,
+        epoch: String,
+    ) {
+        device.lifecycle.beginErasure()
+        device.stateStore.eraseAll()
+        device.lifecycle.finishErasure()
+        val replacementFence = device.lifecycle.beginSession(
+            SecureMessagingSessionBinding(
+                sessionEpoch = epoch,
+                userId = device.userId,
+                serverDeviceId = device.deviceId,
+                installationId = "$epoch-installation",
+            ),
+        )
+        device.stateStore.allowForActiveSession()
+        device.lifecycle.assertCurrent(
+            device.lifecycle.activationCapability(replacementFence),
         )
     }
 
@@ -951,12 +1148,18 @@ class LibSignalSecureMessagingCryptoEngineTest {
         )
 
         private val records = mutableMapOf<Pair<String, String>, Stored>()
+        private val lifecycleGate = SecureMessagingLifecycleGate()
+        private val activationLeaseHookLock = Any()
+        private var nextActivationLeaseBlock: ActivationLeaseBlock? = null
         private var clock = 1_000L
         var failNextBatch = false
         var lastPagePlaintextBuffers: List<ByteArray> = emptyList()
             private set
 
-        override suspend fun read(namespace: String, recordKey: String): SecureMessagingRecord? =
+        override suspend fun read(
+            namespace: String,
+            recordKey: String,
+        ): SecureMessagingRecord? = lifecycleGate.withOperation {
             records[namespace to recordKey]?.let {
                 SecureMessagingRecord(
                     namespace,
@@ -966,12 +1169,13 @@ class LibSignalSecureMessagingCryptoEngineTest {
                     it.updatedAtEpochMillis,
                 )
             }
+        }
 
         override suspend fun readNamespacePage(
             namespace: String,
             afterRecordKey: String?,
             limit: Int,
-        ): SecureMessagingRecordPage {
+        ): SecureMessagingRecordPage = lifecycleGate.withOperation {
             validateSecureMessagingNamespacePageRequest(namespace, afterRecordKey, limit)
             val pageRecords = records.entries.asSequence()
                 .filter { it.key.first == namespace }
@@ -989,7 +1193,7 @@ class LibSignalSecureMessagingCryptoEngineTest {
                 )
             }
             lastPagePlaintextBuffers = selected.map(SecureMessagingRecord::bytes)
-            return SecureMessagingRecordPage(
+            SecureMessagingRecordPage(
                 records = selected,
                 nextAfterRecordKey = if (pageRecords.size > limit) {
                     selected.last().recordKey
@@ -1010,7 +1214,7 @@ class LibSignalSecureMessagingCryptoEngineTest {
 
         override suspend fun writeBatch(
             writes: List<SecureMessagingStateWrite>,
-        ): List<SecureMessagingRecordVersion> {
+        ): List<SecureMessagingRecordVersion> = lifecycleGate.withOperation {
             if (failNextBatch) {
                 failNextBatch = false
                 throw IllegalStateException("injected atomic write failure")
@@ -1032,19 +1236,48 @@ class LibSignalSecureMessagingCryptoEngineTest {
                     Stored(version, write.copyBytes(), clock++),
                 )?.bytes?.fill(0)
             }
-            return writes.zip(versions).map { (write, version) ->
+            writes.zip(versions).map { (write, version) ->
                 SecureMessagingRecordVersion(write.namespace, write.recordKey, version)
             }
         }
 
-        override suspend fun deleteNamespace(namespace: String) {
-            records.keys.removeAll { it.first == namespace }
+        override suspend fun <T> withActivationLease(
+            activation: SecureMessagingActivationCapability,
+            readyRequired: Boolean,
+            operation: suspend () -> T,
+        ): T {
+            val block = synchronized(activationLeaseHookLock) {
+                nextActivationLeaseBlock.also { nextActivationLeaseBlock = null }
+            }
+            block?.pause()
+            return lifecycleGate.withActivationOperation(
+                activation = activation,
+                readyRequired = readyRequired,
+                operation = operation,
+            )
         }
 
-        override suspend fun eraseAll() {
+        override suspend fun deleteNamespace(namespace: String) = lifecycleGate.withOperation {
+            records.keys.removeAll { it.first == namespace }
+            Unit
+        }
+
+        override suspend fun eraseAll() = lifecycleGate.erase {
             records.values.forEach { it.bytes.fill(0) }
             records.clear()
         }
+
+        override suspend fun allowForActiveSession() = lifecycleGate.open()
+
+        fun blockBeforeNextActivationLease(): ActivationLeaseBlock =
+            synchronized(activationLeaseHookLock) {
+                check(nextActivationLeaseBlock == null) {
+                    "An activation-lease block is already installed"
+                }
+                ActivationLeaseBlock().also { nextActivationLeaseBlock = it }
+            }
+
+        fun isEmpty(): Boolean = records.isEmpty()
 
         fun version(namespace: String, recordKey: String): Long? =
             records[namespace to recordKey]?.version
@@ -1054,6 +1287,22 @@ class LibSignalSecureMessagingCryptoEngineTest {
                 namespace to recordKey,
                 Stored(version = 1, bytes = bytes.copyOf(), updatedAtEpochMillis = clock++),
             )?.bytes?.fill(0)
+        }
+
+        class ActivationLeaseBlock internal constructor() {
+            private val entered = CompletableDeferred<Unit>()
+            private val released = CompletableDeferred<Unit>()
+
+            suspend fun awaitEntered() = entered.await()
+
+            fun release() {
+                released.complete(Unit)
+            }
+
+            suspend fun pause() {
+                entered.complete(Unit)
+                released.await()
+            }
         }
     }
 

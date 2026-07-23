@@ -30,6 +30,7 @@ import com.kit.wallet.data.messaging.SecureMessagingIncomingNotification
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotificationSink
 import com.kit.wallet.data.messaging.SecureMessagingHistoryBackfillCodec
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
+import com.kit.wallet.data.messaging.SecureMessagingLifecycleGate
 import com.kit.wallet.data.messaging.SecureMessagingNotificationPublicationException
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
@@ -49,6 +50,7 @@ import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingStateStore
 import com.kit.wallet.data.messaging.SecureMessagingStateWrite
 import com.kit.wallet.data.messaging.SecureMessagingSyncCursorStore
+import com.kit.wallet.data.messaging.SecureMessagingSyncCompletionSignal
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.SecureMessagingTextContentBinding
 import com.kit.wallet.data.messaging.encodeSecureMessagingTextContent
@@ -85,9 +87,12 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -96,6 +101,7 @@ import okhttp3.mockwebserver.RecordedRequest
 import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -126,6 +132,39 @@ class SecureMessagingEventProcessorTest {
 
     @After
     fun tearDown() = server.shutdown()
+
+    @Test
+    fun `sync completion waits for its exact exposed active identity`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+        val active = registry.publish(session, fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val completions = SecureMessagingSyncCompletionSignal()
+        val runtime = DefaultSecureMessagingChatRuntime(
+            sessions = registry,
+            engine = PersistingDecryptionEngine(stateStore),
+            projections = projectionStore(stateStore),
+            syncEngine = object : SecureMessagingSyncEngine {
+                override val isReady = true
+                override suspend fun synchronize() = Unit
+            },
+            scope = backgroundScope,
+            clock = Clock.fixed(Instant.parse(TIMESTAMP), ZoneOffset.UTC),
+            syncCompletions = completions,
+        )
+        val retry = async(start = CoroutineStart.UNDISPATCHED) {
+            runtime.baselineRetrySessions.first()
+        }
+
+        completions.completed(active)
+        assertFalse(retry.isCompleted)
+        runCurrent()
+
+        val exposed = retry.await()
+        assertTrue(runtime.isCurrent(exposed))
+        assertEquals(BINDING.sessionEpoch, exposed.sessionEpoch)
+    }
 
     @Test
     fun `initial sync durably processes inbound and outbound before advancing cursor`() = runTest {
@@ -816,6 +855,100 @@ class SecureMessagingEventProcessorTest {
             "committed_cursor" to null,
             requireSecureMessagingSyncResumePosition(loaded.position),
         )
+    }
+
+    @Test
+    fun `stale event processor cannot commit projection metadata into replacement activation`() =
+        runTest {
+            val (session, lifecycle, _) = openSyncingSession()
+            val delegate = TestSecureMessagingStateStore()
+            val stateStore = LifecycleLeasedStateStore(delegate)
+            stateStore.allowForActiveSession()
+            val projections = projectionStore(stateStore)
+            val roster = authoritativeRoster()
+            val outbound = delegate.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = OUTBOUND_CLIENT_ID,
+                clientMessageId = OUTBOUND_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = "stale outbound",
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        recipient = PEER,
+                        kind = SecureMessagingEnvelopeKind.SESSION,
+                        ciphertext = byteArrayOf(1, 2, 3),
+                    ),
+                ),
+            )
+            projections.recordOutboundPending(outbound, Instant.parse(TIMESTAMP))
+            val responseRelease = CountDownLatch(1)
+            val requestEntered = CountDownLatch(1)
+            server.dispatcher = blockingResponseDispatcher(
+                syncResponse(
+                    events = listOf(outboundEvent(roster, eventId = 10)),
+                    nextCursor = "stale_projection_cursor",
+                ),
+                requestEntered,
+                responseRelease,
+            )
+            val processor = processor(
+                stateStore,
+                PersistingDecryptionEngine(delegate),
+                projections,
+            )
+            val staleSync = async(Dispatchers.IO) {
+                runCatching { processor.synchronize(session) }.exceptionOrNull()
+            }
+
+            assertTrue(requestEntered.await(5, TimeUnit.SECONDS))
+            val leaseBlock = stateStore.blockBeforeNextActivationLease()
+            responseRelease.countDown()
+            leaseBlock.awaitEntered()
+            try {
+                replaceWithFreshActivation(lifecycle, stateStore, "projection-replacement")
+            } finally {
+                leaseBlock.release()
+            }
+
+            assertTrue(staleSync.await() is IllegalStateException)
+            assertTrue(projections.readPage(limit = 10).messages().isEmpty())
+            assertNull(SecureMessagingSyncCursorStore(stateStore).load())
+        }
+
+    @Test
+    fun `stale event processor cannot commit cursor into replacement activation`() = runTest {
+        val (session, lifecycle, _) = openSyncingSession()
+        val delegate = TestSecureMessagingStateStore()
+        val stateStore = LifecycleLeasedStateStore(delegate)
+        stateStore.allowForActiveSession()
+        val responseRelease = CountDownLatch(1)
+        val requestEntered = CountDownLatch(1)
+        server.dispatcher = blockingResponseDispatcher(
+            syncResponse(events = emptyList(), nextCursor = "stale_cursor"),
+            requestEntered,
+            responseRelease,
+        )
+        val processor = processor(stateStore, PersistingDecryptionEngine(delegate))
+        val staleSync = async(Dispatchers.IO) {
+            runCatching { processor.synchronize(session) }.exceptionOrNull()
+        }
+
+        assertTrue(requestEntered.await(5, TimeUnit.SECONDS))
+        val leaseBlock = stateStore.blockBeforeNextActivationLease()
+        responseRelease.countDown()
+        leaseBlock.awaitEntered()
+        try {
+            replaceWithFreshActivation(lifecycle, stateStore, "cursor-replacement")
+        } finally {
+            leaseBlock.release()
+        }
+
+        assertTrue(staleSync.await() is IllegalStateException)
+        assertNull(SecureMessagingSyncCursorStore(stateStore).load())
     }
 
     @Test
@@ -1601,8 +1734,11 @@ class SecureMessagingEventProcessorTest {
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
         enqueueRoster(roster) // Sentinel: a broken gate would consume this response.
         val requestsBeforeRetry = server.requestCount
+        runCurrent()
+        val activeChatSession = checkNotNull(runtime.activeSession.value)
 
         runtime.sendText(
+            activeChatSession,
             CONVERSATION_ID,
             media.authenticatedText,
             retryClientMessageId = OUTBOUND_CLIENT_ID,
@@ -1726,6 +1862,38 @@ class SecureMessagingEventProcessorTest {
         lifecycle.beginKeyPreparation(fence)
         lifecycle.beginRosterSync(fence)
         return Triple(session, lifecycle, fence)
+    }
+
+    private fun blockingResponseDispatcher(
+        response: MockResponse,
+        requestEntered: CountDownLatch,
+        responseRelease: CountDownLatch,
+    ): Dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+            requestEntered.countDown()
+            return if (responseRelease.await(5, TimeUnit.SECONDS)) {
+                response
+            } else {
+                MockResponse().setResponseCode(503)
+            }
+        }
+    }
+
+    private suspend fun replaceWithFreshActivation(
+        lifecycle: SecureMessagingLifecycleGuard,
+        stateStore: LifecycleLeasedStateStore,
+        sessionEpoch: String,
+    ) {
+        lifecycle.beginErasure()
+        stateStore.eraseAll()
+        lifecycle.finishErasure()
+        lifecycle.beginSession(
+            BINDING.copy(
+                sessionEpoch = sessionEpoch,
+                installationId = "$sessionEpoch-installation",
+            ),
+        )
+        stateStore.allowForActiveSession()
     }
 
     private fun processor(
@@ -2553,6 +2721,90 @@ class SecureMessagingEventProcessorTest {
                 throw SecureMessagingStateConflictException("committed before injected conflict")
             }
             return committed
+        }
+    }
+
+    private class LifecycleLeasedStateStore(
+        private val delegate: TestSecureMessagingStateStore,
+    ) : SecureMessagingStateStore {
+        private val lifecycleGate = SecureMessagingLifecycleGate()
+        private val hookLock = Any()
+        private var nextActivationLeaseBlock: ActivationLeaseBlock? = null
+
+        override suspend fun read(
+            namespace: String,
+            recordKey: String,
+        ): SecureMessagingRecord? = lifecycleGate.withOperation {
+            delegate.read(namespace, recordKey)
+        }
+
+        override suspend fun readNamespacePage(
+            namespace: String,
+            afterRecordKey: String?,
+            limit: Int,
+        ): SecureMessagingRecordPage = lifecycleGate.withOperation {
+            delegate.readNamespacePage(namespace, afterRecordKey, limit)
+        }
+
+        override suspend fun write(
+            namespace: String,
+            recordKey: String,
+            expectedVersion: Long?,
+            bytes: ByteArray,
+        ): SecureMessagingRecordVersion = lifecycleGate.withOperation {
+            delegate.write(namespace, recordKey, expectedVersion, bytes)
+        }
+
+        override suspend fun writeBatch(
+            writes: List<SecureMessagingStateWrite>,
+        ): List<SecureMessagingRecordVersion> = lifecycleGate.withOperation {
+            delegate.writeBatch(writes)
+        }
+
+        override suspend fun <T> withActivationLease(
+            activation: SecureMessagingActivationCapability,
+            readyRequired: Boolean,
+            operation: suspend () -> T,
+        ): T {
+            val block = synchronized(hookLock) {
+                nextActivationLeaseBlock.also { nextActivationLeaseBlock = null }
+            }
+            block?.pause()
+            return lifecycleGate.withActivationOperation(
+                activation = activation,
+                readyRequired = readyRequired,
+                operation = operation,
+            )
+        }
+
+        override suspend fun deleteNamespace(namespace: String) =
+            lifecycleGate.withOperation { delegate.deleteNamespace(namespace) }
+
+        override suspend fun eraseAll() = lifecycleGate.erase { delegate.eraseAll() }
+
+        override suspend fun allowForActiveSession() = lifecycleGate.open()
+
+        fun blockBeforeNextActivationLease(): ActivationLeaseBlock = synchronized(hookLock) {
+            check(nextActivationLeaseBlock == null) {
+                "An activation-lease block is already installed"
+            }
+            ActivationLeaseBlock().also { nextActivationLeaseBlock = it }
+        }
+
+        class ActivationLeaseBlock internal constructor() {
+            private val entered = CompletableDeferred<Unit>()
+            private val released = CompletableDeferred<Unit>()
+
+            suspend fun awaitEntered() = entered.await()
+
+            fun release() {
+                released.complete(Unit)
+            }
+
+            suspend fun pause() {
+                entered.complete(Unit)
+                released.await()
+            }
         }
     }
 

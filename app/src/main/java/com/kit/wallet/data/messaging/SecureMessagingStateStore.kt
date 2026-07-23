@@ -1,5 +1,7 @@
 package com.kit.wallet.data.messaging
 
+import android.content.Context
+import android.os.UserManager
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
@@ -8,7 +10,10 @@ import androidx.annotation.VisibleForTesting
 import androidx.room.withTransaction
 import com.kit.wallet.data.local.KitWalletDatabase
 import com.kit.wallet.data.local.SecureMessagingRecordEntity
+import com.kit.wallet.data.session.CoroutineOwnedMutex
+import dagger.hilt.android.qualifiers.ApplicationContext
 import java.nio.ByteBuffer
+import java.security.InvalidKeyException
 import java.security.KeyStore
 import java.security.KeyStoreException
 import java.security.ProviderException
@@ -19,8 +24,7 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -147,6 +151,32 @@ interface SecureMessagingStateStore : SecureMessagingStateEraser {
     /** Atomically commits all records or none, allowing ratchet/replay/message state to advance together. */
     suspend fun writeBatch(writes: List<SecureMessagingStateWrite>): List<SecureMessagingRecordVersion>
 
+    /**
+     * Holds the open-state lifecycle lease across a compound operation that is already fenced by
+     * its exact authenticated-session owner. Unlike [withActivationLease], this does not establish
+     * activation authority by itself; callers must acquire the SessionStore owner first.
+     */
+    suspend fun <T> withStateLease(operation: suspend () -> T): T = operation()
+
+    /**
+     * Runs state work only for one exact messaging activation. Production holds the same exclusive
+     * lease used by erasure, so an obsolete coroutine can neither cross erase/reopen nor commit
+     * into a replacement activation's freshly opened store.
+     */
+    suspend fun <T> withActivationLease(
+        activation: SecureMessagingActivationCapability,
+        readyRequired: Boolean = false,
+        operation: suspend () -> T,
+    ): T {
+        val provenance = SecureMessagingActivationProvenance.requireCurrent(
+            activation,
+            readyRequired,
+        )
+        val result = operation()
+        provenance.assertCurrent(readyRequired)
+        return result
+    }
+
     suspend fun deleteNamespace(namespace: String)
 
     /** Cryptographically erases all device-local messaging state before a Kit session is removed. */
@@ -156,12 +186,29 @@ interface SecureMessagingStateStore : SecureMessagingStateEraser {
 fun interface SecureMessagingStateEraser {
     suspend fun eraseAll()
 
+    /**
+     * Runs [finalSnapshot] after all in-flight state operations have finished and before state is
+     * closed and erased. Production implementations keep the same exclusive state lease across
+     * both calls, so no accepted commit can land between the snapshot and cryptographic erasure.
+     */
+    suspend fun eraseAllAfterFinalSnapshot(finalSnapshot: suspend () -> Unit) {
+        finalSnapshot()
+        eraseAll()
+    }
+
     suspend fun allowForActiveSession() = Unit
 }
 
 data class EncryptedMessagingRecord(
     val iv: ByteArray,
     val ciphertext: ByteArray,
+)
+
+/** Distinguishes a genuinely new alias from an existing handle found during bootstrap. */
+@VisibleForTesting
+internal data class SecureMessagingRecordKeyResolution<T : Any>(
+    val key: T,
+    val createdNow: Boolean,
 )
 
 interface SecureMessagingRecordCipher {
@@ -176,18 +223,34 @@ interface SecureMessagingRecordCipher {
 }
 
 @Singleton
-class AndroidKeystoreMessagingRecordCipher @Inject constructor() : SecureMessagingRecordCipher {
+class AndroidKeystoreMessagingRecordCipher @Inject constructor(
+    @ApplicationContext private val context: Context,
+) : SecureMessagingRecordCipher {
+    private val keyHealth = context.getSharedPreferences(KEY_HEALTH_PREFERENCES, Context.MODE_PRIVATE)
+
     override fun encrypt(
         aad: ByteArray,
         plaintext: ByteArray,
         allowKeyCreation: Boolean,
     ): EncryptedMessagingRecord = try {
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, recordKey(allowKeyCreation))
-        cipher.updateAAD(aad)
+        val resolvedKey = recordKey(allowKeyCreation)
+        try {
+            cipher.init(Cipher.ENCRYPT_MODE, resolvedKey.key)
+        } catch (error: Exception) {
+            throw recordKeyOperationFailure(error, resolvedKey.createdNow)
+        }
+        val ciphertext = completeKeystoreCipherOperation(
+            operation = {
+                cipher.updateAAD(aad)
+                cipher.doFinal(plaintext)
+            },
+            classifyFailure = { recordKeyOperationFailure(it, resolvedKey.createdNow) },
+            onSuccess = ::clearKeyFailureObservations,
+        )
         EncryptedMessagingRecord(
             iv = cipher.iv.copyOf(),
-            ciphertext = cipher.doFinal(plaintext),
+            ciphertext = ciphertext,
         )
     } catch (error: Exception) {
         throw secureMessagingStateAccessFailure(
@@ -200,16 +263,29 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor() : SecureMessagi
         require(record.iv.size == GCM_IV_BYTES) { "Invalid secure messaging state IV" }
         require(record.ciphertext.size >= GCM_TAG_BYTES) { "Invalid secure messaging ciphertext" }
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(
-            Cipher.DECRYPT_MODE,
-            // Never manufacture a replacement key while ciphertext is present. Some Android 9
-            // Keystore providers briefly hide an existing alias while locked or recovering; a
-            // replacement would make every retained messaging record permanently undecryptable.
-            recordKey(allowCreation = false),
-            GCMParameterSpec(GCM_TAG_BITS, record.iv),
+        val resolvedKey = recordKey(allowCreation = false)
+        try {
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                // Never manufacture a replacement key while ciphertext is present. Some Android 9
+                // Keystore providers briefly hide an existing alias while locked or recovering; a
+                // replacement would make every retained messaging record permanently undecryptable.
+                resolvedKey.key,
+                GCMParameterSpec(GCM_TAG_BITS, record.iv),
+            )
+        } catch (error: Exception) {
+            // Android 9 providers can defer an alias lookup until Cipher.init(). Feed those
+            // alias-specific failures through the same bounded missing-key proof as getKey().
+            throw recordKeyOperationFailure(error, resolvedKey.createdNow)
+        }
+        completeKeystoreCipherOperation(
+            operation = {
+                cipher.updateAAD(aad)
+                cipher.doFinal(record.ciphertext)
+            },
+            classifyFailure = { recordKeyOperationFailure(it, resolvedKey.createdNow) },
+            onSuccess = ::clearKeyFailureObservations,
         )
-        cipher.updateAAD(aad)
-        cipher.doFinal(record.ciphertext)
     } catch (error: Exception) {
         throw secureMessagingStateAccessFailure(
             "Secure messaging state failed authenticated decryption",
@@ -221,7 +297,11 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor() : SecureMessagi
     override fun eraseKey() {
         try {
             val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            if (keyStore.containsAlias(KEY_ALIAS)) keyStore.deleteEntry(KEY_ALIAS)
+            deleteKeystoreAliasAndVerifyAbsent(
+                deleteEntry = { keyStore.deleteEntry(KEY_ALIAS) },
+                aliasExists = { keyStore.containsAlias(KEY_ALIAS) },
+            )
+            clearKeyFailureObservations()
         } catch (error: Exception) {
             throw SecureMessagingStateUnavailableException(
                 "Secure messaging state key could not be erased",
@@ -230,21 +310,174 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor() : SecureMessagi
         }
     }
 
-    private fun recordKey(allowCreation: Boolean): SecretKey = resolveSecureMessagingRecordKey(
-        allowCreation = allowCreation,
-        loadExisting = {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            keyStore.getKey(KEY_ALIAS, null) as? SecretKey
-        },
-        createNew = ::generateKey,
-    )
+    @Synchronized
+    private fun recordKey(
+        allowCreation: Boolean,
+    ): SecureMessagingRecordKeyResolution<SecretKey> {
+        var freshKeyGenerationStarted = false
+        return try {
+            resolveSecureMessagingRecordKeyWithCreationStatus(
+                allowCreation = allowCreation,
+                loadExisting = {
+                    val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                    (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.also {
+                        // A visible handle disproves only alias absence. Recoverability is proved
+                        // separately by successful Cipher.init(), so preserve that observation.
+                        clearMissingKeyObservations()
+                    }
+                },
+                createNew = {
+                    generateKey { freshKeyGenerationStarted = true }
+                },
+                missingKeyFailure = ::missingKeyFailure,
+                classifyExistingAliasFailure = ::classifyRetryableAliasAccessFailure,
+            )
+        } catch (error: Exception) {
+            // A failure while resolving an already-present alias must not inherit the empty-store
+            // permission to create. Only an attempt that reached fresh key generation retains
+            // bootstrap retry semantics.
+            throw classifySecureMessagingRecordKeyOperationFailure(
+                error = error,
+                keyCreatedNow = freshKeyGenerationStarted,
+                classifyExistingAliasFailure = ::classifyRetryableAliasAccessFailure,
+            )
+        }
+    }
 
     @Synchronized
-    private fun generateKey(): SecretKey {
-        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+    private fun recordKeyOperationFailure(
+        error: Exception,
+        keyCreatedNow: Boolean,
+    ): Exception = classifySecureMessagingRecordKeyOperationFailure(
+        error = error,
+        keyCreatedNow = keyCreatedNow,
+        classifyExistingAliasFailure = ::classifyRetryableAliasAccessFailure,
+    )
 
-        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE).run {
+    /**
+     * Provider errors alone do not prove that ciphertext lost its key. Advance recovery only for
+     * an independently absent alias, or the narrow present-but-UnrecoverableKeyException case.
+     */
+    @Synchronized
+    private fun classifyRetryableAliasAccessFailure(error: Exception): Exception {
+        val requiresUserAuthentication = generateSequence<Throwable>(error) { it.cause }
+            .any { it is UserNotAuthenticatedException }
+        if (requiresUserAuthentication) {
+            clearKeyFailureObservations()
+        }
+        val aliasPresent = runCatching {
+            KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }.containsAlias(KEY_ALIAS)
+        }.getOrNull()
+        val unrecoverableKey = error.hasUnrecoverableSecureMessagingRecordKeyCause()
+        when {
+            aliasPresent == false -> clearUnrecoverableKeyObservations()
+            aliasPresent == true && unrecoverableKey -> clearMissingKeyObservations()
+            aliasPresent == true -> clearKeyFailureObservations()
+        }
+        return classifySecureMessagingRecordKeyAccessFailure(
+            cause = error,
+            userAuthenticationRequired = requiresUserAuthentication,
+            aliasPresent = aliasPresent,
+            observeMissingAlias = ::missingKeyFailure,
+            observeUnrecoverableAlias = ::unrecoverableKeyFailure,
+        )
+    }
+
+    @Synchronized
+    private fun missingKeyFailure(cause: Throwable? = null): RuntimeException {
+        clearUnrecoverableKeyObservations()
+        return observedKeyFailure(
+            cause = cause,
+            countPreference = KEY_MISSING_COUNT,
+            firstObservedAtPreference = KEY_FIRST_MISSING_AT,
+            permanentFailure = ::SecureMessagingRecordKeyPermanentlyMissingException,
+        )
+    }
+
+    @Synchronized
+    private fun unrecoverableKeyFailure(cause: Throwable): RuntimeException {
+        clearMissingKeyObservations()
+        return observedKeyFailure(
+            cause = cause,
+            countPreference = KEY_UNRECOVERABLE_COUNT,
+            firstObservedAtPreference = KEY_FIRST_UNRECOVERABLE_AT,
+            permanentFailure = ::SecureMessagingRecordKeyPermanentlyUnrecoverableException,
+        )
+    }
+
+    private fun observedKeyFailure(
+        cause: Throwable?,
+        countPreference: String,
+        firstObservedAtPreference: String,
+        permanentFailure: (Throwable?) -> RuntimeException,
+    ): RuntimeException {
+        val now = System.currentTimeMillis()
+        val previous = SecureMessagingRecordKeyMissState(
+            consecutiveUnlockedMisses = keyHealth.getInt(countPreference, 0),
+            firstUnlockedMissAtEpochMillis = keyHealth.getLong(firstObservedAtPreference, 0L),
+        )
+        val requiresUserAuthentication = generateSequence(cause) { it.cause }
+            .any { it is UserNotAuthenticatedException }
+        val userUnlocked = !requiresUserAuthentication &&
+            context.getSystemService(UserManager::class.java)?.isUserUnlocked == true
+        val observed = observeSecureMessagingRecordKeyMiss(
+            previous = previous,
+            userUnlocked = userUnlocked,
+            nowEpochMillis = now,
+        )
+        keyHealth.edit()
+            .putInt(countPreference, observed.consecutiveUnlockedMisses)
+            .putLong(firstObservedAtPreference, observed.firstUnlockedMissAtEpochMillis)
+            .commit()
+        return if (observed.permanentlyMissing) {
+            permanentFailure(cause)
+        } else {
+            SecureMessagingRecordKeyTemporarilyUnavailableException(cause)
+        }
+    }
+
+    @Synchronized
+    private fun clearMissingKeyObservations() {
+        if (keyHealth.contains(KEY_MISSING_COUNT) || keyHealth.contains(KEY_FIRST_MISSING_AT)) {
+            keyHealth.edit()
+                .remove(KEY_MISSING_COUNT)
+                .remove(KEY_FIRST_MISSING_AT)
+                .apply()
+        }
+    }
+
+    @Synchronized
+    private fun clearUnrecoverableKeyObservations() {
+        if (keyHealth.contains(KEY_UNRECOVERABLE_COUNT) ||
+            keyHealth.contains(KEY_FIRST_UNRECOVERABLE_AT)
+        ) {
+            keyHealth.edit()
+                .remove(KEY_UNRECOVERABLE_COUNT)
+                .remove(KEY_FIRST_UNRECOVERABLE_AT)
+                .apply()
+        }
+    }
+
+    @Synchronized
+    private fun clearKeyFailureObservations() {
+        clearMissingKeyObservations()
+        clearUnrecoverableKeyObservations()
+    }
+
+    @Synchronized
+    private fun generateKey(
+        onFreshGenerationStarted: () -> Unit,
+    ): SecureMessagingRecordKeyResolution<SecretKey> {
+        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { existing ->
+            return SecureMessagingRecordKeyResolution(existing, createdNow = false)
+        }
+
+        onFreshGenerationStarted()
+        val generated = KeyGenerator.getInstance(
+            KeyProperties.KEY_ALGORITHM_AES,
+            ANDROID_KEYSTORE,
+        ).run {
             init(
                 KeyGenParameterSpec.Builder(
                     KEY_ALIAS,
@@ -257,10 +490,16 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor() : SecureMessagi
             )
             generateKey()
         }
+        return SecureMessagingRecordKeyResolution(generated, createdNow = true)
     }
 
     private companion object {
         const val KEY_ALIAS = "kit_pay_secure_messaging_aes_v1"
+        const val KEY_HEALTH_PREFERENCES = "kit_pay_secure_messaging_key_health_v1"
+        const val KEY_MISSING_COUNT = "missing_alias_count"
+        const val KEY_FIRST_MISSING_AT = "missing_alias_first_seen_at"
+        const val KEY_UNRECOVERABLE_COUNT = "unrecoverable_alias_count"
+        const val KEY_FIRST_UNRECOVERABLE_AT = "unrecoverable_alias_first_seen_at"
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val GCM_TAG_BITS = 128
@@ -511,17 +750,33 @@ class RoomSecureMessagingStateStore @Inject constructor(
         writes.forEach(SecureMessagingStateWrite::wipeBytes)
     }
 
+    override suspend fun <T> withActivationLease(
+        activation: SecureMessagingActivationCapability,
+        readyRequired: Boolean,
+        operation: suspend () -> T,
+    ): T = lifecycleGate.withActivationOperation(
+        activation = activation,
+        readyRequired = readyRequired,
+        operation = operation,
+    )
+
+    override suspend fun <T> withStateLease(operation: suspend () -> T): T =
+        lifecycleGate.withOperation(operation)
+
     override suspend fun deleteNamespace(namespace: String) = lifecycleGate.withOperation {
         validateRecordAddress(namespace, "namespace-delete")
         records.deleteNamespace(namespace)
     }
 
-    override suspend fun eraseAll() = lifecycleGate.erase {
-        eraseMessagingKeyAndRecords(
-            eraseKey = cipher::eraseKey,
-            eraseRecords = records::deleteAll,
-        )
-    }
+    override suspend fun eraseAll() = eraseAllAfterFinalSnapshot { }
+
+    override suspend fun eraseAllAfterFinalSnapshot(finalSnapshot: suspend () -> Unit) =
+        lifecycleGate.eraseAfterFinalSnapshot(finalSnapshot) {
+            eraseMessagingKeyAndRecords(
+                eraseKey = cipher::eraseKey,
+                eraseRecords = records::deleteAll,
+            )
+        }
 
     override suspend fun allowForActiveSession() {
         lifecycleGate.open()
@@ -542,8 +797,16 @@ class SecureMessagingSessionLifecycle @Inject internal constructor(
         if (!isSameSession) eraseActivationState()
     }
 
-    suspend fun beforeSessionClear() {
-        eraseActivationState()
+    suspend fun beforeSessionClear(
+        allowPermanentlyUnavailableSnapshot: Boolean = false,
+        finalSnapshot: suspend () -> Unit = {},
+        beforeErasure: () -> Unit = {},
+    ) {
+        eraseActivationState(
+            allowPermanentlyUnavailableSnapshot = allowPermanentlyUnavailableSnapshot,
+            finalSnapshot = finalSnapshot,
+            beforeErasure = beforeErasure,
+        )
     }
 
     suspend fun afterSessionSave() {
@@ -552,28 +815,76 @@ class SecureMessagingSessionLifecycle @Inject internal constructor(
     }
 
     /** Exact-generation variant used after an enrollment reset proof or local revocation proof. */
-    internal suspend fun resetForRecovery(fence: SecureMessagingSessionFence) {
-        lifecycle.beginRecoveryErasure(fence)
-        mutableStateAvailable.value = false
-        runCatching { notifications.cancelAll() }
+    internal suspend fun resetForRecovery(
+        fence: SecureMessagingSessionFence,
+        allowPermanentlyUnavailableSnapshot: Boolean = false,
+        finalSnapshot: suspend () -> Unit = {},
+        beforeErasure: () -> Unit = {},
+    ) {
+        var erasureStarted = false
         try {
-            eraser.eraseAll()
+            eraser.eraseAllAfterFinalSnapshot {
+                lifecycle.assertRecoveryErasureCurrent(fence)
+                runFinalSnapshot(
+                    allowPermanentlyUnavailableSnapshot,
+                    finalSnapshot,
+                )
+                // Validate the exact activation and persist the caller's crash fence atomically.
+                // A stale fence or marker failure therefore leaves this activation retryable.
+                lifecycle.beginRecoveryErasure(fence, beforeErasure)
+                erasureStarted = true
+                mutableStateAvailable.value = false
+                runCatching { notifications.cancelAll() }
+            }
         } finally {
-            lifecycle.finishErasure()
+            if (erasureStarted) lifecycle.finishErasure()
         }
     }
 
-    private suspend fun eraseActivationState() {
-        mutableStateAvailable.value = false
-        // Revoke local tap grants before any suspension in cryptographic erasure.
-        runCatching { notifications.cancelAll() }
-        lifecycle.beginErasure()
+    private suspend fun eraseActivationState(
+        allowPermanentlyUnavailableSnapshot: Boolean = false,
+        finalSnapshot: suspend () -> Unit = {},
+        beforeErasure: () -> Unit = {},
+    ) {
+        var erasureStarted = false
         try {
-            eraser.eraseAll()
+            eraser.eraseAllAfterFinalSnapshot {
+                // The exclusive state lease has drained earlier commits. Snapshot while the
+                // existing capability is still valid; if it fails, leave the session usable so
+                // logout can be retried without losing the only recoverable projection.
+                runFinalSnapshot(
+                    allowPermanentlyUnavailableSnapshot,
+                    finalSnapshot,
+                )
+                beforeErasure()
+                mutableStateAvailable.value = false
+                runCatching { notifications.cancelAll() }
+                lifecycle.beginErasure()
+                erasureStarted = true
+            }
         } finally {
-            // A failed key/database erase still invalidates every in-memory capability. The
-            // session store separately retains its erasure-pending marker and refuses reuse.
-            lifecycle.finishErasure()
+            if (erasureStarted) {
+                // A failed key/database erase still invalidates every in-memory capability. The
+                // session store separately retains its erasure-pending marker and refuses reuse.
+                lifecycle.finishErasure()
+            }
+        }
+    }
+
+    private suspend fun runFinalSnapshot(
+        allowPermanentlyUnavailableSnapshot: Boolean,
+        finalSnapshot: suspend () -> Unit,
+    ) {
+        try {
+            finalSnapshot()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            if (!allowPermanentlyUnavailableSnapshot ||
+                !isPermanentlyMissingSecureMessagingRecordKey(error)
+            ) {
+                throw error
+            }
         }
     }
 }
@@ -598,25 +909,54 @@ internal class ErasingSecureMessagingCurrentActivationRevocation @Inject constru
 
 @VisibleForTesting
 internal class SecureMessagingLifecycleGate {
-    private val mutex = Mutex()
+    private val mutex = CoroutineOwnedMutex()
     private var operationsAllowed = false
 
-    suspend fun <T> withOperation(operation: suspend () -> T): T = mutex.withLock {
+    suspend fun <T> withOperation(operation: suspend () -> T): T = withExclusiveLease {
         check(operationsAllowed) {
             "Secure messaging state is unavailable without an active local session"
         }
         operation()
     }
 
-    suspend fun erase(erasure: suspend () -> Unit) = mutex.withLock {
-        // Close first and remain closed even if cryptographic/database erasure fails.
+    suspend fun <T> withActivationOperation(
+        activation: SecureMessagingActivationCapability,
+        readyRequired: Boolean = false,
+        operation: suspend () -> T,
+    ): T = withExclusiveLease {
+        check(operationsAllowed) {
+            "Secure messaging state is unavailable without an active local session"
+        }
+        val provenance = SecureMessagingActivationProvenance.requireCurrent(
+            activation,
+            readyRequired,
+        )
+        val result = operation()
+        provenance.assertCurrent(readyRequired)
+        result
+    }
+
+    suspend fun erase(erasure: suspend () -> Unit) =
+        eraseAfterFinalSnapshot(finalSnapshot = {}, erasure = erasure)
+
+    suspend fun eraseAfterFinalSnapshot(
+        finalSnapshot: suspend () -> Unit,
+        erasure: suspend () -> Unit,
+    ) = withExclusiveLease {
+        finalSnapshot()
+        // Close only after the final snapshot succeeds, and remain closed even if
+        // cryptographic/database erasure subsequently fails.
         operationsAllowed = false
         erasure()
     }
 
-    suspend fun open() = mutex.withLock {
+    suspend fun open() = withExclusiveLease {
         operationsAllowed = true
     }
+
+    /** Allows state-store calls made by the same coroutine during the final snapshot. */
+    private suspend fun <T> withExclusiveLease(operation: suspend () -> T): T =
+        mutex.withLock(operation)
 }
 
 @VisibleForTesting
@@ -641,16 +981,99 @@ internal suspend fun eraseMessagingKeyAndRecords(
     keyFailure?.let { throw it }
 }
 
+/**
+ * Deletes by exact alias without using `containsAlias(false)` as proof of erasure. Android 9 OEM
+ * providers can temporarily hide a live alias from lookup; the delete operation must still be
+ * attempted, and a provider that leaves the alias visible must keep lifecycle recovery fenced.
+ */
+@VisibleForTesting
+internal fun deleteKeystoreAliasAndVerifyAbsent(
+    deleteEntry: () -> Unit,
+    aliasExists: () -> Boolean,
+) {
+    deleteEntry()
+    check(!aliasExists()) { "Android Keystore retained an alias after deletion" }
+}
+
+/**
+ * Android 9 providers may defer use of an alias-backed key until updateAAD/doFinal. Keep failure
+ * classification around that complete operation and clear key-health evidence only on success.
+ */
+@VisibleForTesting
+internal fun <T> completeKeystoreCipherOperation(
+    operation: () -> T,
+    classifyFailure: (Exception) -> Exception,
+    onSuccess: () -> Unit,
+): T {
+    val result = try {
+        operation()
+    } catch (error: Exception) {
+        throw classifyFailure(error)
+    }
+    onSuccess()
+    return result
+}
+
 /** A decrypt/update path must never replace an alias that Android 9 temporarily cannot expose. */
 @VisibleForTesting
 internal fun <T : Any> resolveSecureMessagingRecordKey(
     allowCreation: Boolean,
     loadExisting: () -> T?,
     createNew: () -> T,
+    missingKeyFailure: () -> RuntimeException = {
+        SecureMessagingRecordKeyTemporarilyUnavailableException()
+    },
 ): T {
     loadExisting()?.let { return it }
-    if (!allowCreation) throw SecureMessagingRecordKeyTemporarilyUnavailableException()
+    if (!allowCreation) throw missingKeyFailure()
     return createNew()
+}
+
+/**
+ * Production key resolution retains whether this call actually generated the returned alias.
+ * An empty database merely permits creation; it does not make an existing unusable alias fresh.
+ */
+@VisibleForTesting
+internal fun <T : Any> resolveSecureMessagingRecordKeyWithCreationStatus(
+    allowCreation: Boolean,
+    loadExisting: () -> T?,
+    createNew: () -> SecureMessagingRecordKeyResolution<T>,
+    missingKeyFailure: () -> RuntimeException = {
+        SecureMessagingRecordKeyTemporarilyUnavailableException()
+    },
+    classifyExistingAliasFailure: ((Exception) -> Exception)? = null,
+): SecureMessagingRecordKeyResolution<T> {
+    val existing = try {
+        loadExisting()
+    } catch (error: Exception) {
+        val classifier = classifyExistingAliasFailure ?: throw error
+        throw classifySecureMessagingRecordKeyOperationFailure(
+            error = error,
+            keyCreatedNow = false,
+            classifyExistingAliasFailure = classifier,
+        )
+    }
+    existing?.let { resolved ->
+        return SecureMessagingRecordKeyResolution(resolved, createdNow = false)
+    }
+    if (!allowCreation) throw missingKeyFailure()
+    return createNew()
+}
+
+/** Existing aliases use the bounded Android-9 recovery proof even on an empty-store write. */
+@VisibleForTesting
+internal fun classifySecureMessagingRecordKeyOperationFailure(
+    error: Exception,
+    keyCreatedNow: Boolean,
+    classifyExistingAliasFailure: (Exception) -> Exception,
+): Exception = when {
+    error.hasPermanentlyInvalidatedSecureMessagingRecordKey() ->
+        SecureMessagingRecordKeyPermanentlyUnrecoverableException(error)
+    keyCreatedNow ||
+        isTransientSecureMessagingRecordKeyFailure(error) ||
+        isPermanentlyMissingSecureMessagingRecordKey(error) ||
+        !isRetryableSecureMessagingStateFailure(error) -> error
+    else -> classifyExistingAliasFailure(error)
 }
 
 /** Only the first encryption in a genuinely empty store may bootstrap a new at-rest key. */
@@ -664,10 +1087,90 @@ internal fun secureMessagingKeyCreationAllowed(
     return existingRecordCount == 0 && writeIndex == 0
 }
 
+/** A generic provider failure is never by itself evidence that a retained alias disappeared. */
+@VisibleForTesting
+internal fun classifySecureMessagingRecordKeyAccessFailure(
+    cause: Throwable,
+    userAuthenticationRequired: Boolean,
+    aliasPresent: Boolean?,
+    observeMissingAlias: (Throwable) -> RuntimeException,
+    observeUnrecoverableAlias: (Throwable) -> RuntimeException,
+): RuntimeException = when {
+    userAuthenticationRequired -> SecureMessagingRecordKeyTemporarilyUnavailableException(cause)
+    aliasPresent == false -> observeMissingAlias(cause)
+    aliasPresent == true && cause.hasUnrecoverableSecureMessagingRecordKeyCause() ->
+        observeUnrecoverableAlias(cause)
+    else -> SecureMessagingRecordKeyTemporarilyUnavailableException(cause)
+}
+
 @VisibleForTesting
 internal class SecureMessagingRecordKeyTemporarilyUnavailableException(
     cause: Throwable? = null,
 ) : IllegalStateException("The secure messaging record key is temporarily unavailable", cause)
+
+/** The device is unlocked and repeated observations prove that retained ciphertext lost its key. */
+@VisibleForTesting
+internal class SecureMessagingRecordKeyPermanentlyMissingException(
+    cause: Throwable? = null,
+) : IllegalStateException(
+    "The secure messaging record key is permanently missing",
+    cause,
+)
+
+/** The alias exists, but Android repeatedly proves that its key material cannot be recovered. */
+@VisibleForTesting
+internal class SecureMessagingRecordKeyPermanentlyUnrecoverableException(
+    cause: Throwable? = null,
+) : IllegalStateException(
+    "The secure messaging record key is permanently unrecoverable",
+    cause,
+)
+
+@VisibleForTesting
+internal data class SecureMessagingRecordKeyMissState(
+    val consecutiveUnlockedMisses: Int = 0,
+    val firstUnlockedMissAtEpochMillis: Long = 0L,
+) {
+    val permanentlyMissing: Boolean
+        get() = consecutiveUnlockedMisses >= PERMANENT_MISSING_KEY_OBSERVATIONS &&
+            firstUnlockedMissAtEpochMillis > 0L
+}
+
+/**
+ * A single null lookup is ambiguous on Android 9. Escalate only after several unlocked-device
+ * observations spanning a real interval; lock-state or clock anomalies restart the proof.
+ */
+@VisibleForTesting
+internal fun observeSecureMessagingRecordKeyMiss(
+    previous: SecureMessagingRecordKeyMissState,
+    userUnlocked: Boolean,
+    nowEpochMillis: Long,
+): SecureMessagingRecordKeyMissState {
+    if (!userUnlocked || nowEpochMillis <= 0L) return SecureMessagingRecordKeyMissState()
+    val first = previous.firstUnlockedMissAtEpochMillis
+    val continues = previous.consecutiveUnlockedMisses > 0 &&
+        first > 0L &&
+        nowEpochMillis >= first &&
+        nowEpochMillis - first <= MAX_MISSING_KEY_OBSERVATION_WINDOW_MILLIS
+    val firstObservedAt = if (continues) first else nowEpochMillis
+    val count = if (continues) {
+        (previous.consecutiveUnlockedMisses + 1).coerceAtMost(PERMANENT_MISSING_KEY_OBSERVATIONS)
+    } else {
+        1
+    }
+    val elapsed = nowEpochMillis - firstObservedAt
+    return SecureMessagingRecordKeyMissState(
+        consecutiveUnlockedMisses = if (
+            count >= PERMANENT_MISSING_KEY_OBSERVATIONS &&
+            elapsed < MIN_PERMANENT_MISSING_KEY_INTERVAL_MILLIS
+        ) {
+            PERMANENT_MISSING_KEY_OBSERVATIONS - 1
+        } else {
+            count
+        },
+        firstUnlockedMissAtEpochMillis = firstObservedAt,
+    )
+}
 
 /**
  * Provider/lock-state failures retry without resetting the server enrollment. Authenticated
@@ -676,16 +1179,56 @@ internal class SecureMessagingRecordKeyTemporarilyUnavailableException(
 @VisibleForTesting
 internal fun isRetryableSecureMessagingStateFailure(error: Throwable): Boolean {
     val causes = generateSequence(error) { it.cause }.toList()
-    if (causes.any { it is KeyPermanentlyInvalidatedException }) return false
+    if (causes.any {
+            it is KeyPermanentlyInvalidatedException ||
+                it is SecureMessagingRecordKeyPermanentlyMissingException ||
+                it is SecureMessagingRecordKeyPermanentlyUnrecoverableException
+        }
+    ) {
+        return false
+    }
     return causes.any { cause ->
         cause is SecureMessagingRecordKeyTemporarilyUnavailableException ||
             cause is UserNotAuthenticatedException ||
             cause.javaClass.name == "android.security.KeyStoreException" ||
+            cause is InvalidKeyException ||
             cause is KeyStoreException ||
             cause is UnrecoverableKeyException ||
             cause is ProviderException
-    }
+        }
 }
+
+private fun Throwable.hasUnrecoverableSecureMessagingRecordKeyCause(): Boolean =
+    generateSequence(this) { it.cause }
+        .any {
+            it is UnrecoverableKeyException ||
+                it is KeyPermanentlyInvalidatedException ||
+                it is InvalidKeyException
+        }
+
+private fun Throwable.hasPermanentlyInvalidatedSecureMessagingRecordKey(): Boolean =
+    generateSequence(this) { it.cause }.any { it is KeyPermanentlyInvalidatedException }
+
+/** True only for the explicit Android-Keystore alias observation used by bounded local retries. */
+@VisibleForTesting
+internal fun isTransientSecureMessagingRecordKeyFailure(error: Throwable): Boolean {
+    val causes = generateSequence(error) { it.cause }.toList()
+    return causes.none {
+        it is SecureMessagingRecordKeyPermanentlyMissingException ||
+            it is SecureMessagingRecordKeyPermanentlyUnrecoverableException
+    } &&
+        causes.any { it is SecureMessagingRecordKeyTemporarilyUnavailableException }
+}
+
+/** Distinguishes permanently unavailable at-rest keys from authenticated ciphertext corruption. */
+@VisibleForTesting
+internal fun isPermanentlyMissingSecureMessagingRecordKey(error: Throwable): Boolean =
+    generateSequence(error) { it.cause }
+        .any {
+            it is SecureMessagingRecordKeyPermanentlyMissingException ||
+                it is SecureMessagingRecordKeyPermanentlyUnrecoverableException ||
+                it is KeyPermanentlyInvalidatedException
+        }
 
 /** Keeps transient Android 9/OEM provider failures retryable while corruption stays fail-closed. */
 @VisibleForTesting
@@ -735,5 +1278,8 @@ internal fun validateSecureMessagingNamespacePageRequest(
 
 private val SECURE_RECORD_ADDRESS = Regex("^[A-Za-z0-9._:@-]{1,160}$")
 
+private const val PERMANENT_MISSING_KEY_OBSERVATIONS = 4
+private const val MIN_PERMANENT_MISSING_KEY_INTERVAL_MILLIS = 15_000L
+private const val MAX_MISSING_KEY_OBSERVATION_WINDOW_MILLIS = 24L * 60L * 60L * 1_000L
 private const val MAX_ATOMIC_WRITES = 256
 internal const val MAX_SECURE_MESSAGING_NAMESPACE_PAGE_SIZE = 100

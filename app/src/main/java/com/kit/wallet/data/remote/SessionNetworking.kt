@@ -2,6 +2,8 @@ package com.kit.wallet.data.remote
 
 import com.kit.wallet.data.auth.requiresProfileSetup
 import com.kit.wallet.data.local.WalletCache
+import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
+import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
 import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
@@ -158,6 +160,8 @@ class SessionAuthenticator @Inject constructor(
     private val tokenRefresher: dagger.Lazy<AuthTokenRefresher>,
     private val walletCache: WalletCache,
     private val refreshCoordinator: AuthSessionRefreshCoordinator = AuthSessionRefreshCoordinator(),
+    private val messageHistory: AccountMessageHistoryRetention =
+        NoOpAccountMessageHistoryRetention,
 ) : Authenticator {
     override fun authenticate(route: Route?, response: Response): Request? {
         if (responseCount(response) >= MAX_AUTH_ATTEMPTS) return null
@@ -212,7 +216,12 @@ class SessionAuthenticator @Inject constructor(
         var failure: Throwable? = null
         var targetCleared = false
         try {
-            targetCleared = sessions.clearIfCredentialsCurrent(failedSession)
+            targetCleared = sessions.clearIfCredentialsCurrentAfterFinalMessagingSnapshot(
+                expected = failedSession,
+                allowPermanentlyUnavailableSnapshot = true,
+            ) {
+                messageHistory.snapshotActiveHistory(failedSession.fence())
+            }
         } catch (error: Throwable) {
             failure = error
             targetCleared = sessions.current() == null

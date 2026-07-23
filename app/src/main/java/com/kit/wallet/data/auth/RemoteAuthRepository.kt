@@ -1,6 +1,10 @@
 package com.kit.wallet.data.auth
 
 import com.kit.wallet.data.notifications.PushTokenCoordinator
+import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
+import com.kit.wallet.data.messaging.AccountMessageArchivePurgeNotDurableException
+import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
+import com.kit.wallet.data.messaging.SecureMessagingSessionFence
 import com.kit.wallet.data.remote.AuthChallengeDto
 import com.kit.wallet.data.remote.AuthResultDto
 import com.kit.wallet.data.remote.AuthTokenRefresher
@@ -62,6 +66,8 @@ class RemoteAuthRepository @Inject constructor(
     private val walletRefreshTrigger: WalletRefreshTrigger,
     private val pushTokens: PushTokenCoordinator,
     private val paymentAuthorizer: PaymentAuthorizer,
+    private val messageHistory: AccountMessageHistoryRetention =
+        NoOpAccountMessageHistoryRetention,
     @ApplicationScope applicationScope: CoroutineScope,
 ) : AuthRepository {
 
@@ -220,7 +226,10 @@ class RemoteAuthRepository @Inject constructor(
                     )
                 }
                 is SessionRefreshResult.Rejected -> {
-                    clearLocalUserDataIfCredentialsCurrent(current)
+                    clearLocalUserDataIfCredentialsCurrent(
+                        current,
+                        preserveMessagingHistory = true,
+                    )
                     throw refresh.error
                 }
             }
@@ -234,6 +243,29 @@ class RemoteAuthRepository @Inject constructor(
                 remoteRevocation = RemoteRevocationState.ALREADY_REVOKED,
                 retryRecommended = false,
             )
+        var historyCleanupFailed = false
+        if (allDevices) {
+            // Persist both independent crash fences before remote revocation. A restart can then
+            // remove credentials/Signal state and retry the exact-generation archive purge even
+            // if this process dies during the network request.
+            messageHistory.scheduleAccountErasure(target)
+            if (!sessions.prepareClearIfCurrent(target)) {
+                throw SessionInvalidatedException()
+            }
+        } else {
+            // Write-through normally keeps this current. This early pass migrates messages
+            // created before archive support and surfaces archive failures before revocation.
+            // A second, state-exclusive pass is coupled to local erasure below.
+            try {
+                messageHistory.snapshotActiveHistory(target)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                // Do not erase the only remaining projection after a failed final snapshot. The
+                // authenticated session stays active so the user can retry logout without loss.
+                throw error
+            }
+        }
         var remoteRevocation = RemoteRevocationState.CONFIRMED
         var warning: String? = null
         try {
@@ -249,10 +281,17 @@ class RemoteAuthRepository @Inject constructor(
             }
             apiCalls.execute { api.logout(LogoutRequest(allDevices)) }
         } catch (cancelled: CancellationException) {
-            withContext(NonCancellable) {
-                runCatching { clearLocalUserData(target) }
-                    .exceptionOrNull()
-                    ?.let(cancelled::addSuppressed)
+            try {
+                nonCancellablePreservingFailure {
+                    clearLocalUserData(
+                        target,
+                        preserveMessagingHistory = !allDevices,
+                        purgeMessagingHistory = allDevices,
+                        onHistoryCleanupFailure = { historyCleanupFailed = true },
+                    )
+                }
+            } catch (cleanupFailure: Throwable) {
+                cancelled.addSuppressed(cleanupFailure)
             }
             throw cancelled
         } catch (error: KitWalletApiException) {
@@ -269,21 +308,36 @@ class RemoteAuthRepository @Inject constructor(
                 "Sign in and retry when connected."
         }
 
-        val localCleared = clearLocalUserData(target)
+        val localCleared = nonCancellablePreservingFailure {
+            clearLocalUserData(
+                target,
+                preserveMessagingHistory = !allDevices,
+                purgeMessagingHistory = allDevices,
+                onHistoryCleanupFailure = { historyCleanupFailed = true },
+            )
+        }
+        if (historyCleanupFailed) {
+            warning = listOfNotNull(
+                warning,
+                "Signed out, but encrypted local message-history cleanup must be retried.",
+            ).joinToString(" ")
+        }
         return LogoutResult(
             localSessionCleared = localCleared,
             remoteRevocation = remoteRevocation,
-            retryRecommended = remoteRevocation == RemoteRevocationState.UNCONFIRMED,
+            retryRecommended = remoteRevocation == RemoteRevocationState.UNCONFIRMED ||
+                historyCleanupFailed,
             warning = warning,
         )
     }
 
     override suspend fun recoverMissingSecureMessagingEnrollment(
-        expectedSessionEpoch: String,
+        expectedSession: SessionFence,
+        activationFence: SecureMessagingSessionFence,
         target: SecureMessagingEnrollmentResetTarget,
     ) {
         var targetFence = sessions.current()?.fence() ?: throw SessionInvalidatedException()
-        if (targetFence.sessionId != expectedSessionEpoch) throw SessionInvalidatedException()
+        if (targetFence != expectedSession) throw SessionInvalidatedException()
         var targetSession = sessions.withCurrentSession(targetFence) { it }
         var accessRefreshAttempted = false
         val pendingReset = SecureMessagingResetProofFence(
@@ -325,7 +379,7 @@ class RemoteAuthRepository @Inject constructor(
                 if (error.statusCode == 409 &&
                     error.code == "MESSAGING_ENROLLMENT_RESET_STALE"
                 ) {
-                    requireFreshAuthentication(targetFence)
+                    requireFreshAuthentication(targetFence, activationFence)
                 }
                 if (error.statusCode == 401 && !accessRefreshAttempted) {
                     accessRefreshAttempted = true
@@ -351,7 +405,7 @@ class RemoteAuthRepository @Inject constructor(
                                 refresh.tokens
                             }
                             is SessionRefreshResult.Rejected -> {
-                                requireFreshAuthentication(targetFence)
+                                requireFreshAuthentication(targetFence, activationFence)
                             }
                         }
                     }
@@ -359,7 +413,7 @@ class RemoteAuthRepository @Inject constructor(
                     continue
                 }
                 if (error.isDefinitiveSessionRejection()) {
-                    requireFreshAuthentication(targetFence)
+                    requireFreshAuthentication(targetFence, activationFence)
                 }
                 throw error
             }
@@ -367,15 +421,27 @@ class RemoteAuthRepository @Inject constructor(
     }
 
     override suspend fun requireFreshAuthenticationForSecureMessagingRecovery(
-        expectedSessionEpoch: String,
+        expectedSession: SessionFence,
+        activationFence: SecureMessagingSessionFence,
     ) {
         val target = sessions.current()?.fence() ?: throw SessionInvalidatedException()
-        if (target.sessionId != expectedSessionEpoch) throw SessionInvalidatedException()
-        clearLocalUserData(target)
+        if (target != expectedSession) throw SessionInvalidatedException()
+        clearLocalUserData(
+            target = target,
+            preserveMessagingHistory = true,
+            recoveryActivationFence = activationFence,
+        )
     }
 
-    private suspend fun requireFreshAuthentication(target: SessionFence): Nothing {
-        clearLocalUserData(target)
+    private suspend fun requireFreshAuthentication(
+        target: SessionFence,
+        activationFence: SecureMessagingSessionFence,
+    ): Nothing {
+        clearLocalUserData(
+            target = target,
+            preserveMessagingHistory = true,
+            recoveryActivationFence = activationFence,
+        )
         throw SessionInvalidatedException()
     }
 
@@ -455,14 +521,86 @@ class RemoteAuthRepository @Inject constructor(
         check(receipt.state == "accepted" && receipt.accountStatus == "deletion_pending") {
             "The account deletion request was not accepted"
         }
-        clearLocalUserData(target)
+        nonCancellablePreservingFailure {
+            messageHistory.scheduleAccountErasure(target)
+            if (!sessions.prepareClearIfCurrent(target)) {
+                throw SessionInvalidatedException()
+            }
+            var historyFailure: Exception? = null
+            val sessionFailure = runCatching {
+                clearLocalUserData(
+                    target = target,
+                    purgeMessagingHistory = true,
+                    onHistoryCleanupFailure = { historyFailure = it },
+                )
+            }.exceptionOrNull()
+            val retainedHistoryFailure = historyFailure
+            if (retainedHistoryFailure != null) {
+                sessionFailure?.let(retainedHistoryFailure::addSuppressed)
+                throw retainedHistoryFailure
+            }
+            sessionFailure?.let { throw it }
+        }
     }
 
-    private suspend fun clearLocalUserData(target: SessionFence): Boolean {
+    private suspend fun <T> nonCancellablePreservingFailure(
+        block: suspend () -> T,
+    ): T {
+        val outcome = withContext(NonCancellable) {
+            runCatching { block() }
+        }
+        return outcome.getOrThrow()
+    }
+
+    private suspend fun clearLocalUserData(
+        target: SessionFence,
+        preserveMessagingHistory: Boolean = false,
+        purgeMessagingHistory: Boolean = false,
+        recoveryActivationFence: SecureMessagingSessionFence? = null,
+        onHistoryCleanupFailure: (Exception) -> Unit = {},
+    ): Boolean {
+        require(!preserveMessagingHistory || !purgeMessagingHistory) {
+            "Message history cannot be preserved and purged by the same session clear"
+        }
         var sessionFailure: Exception? = null
         var targetCleared = false
         try {
-            sessions.clearIfCurrent(target)
+            when {
+                preserveMessagingHistory -> {
+                    if (recoveryActivationFence == null) {
+                        sessions.clearIfCurrentAfterFinalMessagingSnapshot(
+                            expected = target,
+                            allowPermanentlyUnavailableSnapshot = true,
+                        ) {
+                            messageHistory.snapshotActiveHistory(target)
+                        }
+                    } else {
+                        sessions.clearIfCurrentForSecureMessagingRecovery(
+                            expected = target,
+                            activationFence = recoveryActivationFence,
+                            allowPermanentlyUnavailableSnapshot = true,
+                        ) {
+                            messageHistory.snapshotActiveHistory(target)
+                        }
+                    }
+                }
+                purgeMessagingHistory -> {
+                    sessions.clearIfCurrentAfterFinalMessagingSnapshot(target) {
+                        try {
+                            messageHistory.eraseScheduledAccount(target)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: AccountMessageArchivePurgeNotDurableException) {
+                            throw error
+                        } catch (error: Exception) {
+                            // scheduleAccountErasure already committed the exact-generation
+                            // marker. Continue session/state erasure and retry this purge later.
+                            onHistoryCleanupFailure(error)
+                        }
+                    }
+                }
+                else -> sessions.clearIfCurrent(target)
+            }
             targetCleared = sessions.current()?.fence() != target
         } catch (error: Exception) {
             // Keystore-backed session clear removes the credential in a finally block. Preserve
@@ -471,13 +609,15 @@ class RemoteAuthRepository @Inject constructor(
             targetCleared = sessions.current()?.fence() != target
         }
 
-        try {
-            // This is owner-conditional, so a newer account may claim/populate its cache while
-            // the remote logout is finishing without having its projections erased here.
-            walletSync.clearCachedUserData(target.cacheScopeId)
-        } catch (cacheFailure: Exception) {
-            sessionFailure?.addSuppressed(cacheFailure)
-            if (sessionFailure == null) throw cacheFailure
+        if (targetCleared) {
+            try {
+                // This is owner-conditional, so a newer account may claim/populate its cache while
+                // the remote logout is finishing without having its projections erased here.
+                walletSync.clearCachedUserData(target.cacheScopeId)
+            } catch (cacheFailure: Exception) {
+                sessionFailure?.addSuppressed(cacheFailure)
+                if (sessionFailure == null) throw cacheFailure
+            }
         }
 
         sessionFailure?.let { throw it }
@@ -486,11 +626,21 @@ class RemoteAuthRepository @Inject constructor(
 
     private suspend fun clearLocalUserDataIfCredentialsCurrent(
         expected: SessionTokens,
+        preserveMessagingHistory: Boolean = false,
     ): Boolean {
         var sessionFailure: Exception? = null
         var targetCleared = false
         try {
-            targetCleared = sessions.clearIfCredentialsCurrent(expected)
+            targetCleared = if (preserveMessagingHistory) {
+                sessions.clearIfCredentialsCurrentAfterFinalMessagingSnapshot(
+                    expected = expected,
+                    allowPermanentlyUnavailableSnapshot = true,
+                ) {
+                    messageHistory.snapshotActiveHistory(expected.fence())
+                }
+            } else {
+                sessions.clearIfCredentialsCurrent(expected)
+            }
         } catch (error: Exception) {
             sessionFailure = error
             targetCleared = sessions.current() == null

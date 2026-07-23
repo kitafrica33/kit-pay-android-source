@@ -24,7 +24,9 @@ import androidx.lifecycle.lifecycleScope
 import com.kit.wallet.data.messaging.ACTION_OPEN_AUTHORIZED_SECURE_MESSAGE
 import com.kit.wallet.data.messaging.EXTRA_SECURE_MESSAGE_AUTHORIZATION
 import com.kit.wallet.data.messaging.SecureMessageNavigationAuthorizer
+import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.notifications.IncomingCallPayload
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.feature.chat.ACTION_OPEN_TEXT_SHARE
 import com.kit.wallet.feature.chat.EXTRA_TEXT_SHARE_TOKEN
@@ -36,14 +38,25 @@ import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import com.kit.wallet.worker.scheduleAuthenticatedMessagingCatchUp
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
     @Inject lateinit var sessions: SessionStore
     @Inject lateinit var messagingSyncScheduler: SecureMessagingSyncScheduler
+    @Inject lateinit var messagingSyncEngine: SecureMessagingSyncEngine
     @Inject lateinit var secureMessageAuthorizer: SecureMessageNavigationAuthorizer
+    private val foregroundStartMutex = Mutex()
+    private var foregroundStartJob: Job? = null
     private var pendingDeepLink by mutableStateOf<String?>(null)
     private var pendingSecureMessage by mutableStateOf<PendingSecureMessageRoute?>(null)
     private var pendingTextShare by mutableStateOf<IncomingTextShareRequest?>(null)
@@ -125,18 +138,33 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        lifecycleScope.launch {
-            restoreRetainedSessionWithRetries(
-                pending = { sessions.restorationPending.value },
-                retryable = { sessions.restorationRetryable.value },
-                retry = sessions::retryRestore,
+        foregroundStartJob?.cancel()
+        foregroundStartJob = lifecycleScope.launch {
+            // Cancellation is asynchronous; the mutex ensures a rapid stop/start or duplicate
+            // start cannot enter restoration/activation while its predecessor is still unwinding.
+            foregroundStartMutex.withLock {
+                restoreRetainedSessionWithRetries(
+                    pending = { sessions.restorationPending.value },
+                    retryable = { sessions.restorationRetryable.value },
+                    retry = sessions::retryRestore,
+                    waitBeforeNextAttempt = { delay(it) },
+                )
+            }
+            observeForegroundSecureMessagingSessions(
+                sessionFences = sessions.session.map { it?.fence() },
+                serializationMutex = foregroundStartMutex,
+                currentSession = { sessions.current()?.fence() },
+                engineReady = messagingSyncEngine.isReady,
+                schedule = messagingSyncScheduler::schedule,
+                synchronize = messagingSyncEngine::synchronize,
                 waitBeforeNextAttempt = { delay(it) },
             )
-            scheduleAuthenticatedMessagingCatchUp(
-                hasSession = sessions.current() != null,
-                schedule = messagingSyncScheduler::schedule,
-            )
         }
+    }
+
+    override fun onStop() {
+        foregroundStartJob?.cancel()
+        super.onStop()
     }
 
     private fun retryRetainedSessionFromUi() {
@@ -245,6 +273,8 @@ private fun SessionRestorationGate(
 
 private const val SESSION_RESTORE_ATTEMPTS = 3
 private const val SESSION_RESTORE_RETRY_DELAY_MILLIS = 250L
+private const val FOREGROUND_MESSAGING_SYNC_ATTEMPTS = 4
+private const val FOREGROUND_MESSAGING_SYNC_RETRY_DELAY_MILLIS = 5_000L
 
 @VisibleForTesting
 internal suspend fun restoreRetainedSessionWithRetries(
@@ -264,6 +294,89 @@ internal suspend fun restoreRetainedSessionWithRetries(
         }
     }
     return !pending()
+}
+
+@VisibleForTesting
+internal suspend fun scheduleAndSynchronizeForegroundSecureMessaging(
+    expectedSession: SessionFence?,
+    currentSession: () -> SessionFence?,
+    engineReady: Boolean,
+    schedule: () -> Unit,
+    synchronize: suspend () -> Unit,
+    waitBeforeNextAttempt: suspend (Long) -> Unit,
+): Boolean {
+    // WorkManager remains the durable fallback, but an enqueue/storage failure must not prevent
+    // this foreground process from activating secure messaging immediately.
+    runCatching {
+        scheduleAuthenticatedMessagingCatchUp(
+            hasSession = expectedSession != null,
+            schedule = schedule,
+        )
+    }
+    return synchronizeForegroundSecureMessagingWithRetries(
+        expectedSession = expectedSession,
+        currentSession = currentSession,
+        engineReady = engineReady,
+        synchronize = synchronize,
+        waitBeforeNextAttempt = waitBeforeNextAttempt,
+    )
+}
+
+/**
+ * Keeps foreground activation attached to the authenticated-session owner, including a login that
+ * completes after this Activity has already started. Structurally equal fences are credential
+ * refreshes of the same owner and do not restart work; replacement cancels the obsolete attempt.
+ */
+@VisibleForTesting
+internal suspend fun observeForegroundSecureMessagingSessions(
+    sessionFences: Flow<SessionFence?>,
+    serializationMutex: Mutex,
+    currentSession: () -> SessionFence?,
+    engineReady: Boolean,
+    schedule: () -> Unit,
+    synchronize: suspend () -> Unit,
+    waitBeforeNextAttempt: suspend (Long) -> Unit,
+) {
+    sessionFences.distinctUntilChanged().collectLatest { expectedSession ->
+        serializationMutex.withLock {
+            scheduleAndSynchronizeForegroundSecureMessaging(
+                expectedSession = expectedSession,
+                currentSession = currentSession,
+                engineReady = engineReady,
+                schedule = schedule,
+                synchronize = synchronize,
+                waitBeforeNextAttempt = waitBeforeNextAttempt,
+            )
+        }
+    }
+}
+
+@VisibleForTesting
+internal suspend fun synchronizeForegroundSecureMessagingWithRetries(
+    expectedSession: SessionFence?,
+    currentSession: () -> SessionFence?,
+    engineReady: Boolean,
+    attempts: Int = FOREGROUND_MESSAGING_SYNC_ATTEMPTS,
+    synchronize: suspend () -> Unit,
+    waitBeforeNextAttempt: suspend (Long) -> Unit,
+): Boolean {
+    require(attempts > 0)
+    if (expectedSession == null || !engineReady) return false
+
+    repeat(attempts) { attempt ->
+        if (currentSession() != expectedSession) return false
+        try {
+            synchronize()
+            return currentSession() == expectedSession
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            if (currentSession() != expectedSession) return false
+            if (attempt == attempts - 1) return false
+            waitBeforeNextAttempt(FOREGROUND_MESSAGING_SYNC_RETRY_DELAY_MILLIS)
+        }
+    }
+    return false
 }
 
 private data class PendingSecureMessageRoute(

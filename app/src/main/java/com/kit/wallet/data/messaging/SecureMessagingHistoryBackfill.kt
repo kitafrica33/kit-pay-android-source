@@ -24,7 +24,7 @@ internal sealed interface SecureMessagingAuthenticatedHistory {
     val text: String
 }
 
-private data class AuthenticatedHistoryValue(
+internal data class AuthenticatedHistoryValue(
     override val messageId: String,
     override val clientMessageId: String,
     override val conversationId: String,

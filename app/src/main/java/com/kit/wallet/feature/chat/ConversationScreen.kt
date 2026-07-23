@@ -596,6 +596,26 @@ internal fun MessageBubble(
                             )
                             Spacer(Modifier.width(5.dp))
                         }
+                        if (
+                            msg.fromMe &&
+                            msg.state in setOf(
+                                DeliveryState.SENDING,
+                                DeliveryState.SENT,
+                                DeliveryState.DELIVERED,
+                                DeliveryState.READ,
+                            )
+                        ) {
+                            Text(
+                                outgoingDeliveryLabel(msg.state),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (msg.state == DeliveryState.READ) {
+                                    KitTheme.colors.readReceipt
+                                } else {
+                                    contentColor.copy(alpha = 0.65f)
+                                },
+                            )
+                            Spacer(Modifier.width(5.dp))
+                        }
                         Text(
                             msg.time,
                             style = MaterialTheme.typography.labelSmall,

@@ -287,7 +287,7 @@ val kitWalletBaseUrl = providers.gradleProperty("KIT_WALLET_BASE_URL")
         normalized
     }
 val kitPrivacyNoticeVersion = providers.gradleProperty("KIT_PRIVACY_NOTICE_VERSION")
-    .orElse("kit-privacy-2026-07")
+    .orElse("kit-privacy-2026-07-23")
 val kitPayApplicationId = "com.kit.wallet"
 val kitPayPlayAbis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
 val kitPayApprovedSideloadAbi = "arm64-v8a"
@@ -392,8 +392,8 @@ android {
         applicationId = kitPayApplicationId
         minSdk = 26
         targetSdk = 36
-        versionCode = 17
-        versionName = "0.2.5"
+        versionCode = 18
+        versionName = "0.2.6"
 
         if (kitPaySideloadAbi != null) {
             ndk { abiFilters += kitPaySideloadAbi }

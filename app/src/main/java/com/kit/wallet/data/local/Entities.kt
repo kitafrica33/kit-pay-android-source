@@ -81,3 +81,22 @@ data class SecureMessagingRecordEntity(
     val ciphertext: ByteArray,
     val updatedAtEpochMillis: Long,
 )
+
+/**
+ * Opaque, account-bound message history that is cryptographically independent from active
+ * libsignal state. Plaintext and active protocol/session material must never enter this table.
+ */
+@Entity(
+    tableName = "account_message_archive",
+    primaryKeys = ["ownerAccountId", "installationId", "recordKey"],
+    indices = [Index(value = ["ownerAccountId", "installationId"])],
+)
+data class AccountMessageArchiveEntity(
+    val ownerAccountId: String,
+    val installationId: String,
+    val recordKey: String,
+    val version: Long,
+    val iv: ByteArray,
+    val ciphertext: ByteArray,
+    val updatedAtEpochMillis: Long,
+)

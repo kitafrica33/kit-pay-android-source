@@ -19,7 +19,14 @@ import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingReauthenticationRequiredException
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyTemporarilyUnavailableException
+import com.kit.wallet.data.messaging.SecureMessagingRecordVersion
+import com.kit.wallet.data.messaging.SecureMessagingRevalidationRetryException
+import com.kit.wallet.data.messaging.SecureMessagingRuntimeStage
+import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
 import com.kit.wallet.data.messaging.SecureMessagingSessionLifecycle
+import com.kit.wallet.data.messaging.SecureMessagingStateStore
 import com.kit.wallet.data.messaging.SecureMessagingStateNotReadyException
 import com.kit.wallet.data.messaging.SecureMessagingSyncCursorStore
 import com.kit.wallet.data.messaging.awaitSecureMessagingStateAvailability
@@ -34,8 +41,12 @@ import com.kit.wallet.data.session.SessionTokens
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.lang.reflect.Proxy
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.Dispatcher
@@ -44,6 +55,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import retrofit2.Retrofit
@@ -192,6 +204,466 @@ class SecureMessagingSyncEngineTest {
 
             assertEquals(TOKENS.sessionId, registry.requireCurrent().binding.sessionEpoch)
             assertEquals(7, server.requestCount)
+
+            val active = registry.requireCurrent()
+            val staleFence = com.kit.wallet.data.messaging.SecureMessagingSessionFence(
+                binding = active.binding,
+                activationIdentity = Any(),
+            )
+            val redirected = runCatching { engine.synchronize(staleFence) }.exceptionOrNull()
+
+            assertTrue(redirected is SecureMessagingAuthenticationEpochChangedException)
+            assertEquals(7, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `one worker performs bounded Android 9 key retries without another wake`() = runTest {
+        val server = MockWebServer().apply { start() }
+        try {
+            val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+            val retrofit = Retrofit.Builder()
+                .baseUrl(server.url("/"))
+                .addConverterFactory(MoshiConverterFactory.create(moshi))
+                .build()
+            val api = retrofit.create(KitWalletApi::class.java)
+            val transport = RemoteSecureMessagingTransport(
+                api,
+                retrofit.create(SecureMessagingWireApi::class.java),
+                ApiCallExecutor(moshi),
+            )
+            val sessions = FakeSessionStore(TOKENS)
+            val guard = SecureMessagingLifecycleGuard()
+            val registry = SecureMessagingActiveSessionRegistry(guard)
+            val stateStore = TestSecureMessagingStateStore()
+            val processor = SecureMessagingEventProcessor(
+                UnusedCryptoEngine,
+                SecureMessagingProjectionStore(
+                    stateStore,
+                    com.kit.wallet.data.messaging.LibSignalCompanionStateReader(stateStore),
+                ),
+                SecureMessagingSyncCursorStore(stateStore),
+            )
+            var keyAttempts = 0
+            val coordinator = SecureMessagingActivationCoordinator(
+                transport = transport,
+                lifecycle = guard,
+                sessions = registry,
+                keyActivation = SecureMessagingKeyActivation {
+                    keyAttempts++
+                    if (keyAttempts <= 3) {
+                        throw SecureMessagingRevalidationRetryException(
+                            SecureMessagingRecordKeyTemporarilyUnavailableException(),
+                        )
+                    }
+                },
+                initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+            )
+            val localStateLifecycle = SecureMessagingSessionLifecycle(stateStore, guard)
+            localStateLifecycle.afterSessionSave()
+            val engine = RealSecureMessagingSyncEngine(
+                bindingResolver = SecureMessagingAuthBindingResolver(
+                    sessions,
+                    api,
+                    ApiCallExecutor(moshi),
+                    deviceIdentity(),
+                ),
+                activation = coordinator,
+                processor = processor,
+                sessions = sessions,
+                sessionLifecycle = localStateLifecycle,
+                authRepository = unusedAuthRepository(),
+            )
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            server.enqueue(jsonResponse(READY_CAPABILITIES))
+            // Each bounded retry revalidates the authenticated profile/device before touching
+            // retained key state. The final pair belongs to initial encrypted synchronization.
+            repeat(4) {
+                server.enqueue(jsonResponse(PROFILE))
+                server.enqueue(jsonResponse(DEVICES))
+            }
+            enqueueEmptySync(server, moshi, "initial_cursor")
+            enqueueEmptySync(server, moshi, "wake_cursor")
+
+            engine.synchronize()
+
+            assertEquals(4, keyAttempts)
+            assertEquals(15_000L, currentTime)
+            assertEquals(SecureMessagingRuntimeStage.READY, guard.snapshot().stage)
+            assertEquals(13, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `completed reset reopen failure cannot retain a stale pending activation`() =
+        runTest {
+            val server = MockWebServer().apply { start() }
+            try {
+                val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+                val retrofit = Retrofit.Builder()
+                    .baseUrl(server.url("/"))
+                    .addConverterFactory(MoshiConverterFactory.create(moshi))
+                    .build()
+                val api = retrofit.create(KitWalletApi::class.java)
+                val transport = RemoteSecureMessagingTransport(
+                    api,
+                    retrofit.create(SecureMessagingWireApi::class.java),
+                    ApiCallExecutor(moshi),
+                )
+                val sessions = FakeSessionStore(TOKENS)
+                val guard = SecureMessagingLifecycleGuard()
+                val registry = SecureMessagingActiveSessionRegistry(guard)
+                val durableState = TestSecureMessagingStateStore()
+                var cursorWrites = 0
+                var failNextCursorWrite = false
+                val stateStore = object : SecureMessagingStateStore by durableState {
+                    override suspend fun write(
+                        namespace: String,
+                        recordKey: String,
+                        expectedVersion: Long?,
+                        bytes: ByteArray,
+                    ): SecureMessagingRecordVersion {
+                        cursorWrites++
+                        if (failNextCursorWrite) {
+                            failNextCursorWrite = false
+                            throw SecureMessagingRecordKeyPermanentlyMissingException()
+                        }
+                        return durableState.write(
+                            namespace,
+                            recordKey,
+                            expectedVersion,
+                            bytes,
+                        )
+                    }
+                }
+                val processor = SecureMessagingEventProcessor(
+                    UnusedCryptoEngine,
+                    SecureMessagingProjectionStore(
+                        stateStore,
+                        com.kit.wallet.data.messaging.LibSignalCompanionStateReader(stateStore),
+                    ),
+                    SecureMessagingSyncCursorStore(stateStore),
+                )
+                val coordinator = SecureMessagingActivationCoordinator(
+                    transport = transport,
+                    lifecycle = guard,
+                    sessions = registry,
+                    keyActivation = SecureMessagingKeyActivation { },
+                    initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+                )
+                val localStateLifecycle = SecureMessagingSessionLifecycle(stateStore, guard)
+                localStateLifecycle.afterSessionSave()
+                var localResets = 0
+                val reopenFailure = IllegalStateException("reset gate failed to reopen")
+                var failNextResetReopen = true
+                sessions.messagingReset = { fence ->
+                    localStateLifecycle.resetForRecovery(fence)
+                    localResets++
+                    if (failNextResetReopen) {
+                        failNextResetReopen = false
+                        sessions.setRestorationPending(true)
+                        throw reopenFailure
+                    }
+                    localStateLifecycle.afterSessionSave()
+                }
+                val engine = RealSecureMessagingSyncEngine(
+                    bindingResolver = SecureMessagingAuthBindingResolver(
+                        sessions,
+                        api,
+                        ApiCallExecutor(moshi),
+                        deviceIdentity(),
+                    ),
+                    activation = coordinator,
+                    processor = processor,
+                    sessions = sessions,
+                    sessionLifecycle = localStateLifecycle,
+                    authRepository = unusedAuthRepository(),
+                )
+                // Activate A completely before the foreground recovery captures its exact fence.
+                server.enqueue(jsonResponse(PROFILE))
+                server.enqueue(jsonResponse(DEVICES))
+                server.enqueue(jsonResponse(READY_CAPABILITIES))
+                server.enqueue(jsonResponse(PROFILE))
+                server.enqueue(jsonResponse(DEVICES))
+                enqueueEmptySync(server, moshi, "a_initial_cursor")
+                enqueueEmptySync(server, moshi, "a_wake_cursor")
+
+                engine.synchronize()
+                val initial = registry.requireCurrent()
+                failNextCursorWrite = true
+
+                // Recovery first re-enters A and proves the missing key, then resets and performs
+                // the complete activation plus wake sync for its one pinned successor B.
+                server.enqueue(jsonResponse(PROFILE))
+                server.enqueue(jsonResponse(DEVICES))
+                enqueueEmptySync(server, moshi, "a_missing_cursor")
+                repeat(1) { activationIndex ->
+                    server.enqueue(jsonResponse(PROFILE))
+                    server.enqueue(jsonResponse(DEVICES))
+                    server.enqueue(jsonResponse(READY_CAPABILITIES))
+                    server.enqueue(jsonResponse(PROFILE))
+                    server.enqueue(jsonResponse(DEVICES))
+                    enqueueEmptySync(server, moshi, "initial_cursor_$activationIndex")
+                    enqueueEmptySync(server, moshi, "wake_cursor_$activationIndex")
+                }
+
+                val failedReopen = runCatching {
+                    engine.recoverPermanentlyUnavailableState(initial.fence)
+                }.exceptionOrNull()
+
+                assertSame(reopenFailure, failedReopen)
+                assertEquals(1, localResets)
+
+                // The exact-session retry owns gate reopening. A subsequent generic sync must
+                // proceed to the successor instead of replaying the erased pending reset fence.
+                sessions.setRestorationPending(false)
+                localStateLifecycle.afterSessionSave()
+                engine.synchronize()
+
+                assertEquals(1, localResets)
+                assertEquals(5, cursorWrites)
+                assertEquals(SecureMessagingRuntimeStage.READY, guard.snapshot().stage)
+                val successor = registry.requireCurrent()
+                assertTrue(successor.fence !== initial.fence)
+                assertEquals(TOKENS.sessionId, successor.binding.sessionEpoch)
+                assertEquals(17, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+
+    @Test
+    fun `exact sync may erase recovered A but never enters replacement B`() = runTest {
+        val server = MockWebServer().apply { start() }
+        try {
+            val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+            val retrofit = Retrofit.Builder()
+                .baseUrl(server.url("/"))
+                .addConverterFactory(MoshiConverterFactory.create(moshi))
+                .build()
+            val api = retrofit.create(KitWalletApi::class.java)
+            val transport = RemoteSecureMessagingTransport(
+                api,
+                retrofit.create(SecureMessagingWireApi::class.java),
+                ApiCallExecutor(moshi),
+            )
+            val sessions = FakeSessionStore(TOKENS)
+            val guard = SecureMessagingLifecycleGuard()
+            val registry = SecureMessagingActiveSessionRegistry(guard)
+            val durableState = TestSecureMessagingStateStore()
+            var failNextCursorWrite = false
+            var cursorWrites = 0
+            val stateStore = object : SecureMessagingStateStore by durableState {
+                override suspend fun write(
+                    namespace: String,
+                    recordKey: String,
+                    expectedVersion: Long?,
+                    bytes: ByteArray,
+                ): SecureMessagingRecordVersion {
+                    cursorWrites++
+                    if (failNextCursorWrite) {
+                        failNextCursorWrite = false
+                        throw SecureMessagingRecordKeyPermanentlyMissingException()
+                    }
+                    return durableState.write(namespace, recordKey, expectedVersion, bytes)
+                }
+            }
+            val processor = SecureMessagingEventProcessor(
+                UnusedCryptoEngine,
+                SecureMessagingProjectionStore(
+                    stateStore,
+                    com.kit.wallet.data.messaging.LibSignalCompanionStateReader(stateStore),
+                ),
+                SecureMessagingSyncCursorStore(stateStore),
+            )
+            val coordinator = SecureMessagingActivationCoordinator(
+                transport = transport,
+                lifecycle = guard,
+                sessions = registry,
+                keyActivation = SecureMessagingKeyActivation { },
+                initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+            )
+            val localStateLifecycle = SecureMessagingSessionLifecycle(stateStore, guard)
+            localStateLifecycle.afterSessionSave()
+            var localResets = 0
+            sessions.messagingReset = { fence ->
+                localStateLifecycle.resetForRecovery(fence)
+                localStateLifecycle.afterSessionSave()
+                localResets++
+            }
+            val engine = RealSecureMessagingSyncEngine(
+                bindingResolver = SecureMessagingAuthBindingResolver(
+                    sessions,
+                    api,
+                    ApiCallExecutor(moshi),
+                    deviceIdentity(),
+                ),
+                activation = coordinator,
+                processor = processor,
+                sessions = sessions,
+                sessionLifecycle = localStateLifecycle,
+                authRepository = unusedAuthRepository(),
+            )
+
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            server.enqueue(jsonResponse(READY_CAPABILITIES))
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            enqueueEmptySync(server, moshi, "a_initial_cursor")
+            enqueueEmptySync(server, moshi, "a_wake_cursor")
+            engine.synchronize()
+            val initial = registry.requireCurrent()
+
+            failNextCursorWrite = true
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            enqueueEmptySync(server, moshi, "a_missing_cursor")
+            // These B responses make accidental redirection deterministic instead of hanging.
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            server.enqueue(jsonResponse(READY_CAPABILITIES))
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            enqueueEmptySync(server, moshi, "b_initial_cursor")
+            enqueueEmptySync(server, moshi, "b_wake_cursor")
+
+            val failure = runCatching {
+                engine.synchronize(initial.fence)
+            }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingAuthenticationEpochChangedException)
+            assertEquals(1, localResets)
+            assertEquals(3, cursorWrites)
+            assertEquals(SecureMessagingRuntimeStage.NO_SESSION, guard.snapshot().stage)
+            assertTrue(registry.currentOrNull() == null)
+            assertEquals(10, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `exact sync transient retry cannot redirect A into replacement B`() = runTest {
+        val server = MockWebServer().apply { start() }
+        try {
+            val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+            val retrofit = Retrofit.Builder()
+                .baseUrl(server.url("/"))
+                .addConverterFactory(MoshiConverterFactory.create(moshi))
+                .build()
+            val api = retrofit.create(KitWalletApi::class.java)
+            val transport = RemoteSecureMessagingTransport(
+                api,
+                retrofit.create(SecureMessagingWireApi::class.java),
+                ApiCallExecutor(moshi),
+            )
+            val sessions = FakeSessionStore(TOKENS)
+            val guard = SecureMessagingLifecycleGuard()
+            val registry = SecureMessagingActiveSessionRegistry(guard)
+            val durableState = TestSecureMessagingStateStore()
+            val transientFailureObserved = CompletableDeferred<Unit>()
+            var failNextCursorWrite = false
+            val stateStore = object : SecureMessagingStateStore by durableState {
+                override suspend fun write(
+                    namespace: String,
+                    recordKey: String,
+                    expectedVersion: Long?,
+                    bytes: ByteArray,
+                ): SecureMessagingRecordVersion {
+                    if (failNextCursorWrite) {
+                        failNextCursorWrite = false
+                        transientFailureObserved.complete(Unit)
+                        throw SecureMessagingRecordKeyTemporarilyUnavailableException()
+                    }
+                    return durableState.write(namespace, recordKey, expectedVersion, bytes)
+                }
+            }
+            val processor = SecureMessagingEventProcessor(
+                UnusedCryptoEngine,
+                SecureMessagingProjectionStore(
+                    stateStore,
+                    com.kit.wallet.data.messaging.LibSignalCompanionStateReader(stateStore),
+                ),
+                SecureMessagingSyncCursorStore(stateStore),
+            )
+            val coordinator = SecureMessagingActivationCoordinator(
+                transport = transport,
+                lifecycle = guard,
+                sessions = registry,
+                keyActivation = SecureMessagingKeyActivation { },
+                initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+            )
+            val localStateLifecycle = SecureMessagingSessionLifecycle(stateStore, guard)
+            localStateLifecycle.afterSessionSave()
+            val engine = RealSecureMessagingSyncEngine(
+                bindingResolver = SecureMessagingAuthBindingResolver(
+                    sessions,
+                    api,
+                    ApiCallExecutor(moshi),
+                    deviceIdentity(),
+                ),
+                activation = coordinator,
+                processor = processor,
+                sessions = sessions,
+                sessionLifecycle = localStateLifecycle,
+                authRepository = unusedAuthRepository(),
+            )
+
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            server.enqueue(jsonResponse(READY_CAPABILITIES))
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            enqueueEmptySync(server, moshi, "a_initial_cursor")
+            enqueueEmptySync(server, moshi, "a_wake_cursor")
+            engine.synchronize()
+            val initial = registry.requireCurrent()
+
+            failNextCursorWrite = true
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            enqueueEmptySync(server, moshi, "a_retry_cursor")
+            val staleExactSync = async {
+                runCatching { engine.synchronize(initial.fence) }.exceptionOrNull()
+            }
+            transientFailureObserved.await()
+            runCurrent()
+
+            // Replace A while its internal Android-9 retry is sleeping. B activation is allowed
+            // to finish independently, but waking A must fail before another binding/sync request.
+            localStateLifecycle.beforeSessionClear()
+            localStateLifecycle.afterSessionSave()
+            server.enqueue(jsonResponse(READY_CAPABILITIES))
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            enqueueEmptySync(server, moshi, "b_initial_cursor")
+            val replacement = coordinator.ensureActivated(
+                SecureMessagingSessionBinding(
+                    sessionEpoch = TOKENS.sessionId,
+                    userId = USER_ID,
+                    serverDeviceId = DEVICE_ID,
+                    installationId = INSTALLATION_ID,
+                ),
+            )
+            assertTrue(replacement.fence !== initial.fence)
+            val requestsBeforeWake = server.requestCount
+
+            advanceTimeBy(5_000L)
+            runCurrent()
+
+            assertTrue(
+                staleExactSync.await() is SecureMessagingAuthenticationEpochChangedException,
+            )
+            assertTrue(registry.requireCurrent().fence === replacement.fence)
+            assertEquals(requestsBeforeWake, server.requestCount)
         } finally {
             server.shutdown()
         }
@@ -425,11 +897,13 @@ class SecureMessagingSyncEngineTest {
     ) { instance, method, arguments ->
         when (method.name) {
             "recoverMissingSecureMessagingEnrollment" -> recover?.invoke(
-                arguments?.get(0) as String,
-                arguments[1] as SecureMessagingEnrollmentResetTarget,
+                (arguments?.get(0) as com.kit.wallet.data.session.SessionFence).sessionId,
+                arguments[2] as SecureMessagingEnrollmentResetTarget,
             ) ?: error("Recovery must not run for an intact enrollment")
             "requireFreshAuthenticationForSecureMessagingRecovery" ->
-                freshAuthentication?.invoke(arguments?.get(0) as String)
+                freshAuthentication?.invoke(
+                    (arguments?.get(0) as com.kit.wallet.data.session.SessionFence).sessionId,
+                )
                     ?: error("Fresh authentication must not run in this test")
             "toString" -> "UnusedAuthRepository"
             "hashCode" -> System.identityHashCode(instance)
@@ -459,8 +933,10 @@ class SecureMessagingSyncEngineTest {
 
     private class FakeSessionStore(initial: SessionTokens?) : SessionStore {
         private val mutable = MutableStateFlow(initial)
+        private val mutableRestorationPending = MutableStateFlow(false)
         private var revision = 0L
         override val session = mutable
+        override val restorationPending = mutableRestorationPending
         var messagingReset: suspend (com.kit.wallet.data.messaging.SecureMessagingSessionFence) -> Unit = {}
 
         override fun current(): SessionTokens? = mutable.value
@@ -514,8 +990,20 @@ class SecureMessagingSyncEngineTest {
         override suspend fun resetSecureMessagingStateIfCurrent(
             expected: com.kit.wallet.data.session.SessionFence,
             activationFence: com.kit.wallet.data.messaging.SecureMessagingSessionFence,
+            allowPermanentlyUnavailableSnapshot: Boolean,
+            finalMessagingSnapshot: suspend () -> Unit,
         ): Boolean {
             if (mutable.value?.fence() != expected) return false
+            try {
+                finalMessagingSnapshot()
+            } catch (error: Throwable) {
+                if (!allowPermanentlyUnavailableSnapshot ||
+                    !com.kit.wallet.data.messaging
+                        .isPermanentlyMissingSecureMessagingRecordKey(error)
+                ) {
+                    throw error
+                }
+            }
             messagingReset(activationFence)
             return true
         }
@@ -528,6 +1016,10 @@ class SecureMessagingSyncEngineTest {
         fun replace(tokens: SessionTokens?) {
             mutable.value = tokens
             revision++
+        }
+
+        fun setRestorationPending(pending: Boolean) {
+            mutableRestorationPending.value = pending
         }
     }
 

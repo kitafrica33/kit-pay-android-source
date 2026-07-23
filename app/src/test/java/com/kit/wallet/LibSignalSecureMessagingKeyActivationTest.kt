@@ -2,6 +2,7 @@ package com.kit.wallet
 
 import com.kit.wallet.data.auth.AuthRepository
 import com.kit.wallet.data.auth.DeviceIdentityProvider
+import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
 import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
 import com.kit.wallet.data.messaging.LibSignalSecureMessagingCryptoEngine
 import com.kit.wallet.data.messaging.LibSignalSecureMessagingKeyActivation
@@ -21,6 +22,7 @@ import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
 import com.kit.wallet.data.messaging.SecureMessagingRecord
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyTemporarilyUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingRecordPage
 import com.kit.wallet.data.messaging.SecureMessagingRecordVersion
@@ -243,6 +245,152 @@ class LibSignalSecureMessagingKeyActivationTest {
         }
 
     @Test
+    fun `lost record key completes enrolled-server reset before publishing one successor`() =
+        runTest {
+            var failNextCursorWrite = false
+            val faultingStateStore = object : SecureMessagingStateStore by stateStore {
+                override suspend fun write(
+                    namespace: String,
+                    recordKey: String,
+                    expectedVersion: Long?,
+                    bytes: ByteArray,
+                ): SecureMessagingRecordVersion {
+                    if (failNextCursorWrite &&
+                        namespace == "messaging-sync" &&
+                        recordKey == "cursor-v1"
+                    ) {
+                        failNextCursorWrite = false
+                        throw SecureMessagingRecordKeyPermanentlyMissingException()
+                    }
+                    return stateStore.write(namespace, recordKey, expectedVersion, bytes)
+                }
+            }
+            val crypto = LibSignalSecureMessagingCryptoEngine(faultingStateStore)
+            val lifecycle = SecureMessagingLifecycleGuard()
+            val sessionLifecycle = SecureMessagingSessionLifecycle(
+                faultingStateStore,
+                lifecycle,
+            )
+            sessionLifecycle.afterSessionSave()
+            val sessionDelegate = ProofSessionStore(resetProof = null)
+            val resetFences = mutableListOf<SecureMessagingSessionFence>()
+            val sessions = object : SessionStore by sessionDelegate {
+                override suspend fun resetSecureMessagingStateIfCurrent(
+                    expected: SessionFence,
+                    activationFence: SecureMessagingSessionFence,
+                    allowPermanentlyUnavailableSnapshot: Boolean,
+                    finalMessagingSnapshot: suspend () -> Unit,
+                ): Boolean {
+                    if (current()?.fence() != expected) return false
+                    sessionLifecycle.resetForRecovery(
+                        fence = activationFence,
+                        allowPermanentlyUnavailableSnapshot =
+                            allowPermanentlyUnavailableSnapshot,
+                        finalSnapshot = finalMessagingSnapshot,
+                    )
+                    if (current()?.fence() != expected) return false
+                    sessionLifecycle.afterSessionSave()
+                    resetFences += activationFence
+                    return true
+                }
+            }
+            val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+            val processor = SecureMessagingEventProcessor(
+                crypto,
+                SecureMessagingProjectionStore(
+                    faultingStateStore,
+                    LibSignalCompanionStateReader(faultingStateStore),
+                ),
+                SecureMessagingSyncCursorStore(faultingStateStore),
+            )
+            val coordinator = SecureMessagingActivationCoordinator(
+                transport = remote,
+                lifecycle = lifecycle,
+                sessions = registry,
+                keyActivation = LibSignalSecureMessagingKeyActivation(crypto, sessions),
+                initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+            )
+            var remoteResets = 0
+            var remoteResetFence: SecureMessagingSessionFence? = null
+            val authRepository = Proxy.newProxyInstance(
+                AuthRepository::class.java.classLoader,
+                arrayOf(AuthRepository::class.java),
+            ) { instance, method, arguments ->
+                when (method.name) {
+                    "recoverMissingSecureMessagingEnrollment" -> {
+                        val expected = arguments?.get(0) as SessionFence
+                        val activationFence = arguments[1] as SecureMessagingSessionFence
+                        val target = arguments[2] as SecureMessagingEnrollmentResetTarget
+                        assertEquals(expected, sessions.current()?.fence())
+                        val resultingEpoch = keyServer.resetEnrollment(target)
+                        sessionDelegate.setResetProof(
+                            SecureMessagingResetProofFence(
+                                serverDeviceId = target.serverDeviceId,
+                                previousEnrollmentEpoch = target.enrollmentEpoch,
+                                resultingEnrollmentEpoch = resultingEpoch,
+                                previousRegistrationId = target.registrationId,
+                                previousIdentityKeySha256 = target.identityKeySha256,
+                                previousBundleVersion = target.bundleVersion,
+                            ),
+                        )
+                        remoteResetFence = activationFence
+                        remoteResets++
+                        Unit
+                    }
+                    "requireFreshAuthenticationForSecureMessagingRecovery" ->
+                        error("A proved lost record key must use the exact enrollment reset")
+                    "toString" -> "LostKeyRecoveryAuthRepository"
+                    "hashCode" -> System.identityHashCode(instance)
+                    "equals" -> instance === arguments?.firstOrNull()
+                    else -> error("Unexpected auth repository call: ${method.name}")
+                }
+            } as AuthRepository
+            val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+            val retrofit = Retrofit.Builder()
+                .baseUrl(server.url("/"))
+                .addConverterFactory(MoshiConverterFactory.create(moshi))
+                .build()
+            val sync = RealSecureMessagingSyncEngine(
+                bindingResolver = SecureMessagingAuthBindingResolver(
+                    sessions = sessions,
+                    api = retrofit.create(KitWalletApi::class.java),
+                    apiCalls = ApiCallExecutor(moshi),
+                    deviceIdentity = object : DeviceIdentityProvider {
+                        override fun registration() = DeviceRegistrationDto(
+                            installationId = BINDING.installationId,
+                            name = "Test phone",
+                            appVersion = "1",
+                            osVersion = "1",
+                            model = "Test",
+                        )
+                    },
+                ),
+                activation = coordinator,
+                processor = processor,
+                sessions = sessions,
+                sessionLifecycle = sessionLifecycle,
+                authRepository = authRepository,
+            )
+
+            sync.synchronize()
+            val initial = registry.requireCurrent()
+            failNextCursorWrite = true
+
+            sync.recoverPermanentlyUnavailableState(initial.fence)
+
+            assertEquals(2, resetFences.size)
+            assertTrue(resetFences[0] === initial.fence)
+            assertTrue(resetFences[1] === remoteResetFence)
+            assertEquals(1, remoteResets)
+            assertEquals(2, keyServer.publishRequests().size)
+            assertNull(sessionDelegate.current()?.messagingResetProof)
+            val successor = registry.requireCurrent()
+            assertTrue(successor.fence !== initial.fence)
+            assertTrue(successor.fence !== remoteResetFence)
+            assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+        }
+
+    @Test
     fun `proved reset with no local state provisions at N plus one and clears proof`() = runTest {
         keyServer.setEnrollmentEpoch(RESET_RESULT_EPOCH)
         val sessions = ProofSessionStore(RESET_PROVED)
@@ -433,7 +581,10 @@ class LibSignalSecureMessagingKeyActivationTest {
             ) { instance, method, arguments ->
                 when (method.name) {
                     "requireFreshAuthenticationForSecureMessagingRecovery" -> {
-                        assertEquals(BINDING.sessionEpoch, arguments?.get(0))
+                        assertEquals(
+                            BINDING.sessionEpoch,
+                            (arguments?.get(0) as com.kit.wallet.data.session.SessionFence).sessionId,
+                        )
                         freshAuthenticationCalls++
                         runBlocking {
                             val expected = checkNotNull(sessions.current()).fence()
@@ -502,12 +653,23 @@ class LibSignalSecureMessagingKeyActivationTest {
         private var currentStatus: MessagingKeyStatusDto? = null
         private var enrollmentEpoch = 1L
         private var revision = 0
+        private var syncRevision = 0
         var failNextPublications: Int = 0
 
         override fun dispatch(request: RecordedRequest): MockResponse = when {
             request.path == "/api/kit-wallet/v1/capabilities" -> jsonResponse(READY_CAPABILITIES)
             request.path == "/api/kit-wallet/v1/profile" -> jsonResponse(PROFILE)
             request.path == "/api/kit-wallet/v1/devices" -> jsonResponse(DEVICES)
+            request.path?.startsWith("/api/kit-wallet/v1/messaging/sync") == true ->
+                synchronized(lock) {
+                    syncRevision++
+                    jsonResponse(
+                        """
+                        {"ok":true,"data":{"events":[],"page":{
+                        "next_cursor":"key_sync_$syncRevision","has_more":false,"limit":50}}}
+                        """.trimIndent(),
+                    )
+                }
             request.path == "/api/kit-wallet/v1/messaging/keys/status" -> synchronized(lock) {
                 statusResponse(currentStatus ?: unenrolledStatus())
             }
@@ -541,6 +703,20 @@ class LibSignalSecureMessagingKeyActivationTest {
         fun replaceStatus(status: MessagingKeyStatusDto) = synchronized(lock) {
             currentStatus = status
         }
+
+        fun resetEnrollment(target: SecureMessagingEnrollmentResetTarget): Long =
+            synchronized(lock) {
+                val status = checkNotNull(currentStatus)
+                check(status.enrolled == true)
+                check(status.deviceId == target.serverDeviceId)
+                check(status.enrollmentEpoch == target.enrollmentEpoch)
+                check(status.registrationId == target.registrationId)
+                check(status.identityKeySha256 == target.identityKeySha256)
+                check(status.bundleVersion == target.bundleVersion)
+                enrollmentEpoch = target.enrollmentEpoch + 1L
+                currentStatus = null
+                enrollmentEpoch
+            }
 
         fun setEnrollmentEpoch(epoch: Long) = synchronized(lock) {
             require(epoch > 0L)

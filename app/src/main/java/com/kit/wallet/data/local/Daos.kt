@@ -151,3 +151,72 @@ interface SecureMessagingRecordDao {
     @Query("DELETE FROM secure_messaging_records")
     suspend fun deleteAll()
 }
+
+@Dao
+interface AccountMessageArchiveDao {
+    @Query(
+        "SELECT COUNT(*) FROM account_message_archive " +
+            "WHERE ownerAccountId = :ownerAccountId AND installationId = :installationId",
+    )
+    suspend fun countForOwner(ownerAccountId: String, installationId: String): Int
+
+    @Query(
+        "SELECT * FROM account_message_archive " +
+            "WHERE ownerAccountId = :ownerAccountId AND installationId = :installationId " +
+            "AND recordKey = :recordKey",
+    )
+    suspend fun get(
+        ownerAccountId: String,
+        installationId: String,
+        recordKey: String,
+    ): AccountMessageArchiveEntity?
+
+    @Query(
+        "SELECT * FROM account_message_archive " +
+            "WHERE ownerAccountId = :ownerAccountId AND installationId = :installationId " +
+            "AND (:afterRecordKey IS NULL OR " +
+            "recordKey COLLATE BINARY > :afterRecordKey COLLATE BINARY) " +
+            "ORDER BY recordKey COLLATE BINARY ASC LIMIT :limit",
+    )
+    suspend fun page(
+        ownerAccountId: String,
+        installationId: String,
+        afterRecordKey: String?,
+        limit: Int,
+    ): List<AccountMessageArchiveEntity>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insert(record: AccountMessageArchiveEntity)
+
+    @Query(
+        "UPDATE account_message_archive SET version = :newVersion, iv = :iv, " +
+            "ciphertext = :ciphertext, updatedAtEpochMillis = :updatedAtEpochMillis " +
+            "WHERE ownerAccountId = :ownerAccountId AND installationId = :installationId " +
+            "AND recordKey = :recordKey AND version = :expectedVersion",
+    )
+    suspend fun compareAndSet(
+        ownerAccountId: String,
+        installationId: String,
+        recordKey: String,
+        expectedVersion: Long,
+        newVersion: Long,
+        iv: ByteArray,
+        ciphertext: ByteArray,
+        updatedAtEpochMillis: Long,
+    ): Int
+
+    @Query(
+        "DELETE FROM account_message_archive " +
+            "WHERE ownerAccountId = :ownerAccountId AND installationId = :installationId",
+    )
+    suspend fun deleteOwner(ownerAccountId: String, installationId: String): Int
+
+    @Query(
+        "SELECT DISTINCT installationId FROM account_message_archive " +
+            "WHERE ownerAccountId = :ownerAccountId ORDER BY installationId COLLATE BINARY ASC",
+    )
+    suspend fun installationIdsForAccount(ownerAccountId: String): List<String>
+
+    @Query("DELETE FROM account_message_archive WHERE ownerAccountId = :ownerAccountId")
+    suspend fun deleteAccount(ownerAccountId: String): Int
+}

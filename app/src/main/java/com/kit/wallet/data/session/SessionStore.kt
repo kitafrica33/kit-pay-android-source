@@ -1,7 +1,9 @@
 package com.kit.wallet.data.session
 
 import com.kit.wallet.data.messaging.SecureMessagingSessionFence
+import com.kit.wallet.data.messaging.isPermanentlyMissingSecureMessagingRecordKey
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.StateFlow
 
 enum class ProfileSetupState {
@@ -180,8 +182,63 @@ interface SessionStore {
         block: suspend (SessionTokens) -> T,
     ): T
 
+    /** Serializes work against login, replacement, and clear for an exact nullable snapshot. */
+    suspend fun <T> withUnchangedSession(
+        expected: SessionSnapshot,
+        block: suspend (SessionTokens?) -> T,
+    ): T {
+        if (snapshot() != expected) throw SessionInvalidatedException()
+        val result = block(current())
+        if (snapshot() != expected) throw SessionInvalidatedException()
+        return result
+    }
+
     /** Clears credentials only if [expected] still owns the local authenticated session. */
     suspend fun clearIfCurrent(expected: SessionFence): Boolean
+
+    /** Crash-fences an intended clear without erasing or revoking the current in-memory owner. */
+    suspend fun prepareClearIfCurrent(expected: SessionFence): Boolean =
+        current()?.fence() == expected
+
+    /**
+     * Clears the exact session while serializing [finalMessagingSnapshot] with messaging-state
+     * erasure. Production storage drains earlier commits, runs the snapshot, then erases state
+     * without admitting another commit in between.
+     */
+    suspend fun clearIfCurrentAfterFinalMessagingSnapshot(
+        expected: SessionFence,
+        allowPermanentlyUnavailableSnapshot: Boolean = false,
+        finalMessagingSnapshot: suspend () -> Unit,
+    ): Boolean {
+        if (current()?.fence() != expected) return false
+        try {
+            finalMessagingSnapshot()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            if (!allowPermanentlyUnavailableSnapshot ||
+                !isPermanentlyMissingSecureMessagingRecordKey(error)
+            ) {
+                throw error
+            }
+        }
+        return clearIfCurrent(expected)
+    }
+
+    /**
+     * Exact-activation variant for an unverifiable secure-messaging transition. Production
+     * storage rejects a stale [activationFence] before snapshotting or erasing local state.
+     */
+    suspend fun clearIfCurrentForSecureMessagingRecovery(
+        expected: SessionFence,
+        activationFence: SecureMessagingSessionFence,
+        allowPermanentlyUnavailableSnapshot: Boolean = false,
+        finalMessagingSnapshot: suspend () -> Unit,
+    ): Boolean = clearIfCurrentAfterFinalMessagingSnapshot(
+        expected = expected,
+        allowPermanentlyUnavailableSnapshot = allowPermanentlyUnavailableSnapshot,
+        finalMessagingSnapshot = finalMessagingSnapshot,
+    )
 
     /** Clears only the exact refresh generation rejected by the server. */
     suspend fun clearIfCredentialsCurrent(expected: SessionTokens): Boolean {
@@ -190,13 +247,33 @@ interface SessionStore {
         return clearIfCurrent(expected.fence())
     }
 
+    /** Exact-refresh-generation clear with the same atomic final messaging snapshot guarantee. */
+    suspend fun clearIfCredentialsCurrentAfterFinalMessagingSnapshot(
+        expected: SessionTokens,
+        allowPermanentlyUnavailableSnapshot: Boolean = false,
+        finalMessagingSnapshot: suspend () -> Unit,
+    ): Boolean {
+        val latest = current() ?: return false
+        if (!latest.hasSameRefreshCredential(expected)) return false
+        return clearIfCurrentAfterFinalMessagingSnapshot(
+            expected = expected.fence(),
+            allowPermanentlyUnavailableSnapshot = allowPermanentlyUnavailableSnapshot,
+            finalMessagingSnapshot = finalMessagingSnapshot,
+        )
+    }
+
     /**
      * Crash-safely erases and reopens messaging state only while [expected] and the exact
-     * messaging activation generation still own this session.
+     * messaging activation generation still own this session. Production storage runs
+     * [finalMessagingSnapshot] under the same exclusive messaging-state lease and writes its
+     * crash fence only after that snapshot succeeds. A proved-permanently-unavailable record key
+     * may bypass only its own snapshot failure because no retained record can then be decrypted.
      */
     suspend fun resetSecureMessagingStateIfCurrent(
         expected: SessionFence,
         activationFence: SecureMessagingSessionFence,
+        allowPermanentlyUnavailableSnapshot: Boolean = false,
+        finalMessagingSnapshot: suspend () -> Unit = {},
     ): Boolean = throw UnsupportedOperationException(
         "This session store cannot reset secure messaging state",
     )

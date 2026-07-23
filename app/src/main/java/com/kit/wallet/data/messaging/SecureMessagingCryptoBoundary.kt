@@ -1775,21 +1775,18 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
         return result.first
     }
 
-    /** Starts erasure only for the exact activation that requested enrollment recovery. */
-    internal fun beginRecoveryErasure(fence: SecureMessagingSessionFence) {
+    /**
+     * Starts erasure only for the exact activation that requested enrollment recovery.
+     * [persistErasureFence] runs while the lifecycle lock still proves that exact activation;
+     * if it fails, the runtime stage and capability remain unchanged.
+     */
+    internal fun beginRecoveryErasure(
+        fence: SecureMessagingSessionFence,
+        persistErasureFence: () -> Unit = {},
+    ) {
         val listeners = synchronized(lock) {
-            check(currentActivationIdentity === fence.activationIdentity) {
-                "Secure messaging recovery activation generation changed"
-            }
-            check(current.binding == fence.binding) {
-                "Secure messaging recovery session epoch changed"
-            }
-            check(
-                current.stage in setOf(
-                    SecureMessagingRuntimeStage.PREPARING_KEYS,
-                    SecureMessagingRuntimeStage.QUARANTINED,
-                ),
-            ) { "Secure messaging recovery cannot erase from ${current.stage}" }
+            assertRecoveryErasureCurrentLocked(fence)
+            persistErasureFence()
             setCurrentLocked(
                 SecureMessagingRuntimeSnapshot(
                     stage = SecureMessagingRuntimeStage.ERASING,
@@ -1800,6 +1797,12 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
         }
         notifyReadinessInvalidated(listeners)
     }
+
+    /** Non-mutating preflight used before a recovery snapshot enters any account archive. */
+    internal fun assertRecoveryErasureCurrent(fence: SecureMessagingSessionFence) =
+        synchronized(lock) {
+            assertRecoveryErasureCurrentLocked(fence)
+        }
 
     fun finishErasure() {
         val listeners = synchronized(lock) {
@@ -1830,11 +1833,38 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
         assertCurrentLocked(fence, readyRequired)
     }
 
+    /** Includes a quarantined generation that still exclusively owns fenced recovery. */
+    internal fun ownsGeneration(fence: SecureMessagingSessionFence): Boolean = synchronized(lock) {
+        currentActivationIdentity === fence.activationIdentity &&
+            current.binding == fence.binding &&
+            current.stage !in setOf(
+                SecureMessagingRuntimeStage.NO_SESSION,
+                SecureMessagingRuntimeStage.ERASING,
+            )
+    }
+
     fun assertCurrent(
         capability: SecureMessagingActivationCapability,
         readyRequired: Boolean = false,
     ) {
         SecureMessagingActivationProvenance.requireCurrent(capability, readyRequired)
+    }
+
+    /**
+     * Runs one non-suspending publication while the exact activation remains READY. Lifecycle
+     * transitions cannot interleave with the callback, so observers can never see a projection
+     * published after logout/quarantine has begun.
+     */
+    internal fun runIfCurrentAndReady(
+        fence: SecureMessagingSessionFence,
+        publication: () -> Unit,
+    ): Boolean = synchronized(lock) {
+        val currentAndReady = runCatching {
+            assertCurrentLocked(fence, readyRequired = true)
+        }.isSuccess
+        if (!currentAndReady) return@synchronized false
+        publication()
+        true
     }
 
     private fun transition(
@@ -1886,6 +1916,21 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
                 "Secure messaging is not ready for message exchange"
             }
         }
+    }
+
+    private fun assertRecoveryErasureCurrentLocked(fence: SecureMessagingSessionFence) {
+        check(currentActivationIdentity === fence.activationIdentity) {
+            "Secure messaging recovery activation generation changed"
+        }
+        check(current.binding == fence.binding) {
+            "Secure messaging recovery session epoch changed"
+        }
+        check(
+            current.stage in setOf(
+                SecureMessagingRuntimeStage.PREPARING_KEYS,
+                SecureMessagingRuntimeStage.QUARANTINED,
+            ),
+        ) { "Secure messaging recovery cannot erase from ${current.stage}" }
     }
 
     private fun assertCurrentIdentityLocked(

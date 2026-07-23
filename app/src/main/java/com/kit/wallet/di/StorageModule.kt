@@ -10,10 +10,16 @@ import com.kit.wallet.data.local.WalletTransactionDao
 import com.kit.wallet.data.session.KeystoreSessionStore
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.messaging.AndroidKeystoreMessagingRecordCipher
+import com.kit.wallet.data.messaging.AccountMessageArchiveCipher
+import com.kit.wallet.data.messaging.AccountMessageArchiveStore
+import com.kit.wallet.data.messaging.AccountMessageHistoryAccess
+import com.kit.wallet.data.messaging.AccountMessageHistoryArchive
+import com.kit.wallet.data.messaging.AndroidKeystoreAccountMessageArchiveCipher
 import com.kit.wallet.data.messaging.LibSignalSecureMessagingCryptoEngine
 import com.kit.wallet.data.messaging.LibSignalSecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.RealSecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.RoomSecureMessagingStateStore
+import com.kit.wallet.data.messaging.RoomAccountMessageArchiveStore
 import com.kit.wallet.data.messaging.SecureMessagingCryptoEngine
 import com.kit.wallet.data.messaging.SecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
@@ -43,7 +49,25 @@ abstract class SessionModule {
 
 @Module
 @InstallIn(SingletonComponent::class)
-abstract class SecureMessagingStorageModule {
+internal abstract class SecureMessagingStorageModule {
+    @Binds
+    @Singleton
+    abstract fun bindAccountMessageHistoryAccess(
+        implementation: AccountMessageHistoryArchive,
+    ): AccountMessageHistoryAccess
+
+    @Binds
+    @Singleton
+    abstract fun bindAccountMessageArchiveCipher(
+        implementation: AndroidKeystoreAccountMessageArchiveCipher,
+    ): AccountMessageArchiveCipher
+
+    @Binds
+    @Singleton
+    abstract fun bindAccountMessageArchiveStore(
+        implementation: RoomAccountMessageArchiveStore,
+    ): AccountMessageArchiveStore
+
     @Binds
     @Singleton
     abstract fun bindSecureMessagingRecordCipher(
@@ -92,6 +116,7 @@ object StorageModule {
                 KitWalletDatabase.MIGRATION_1_2,
                 KitWalletDatabase.MIGRATION_2_3,
                 KitWalletDatabase.MIGRATION_3_4,
+                KitWalletDatabase.MIGRATION_4_5,
             )
             .fallbackToDestructiveMigrationOnDowngrade()
             .build()

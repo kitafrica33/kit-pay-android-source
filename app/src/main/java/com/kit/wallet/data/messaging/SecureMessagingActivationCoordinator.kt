@@ -17,6 +17,7 @@ import kotlinx.coroutines.sync.withLock
 class SecureMessagingActiveSession internal constructor(
     internal val transport: RemoteSecureMessagingTransport.Session,
     internal val fence: SecureMessagingSessionFence,
+    internal val activation: SecureMessagingActivationCapability,
 ) {
     val binding: SecureMessagingSessionBinding = transport.binding
 }
@@ -60,6 +61,27 @@ class SecureMessagingActiveSessionRegistry @Inject constructor(
         "Secure messaging has no active message-ready session"
     }
 
+    /**
+     * Commits a non-suspending projection only while [expected] is still the exact published
+     * activation. The registry lock closes replacement races; the lifecycle guard holds its own
+     * lock across the callback so leaving READY cannot interleave with observable publication.
+     */
+    internal fun publishIfCurrent(
+        expected: SecureMessagingActiveSession?,
+        publication: () -> Unit,
+    ): Boolean = synchronized(lock) {
+        if (mutableActiveSession.value !== expected) return@synchronized false
+        if (expected == null) {
+            publication()
+            return@synchronized true
+        }
+        if (!lifecycle.runIfCurrentAndReady(expected.fence, publication)) {
+            clearLocked()
+            return@synchronized false
+        }
+        true
+    }
+
     internal fun publish(
         transport: RemoteSecureMessagingTransport.Session,
         fence: SecureMessagingSessionFence,
@@ -81,7 +103,11 @@ class SecureMessagingActiveSessionRegistry @Inject constructor(
             retainedDuringRevalidation = null
         }
 
-        val active = SecureMessagingActiveSession(transport, fence)
+        val active = SecureMessagingActiveSession(
+            transport = transport,
+            fence = fence,
+            activation = lifecycle.activationCapability(fence, readyRequired = true),
+        )
         mutableActiveSession.value = active
         try {
             // Close the race in which erasure starts after the first check but before publication.
@@ -226,6 +252,12 @@ class SecureMessagingActivationCoordinator @Inject constructor(
     val activationState: StateFlow<SecureMessagingRuntimeSnapshot> = lifecycle.runtime
     val activeSession: StateFlow<SecureMessagingActiveSession?> = sessions.activeSession
 
+    internal fun ownsGeneration(fence: SecureMessagingSessionFence): Boolean =
+        lifecycle.ownsGeneration(fence)
+
+    internal fun hasNoGeneration(): Boolean =
+        lifecycle.snapshot().stage == SecureMessagingRuntimeStage.NO_SESSION
+
     suspend fun ensureActivated(
         binding: SecureMessagingSessionBinding,
     ): SecureMessagingActiveSession = mutex.withLock {
@@ -245,13 +277,37 @@ class SecureMessagingActivationCoordinator @Inject constructor(
             pendingAttempt = null
             active
         } catch (error: Throwable) {
-            if (error is SecureMessagingKeyReconciliationException && isCurrent(attempt)) {
+            val permanentlyMissingRecordKey =
+                isPermanentlyMissingSecureMessagingRecordKey(error)
+            if (permanentlyMissingRecordKey) {
+                // Initial roster/projection recovery can discover the same lost Android-Keystore
+                // alias after key reconciliation. Convert that exact storage failure into the
+                // fenced local-reset path instead of leaving this login quarantined forever.
+                runCatching {
+                    lifecycle.quarantine(
+                        attempt.fence,
+                        SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                    )
+                }.exceptionOrNull()?.let(error::addSuppressed)
+            } else if (error is SecureMessagingKeyReconciliationException && isCurrent(attempt)) {
                 runCatching {
                     lifecycle.quarantine(attempt.fence, error.quarantineReason)
                 }.exceptionOrNull()?.let(error::addSuppressed)
             }
             sessions.clearIfOwnedBy(attempt.fence)
             if (!isCurrent(attempt)) pendingAttempt = null
+            if (
+                permanentlyMissingRecordKey &&
+                error !is SecureMessagingReauthenticationRequiredException &&
+                error !is SecureMessagingLocalEnrollmentResetRequiredException &&
+                error !is SecureMessagingFreshAuthenticationRequiredException
+            ) {
+                throw SecureMessagingLocalEnrollmentResetRequiredException(
+                    activationFence = attempt.fence,
+                    message = "The secure messaging record key is permanently unavailable",
+                    cause = error,
+                )
+            }
             throw error
         }
     }

@@ -1,14 +1,21 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.session.ProfileSetupState
+import com.kit.wallet.data.session.PendingRestorationDiscardTarget
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionKeyTemporarilyUnavailableException
 import com.kit.wallet.data.session.SessionTokens
+import com.kit.wallet.data.session.activateMessagingForPublishedSession
 import com.kit.wallet.data.session.fenceThenEraseMessagingAndClearSession
+import com.kit.wallet.data.session.pendingRestorationDiscardTarget
 import com.kit.wallet.data.session.resolveSessionKey
 import com.kit.wallet.data.session.restoreRetainingEncryptedSession
+import com.kit.wallet.data.session.retryPublishedMessagingActivationWithRetries
 import com.kit.wallet.data.session.retryRetainedEncryptedSession
 import com.kit.wallet.data.session.sessionKeyCreationAllowed
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -18,6 +25,293 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class KeystoreSessionRestorationTest {
+    @Test
+    fun `retry restore finishes messaging activation before propagating cancellation`() = runTest {
+        val activationStarted = CompletableDeferred<Unit>()
+        val finishActivation = CompletableDeferred<Unit>()
+        val observed = CompletableDeferred<Throwable>()
+        var stateAvailable = false
+        val cancellation = CancellationException("retry restore was cancelled")
+
+        val restoration = launch {
+            try {
+                activateMessagingForPublishedSession(
+                    expected = SESSION.fence(),
+                    currentSession = { SESSION.fence() },
+                    activate = {
+                        activationStarted.complete(Unit)
+                        finishActivation.await()
+                        stateAvailable = true
+                    },
+                )
+            } catch (error: Throwable) {
+                observed.complete(error)
+            }
+        }
+
+        activationStarted.await()
+        restoration.cancel(cancellation)
+        finishActivation.complete(Unit)
+
+        assertSame(cancellation, observed.await())
+        restoration.join()
+        assertTrue(stateAvailable)
+    }
+
+    @Test
+    fun `regular persist finishes messaging activation before propagating cancellation`() = runTest {
+        val activationStarted = CompletableDeferred<Unit>()
+        val finishActivation = CompletableDeferred<Unit>()
+        val observed = CompletableDeferred<Throwable>()
+        val events = mutableListOf<String>()
+        val cancellation = CancellationException("session persist was cancelled")
+
+        val persistence = launch {
+            try {
+                activateMessagingForPublishedSession(
+                    expected = SESSION.fence(),
+                    currentSession = { SESSION.fence() },
+                    activate = {
+                        events += "activation-started"
+                        activationStarted.complete(Unit)
+                        finishActivation.await()
+                        events += "state-available"
+                    },
+                )
+            } catch (error: Throwable) {
+                events += "cancelled"
+                observed.complete(error)
+            }
+        }
+
+        activationStarted.await()
+        persistence.cancel(cancellation)
+        finishActivation.complete(Unit)
+
+        assertSame(cancellation, observed.await())
+        persistence.join()
+        assertEquals(listOf("activation-started", "state-available", "cancelled"), events)
+    }
+
+    @Test
+    fun `reset reopening survives cancellation without abandoning the authenticated session`() =
+        runTest {
+            val activationStarted = CompletableDeferred<Unit>()
+            val finishActivation = CompletableDeferred<Unit>()
+            val observed = CompletableDeferred<Throwable>()
+            val cancellation = CancellationException("foreground recovery stopped")
+            var sessionPublished = true
+            var stateAvailable = false
+
+            val recovery = launch {
+                try {
+                    activateMessagingForPublishedSession(
+                        expected = SESSION.fence(),
+                        currentSession = { SESSION.fence().takeIf { sessionPublished } },
+                        activate = {
+                            activationStarted.complete(Unit)
+                            finishActivation.await()
+                            stateAvailable = true
+                        },
+                    )
+                } catch (error: Throwable) {
+                    observed.complete(error)
+                }
+            }
+
+            activationStarted.await()
+            recovery.cancel(cancellation)
+            finishActivation.complete(Unit)
+
+            assertSame(cancellation, observed.await())
+            recovery.join()
+            assertTrue(sessionPublished)
+            assertTrue(stateAvailable)
+        }
+
+    @Test
+    fun `replacement or logout cannot reopen messaging for the obsolete session`() = runTest {
+        val expected = SESSION.fence()
+        var current: SessionFence? = null
+        var activations = 0
+
+        assertFalse(
+            activateMessagingForPublishedSession(
+                expected = expected,
+                currentSession = { current },
+                activate = { activations++ },
+            ),
+        )
+
+        current = expected.copy(sessionId = "replacement-session")
+        assertFalse(
+            activateMessagingForPublishedSession(
+                expected = expected,
+                currentSession = { current },
+                activate = { activations++ },
+            ),
+        )
+
+        assertEquals(0, activations)
+    }
+
+    @Test
+    fun `caller cancellation wins and retains an activation failure as suppressed`() = runTest {
+        val activationStarted = CompletableDeferred<Unit>()
+        val finishActivation = CompletableDeferred<Unit>()
+        val observed = CompletableDeferred<Throwable>()
+        val activationFailure = IllegalStateException("gate activation failed")
+        val cancellation = CancellationException("caller stopped")
+
+        val persistence = launch {
+            try {
+                activateMessagingForPublishedSession(
+                    expected = SESSION.fence(),
+                    currentSession = { SESSION.fence() },
+                    activate = {
+                        activationStarted.complete(Unit)
+                        finishActivation.await()
+                        throw activationFailure
+                    },
+                )
+            } catch (error: Throwable) {
+                observed.complete(error)
+            }
+        }
+
+        activationStarted.await()
+        persistence.cancel(cancellation)
+        finishActivation.complete(Unit)
+
+        val thrown = observed.await()
+        assertSame(cancellation, thrown)
+        assertEquals(listOf(activationFailure), thrown.suppressed.toList())
+        persistence.join()
+    }
+
+    @Test
+    fun `activation failure marks the published session retryable and a retry opens it`() = runTest {
+        val activationFailure = IllegalStateException("lifecycle gate temporarily failed")
+        var retryPending = false
+        var attempts = 0
+
+        val observed = runCatching {
+            activateMessagingForPublishedSession(
+                expected = SESSION.fence(),
+                currentSession = { SESSION.fence() },
+                activate = {
+                    attempts++
+                    throw activationFailure
+                },
+                onActivationFailure = { retryPending = true },
+            )
+        }.exceptionOrNull()
+
+        assertSame(activationFailure, observed)
+        assertTrue(retryPending)
+
+        val activated = activateMessagingForPublishedSession(
+            expected = SESSION.fence(),
+            currentSession = { SESSION.fence() },
+            activate = {
+                attempts++
+                retryPending = false
+            },
+            onActivationFailure = { retryPending = true },
+        )
+
+        assertTrue(activated)
+        assertFalse(retryPending)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun `reset reopen failure retains the authenticated session for retry`() = runTest {
+        val activationFailure = IllegalStateException("reset gate failed to reopen")
+        var retryPending = false
+        val sessionPublished = true
+
+        val observed = runCatching {
+            activateMessagingForPublishedSession(
+                expected = SESSION.fence(),
+                currentSession = { SESSION.fence().takeIf { sessionPublished } },
+                activate = { throw activationFailure },
+                onActivationFailure = { retryPending = true },
+            )
+        }.exceptionOrNull()
+
+        assertSame(activationFailure, observed)
+        assertTrue(sessionPublished)
+        assertTrue(retryPending)
+    }
+
+    @Test
+    fun `reset reopen retry eventually opens the exact authenticated session`() = runTest {
+        val expected = SESSION.fence()
+        var current: SessionFence? = expected
+        var retryPending = true
+        var attempts = 0
+        val waits = mutableListOf<Long>()
+
+        val reopened = retryPublishedMessagingActivationWithRetries(
+            attempts = 3,
+            retryDelayMillis = 250L,
+            attemptActivation = {
+                if (current != expected) return@retryPublishedMessagingActivationWithRetries null
+                attempts++
+                if (attempts < 3) {
+                    false
+                } else {
+                    retryPending = false
+                    true
+                }
+            },
+            waitBeforeNextAttempt = { waits += it },
+        )
+
+        assertTrue(reopened)
+        assertFalse(retryPending)
+        assertEquals(3, attempts)
+        assertEquals(listOf(250L, 500L), waits)
+
+        current = expected.copy(sessionId = "replacement-session")
+        val obsoleteReopened = retryPublishedMessagingActivationWithRetries(
+            attempts = 3,
+            retryDelayMillis = 250L,
+            attemptActivation = {
+                if (current != expected) null else error("Obsolete activation was retried")
+            },
+            waitBeforeNextAttempt = { error("Obsolete activation entered backoff") },
+        )
+
+        assertFalse(obsoleteReopened)
+    }
+
+    @Test
+    fun `published session with a failed messaging gate can be explicitly discarded`() {
+        assertEquals(
+            PendingRestorationDiscardTarget.PUBLISHED_CREDENTIAL,
+            pendingRestorationDiscardTarget(
+                restorationPending = true,
+                sessionPublished = true,
+            ),
+        )
+        assertEquals(
+            PendingRestorationDiscardTarget.RETAINED_CREDENTIAL,
+            pendingRestorationDiscardTarget(
+                restorationPending = true,
+                sessionPublished = false,
+            ),
+        )
+        assertEquals(
+            PendingRestorationDiscardTarget.NONE,
+            pendingRestorationDiscardTarget(
+                restorationPending = false,
+                sessionPublished = true,
+            ),
+        )
+    }
+
     @Test
     fun `foreground restoration retries transient failures with a bounded backoff`() = runTest {
         var pending = true
