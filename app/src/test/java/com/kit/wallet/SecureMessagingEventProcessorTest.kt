@@ -34,8 +34,11 @@ import com.kit.wallet.data.messaging.SecureMessagingLifecycleGate
 import com.kit.wallet.data.messaging.SecureMessagingNotificationPublicationException
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
+import com.kit.wallet.data.messaging.SecureMessagingPreparedEnvelope
+import com.kit.wallet.data.messaging.SecureMessagingPreparedFanout
 import com.kit.wallet.data.messaging.SecureMessagingProvisioningPlan
 import com.kit.wallet.data.messaging.SecureMessagingRecord
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
 import com.kit.wallet.data.messaging.SecureMessagingRecordPage
 import com.kit.wallet.data.messaging.SecureMessagingRecordVersion
 import com.kit.wallet.data.messaging.SecureMessagingReauthenticationRequiredException
@@ -75,8 +78,14 @@ import com.kit.wallet.data.remote.MessagingSyncDto
 import com.kit.wallet.data.remote.MessagingSyncEventDataDto
 import com.kit.wallet.data.remote.MessagingSyncEventDto
 import com.kit.wallet.data.remote.SecureMessagingWireApi
+import com.kit.wallet.data.session.ProfileSetupState
+import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionSnapshot
+import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.data.session.SessionTokens
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Instant
@@ -90,10 +99,17 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.Dispatcher
@@ -110,6 +126,7 @@ import org.junit.Test
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class SecureMessagingEventProcessorTest {
     private lateinit var server: MockWebServer
     private lateinit var transport: RemoteSecureMessagingTransport
@@ -143,6 +160,7 @@ class SecureMessagingEventProcessorTest {
         val completions = SecureMessagingSyncCompletionSignal()
         val runtime = DefaultSecureMessagingChatRuntime(
             sessions = registry,
+            authenticationSessions = MutableTestSessionStore(authenticatedSession()),
             engine = PersistingDecryptionEngine(stateStore),
             projections = projectionStore(stateStore),
             syncEngine = object : SecureMessagingSyncEngine {
@@ -164,6 +182,212 @@ class SecureMessagingEventProcessorTest {
         val exposed = retry.await()
         assertTrue(runtime.isCurrent(exposed))
         assertEquals(BINDING.sessionEpoch, exposed.sessionEpoch)
+    }
+
+    @Test
+    fun `runtime reports exact durable client ID before transport and never before commit`() = runTest {
+        val (transportSession, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+        registry.publish(transportSession, fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val runtime = DefaultSecureMessagingChatRuntime(
+            sessions = registry,
+            authenticationSessions = MutableTestSessionStore(authenticatedSession()),
+            engine = OutboundCommitTestEngine(
+                stateStore = stateStore,
+                authenticatedText = "operation-owned callback",
+                failuresBeforeCommit = 1,
+            ),
+            projections = projections,
+            syncEngine = object : SecureMessagingSyncEngine {
+                override val isReady = true
+                override suspend fun synchronize() = Unit
+            },
+            scope = backgroundScope,
+            clock = Clock.fixed(Instant.parse(TIMESTAMP), ZoneOffset.UTC),
+        )
+        runCurrent()
+        val active = checkNotNull(runtime.activeSession.value)
+        val roster = authoritativeRoster()
+
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        val preCommitCallbacks = mutableListOf<String>()
+        val preCommitFailure = runCatching {
+            runtime.sendText(
+                session = active,
+                conversationId = CONVERSATION_ID,
+                text = "operation-owned callback",
+                onDurablyCommitted = preCommitCallbacks::add,
+            )
+        }.exceptionOrNull()
+
+        assertTrue(preCommitFailure is SecureMessagingStateConflictException)
+        assertTrue(preCommitCallbacks.isEmpty())
+        assertTrue(projections.readPage(limit = 10).messages().isEmpty())
+
+        enqueueRoster(roster)
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        val committedClientId = CompletableDeferred<String>()
+        val send = async(start = CoroutineStart.UNDISPATCHED) {
+            runtime.sendText(
+                session = active,
+                conversationId = CONVERSATION_ID,
+                text = "operation-owned callback",
+                onDurablyCommitted = { committedClientId.complete(it) },
+            )
+        }
+
+        val callbackId = withContext(Dispatchers.Default.limitedParallelism(1)) {
+            withTimeout(5_000L) { committedClientId.await() }
+        }
+        val pending = projections.readPage(limit = 10).messages().single()
+        assertEquals(pending.durableRecord.clientMessageId, callbackId)
+        assertEquals(SecureMessagingProjectionDeliveryState.OUTBOUND_PENDING, pending.deliveryState)
+        assertFalse(send.isCompleted)
+
+        send.cancelAndJoin()
+    }
+
+    @Test
+    fun `quarantined failed recovery retries immediately under the same authentication fence`() =
+        runTest {
+            val (session, lifecycle, fence) = openSyncingSession()
+            lifecycle.finishActivation(fence)
+            val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+            registry.publish(session, fence)
+            val authentication = MutableTestSessionStore(authenticatedSession())
+            val stateStore = TestSecureMessagingStateStore()
+            var continuationCalls = 0
+            val continuationFences = mutableListOf<SessionFence>()
+            val sync = object : SecureMessagingSyncEngine {
+                override val isReady = true
+                override suspend fun synchronize() = Unit
+
+                override suspend fun synchronize(expectedSession: SessionFence) {
+                    continuationFences += expectedSession
+                    continuationCalls++
+                    if (continuationCalls == 1) {
+                        throw IOException("provider is still opening")
+                    }
+                }
+
+                override suspend fun recoverPermanentlyUnavailableState(
+                    expectedActivation: SecureMessagingSessionFence,
+                ) {
+                    session.quarantine(
+                        SecureMessagingCryptographicFailureException(
+                            quarantineReason = SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                            message = "proved local record key loss",
+                        ),
+                    )
+                    throw IOException("recovery transport unavailable")
+                }
+            }
+            val runtime = DefaultSecureMessagingChatRuntime(
+                sessions = registry,
+                authenticationSessions = authentication,
+                engine = PersistingDecryptionEngine(stateStore),
+                projections = projectionStore(stateStore),
+                syncEngine = sync,
+                scope = backgroundScope,
+                clock = Clock.fixed(Instant.parse(TIMESTAMP), ZoneOffset.UTC),
+            )
+            runCurrent()
+
+            assertFalse(
+                runtime.recoverPermanentlyUnavailableState(
+                    IOException("temporary baseline provider failure"),
+                ),
+            )
+            assertEquals(0, continuationCalls)
+
+            val failure = runCatching {
+                runtime.recoverPermanentlyUnavailableState(
+                    IOException(
+                        "projection baseline key is permanently unavailable",
+                        SecureMessagingRecordKeyPermanentlyMissingException(),
+                    ),
+                )
+            }.exceptionOrNull()
+            assertTrue(failure is IOException)
+            runCurrent()
+
+            val expected = checkNotNull(authentication.current()).fence()
+            assertEquals(1, continuationCalls)
+            assertEquals(listOf(expected), continuationFences)
+
+            advanceTimeBy(4_999L)
+            runCurrent()
+            assertEquals(1, continuationCalls)
+            advanceTimeBy(1L)
+            runCurrent()
+
+            assertEquals(2, continuationCalls)
+            assertEquals(listOf(expected, expected), continuationFences)
+        }
+
+    @Test
+    fun `authentication replacement cancels quarantined recovery continuation`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+        registry.publish(session, fence)
+        val authentication = MutableTestSessionStore(authenticatedSession())
+        val stateStore = TestSecureMessagingStateStore()
+        var continuationCalls = 0
+        val sync = object : SecureMessagingSyncEngine {
+            override val isReady = true
+            override suspend fun synchronize() = Unit
+
+            override suspend fun synchronize(expectedSession: SessionFence) {
+                continuationCalls++
+                throw IOException("provider is still unavailable")
+            }
+
+            override suspend fun recoverPermanentlyUnavailableState(
+                expectedActivation: SecureMessagingSessionFence,
+            ) {
+                session.quarantine(
+                    SecureMessagingCryptographicFailureException(
+                        quarantineReason = SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                        message = "proved local record key loss",
+                    ),
+                )
+                throw IOException("recovery transport unavailable")
+            }
+        }
+        val runtime = DefaultSecureMessagingChatRuntime(
+            sessions = registry,
+            authenticationSessions = authentication,
+            engine = PersistingDecryptionEngine(stateStore),
+            projections = projectionStore(stateStore),
+            syncEngine = sync,
+            scope = backgroundScope,
+            clock = Clock.fixed(Instant.parse(TIMESTAMP), ZoneOffset.UTC),
+        )
+        runCurrent()
+
+        val failure = runCatching {
+            runtime.recoverPermanentlyUnavailableState(
+                IOException(
+                    "projection baseline key is permanently unavailable",
+                    SecureMessagingRecordKeyPermanentlyMissingException(),
+                ),
+            )
+        }.exceptionOrNull()
+        assertTrue(failure is IOException)
+        runCurrent()
+        assertEquals(1, continuationCalls)
+
+        authentication.replace(authenticatedSession(sessionId = "replacement-epoch"))
+        runCurrent()
+        advanceTimeBy(60_000L)
+        runCurrent()
+
+        assertEquals(1, continuationCalls)
     }
 
     @Test
@@ -1722,6 +1946,7 @@ class SecureMessagingEventProcessorTest {
         registry.publish(session, fence)
         val runtime = DefaultSecureMessagingChatRuntime(
             sessions = registry,
+            authenticationSessions = MutableTestSessionStore(authenticatedSession()),
             engine = PersistingDecryptionEngine(stateStore),
             projections = projections,
             syncEngine = object : SecureMessagingSyncEngine {
@@ -1863,6 +2088,14 @@ class SecureMessagingEventProcessorTest {
         lifecycle.beginRosterSync(fence)
         return Triple(session, lifecycle, fence)
     }
+
+    private fun authenticatedSession(sessionId: String = BINDING.sessionEpoch) = SessionTokens(
+        accessToken = "test-access",
+        refreshToken = "test-refresh",
+        sessionId = sessionId,
+        cacheScopeId = "scope:$sessionId",
+        accountId = CURRENT_USER_ID,
+    )
 
     private fun blockingResponseDispatcher(
         response: MockResponse,
@@ -2510,6 +2743,135 @@ class SecureMessagingEventProcessorTest {
         .setResponseCode(status)
         .setBody("""{"ok":false,"error":{"code":"$code","message":"rejected"}}""")
 
+    private class OutboundCommitTestEngine(
+        private val stateStore: TestSecureMessagingStateStore,
+        private val authenticatedText: String,
+        failuresBeforeCommit: Int,
+    ) : SecureMessagingCryptoEngine {
+        private var remainingFailures = failuresBeforeCommit
+
+        override suspend fun openTransaction(
+            activation: SecureMessagingActivationCapability,
+        ): SecureMessagingCryptoTransaction = OutboundCommitTestTransaction(
+            activation = activation,
+            stateStore = stateStore,
+            authenticatedText = authenticatedText,
+            failCommit = {
+                if (remainingFailures > 0) {
+                    remainingFailures--
+                    true
+                } else {
+                    false
+                }
+            },
+        )
+
+        override suspend fun eraseAll() = stateStore.eraseAll()
+
+        override suspend fun retireRemoteDevices(
+            activation: SecureMessagingActivationCapability,
+            affectedUserId: String,
+            affectedServerDeviceId: String?,
+        ) = Unit
+    }
+
+    private class OutboundCommitTestTransaction(
+        activation: SecureMessagingActivationCapability,
+        private val stateStore: TestSecureMessagingStateStore,
+        private val authenticatedText: String,
+        private val failCommit: () -> Boolean,
+    ) : FailClosedSecureMessagingCryptoTransaction(activation) {
+        private var stagedFanout: SecureMessagingPreparedFanout? = null
+        private var stagedPlan: com.kit.wallet.data.messaging.SecureMessagingEncryptionPlanSnapshot? = null
+        private var destination: Pair<String, String>? = null
+
+        override suspend fun stageProvisioningMaterial(plan: SecureMessagingProvisioningPlan) =
+            error("unexpected provisioning")
+
+        override suspend fun stageSessionMaterial(
+            request: SecureMessagingSessionEstablishmentRequest,
+        ) = error("unexpected session establishment")
+
+        override suspend fun findMissingSessionAddresses(
+            plan: SecureMessagingEncryptionPlan,
+            candidates: List<SecureMessagingCryptoAddress>,
+        ): Collection<SecureMessagingCryptoAddress> = emptyList()
+
+        override suspend fun stageEncryptionMaterial(request: SecureMessagingEncryptionRequest) {
+            val plan = request.planSnapshot.snapshot()
+            stagedPlan = plan
+            stagedFanout = SecureMessagingPreparedFanout(
+                conversationId = plan.conversationId,
+                clientMessageId = request.clientMessageId,
+                rosterRevision = plan.rosterRevision,
+                recipients = plan.recipients,
+                envelopes = plan.recipients.addresses().mapIndexed { index, recipient ->
+                    SecureMessagingPreparedEnvelope(
+                        recipient = recipient,
+                        kind = SecureMessagingEnvelopeKind.SESSION,
+                        ciphertext = OpaqueCryptoBytes.copyOf(
+                            byteArrayOf((index + 1).toByte(), 0x5a),
+                        ),
+                    )
+                },
+                replyToMessageId = request.replyToMessageId,
+            )
+        }
+
+        override suspend fun stageDecryptionMaterial(request: SecureMessagingDecryptionRequest) =
+            error("unexpected decryption")
+
+        override suspend fun prepareStaged(
+            operation: SecureMessagingCryptoOperation,
+            companionStateIntent: SecureMessagingCompanionStateIntent?,
+        ): PreparedCommit {
+            check(operation == SecureMessagingCryptoOperation.ENCRYPT)
+            val resolved = companionStateDestination(checkNotNull(companionStateIntent))
+            destination = resolved.namespace to resolved.recordKey
+            return preparedEncryption(checkNotNull(stagedFanout))
+        }
+
+        override suspend fun commitPrepared(
+            operation: SecureMessagingCryptoOperation,
+            preparedResult: PreparedCommit,
+        ) {
+            check(operation == SecureMessagingCryptoOperation.ENCRYPT)
+            if (failCommit()) {
+                throw SecureMessagingStateConflictException("injected failure before durable commit")
+            }
+            val fanout = checkNotNull(stagedFanout)
+            val plan = checkNotNull(stagedPlan)
+            val target = checkNotNull(destination)
+            stateStore.persistCompanionRecordForTest(
+                namespace = target.first,
+                recordKey = target.second,
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = fanout.clientMessageId,
+                clientMessageId = fanout.clientMessageId,
+                conversationId = fanout.conversationId,
+                rosterRevision = fanout.rosterRevision,
+                sender = plan.sender,
+                replyToMessageId = fanout.replyToMessageId,
+                text = authenticatedText,
+                envelopes = fanout.envelopes.map { envelope ->
+                    PersistedCompanionEnvelopeFixture(
+                        recipient = envelope.recipient,
+                        kind = envelope.kind,
+                        ciphertext = envelope.ciphertext.copyBytes(),
+                    )
+                },
+            )
+        }
+
+        override suspend fun abortStaged() = Unit
+
+        override fun wipeStagedSecrets() {
+            stagedFanout = null
+            stagedPlan = null
+            destination = null
+        }
+    }
+
     private class PersistingDecryptionEngine(
         private val stateStore: TestSecureMessagingStateStore,
         failedCommits: Int = 0,
@@ -2721,6 +3083,65 @@ class SecureMessagingEventProcessorTest {
                 throw SecureMessagingStateConflictException("committed before injected conflict")
             }
             return committed
+        }
+    }
+
+    private class MutableTestSessionStore(initial: SessionTokens?) : SessionStore {
+        private val mutableSession = MutableStateFlow(initial)
+        private var revision = 0L
+        override val session = mutableSession
+
+        override fun current(): SessionTokens? = mutableSession.value
+
+        override fun snapshot() = SessionSnapshot(revision, current()?.fence())
+
+        override suspend fun save(tokens: SessionTokens) {
+            mutableSession.value = tokens
+            revision++
+        }
+
+        override suspend fun saveIfUnchanged(
+            expected: SessionSnapshot,
+            tokens: SessionTokens,
+        ): Boolean {
+            if (snapshot() != expected) return false
+            save(tokens)
+            return true
+        }
+
+        override suspend fun updateProfileSetupState(
+            expected: SessionFence,
+            state: ProfileSetupState,
+        ): Boolean {
+            val current = current() ?: return false
+            if (current.fence() != expected) return false
+            save(current.copy(profileSetupState = state))
+            return true
+        }
+
+        override suspend fun <T> withCurrentSession(
+            expected: SessionFence,
+            block: suspend (SessionTokens) -> T,
+        ): T {
+            val current = checkNotNull(current())
+            check(current.fence() == expected)
+            return block(current)
+        }
+
+        override suspend fun clearIfCurrent(expected: SessionFence): Boolean {
+            if (current()?.fence() != expected) return false
+            clear()
+            return true
+        }
+
+        override suspend fun clear() {
+            mutableSession.value = null
+            revision++
+        }
+
+        fun replace(tokens: SessionTokens?) {
+            mutableSession.value = tokens
+            revision++
         }
     }
 

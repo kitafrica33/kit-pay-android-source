@@ -90,8 +90,13 @@ class SharedTextShareViewModelTest {
 
         override suspend fun openDirectConversation(contact: Contact): String = error("Not used")
 
-        override suspend fun sendMessage(chatId: String, text: String) {
+        override suspend fun sendMessage(
+            chatId: String,
+            text: String,
+            onDurablyCommitted: (clientMessageId: String) -> Unit,
+        ) {
             sentMessages += chatId to text
+            onDurablyCommitted("test-client-${sentMessages.size}")
         }
     }
 }

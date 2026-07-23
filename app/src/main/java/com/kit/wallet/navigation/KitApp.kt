@@ -71,6 +71,7 @@ import com.kit.wallet.feature.bills.BillsScreen
 import com.kit.wallet.feature.calls.ActiveCallScreen
 import com.kit.wallet.feature.calls.CallsScreen
 import com.kit.wallet.feature.chat.ChatsScreen
+import com.kit.wallet.feature.chat.ChatsViewModel
 import com.kit.wallet.feature.chat.ConversationScreen
 import com.kit.wallet.feature.chat.IncomingTextShareCoordinator
 import com.kit.wallet.feature.chat.IncomingTextShareRequest
@@ -123,10 +124,20 @@ fun KitApp(
     ) { notificationPermissionRequested.value = true }
     val authState by authViewModel.uiState.collectAsStateWithLifecycle()
     val capabilities by capabilitiesViewModel.state.collectAsStateWithLifecycle()
+    val chatsBadgeViewModel: ChatsViewModel = hiltViewModel()
+    val totalUnread by chatsBadgeViewModel.totalUnread.collectAsStateWithLifecycle()
     val tabs = buildList {
         add(Tab(Dest.HOME, "Home", Icons.Outlined.AccountBalanceWallet, Icons.Filled.AccountBalanceWallet))
         if (capabilities.messagingEntryVisible) {
-            add(Tab(Dest.CHATS, "Messages", Icons.Outlined.ChatBubbleOutline, Icons.Filled.ChatBubble))
+            add(
+                Tab(
+                    Dest.CHATS,
+                    "Messages",
+                    Icons.Outlined.ChatBubbleOutline,
+                    Icons.Filled.ChatBubble,
+                    badge = totalUnread,
+                ),
+            )
         }
         if (capabilities.enabled(KitFeature.CALLS)) {
             add(Tab(Dest.CALLS, "Calls", Icons.Outlined.Call, Icons.Filled.Call))
@@ -268,7 +279,11 @@ fun KitApp(
                             },
                             icon = {
                                 BadgedBox(badge = {
-                                    if (tab.badge > 0) Badge { Text(tab.badge.toString()) }
+                                    if (tab.badge > 0) {
+                                        Badge {
+                                            Text(if (tab.badge > 99) "99+" else tab.badge.toString())
+                                        }
+                                    }
                                 }) {
                                     Icon(
                                         if (selected) tab.activeIcon else tab.icon,

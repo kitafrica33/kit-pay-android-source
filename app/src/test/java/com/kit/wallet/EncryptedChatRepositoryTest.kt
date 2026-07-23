@@ -11,6 +11,7 @@ import com.kit.wallet.data.repository.EncryptedChatRepository
 import com.kit.wallet.data.repository.SecureMessagingChatSession
 import com.kit.wallet.data.repository.SecureMessagingChatRuntime
 import com.kit.wallet.data.repository.projectionIsFromCurrentUser
+import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import java.io.IOException
@@ -231,19 +232,21 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
-    fun `later worker reactivation recovers after foreground key recovery fails`() = runTest {
+    fun `failed proved loss recovery uses bounded cooldown in the same active identity`() =
+        runTest {
         val runtime = FakeRuntime(
             epoch = null,
             baselineFailures = 4,
             permanentBaselineFailureAttempt = 4,
             recoverPermanentBaselineFailure = true,
             permanentRecoveryError = IOException("recovery network unavailable"),
+            permanentRecoveryFailures = 4,
         ).apply {
             conversations += conversation(CONVERSATION_ONE, "Grace")
         }
         val repository = repository(runtime)
 
-        runtime.activate("session-worker-retry")
+        runtime.activate("session-foreground-retry")
         runCurrent()
         advanceTimeBy(15_000L)
         runCurrent()
@@ -252,11 +255,91 @@ class EncryptedChatRepositoryTest {
         assertEquals(4, runtime.baselineAttempts)
         assertFalse(repository.readiness.value)
 
-        runtime.reactivate()
+        advanceTimeBy(14_999L)
+        runCurrent()
+        assertEquals(3, runtime.permanentRecoveryAttempts)
+        assertFalse(repository.readiness.value)
+
+        advanceTimeBy(1L)
+        runCurrent()
+        assertEquals(4, runtime.permanentRecoveryAttempts)
+        assertFalse(repository.readiness.value)
+
+        advanceTimeBy(29_999L)
+        runCurrent()
+        assertEquals(4, runtime.permanentRecoveryAttempts)
+        assertFalse(repository.readiness.value)
+
+        advanceTimeBy(1L)
         runCurrent()
 
+        assertEquals(5, runtime.permanentRecoveryAttempts)
         assertEquals(5, runtime.baselineAttempts)
         assertTrue(repository.readiness.value)
+    }
+
+    @Test
+    fun `session replacement cancels a failed proved loss recovery retry`() = runTest {
+        val runtime = FakeRuntime(
+            epoch = null,
+            baselineFailures = 4,
+            permanentBaselineFailureAttempt = 4,
+            recoverPermanentBaselineFailure = true,
+            permanentRecoveryError = IOException("recovery network unavailable"),
+            permanentRecoveryFailures = Int.MAX_VALUE,
+        ).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val repository = repository(runtime)
+
+        runtime.activate("session-obsolete-recovery")
+        runCurrent()
+        advanceTimeBy(15_000L)
+        runCurrent()
+        assertEquals(1, runtime.permanentRecoveryAttempts)
+        assertFalse(repository.readiness.value)
+
+        runtime.activate("session-current-recovery")
+        runCurrent()
+        assertTrue(repository.readiness.value)
+
+        advanceTimeBy(60_000L)
+        runCurrent()
+        assertEquals(1, runtime.permanentRecoveryAttempts)
+        assertEquals("session-current-recovery", runtime.baselineAttemptEpochs.last())
+        assertTrue(repository.readiness.value)
+    }
+
+    @Test
+    fun `null status business recovery failure is terminal`() = runTest {
+        val runtime = FakeRuntime(
+            epoch = null,
+            baselineFailures = 1,
+            permanentBaselineFailureAttempt = 1,
+            recoverPermanentBaselineFailure = true,
+            permanentRecoveryError = KitWalletApiException(
+                code = "RECOVERY_NOT_ALLOWED",
+                message = "Recovery is not allowed for this account",
+                statusCode = null,
+                connectivity = false,
+            ),
+            permanentRecoveryFailures = Int.MAX_VALUE,
+        )
+        val repository = repository(runtime)
+
+        runtime.activate("session-business-error")
+        runCurrent()
+
+        assertEquals(1, runtime.permanentRecoveryAttempts)
+        assertEquals(1, runtime.baselineAttempts)
+        assertFalse(repository.readiness.value)
+
+        advanceTimeBy(10 * 60_000L)
+        runCurrent()
+
+        assertEquals(1, runtime.permanentRecoveryAttempts)
+        assertEquals(1, runtime.baselineAttempts)
+        assertFalse(repository.readiness.value)
     }
 
     @Test
@@ -540,14 +623,18 @@ class EncryptedChatRepositoryTest {
         }
         val repository = repository(runtime)
         runCurrent()
+        val durableClientIds = mutableListOf<String>()
 
         val firstFailure = runCatching {
-            repository.sendMessage(CONVERSATION_ONE, "  hello securely  ")
+            repository.sendMessage(CONVERSATION_ONE, "  hello securely  ") {
+                durableClientIds += it
+            }
         }.exceptionOrNull()
         assertTrue(firstFailure is IOException)
         assertEquals(DeliveryState.SENDING, repository.conversation(CONVERSATION_ONE).value.single().state)
 
         val pendingId = repository.conversation(CONVERSATION_ONE).value.single().id
+        assertEquals(listOf(pendingId), durableClientIds)
         repository.retryMessage(CONVERSATION_ONE, pendingId, " hello securely ")
 
         assertEquals(
@@ -558,6 +645,26 @@ class EncryptedChatRepositoryTest {
         val messages = repository.conversation(CONVERSATION_ONE).value
         assertEquals(1, messages.size)
         assertEquals(DeliveryState.SENT, messages.single().state)
+    }
+
+    @Test
+    fun `pre-commit runtime failure never reports a durable client message ID`() = runTest {
+        val runtime = FakeRuntime(sendScenario = SendScenario.PRE_DURABLE_FAILURE).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val repository = repository(runtime)
+        runCurrent()
+        val durableClientIds = mutableListOf<String>()
+
+        val failure = runCatching {
+            repository.sendMessage(CONVERSATION_ONE, "not committed") {
+                durableClientIds += it
+            }
+        }.exceptionOrNull()
+
+        assertTrue(failure is IOException)
+        assertTrue(durableClientIds.isEmpty())
+        assertTrue(repository.conversation(CONVERSATION_ONE).value.isEmpty())
     }
 
     @Test
@@ -614,7 +721,12 @@ class EncryptedChatRepositoryTest {
             clock = Clock.fixed(Instant.parse("2026-07-20T12:00:00Z"), ZoneOffset.UTC),
         )
 
-    private enum class SendScenario { NORMAL, LOST_RESPONSE, CHANGED_ROSTER }
+    private enum class SendScenario {
+        NORMAL,
+        LOST_RESPONSE,
+        CHANGED_ROSTER,
+        PRE_DURABLE_FAILURE,
+    }
 
     private class FakeRuntime(
         epoch: String? = "session-one",
@@ -624,6 +736,7 @@ class EncryptedChatRepositoryTest {
         private val permanentBaselineFailureAttempt: Int? = null,
         private val recoverPermanentBaselineFailure: Boolean = false,
         private val permanentRecoveryError: Exception? = null,
+        permanentRecoveryFailures: Int = if (permanentRecoveryError == null) 0 else Int.MAX_VALUE,
     ) : SecureMessagingChatRuntime {
         private val authorityLock = Any()
         private val initialSession = epoch?.let(::newSession)
@@ -633,6 +746,7 @@ class EncryptedChatRepositoryTest {
         private val sessionBaselineGates =
             mutableMapOf<SecureMessagingChatSession, CompletableDeferred<Unit>>()
         private var remainingBaselineFailures = baselineFailures
+        private var remainingPermanentRecoveryFailures = permanentRecoveryFailures
         override val activeSession = MutableStateFlow(initialSession)
         override val projectionChanges = MutableStateFlow(0L)
         private val mutableBaselineRetrySessions =
@@ -719,8 +833,11 @@ class EncryptedChatRepositoryTest {
         override suspend fun recoverPermanentlyUnavailableState(error: Throwable): Boolean {
             if (!recoverPermanentBaselineFailure) return false
             permanentRecoveryAttempts++
+            if (remainingPermanentRecoveryFailures > 0) {
+                remainingPermanentRecoveryFailures--
+                throw checkNotNull(permanentRecoveryError)
+            }
             remainingBaselineFailures = 0
-            permanentRecoveryError?.let { throw it }
             return true
         }
 
@@ -788,22 +905,31 @@ class EncryptedChatRepositoryTest {
             conversationId: String,
             text: String,
             retryClientMessageId: String?,
+            onDurablyCommitted: (clientMessageId: String) -> Unit,
         ) {
             requireCurrent(session)
             sendAttempts += Triple(conversationId, text, retryClientMessageId)
             when (sendScenario) {
-                SendScenario.NORMAL -> recordNormalSend(conversationId, text)
+                SendScenario.NORMAL -> {
+                    val committed = recordNormalSend(conversationId, text)
+                    onDurablyCommitted(committed.clientMessageId)
+                }
                 SendScenario.LOST_RESPONSE -> retryScenario(
                     conversationId,
                     text,
                     retryClientMessageId,
                     changedRoster = false,
+                    onDurablyCommitted = onDurablyCommitted,
                 )
                 SendScenario.CHANGED_ROSTER -> retryScenario(
                     conversationId,
                     text,
                     retryClientMessageId,
                     changedRoster = true,
+                    onDurablyCommitted = onDurablyCommitted,
+                )
+                SendScenario.PRE_DURABLE_FAILURE -> throw IOException(
+                    "injected failure before durable encryption commit",
                 )
             }
         }
@@ -855,16 +981,19 @@ class EncryptedChatRepositoryTest {
             text: String,
             retryClientMessageId: String?,
             changedRoster: Boolean,
+            onDurablyCommitted: (clientMessageId: String) -> Unit,
         ) {
             if (sendAttempts.size == 1) {
-                projected += message(
+                val committed = message(
                     recordKey = "out:durable-one",
                     conversationId = conversationId,
                     text = text,
                     fromMe = true,
                     state = AuthenticatedTextDeliveryState.PENDING,
                 )
+                projected += committed
                 projectionChanges.value++
+                onDurablyCommitted(committed.clientMessageId)
                 throw IOException("response lost")
             }
             val original = projected.single()
@@ -891,9 +1020,12 @@ class EncryptedChatRepositoryTest {
             projectionChanges.value++
         }
 
-        private fun recordNormalSend(conversationId: String, text: String) {
+        private fun recordNormalSend(
+            conversationId: String,
+            text: String,
+        ): AuthenticatedProjectedText {
             val attempt = sendAttempts.size
-            projected += message(
+            val committed = message(
                 recordKey = "out:normal-$attempt",
                 conversationId = conversationId,
                 text = text,
@@ -901,7 +1033,9 @@ class EncryptedChatRepositoryTest {
                 state = AuthenticatedTextDeliveryState.SENT,
                 sentAt = Instant.parse("2026-07-20T12:00:00Z").plusSeconds(attempt.toLong()),
             )
+            projected += committed
             projectionChanges.value++
+            return committed
         }
 
         private fun newSession(epoch: String) = SecureMessagingChatSession(epoch, Any())

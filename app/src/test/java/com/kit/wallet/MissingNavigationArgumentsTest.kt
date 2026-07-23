@@ -118,7 +118,11 @@ class MissingNavigationArgumentsTest {
 
         override suspend fun openDirectConversation(contact: Contact): String = error("Not used")
 
-        override suspend fun sendMessage(chatId: String, text: String) = Unit
+        override suspend fun sendMessage(
+            chatId: String,
+            text: String,
+            onDurablyCommitted: (clientMessageId: String) -> Unit,
+        ) = Unit
     }
 
     private object UnusedWalletRepository : WalletRepository {

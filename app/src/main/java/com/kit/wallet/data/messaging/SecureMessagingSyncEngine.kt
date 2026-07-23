@@ -6,19 +6,20 @@ import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.SecureMessagingTransportValidator
-import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
 import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -33,6 +34,11 @@ interface SecureMessagingSyncEngine {
     val isReady: Boolean
 
     suspend fun synchronize()
+
+    /** Process-local continuation fenced to one authenticated session, even after quarantine. */
+    suspend fun synchronize(expectedSession: SessionFence) {
+        error("Exact-session secure messaging synchronization is unavailable")
+    }
 
     /** Foreground action variant that must not redirect an obsolete activation into a newer one. */
     suspend fun synchronize(expectedActivation: SecureMessagingSessionFence) {
@@ -78,6 +84,8 @@ class SecureMessagingUnavailableSyncEngine @Inject constructor() : SecureMessagi
 
     override suspend fun synchronize(): Nothing =
         error("Secure messaging sync requires the reviewed end-to-end encryption engine")
+
+    override suspend fun synchronize(expectedSession: SessionFence): Nothing = synchronize()
 
     override suspend fun synchronize(expectedActivation: SecureMessagingSessionFence): Nothing =
         synchronize()
@@ -136,14 +144,26 @@ internal class SecureMessagingAuthBindingResolver @Inject constructor(
                 "Authentication epoch changed before resolving secure messaging",
             )
         }
+        return resolveCurrent(sessionEpoch) { assertCurrent(sessionEpoch) }
+    }
+
+    suspend fun resolve(expectedSession: SessionFence): SecureMessagingSessionBinding {
+        assertCurrent(expectedSession)
+        return resolveCurrent(expectedSession.sessionId) { assertCurrent(expectedSession) }
+    }
+
+    private suspend fun resolveCurrent(
+        sessionEpoch: String,
+        assertOwner: () -> Unit,
+    ): SecureMessagingSessionBinding {
         val profile = apiCalls.execute { api.profile() }
-        assertCurrent(sessionEpoch)
+        assertOwner()
         require(UUID_PATTERN.matches(profile.id)) { "Invalid authenticated profile ID" }
 
         val device = SecureMessagingTransportValidator.requireCurrentServerDevice(
             apiCalls.execute { api.devices() },
         )
-        assertCurrent(sessionEpoch)
+        assertOwner()
         val installationId = deviceIdentity.registration().installationId
         val binding = SecureMessagingSessionBinding(
             sessionEpoch = sessionEpoch,
@@ -151,7 +171,10 @@ internal class SecureMessagingAuthBindingResolver @Inject constructor(
             serverDeviceId = device.id,
             installationId = installationId,
         )
-        assertCurrent(binding)
+        assertOwner()
+        check(deviceIdentity.registration().installationId == binding.installationId) {
+            "Secure-messaging installation identity changed"
+        }
         return binding
     }
 
@@ -172,6 +195,14 @@ internal class SecureMessagingAuthBindingResolver @Inject constructor(
         if (sessions.current()?.sessionId != expectedSessionEpoch) {
             throw SecureMessagingAuthenticationEpochChangedException(
                 "Authentication epoch changed while resolving secure messaging",
+            )
+        }
+    }
+
+    private fun assertCurrent(expectedSession: SessionFence) {
+        if (sessions.current()?.fence() != expectedSession) {
+            throw SecureMessagingAuthenticationEpochChangedException(
+                "Authentication changed while resolving secure messaging",
             )
         }
     }
@@ -242,7 +273,15 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
 
     override val isReady: Boolean = true
 
-    override suspend fun synchronize() = synchronizeExpected(expected = null)
+    override suspend fun synchronize() = synchronizeExpected(
+        expected = null,
+        expectedSession = null,
+    )
+
+    override suspend fun synchronize(expectedSession: SessionFence) = synchronizeExpected(
+        expected = null,
+        expectedSession = expectedSession,
+    )
 
     override suspend fun synchronize(expectedActivation: SecureMessagingSessionFence) =
         synchronizeExpected(
@@ -250,6 +289,7 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                 initial = expectedActivation,
                 allowRecoverySuccessor = false,
             ),
+            expectedSession = null,
         )
 
     override suspend fun recoverPermanentlyUnavailableState(
@@ -259,19 +299,28 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
             initial = expectedActivation,
             allowRecoverySuccessor = true,
         ),
+        expectedSession = null,
     )
 
     private suspend fun synchronizeExpected(
         expected: ExpectedSynchronization?,
+        expectedSession: SessionFence?,
     ) = synchronizationMutex.withLock {
+        assertExpectedAuthenticatedSession(expectedSession)
         assertExpectedSynchronizationEntry(expected)
         var completedRecordKeyRetries = 0
         while (true) {
+            assertExpectedAuthenticatedSession(expectedSession)
             assertExpectedSynchronizationCurrent(expected)
             val sessionTarget = sessions.current()?.fence()
                 ?: throw SecureMessagingAuthenticationEpochChangedException(
                     "Secure messaging requires an authenticated session",
                 )
+            if (expectedSession != null && sessionTarget != expectedSession) {
+                throw SecureMessagingAuthenticationEpochChangedException(
+                    "Authentication changed during exact-session secure messaging recovery",
+                )
+            }
             var activeForLostKeyRecovery: SecureMessagingActiveSession? = null
             try {
                 val sessionEpoch = sessionTarget.sessionId
@@ -296,12 +345,18 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                         stateAvailable = sessionLifecycle.stateAvailable,
                         sessions = sessions.session,
                     )
+                    assertExpectedAuthenticatedSession(expectedSession)
                 } else {
                     continue
                 }
                 assertExpectedSynchronizationCurrent(expected)
-                val binding = bindingResolver.resolve(sessionEpoch)
+                val binding = if (expectedSession == null) {
+                    bindingResolver.resolve(sessionEpoch)
+                } else {
+                    bindingResolver.resolve(expectedSession)
+                }
                 bindingResolver.assertCurrent(binding)
+                assertExpectedAuthenticatedSession(expectedSession)
                 assertExpectedSynchronizationCurrent(expected)
                 val active = try {
                     activation.ensureActivated(binding)
@@ -337,6 +392,7 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                     "Secure-messaging activation returned another authentication epoch"
                 }
                 bindingResolver.assertCurrent(binding)
+                assertExpectedAuthenticatedSession(expectedSession)
                 assertActiveForExpectedSynchronization(expected, active.fence)
                 try {
                     processor.synchronize(active.transport)
@@ -367,19 +423,25 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                     continue
                 }
                 bindingResolver.assertCurrent(binding)
+                assertExpectedAuthenticatedSession(expectedSession)
                 assertActiveForExpectedSynchronization(expected, active.fence)
                 processor.recoverPendingOutbox(active.transport)
                 bindingResolver.assertCurrent(binding)
+                assertExpectedAuthenticatedSession(expectedSession)
                 assertActiveForExpectedSynchronization(expected, active.fence)
                 processor.recoverPendingHistory(active.transport)
                 bindingResolver.assertCurrent(binding)
+                assertExpectedAuthenticatedSession(expectedSession)
                 assertActiveForExpectedSynchronization(expected, active.fence)
                 syncCompletions.completed(active)
                 return@withLock
             } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                assertExpectedAuthenticatedSession(expectedSession)
                 if (isTransientSecureMessagingRecordKeyFailure(error) &&
                     completedRecordKeyRetries < MAX_INTERNAL_RECORD_KEY_RETRIES
                 ) {
+                    assertExpectedAuthenticatedSession(expectedSession)
                     assertExpectedSynchronizationCurrent(expected)
                     completedRecordKeyRetries++
                     delay(INTERNAL_RECORD_KEY_RETRY_DELAY_MILLIS)
@@ -416,6 +478,14 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                 }
                 throw error
             }
+        }
+    }
+
+    private fun assertExpectedAuthenticatedSession(expected: SessionFence?) {
+        if (expected != null && sessions.current()?.fence() != expected) {
+            throw SecureMessagingAuthenticationEpochChangedException(
+                "Authentication changed during exact-session secure messaging recovery",
+            )
         }
     }
 

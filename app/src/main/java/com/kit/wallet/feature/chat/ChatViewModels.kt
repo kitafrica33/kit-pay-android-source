@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
+import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.WalletRepository
@@ -17,6 +19,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
@@ -96,6 +99,15 @@ internal class ConversationSoundBaseline {
 class ChatsViewModel @Inject constructor(chatRepo: ChatRepository) : ViewModel() {
     val messagingAvailable = chatRepo.readiness
     val chats = chatRepo.chats
+
+    /** Total unread messages across every conversation, for the navigation badge. */
+    val totalUnread: StateFlow<Int> = chatRepo.chats
+        .map { previews -> previews.sumOf { preview -> preview.unread } }
+        .stateIn(
+            viewModelScope,
+            SharingStarted.Eagerly,
+            chatRepo.chats.value.sumOf { preview -> preview.unread },
+        )
 }
 
 @HiltViewModel
@@ -292,19 +304,38 @@ class ConversationViewModel @Inject constructor(
         val selectedChat = chat.value ?: return
         val normalized = text.trim()
         if (!messagingAvailable.value || normalized.isBlank()) return
-        // Clear the composer immediately. The message is committed to the encrypted outbox and
-        // appears in the thread with a clock tick right away — no spinner and no waiting on the
-        // network round-trip. The "sent" sound plays when it reaches its first tick (see below).
-        // Concurrent sends are serialized inside the runtime.
-        onSent()
         viewModelScope.launch {
-            try {
-                chatRepo.sendMessage(selectedChat.id, normalized)
+            val composerReleased = AtomicBoolean(false)
+            fun releaseComposer() {
+                if (composerReleased.compareAndSet(false, true)) onSent()
+            }
+            val failure = try {
+                chatRepo.sendMessage(selectedChat.id, normalized) {
+                    releaseComposer()
+                }
+                null
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                mutableError.value = error.message
-                    ?: "Secure messaging is temporarily unavailable"
+                error
+            }
+            val durablyHandled = failure == null || composerReleased.get()
+
+            // A successful return is a final fallback for implementations whose network round-trip
+            // completed before they notified the durable boundary.
+            if (durablyHandled) releaseComposer()
+
+            failure?.let { error ->
+                val connectivity = error.isKitConnectivityError()
+                // Stay silent like WhatsApp only when this exact operation committed an encrypted
+                // retry. Otherwise keep the composer and show address-free connectivity copy.
+                if (!connectivity || !durablyHandled) {
+                    mutableError.value = if (connectivity) {
+                        KIT_NETWORK_UNAVAILABLE_MESSAGE
+                    } else {
+                        error.message ?: "Secure messaging is temporarily unavailable"
+                    }
+                }
             }
         }
     }

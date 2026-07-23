@@ -2,6 +2,7 @@ package com.kit.wallet.feature.contacts
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.ui.model.Contact
@@ -127,7 +128,11 @@ class ContactsViewModel @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                mutableError.value = error.message ?: "Unable to load contacts"
+                // Offline is not an error worth showing: the cached and on-device contacts stay on
+                // screen and the list refreshes automatically once the network returns.
+                if (!error.isKitConnectivityError()) {
+                    mutableError.value = error.message ?: "Unable to load contacts"
+                }
             } finally {
                 mutableSyncing.value = false
             }

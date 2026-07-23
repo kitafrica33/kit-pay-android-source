@@ -526,7 +526,6 @@ private fun HomePreview() {
                 ),
                 loaded = true,
                 qrScannerClientReady = true,
-                receiveQrClientReady = true,
             ),
             favorites = DemoData.contacts.filter { it.favorite },
             recent = DemoData.transactions.take(5),

@@ -196,7 +196,11 @@ class AppCapabilitiesViewModelTest {
 
         override suspend fun openDirectConversation(contact: Contact): String = error("Not used")
 
-        override suspend fun sendMessage(chatId: String, text: String) = error("Not used")
+        override suspend fun sendMessage(
+            chatId: String,
+            text: String,
+            onDurablyCommitted: (clientMessageId: String) -> Unit,
+        ) = error("Not used")
     }
 
     private object FakePushMessagingTransport : PushMessagingTransport {

@@ -48,26 +48,23 @@ class HomeActionPolicyTest {
     }
 
     @Test
-    fun `receive and scan stay discoverable but gated until reviewed clients activate`() {
+    fun `receive opens with wallets while scan waits for a reviewed client`() {
         val serverActivated = fullyActivatedCapabilities().copy(
             qrScannerClientReady = false,
-            receiveQrClientReady = false,
         )
 
         assertFalse(serverActivated.homeActionAccess(HomeAction.SCAN_QR).available)
-        assertFalse(serverActivated.homeActionAccess(HomeAction.RECEIVE_MONEY).available)
+        assertTrue(serverActivated.homeActionAccess(HomeAction.RECEIVE_MONEY).available)
         HomeAction.entries
-            .filterNot { it in setOf(HomeAction.SCAN_QR, HomeAction.RECEIVE_MONEY) }
+            .filterNot { it == HomeAction.SCAN_QR }
             .forEach { action ->
                 assertTrue(action.name, serverActivated.homeActionAccess(action).available)
             }
 
         val clientActivated = serverActivated.copy(
             qrScannerClientReady = true,
-            receiveQrClientReady = true,
         )
         assertTrue(clientActivated.homeActionAccess(HomeAction.SCAN_QR).available)
-        assertTrue(clientActivated.homeActionAccess(HomeAction.RECEIVE_MONEY).available)
     }
 
     private fun fullyActivatedCapabilities() = AppCapabilities(
@@ -85,6 +82,5 @@ class HomeActionPolicyTest {
         ),
         loaded = true,
         qrScannerClientReady = true,
-        receiveQrClientReady = true,
     )
 }

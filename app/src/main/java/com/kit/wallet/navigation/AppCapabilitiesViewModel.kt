@@ -30,8 +30,6 @@ data class AppCapabilities(
     val pushMessagingConfigured: Boolean = false,
     // The current scanner is presentation-only: it has no CameraX/QR decoder integration.
     val qrScannerClientReady: Boolean = false,
-    // The current receive QR is not backed by a versioned, signed backend payload.
-    val receiveQrClientReady: Boolean = false,
 ) {
     fun enabled(feature: String): Boolean = loaded && !loadFailed && features[feature] == true
 
@@ -61,9 +59,6 @@ data class AppCapabilities(
         get() = allEnabled(KitFeature.MERCHANT_PAYMENTS, KitFeature.QR_PAYMENTS) &&
             qrScannerClientReady
 
-    val receiveQrUsable: Boolean
-        get() = enabled(KitFeature.WALLETS) && receiveQrClientReady
-
     /**
      * Central navigation guard. Unknown feature-backed screens are not inferred from a route;
      * every route listed here mirrors the backend feature names above.
@@ -80,7 +75,9 @@ data class AppCapabilities(
         Dest.BANK -> enabled(KitFeature.BANK_TRANSFERS)
         Dest.MOBILE_MONEY -> enabled(KitFeature.MOBILE_MONEY)
         Dest.SEND -> allEnabled(KitFeature.WALLETS, KitFeature.INTERNAL_TRANSFERS)
-        Dest.RECEIVE -> receiveQrUsable
+        // Receive shares the authenticated user's existing Kit tag/phone; it does not depend on
+        // the still-unimplemented QR scanner or a separate client protocol.
+        Dest.RECEIVE -> enabled(KitFeature.WALLETS)
         Dest.REQUEST -> allEnabled(KitFeature.WALLETS, KitFeature.PAYMENT_REQUESTS)
         Dest.SCAN -> qrPaymentsUsable
         Dest.TRANSACTIONS, Dest.TX_DETAIL -> enabled(KitFeature.WALLETS)

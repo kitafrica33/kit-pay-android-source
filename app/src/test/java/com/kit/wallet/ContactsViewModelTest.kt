@@ -104,7 +104,11 @@ class ContactsViewModelTest {
             return CONVERSATION_ID
         }
 
-        override suspend fun sendMessage(chatId: String, text: String) = Unit
+        override suspend fun sendMessage(
+            chatId: String,
+            text: String,
+            onDurablyCommitted: (clientMessageId: String) -> Unit,
+        ) = Unit
     }
 
     private companion object {

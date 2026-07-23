@@ -123,7 +123,11 @@ interface ChatRepository {
     suspend fun markConversationRead(chatId: String) = Unit
     suspend fun synchronizeConversation(chatId: String) = Unit
     suspend fun openDirectConversation(contact: Contact): String
-    suspend fun sendMessage(chatId: String, text: String)
+    suspend fun sendMessage(
+        chatId: String,
+        text: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit = {},
+    )
     suspend fun retryMessage(chatId: String, clientMessageId: String, text: String) {
         error("This chat repository does not support explicit secure-message retries")
     }

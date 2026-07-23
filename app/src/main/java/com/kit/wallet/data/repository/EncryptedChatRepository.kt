@@ -9,6 +9,7 @@ import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.SecureMessagingActiveSession
 import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
+import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
 import com.kit.wallet.data.messaging.SecureMessagingCommittedResult
 import com.kit.wallet.data.messaging.SecureMessagingCryptoEngine
 import com.kit.wallet.data.messaging.SecureMessagingCryptoTransaction
@@ -23,8 +24,11 @@ import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingSyncCompletionSignal
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.isRecoverableSecureMessagingStateLoss
+import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
 import com.kit.wallet.data.messaging.requireDurablyCommittedSessions
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
@@ -43,8 +47,12 @@ import javax.inject.Singleton
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
@@ -57,6 +65,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.stateIn
@@ -184,6 +193,7 @@ internal interface SecureMessagingChatRuntime {
         conversationId: String,
         text: String,
         retryClientMessageId: String? = null,
+        onDurablyCommitted: (clientMessageId: String) -> Unit = {},
     )
 
     /** Encrypts, uploads and sends one image as an end-to-end encrypted media message. */
@@ -207,10 +217,11 @@ internal interface SecureMessagingChatRuntime {
 @Singleton
 internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     private val sessions: SecureMessagingActiveSessionRegistry,
+    private val authenticationSessions: SessionStore,
     private val engine: SecureMessagingCryptoEngine,
     private val projections: SecureMessagingProjectionStore,
     private val syncEngine: SecureMessagingSyncEngine,
-    @ApplicationScope scope: CoroutineScope,
+    @param:ApplicationScope private val scope: CoroutineScope,
     private val clock: Clock,
     private val syncScheduler: SecureMessagingSyncScheduler? = null,
     private val syncCompletions: SecureMessagingSyncCompletionSignal =
@@ -236,6 +247,9 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     private val archiveRestoreMutex = Mutex()
     private val sendMutex = Mutex()
     private val readMutex = Mutex()
+    private val recoveryRetryLock = Any()
+    private var recoveryRetryJob: Job? = null
+    private var recoveryRetryOwner: SessionFence? = null
     private var conversationOwner: SecureMessagingActiveSession? = null
     private var conversationsLoaded = false
     private var archiveRestoredOwner: SecureMessagingActiveSession? = null
@@ -292,6 +306,10 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             return false
         }
         val previous = sessions.currentOrNull() ?: return false
+        // Capture only the non-secret authentication fence before recovery can quarantine and
+        // remove the active transport handle. Tokens are never retained by the retry job.
+        val expectedAuthentication = authenticationSessions.current()?.fence()
+            ?.takeIf { it.sessionId == previous.binding.sessionEpoch }
         // Quarantine temporarily removes the active handle, which cancels collectLatest. Finish
         // the already-authorized fenced recovery so cancellation cannot strand the login in
         // QUARANTINED before the fresh activation is published.
@@ -299,17 +317,73 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             withContext(NonCancellable) {
                 syncEngine.recoverPermanentlyUnavailableState(previous.fence)
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (error: Exception) {
             // A network/provider failure before or during reset must not turn this one foreground
-            // attempt into another permanent stall. WorkManager durably retries; a successful
-            // replacement emits a new opaque active-session identity and restarts the baseline.
+            // attempt into another permanent stall. WorkManager remains the durable fallback.
             runCatching { syncScheduler?.schedule() }
                 .exceptionOrNull()
                 ?.let(error::addSuppressed)
+            if (sessions.currentOrNull() == null) {
+                // Quarantine cancels the repository collector and removes its opaque activation.
+                // Continue the already-proved recovery under the same authenticated-session fence
+                // so Android 9 does not have to wait for an OEM WorkManager wake.
+                expectedAuthentication?.let(::startProcessLocalRecoveryRetry)
+            }
             throw error
         }
         return sessions.currentOrNull()?.let { it !== previous } == true
     }
+
+    private fun startProcessLocalRecoveryRetry(expectedSession: SessionFence) {
+        val candidate = scope.launch(start = CoroutineStart.LAZY) {
+            continueRecoveryWhileAuthenticated(expectedSession)
+        }
+        synchronized(recoveryRetryLock) {
+            val existing = recoveryRetryJob
+            if (existing != null && !existing.isCompleted && recoveryRetryOwner == expectedSession) {
+                candidate.cancel()
+                return
+            }
+            existing?.cancel()
+            recoveryRetryJob = candidate
+            recoveryRetryOwner = expectedSession
+            candidate.invokeOnCompletion {
+                synchronized(recoveryRetryLock) {
+                    if (recoveryRetryJob === candidate) {
+                        recoveryRetryJob = null
+                        recoveryRetryOwner = null
+                    }
+                }
+            }
+            candidate.start()
+        }
+    }
+
+    private suspend fun continueRecoveryWhileAuthenticated(expectedSession: SessionFence) =
+        coroutineScope {
+            val retry = launch {
+                retrySecureMessagingOperation(
+                    isCurrent = { authenticationSessions.current()?.fence() == expectedSession },
+                    operation = {
+                        syncEngine.synchronize(expectedSession)
+                        true
+                    },
+                )
+            }
+            val ownership = launch(start = CoroutineStart.UNDISPATCHED) {
+                authenticationSessions.session
+                    .map { it?.fence() }
+                    .first { it != expectedSession }
+                retry.cancel()
+            }
+            try {
+                retry.join()
+            } finally {
+                ownership.cancelAndJoin()
+            }
+        }
 
     override suspend fun directConversations(
         session: SecureMessagingChatSession,
@@ -411,6 +485,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         conversationId: String,
         text: String,
         retryClientMessageId: String?,
+        onDurablyCommitted: (clientMessageId: String) -> Unit,
     ) = sendMutex.withLock {
         val active = requireCurrent(session)
         val conversation = requireConversation(active, conversationId)
@@ -517,6 +592,9 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 recordOutboundPending(committed, clock.instant())
             }
         }
+        // This operation now owns a durable encrypted outbox record. Notify its exact caller before
+        // the transport can suspend or fail; no text/projection matching is needed at the UI edge.
+        onDurablyCommitted(durable.clientMessageId)
         // Server-visible attachment metadata is derived from the descriptor text on every send
         // and retry, so the end-to-end content and the metadata rows can never disagree.
         val receipt = active.transport.send(
@@ -910,6 +988,62 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     }
 }
 
+/**
+ * Retries one session-owned recovery operation without busy-looping or surviving owner loss.
+ * A false result is terminal; exceptions retry only while they are transient.
+ */
+private suspend fun retrySecureMessagingOperation(
+    isCurrent: () -> Boolean,
+    operation: suspend () -> Boolean,
+): Boolean {
+    var failedAttempts = 0
+    var cooldownMillis = RECOVERY_RETRY_COOLDOWN_MILLIS
+    while (isCurrent()) {
+        try {
+            return operation() && isCurrent()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            if (!isCurrent() || !isRetryableSecureMessagingRecoveryFailure(error)) return false
+            failedAttempts++
+            val retryDelay = if (failedAttempts < RECOVERY_RETRY_ATTEMPTS) {
+                RECOVERY_RETRY_DELAY_MILLIS
+            } else {
+                failedAttempts = 0
+                cooldownMillis.also {
+                    cooldownMillis = (cooldownMillis * 2)
+                        .coerceAtMost(MAX_RECOVERY_RETRY_COOLDOWN_MILLIS)
+                }
+            }
+            delay(retryDelay)
+        }
+    }
+    return false
+}
+
+private fun isRetryableSecureMessagingRecoveryFailure(error: Throwable): Boolean {
+    if (error is SecureMessagingAuthenticationEpochChangedException ||
+        isRecoverableSecureMessagingStateLoss(error)
+    ) {
+        return false
+    }
+    if (isRetryableSecureMessagingStateFailure(error)) return true
+    return when (error) {
+        is IOException,
+        is SecureMessagingStateConflictException,
+        -> true
+        is KitWalletApiException -> error.statusCode?.let { status ->
+            status == 408 || status == 425 || status == 429 || status >= 500
+        } ?: error.connectivity
+        else -> false
+    }
+}
+
+private const val RECOVERY_RETRY_ATTEMPTS = 4
+private const val RECOVERY_RETRY_DELAY_MILLIS = 5_000L
+private const val RECOVERY_RETRY_COOLDOWN_MILLIS = 30_000L
+private const val MAX_RECOVERY_RETRY_COOLDOWN_MILLIS = 5 * 60_000L
+
 @Singleton
 class EncryptedChatRepository @Inject internal constructor(
     private val runtime: SecureMessagingChatRuntime,
@@ -1034,12 +1168,15 @@ class EncryptedChatRepository @Inject internal constructor(
                 ) {
                     permanentRecoveryAttempted = true
                     val recovered = try {
-                        runtime.recoverPermanentlyUnavailableState(error)
+                        retrySecureMessagingOperation(
+                            isCurrent = { runtime.isCurrent(session) },
+                            operation = {
+                                runtime.recoverPermanentlyUnavailableState(error)
+                            },
+                        )
                     } catch (cancelled: CancellationException) {
                         clearPublishedStateIfOwnedBy(session)
                         throw cancelled
-                    } catch (_: Exception) {
-                        false
                     }
                     if (!runtime.isCurrent(session)) {
                         clearPublishedStateIfOwnedBy(session)
@@ -1138,12 +1275,22 @@ class EncryptedChatRepository @Inject internal constructor(
         return created.id
     }
 
-    override suspend fun sendMessage(chatId: String, text: String) {
+    override suspend fun sendMessage(
+        chatId: String,
+        text: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit,
+    ) {
         val session = requireReadySession()
         val normalized = text.trim()
         require(normalized.isNotEmpty()) { "Enter a message to send securely" }
         try {
-            runtime.sendText(session, chatId, normalized, retryClientMessageId = null)
+            runtime.sendText(
+                session = session,
+                conversationId = chatId,
+                text = normalized,
+                retryClientMessageId = null,
+                onDurablyCommitted = onDurablyCommitted,
+            )
         } finally {
             refresh(session, contacts.contacts.value)
         }

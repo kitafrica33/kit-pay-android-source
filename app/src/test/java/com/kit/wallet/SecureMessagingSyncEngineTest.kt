@@ -32,6 +32,7 @@ import com.kit.wallet.data.messaging.SecureMessagingSessionLifecycle
 import com.kit.wallet.data.messaging.SecureMessagingStateStore
 import com.kit.wallet.data.messaging.SecureMessagingStateNotReadyException
 import com.kit.wallet.data.messaging.SecureMessagingSyncCursorStore
+import com.kit.wallet.data.messaging.SecureMessagingSyncCompletionSignal
 import com.kit.wallet.data.messaging.awaitSecureMessagingStateAvailability
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.CursorPageDto
@@ -44,6 +45,8 @@ import com.kit.wallet.data.session.SessionTokens
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.lang.reflect.Proxy
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
@@ -217,10 +220,112 @@ class SecureMessagingSyncEngineTest {
 
             assertTrue(redirected is SecureMessagingAuthenticationEpochChangedException)
             assertEquals(7, server.requestCount)
+
+            val expectedSession = TOKENS.fence()
+            sessions.replace(TOKENS.copy(sessionId = "replacement-session"))
+            val staleSessionContinuation = runCatching {
+                engine.synchronize(expectedSession)
+            }.exceptionOrNull()
+
+            assertTrue(
+                staleSessionContinuation is SecureMessagingAuthenticationEpochChangedException,
+            )
+            assertEquals(7, server.requestCount)
         } finally {
             server.shutdown()
         }
     }
+
+    @Test
+    fun `exact session replacement during binding resolution cannot publish obsolete work`() =
+        runTest {
+            val server = MockWebServer().apply { start() }
+            val profileEntered = CountDownLatch(1)
+            val releaseProfile = CountDownLatch(1)
+            try {
+                val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+                val retrofit = Retrofit.Builder()
+                    .baseUrl(server.url("/"))
+                    .addConverterFactory(MoshiConverterFactory.create(moshi))
+                    .build()
+                val api = retrofit.create(KitWalletApi::class.java)
+                val transport = RemoteSecureMessagingTransport(
+                    api,
+                    retrofit.create(SecureMessagingWireApi::class.java),
+                    ApiCallExecutor(moshi),
+                )
+                val sessions = FakeSessionStore(TOKENS)
+                val guard = SecureMessagingLifecycleGuard()
+                val registry = SecureMessagingActiveSessionRegistry(guard)
+                val stateStore = TestSecureMessagingStateStore()
+                val processor = SecureMessagingEventProcessor(
+                    UnusedCryptoEngine,
+                    SecureMessagingProjectionStore(
+                        stateStore,
+                        com.kit.wallet.data.messaging.LibSignalCompanionStateReader(stateStore),
+                    ),
+                    SecureMessagingSyncCursorStore(stateStore),
+                )
+                var keyActivationCalls = 0
+                val coordinator = SecureMessagingActivationCoordinator(
+                    transport = transport,
+                    lifecycle = guard,
+                    sessions = registry,
+                    keyActivation = SecureMessagingKeyActivation { keyActivationCalls++ },
+                    initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+                )
+                val localStateLifecycle = SecureMessagingSessionLifecycle(stateStore, guard)
+                localStateLifecycle.afterSessionSave()
+                val completions = SecureMessagingSyncCompletionSignal()
+                val engine = RealSecureMessagingSyncEngine(
+                    bindingResolver = SecureMessagingAuthBindingResolver(
+                        sessions,
+                        api,
+                        ApiCallExecutor(moshi),
+                        deviceIdentity(),
+                    ),
+                    activation = coordinator,
+                    processor = processor,
+                    sessions = sessions,
+                    sessionLifecycle = localStateLifecycle,
+                    authRepository = unusedAuthRepository(),
+                    syncCompletions = completions,
+                )
+                server.dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest): MockResponse {
+                        if (request.path == "/api/kit-wallet/v1/profile") {
+                            profileEntered.countDown()
+                            if (releaseProfile.await(5, TimeUnit.SECONDS)) {
+                                return jsonResponse(PROFILE)
+                            }
+                        }
+                        return MockResponse().setResponseCode(503)
+                    }
+                }
+
+                val expectedSession = TOKENS.fence()
+                val staleSynchronization = async {
+                    runCatching { engine.synchronize(expectedSession) }.exceptionOrNull()
+                }
+                runCurrent()
+                assertTrue(profileEntered.await(5, TimeUnit.SECONDS))
+
+                // Retain the same session epoch but replace the exact cache/account owner. The
+                // epoch-only resolver would otherwise continue into device/key activation work.
+                sessions.replace(TOKENS.copy(cacheScopeId = "replacement-cache-scope"))
+                releaseProfile.countDown()
+
+                val failure = staleSynchronization.await()
+                assertTrue(failure is SecureMessagingAuthenticationEpochChangedException)
+                assertTrue(registry.currentOrNull() == null)
+                assertEquals(0, keyActivationCalls)
+                assertTrue(completions.completions.replayCache.isEmpty())
+                assertEquals(1, server.requestCount)
+            } finally {
+                releaseProfile.countDown()
+                server.shutdown()
+            }
+        }
 
     @Test
     @OptIn(ExperimentalCoroutinesApi::class)

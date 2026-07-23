@@ -5,6 +5,10 @@ import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.WalletRepository
+import com.kit.wallet.data.messaging.SecureMessagingStateNotReadyException
+import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
+import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.feature.chat.ConversationComposerState
 import com.kit.wallet.feature.chat.ConversationViewModel
 import com.kit.wallet.feature.chat.MessageSoundPlayer
 import com.kit.wallet.feature.chat.retryableOutgoingMessageIds
@@ -61,21 +65,136 @@ class ConversationViewModelTest {
     }
 
     @Test
-    fun `failed send still clears the composer instantly and surfaces the error`() = runTest {
+    fun `failed send before a durable outbox entry preserves the composer and surfaces the error`() = runTest {
         val repository = FakeChatRepository(failure = IllegalStateException("Ciphertext was not accepted"))
         val viewModel = viewModel(repository)
         var clearRequests = 0
 
         viewModel.send("send instantly") { clearRequests++ }
 
-        // The composer clears immediately; the failed message stays in the thread with a retry.
-        assertEquals(1, clearRequests)
+        assertEquals(0, clearRequests)
         assertEquals("Ciphertext was not accepted", viewModel.error.value)
         assertFalse(viewModel.sending.value)
 
         viewModel.clearError()
         assertEquals(null, viewModel.error.value)
     }
+
+    @Test
+    fun `secure state IOException preserves the composer instead of masquerading as offline`() = runTest {
+        val repository = FakeChatRepository(
+            failure = SecureMessagingStateNotReadyException("Secure messaging state is still opening"),
+        )
+        val viewModel = viewModel(repository)
+        var clearRequests = 0
+
+        viewModel.send("keep this draft") { clearRequests++ }
+
+        assertEquals(0, clearRequests)
+        assertEquals("Secure messaging state is still opening", viewModel.error.value)
+    }
+
+    @Test
+    fun `offline failure before durable outbox preserves composer and uses safe error copy`() = runTest {
+        val repository = FakeChatRepository(failure = connectivityFailure())
+        val viewModel = viewModel(repository)
+        var clearRequests = 0
+
+        viewModel.send("keep this offline draft") { clearRequests++ }
+
+        assertEquals(0, clearRequests)
+        assertEquals(KIT_NETWORK_UNAVAILABLE_MESSAGE, viewModel.error.value)
+    }
+
+    @Test
+    fun `offline failure clears composer only after its durable commit callback`() = runTest {
+        val repository = FakeChatRepository(
+            failure = connectivityFailure(),
+            durablyCommitBeforeCompletion = true,
+        )
+        val viewModel = viewModel(repository)
+        var clearRequests = 0
+
+        viewModel.send("queued securely") { clearRequests++ }
+
+        assertEquals(1, clearRequests)
+        assertEquals(null, viewModel.error.value)
+    }
+
+    @Test
+    fun `durable commit callback clears composer while transport is still pending`() = runTest {
+        val transportRelease = CompletableDeferred<Unit>()
+        val repository = FakeChatRepository(
+            durablyCommitBeforeCompletion = true,
+            blockUntil = transportRelease,
+        )
+        val viewModel = viewModel(repository)
+        var clearRequests = 0
+
+        viewModel.send("already durable") { clearRequests++ }
+
+        assertEquals(1, clearRequests)
+        assertFalse(transportRelease.isCompleted)
+
+        transportRelease.complete(Unit)
+        assertEquals(1, clearRequests)
+    }
+
+    @Test
+    fun `concurrent identical send that fails cannot borrow the other durable commit`() = runTest {
+        val failedAttemptRelease = CompletableDeferred<Unit>()
+        val durableAttemptRelease = CompletableDeferred<Unit>()
+        val repository = FakeChatRepository(
+            sendOutcomes = listOf(
+                FakeSendOutcome(
+                    durablyCommitted = false,
+                    failure = IllegalStateException("first operation failed before commit"),
+                    completionGate = failedAttemptRelease,
+                ),
+                FakeSendOutcome(
+                    durablyCommitted = true,
+                    completionGate = durableAttemptRelease,
+                ),
+            ),
+        )
+        val viewModel = viewModel(repository)
+        var failedAttemptClears = 0
+        var durableAttemptClears = 0
+
+        viewModel.send("identical") { failedAttemptClears++ }
+        viewModel.send("identical") { durableAttemptClears++ }
+
+        assertEquals(0, failedAttemptClears)
+        assertEquals(1, durableAttemptClears)
+
+        failedAttemptRelease.complete(Unit)
+        assertEquals("first operation failed before commit", viewModel.error.value)
+        assertEquals(0, failedAttemptClears)
+        assertEquals(1, durableAttemptClears)
+
+        durableAttemptRelease.complete(Unit)
+        assertEquals(0, failedAttemptClears)
+        assertEquals(1, durableAttemptClears)
+    }
+
+    @Test
+    fun `composer generation preserves edits and identical retyping after send begins`() {
+        val submitted = ConversationComposerState().edited("same text")
+        val edited = submitted.edited("new draft")
+        val retypedIdentically = submitted.edited("same text")
+
+        assertEquals(edited, edited.clearIfUnchanged(submitted))
+        assertEquals(retypedIdentically, retypedIdentically.clearIfUnchanged(submitted))
+        assertTrue(edited.generation > submitted.generation)
+        assertTrue(retypedIdentically.generation > submitted.generation)
+        assertEquals("", submitted.clearIfUnchanged(submitted).text)
+    }
+
+    private fun connectivityFailure() = KitWalletApiException(
+        code = "NETWORK_UNAVAILABLE",
+        message = "failed to reach private-host.test",
+        connectivity = true,
+    )
 
     @Test
     fun `rapid sends are committed instantly without blocking on the network`() = runTest {
@@ -525,9 +644,17 @@ class ConversationViewModelTest {
         ): Transaction = error("Unused in conversation tests")
     }
 
+    private data class FakeSendOutcome(
+        val durablyCommitted: Boolean,
+        val failure: Exception? = null,
+        val completionGate: CompletableDeferred<Unit>? = null,
+    )
+
     private class FakeChatRepository(
         private val failure: Exception? = null,
+        private val durablyCommitBeforeCompletion: Boolean = failure == null,
         private val blockUntil: CompletableDeferred<Unit>? = null,
+        private val sendOutcomes: List<FakeSendOutcome>? = null,
         private var readFailures: Int = 0,
         private val readBlockUntil: CompletableDeferred<Unit>? = null,
         initiallyLoaded: Boolean = true,
@@ -561,10 +688,27 @@ class ConversationViewModelTest {
 
         override suspend fun openDirectConversation(contact: Contact): String = error("Not used")
 
-        override suspend fun sendMessage(chatId: String, text: String) {
+        override suspend fun sendMessage(
+            chatId: String,
+            text: String,
+            onDurablyCommitted: (clientMessageId: String) -> Unit,
+        ) {
+            val attemptIndex = sent.size
             sent += chatId to text
-            failure?.let { throw it }
-            blockUntil?.await()
+            val outcome = sendOutcomes?.getOrNull(attemptIndex) ?: FakeSendOutcome(
+                durablyCommitted = durablyCommitBeforeCompletion,
+                failure = failure,
+                completionGate = blockUntil,
+            )
+            val clientMessageId = "test-client-${attemptIndex + 1}"
+            if (outcome.durablyCommitted) {
+                onDurablyCommitted(clientMessageId)
+            }
+            outcome.completionGate?.await()
+            outcome.failure?.let { throw it }
+            if (!outcome.durablyCommitted) {
+                onDurablyCommitted(clientMessageId)
+            }
         }
 
         override suspend fun retryMessage(

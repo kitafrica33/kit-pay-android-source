@@ -95,7 +95,7 @@ class AppCapabilitiesTest {
     }
 
     @Test
-    fun `prototype QR routes stay closed when only the server is enabled`() {
+    fun `scanner stays closed without a client while receive opens for wallets`() {
         val serverOnly = AppCapabilities(
             features = mapOf(
                 KitFeature.WALLETS to true,
@@ -106,9 +106,8 @@ class AppCapabilitiesTest {
         )
 
         assertFalse(serverOnly.routeUsable(Dest.SCAN))
-        assertFalse(serverOnly.routeUsable(Dest.RECEIVE))
+        assertTrue(serverOnly.routeUsable(Dest.RECEIVE))
         assertTrue(serverOnly.copy(qrScannerClientReady = true).routeUsable(Dest.SCAN))
-        assertTrue(serverOnly.copy(receiveQrClientReady = true).routeUsable(Dest.RECEIVE))
     }
 
     @Test

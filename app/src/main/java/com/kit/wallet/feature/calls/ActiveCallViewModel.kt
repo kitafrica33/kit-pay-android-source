@@ -12,6 +12,7 @@ import com.kit.wallet.data.notifications.CallLifecycleEventBus
 import com.kit.wallet.data.notifications.CallLifecycleKind
 import com.kit.wallet.data.notifications.IncomingCallRelay
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.CallConnection
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ContactRepository
@@ -818,10 +819,15 @@ class ActiveCallViewModel @Inject constructor(
         }
     }
 
-    private fun Throwable.userMessage(): String = when (this) {
-        is KitWalletApiException -> message
-        is IOException -> "The secure call connection could not be established. Check your internet and try again."
-        else -> message?.takeIf(String::isNotBlank) ?: "The call could not be started."
+    private fun Throwable.userMessage(): String = when {
+        // Offline/transport failures are transient and must never echo the call server's host or
+        // IP address; keep the wording calm and reconnection-oriented like WhatsApp.
+        isKitConnectivityError() ->
+            "No internet connection. Kit Pay will reconnect the call automatically when you're back online."
+        // A server-reported error already carries a clean, address-free message.
+        this is KitWalletApiException -> message
+        // Any other failure (e.g. a media-server error) stays generic so no connection internals leak.
+        else -> "The secure call connection could not be established. Check your internet and try again."
     }
 
     override fun onCleared() {

@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
@@ -290,6 +291,20 @@ private fun SecureMessagingUnavailable(onBack: () -> Unit) {
     }
 }
 
+/** In-memory plaintext plus a monotonic edit fence for delayed durable-send callbacks. */
+internal data class ConversationComposerState(
+    val text: String = "",
+    val generation: Long = 0L,
+) {
+    fun edited(value: String): ConversationComposerState = copy(
+        text = value,
+        generation = Math.incrementExact(generation),
+    )
+
+    fun clearIfUnchanged(submitted: ConversationComposerState): ConversationComposerState =
+        if (generation == submitted.generation && text == submitted.text) edited("") else this
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ConversationContent(
@@ -316,11 +331,31 @@ private fun ConversationContent(
 ) {
     // Message plaintext must not enter the Activity saved-instance-state bundle. A rotation or
     // process death deliberately discards this in-memory draft until an encrypted draft store exists.
-    var draft by remember { mutableStateOf("") }
+    var composerState by remember { mutableStateOf(ConversationComposerState()) }
     var showRequestDialog by remember { mutableStateOf(false) }
     var payTarget by remember { mutableStateOf<Message?>(null) }
     val retryableMessageIds = remember(messages) {
         retryableOutgoingMessageIds(messages)
+    }
+
+    // Keep the newest message visible, just like WhatsApp: jump to the bottom the first time the
+    // thread loads, then smoothly follow every message that is sent or arrives afterwards.
+    val listState = rememberLazyListState()
+    var renderedMessageCount by remember { mutableStateOf(0) }
+    LaunchedEffect(messages.size) {
+        if (messages.isEmpty()) {
+            renderedMessageCount = 0
+            return@LaunchedEffect
+        }
+        // The list header adds two leading items (date + encryption notice) and a trailing spacer,
+        // so the newest message sits just above the final index.
+        val bottomIndex = messages.size + 2
+        if (renderedMessageCount == 0) {
+            listState.scrollToItem(bottomIndex)
+        } else if (messages.size > renderedMessageCount) {
+            listState.animateScrollToItem(bottomIndex)
+        }
+        renderedMessageCount = messages.size
     }
 
     if (showRequestDialog) {
@@ -395,12 +430,17 @@ private fun ConversationContent(
                     )
                 }
                 Composer(
-                    draft = draft,
+                    draft = composerState.text,
                     onDraft = {
-                        draft = it
+                        composerState = composerState.edited(it)
                         if (error != null) onClearError()
                     },
-                    onSend = { onSend(draft) { draft = "" } },
+                    onSend = {
+                        val submitted = composerState
+                        onSend(submitted.text) {
+                            composerState = composerState.clearIfUnchanged(submitted)
+                        }
+                    },
                     onAttach = onAttach,
                     mediaEnabled = mediaEnabled,
                     onRequestPayment = {
@@ -412,7 +452,8 @@ private fun ConversationContent(
         },
     ) { padding ->
         LazyColumn(
-            Modifier
+            state = listState,
+            modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
                 .padding(horizontal = 14.dp),
@@ -479,8 +520,11 @@ private fun ConversationContent(
                         retrying = retryingMessageId == message.id,
                         retryEnabled = message.id in retryableMessageIds,
                         onRetry = {
+                            val submitted = composerState
                             onRetry(message) {
-                                if (draft.trim() == message.text) draft = ""
+                                if (submitted.text.trim() == message.text) {
+                                    composerState = composerState.clearIfUnchanged(submitted)
+                                }
                             }
                         },
                         mediaBytes = mediaBytes[message.id],

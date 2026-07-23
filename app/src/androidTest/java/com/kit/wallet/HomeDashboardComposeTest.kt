@@ -221,6 +221,5 @@ class HomeDashboardComposeTest {
         ),
         loaded = true,
         qrScannerClientReady = true,
-        receiveQrClientReady = true,
     )
 }

@@ -3,8 +3,10 @@ package com.kit.wallet.data.remote
 import com.squareup.moshi.Json
 import com.squareup.moshi.JsonClass
 import com.squareup.moshi.Moshi
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
 import retrofit2.HttpException
 
 @JsonClass(generateAdapter = false)
@@ -50,7 +52,37 @@ class KitWalletApiException(
     val details: Map<String, Any?> = emptyMap(),
     val statusCode: Int? = null,
     cause: Throwable? = null,
+    /**
+     * True when the request never reached the server (no connectivity, DNS/TLS/timeout). These are
+     * transient: Kit Pay keeps showing cached content and retries automatically, so the UI must not
+     * present a fatal error, and must never echo the underlying host or IP address.
+     */
+    val connectivity: Boolean = false,
 ) : RuntimeException(message, cause)
+
+/** Stable code and address-free copy used for every transport failure, WhatsApp-style. */
+const val KIT_NETWORK_UNAVAILABLE_CODE = "NETWORK_UNAVAILABLE"
+const val KIT_NETWORK_UNAVAILABLE_MESSAGE =
+    "No internet connection. Kit Pay will keep trying and update automatically."
+
+/**
+ * Whether a failure is a connectivity/transport problem rather than a server-reported error.
+ * Screens use this to stay silent and keep showing cached data instead of surfacing an error.
+ * Only [ApiCallExecutor], the actual network boundary, may issue that classification: secure-state
+ * and Android-Keystore availability exceptions are also IOExceptions.
+ */
+fun Throwable?.isKitConnectivityError(): Boolean {
+    var current = this
+    while (current != null) {
+        // Respect the first classified API boundary and never reinterpret its nested cause.
+        if (current is KitWalletApiException) return current.connectivity
+        // A local secure-state/Keystore IOException owns its failure semantics even when a deeper
+        // cause came from a network attempt during recovery.
+        if (current is IOException) return false
+        current = current.cause
+    }
+    return false
+}
 
 @JsonClass(generateAdapter = false)
 internal data class ApiFailureEnvelope(
@@ -75,6 +107,19 @@ class ApiCallExecutor @Inject constructor(moshi: Moshi) {
             details = failure?.error?.details.orEmpty(),
             statusCode = error.code(),
             cause = error,
+        )
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (transport: IOException) {
+        // The request never reached the server (offline, DNS, TLS, timeout). Replace the raw cause
+        // — which typically embeds the host name or IP address — with one clean, address-free
+        // message so no screen can ever display connection internals to the user.
+        throw KitWalletApiException(
+            code = KIT_NETWORK_UNAVAILABLE_CODE,
+            message = KIT_NETWORK_UNAVAILABLE_MESSAGE,
+            statusCode = null,
+            cause = transport,
+            connectivity = true,
         )
     }
 }
