@@ -218,17 +218,30 @@ class AuthViewModel @Inject constructor(
             kind = AuthOperationKind.PHONE_RESEND,
             challengeId = challenge.id,
         ) { generation ->
+            if (!isCurrentGeneration(generation)) return@launchAuth
+            // A resend can be accepted by the server before its response reaches this process.
+            // Persist that uncertainty before network I/O so process restoration can never revive
+            // the old challenge after an unobserved server-side replacement.
+            markPhoneResendInFlight(challenge.id)
             when (challenge.kind) {
                 AuthChallengeKind.PHONE_OTP -> {
                     val renewed = authRepository.requestPhoneOtp(phone)
+                    if (renewed.id != challenge.id ||
+                        renewed.kind != AuthChallengeKind.PHONE_OTP
+                    ) {
+                        // The stable-resend contract was not honored. Do not silently turn this
+                        // operation into a new sign-in attempt or let an entered code cross IDs.
+                        clearPendingChallenge(
+                            message = PHONE_OTP_RESEND_UNCONFIRMED_MESSAGE,
+                            expectedGeneration = generation,
+                            cancelActiveOperation = false,
+                        )
+                        return@launchAuth
+                    }
                     publishPendingChallenge(
                         challenge = renewed,
                         pendingPhone = phone,
-                        notice = if (renewed.id == challenge.id) {
-                            PHONE_OTP_RESENT_SAME_CHALLENGE_NOTICE
-                        } else {
-                            PHONE_OTP_RESENT_NEW_CHALLENGE_NOTICE
-                        },
+                        notice = PHONE_OTP_RESENT_SAME_CHALLENGE_NOTICE,
                         expectedGeneration = generation,
                     )
                 }
@@ -340,10 +353,27 @@ class AuthViewModel @Inject constructor(
             try {
                 block(generation)
             } catch (cancelled: CancellationException) {
+                if (kind == AuthOperationKind.PHONE_RESEND &&
+                    isCurrentGeneration(generation)
+                ) {
+                    clearPendingChallenge(
+                        message = PHONE_OTP_RESEND_UNCONFIRMED_MESSAGE,
+                        expectedGeneration = generation,
+                        cancelActiveOperation = false,
+                    )
+                }
                 throw cancelled
             } catch (error: Throwable) {
                 if (!isCurrentGeneration(generation)) return@launch
-                if (error.isTerminalChallengeFailure()) {
+                if (kind == AuthOperationKind.PHONE_RESEND) {
+                    // A transport failure cannot prove whether the server accepted and renewed
+                    // the resend. Retaining the old ID could pair it with a newly delivered code.
+                    clearPendingChallenge(
+                        message = PHONE_OTP_RESEND_UNCONFIRMED_MESSAGE,
+                        expectedGeneration = generation,
+                        cancelActiveOperation = false,
+                    )
+                } else if (error.isTerminalChallengeFailure()) {
                     clearPendingChallenge(
                         message = error.userMessage(),
                         expectedGeneration = generation,
@@ -508,7 +538,20 @@ class AuthViewModel @Inject constructor(
         savedStateHandle[STATE_CHALLENGE_ID] = challenge.id
     }
 
+    private fun markPhoneResendInFlight(challengeId: String) {
+        if (challengeId.isBlank()) {
+            clearPersistedPhoneChallenge()
+            return
+        }
+        savedStateHandle[STATE_RESEND_IN_FLIGHT_CHALLENGE_ID] = challengeId
+    }
+
     private fun restorePendingPhoneChallenge(): AuthUiState {
+        // A process may die after the server accepts a resend but before Android receives its
+        // response. The old saved challenge is then ambiguous and must never be restored.
+        if (savedStateHandle.get<String>(STATE_RESEND_IN_FLIGHT_CHALLENGE_ID) != null) {
+            return discardInvalidRestoredChallenge(PHONE_OTP_RESEND_UNCONFIRMED_MESSAGE)
+        }
         val challengeId = savedStateHandle.get<String>(STATE_CHALLENGE_ID)
             ?.takeIf(String::isNotBlank)
             ?: run {
@@ -580,9 +623,9 @@ class AuthViewModel @Inject constructor(
         )
     }
 
-    private fun discardInvalidRestoredChallenge(): AuthUiState {
+    private fun discardInvalidRestoredChallenge(message: String? = null): AuthUiState {
         clearPersistedPhoneChallenge()
-        return AuthUiState()
+        return AuthUiState(error = message)
     }
 
     private fun clearPersistedPhoneChallenge() {
@@ -601,6 +644,7 @@ class AuthViewModel @Inject constructor(
         savedStateHandle.remove<String>(STATE_EXPECTED_SESSION_ID)
         savedStateHandle.remove<String>(STATE_EXPECTED_CACHE_SCOPE_ID)
         savedStateHandle.remove<String>(STATE_EXPECTED_ACCOUNT_ID)
+        savedStateHandle.remove<String>(STATE_RESEND_IN_FLIGHT_CHALLENGE_ID)
     }
 }
 
@@ -667,8 +711,8 @@ private const val PHONE_OTP_RESTORED_NOTICE =
     "Your active verification request was restored. Enter the code already sent to you."
 private const val PHONE_OTP_RESENT_SAME_CHALLENGE_NOTICE =
     "The same code was sent again. Earlier SMS messages for this sign-in still work."
-private const val PHONE_OTP_RESENT_NEW_CHALLENGE_NOTICE =
-    "A new code was sent. Use the code in the latest SMS."
+private const val PHONE_OTP_RESEND_UNCONFIRMED_MESSAGE =
+    "We couldn't confirm the same verification request. Start again and use the latest message."
 
 private val TERMINAL_CHALLENGE_ERROR_CODES = setOf(
     "CHALLENGE_EXPIRED",
@@ -692,6 +736,8 @@ private const val STATE_EXPECTED_FENCE_PRESENT = "auth.phone_otp.expected_fence_
 private const val STATE_EXPECTED_SESSION_ID = "auth.phone_otp.expected_session_id"
 private const val STATE_EXPECTED_CACHE_SCOPE_ID = "auth.phone_otp.expected_cache_scope_id"
 private const val STATE_EXPECTED_ACCOUNT_ID = "auth.phone_otp.expected_account_id"
+private const val STATE_RESEND_IN_FLIGHT_CHALLENGE_ID =
+    "auth.phone_otp.resend_in_flight_challenge_id"
 private const val LEGACY_STATE_EXPIRES_AT_SECONDS = "auth.phone_otp.expires_at_seconds"
 private const val LEGACY_STATE_RESEND_NOT_BEFORE_MILLIS =
     "auth.phone_otp.resend_not_before_millis"

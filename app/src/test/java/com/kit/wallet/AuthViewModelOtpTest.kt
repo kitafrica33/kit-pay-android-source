@@ -20,6 +20,7 @@ import java.lang.reflect.Proxy
 import java.time.Instant
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -68,7 +69,8 @@ class AuthViewModelOtpTest {
     fun `resend countdown blocks early and repeated taps while preserving challenge identity`() {
         val repository = PhoneOtpRepository()
         val clock = MutableElapsedRealtimeClock(1_000_000L)
-        val viewModel = viewModel(repository, clock)
+        val savedState = SavedStateHandle()
+        val viewModel = viewModel(repository, clock, savedState)
 
         viewModel.requestPhoneOtp("0700000002") {}
         dispatcher.scheduler.advanceUntilIdle()
@@ -84,15 +86,17 @@ class AuthViewModelOtpTest {
         assertEquals(2, repository.requestCount)
         assertEquals(CHALLENGE_ID, viewModel.uiState.value.pendingChallenge?.id)
         assertTrue(viewModel.uiState.value.notice.orEmpty().contains("same code"))
+        assertEquals(null, savedState.get<String>(STATE_RESEND_IN_FLIGHT_CHALLENGE_ID))
     }
 
     @Test
-    fun `resend reports a new code when the server replaces the challenge`() {
+    fun `resend rejects a replacement challenge and prevents stale route verification`() {
         val repository = PhoneOtpRepository(
             challengeIds = mutableListOf(CHALLENGE_ID, REPLACEMENT_CHALLENGE_ID),
         )
         val clock = MutableElapsedRealtimeClock(1_000_000L)
-        val viewModel = viewModel(repository, clock)
+        val savedState = SavedStateHandle()
+        val viewModel = viewModel(repository, clock, savedState)
 
         viewModel.requestPhoneOtp("0700000002") {}
         dispatcher.scheduler.advanceUntilIdle()
@@ -100,9 +104,92 @@ class AuthViewModelOtpTest {
         viewModel.resendPhoneOtp()
         dispatcher.scheduler.advanceUntilIdle()
 
-        assertEquals(REPLACEMENT_CHALLENGE_ID, viewModel.uiState.value.pendingChallenge?.id)
-        assertTrue(viewModel.uiState.value.notice.orEmpty().contains("new code"))
-        assertFalse(viewModel.uiState.value.notice.orEmpty().contains("same code"))
+        assertEquals(null, viewModel.uiState.value.pendingChallenge)
+        assertTrue(viewModel.uiState.value.error.orEmpty().contains("Start again"))
+        assertTrue(viewModel.uiState.value.error.orEmpty().contains("latest message"))
+        assertTrue(savedState.keys().none { it.startsWith("auth.phone_otp.") })
+
+        viewModel.verifyCode("123456") { _, _ -> }
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(null, repository.verifiedCode)
+        assertEquals(2, repository.requestCount)
+    }
+
+    @Test
+    fun `restoration fails closed while a resend response is unresolved`() {
+        val repository = PhoneOtpRepository()
+        val clock = MutableElapsedRealtimeClock(1_000_000L)
+        val savedState = SavedStateHandle()
+        val original = viewModel(repository, clock, savedState)
+        original.requestPhoneOtp("0700000002") {}
+        dispatcher.scheduler.advanceUntilIdle()
+
+        clock.advanceSeconds(60)
+        repository.delayNextPhoneRequest = true
+        original.resendPhoneOtp()
+        dispatcher.scheduler.runCurrent()
+
+        assertTrue(repository.phoneRequestPending)
+        assertEquals(
+            CHALLENGE_ID,
+            savedState.get<String>(STATE_RESEND_IN_FLIGHT_CHALLENGE_ID),
+        )
+        val restoredSavedState = SavedStateHandle(
+            savedState.keys().associateWith { key -> savedState.get<Any?>(key) },
+        )
+        val restored = viewModel(repository, clock, restoredSavedState)
+
+        assertEquals(null, restored.uiState.value.pendingChallenge)
+        assertTrue(restored.uiState.value.error.orEmpty().contains("Start again"))
+        assertTrue(restored.uiState.value.error.orEmpty().contains("latest message"))
+        assertTrue(restoredSavedState.keys().none { it.startsWith("auth.phone_otp.") })
+
+        repository.completePhoneRequest()
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(CHALLENGE_ID, original.uiState.value.pendingChallenge?.id)
+    }
+
+    @Test
+    fun `ambiguous resend failure clears the challenge and requires a restart`() {
+        val repository = PhoneOtpRepository()
+        val clock = MutableElapsedRealtimeClock(1_000_000L)
+        val savedState = SavedStateHandle()
+        val viewModel = viewModel(repository, clock, savedState)
+        viewModel.requestPhoneOtp("0700000002") {}
+        dispatcher.scheduler.advanceUntilIdle()
+
+        clock.advanceSeconds(60)
+        repository.nextPhoneRequestFailure = IOException("response was not received")
+        viewModel.resendPhoneOtp()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(null, viewModel.uiState.value.pendingChallenge)
+        assertTrue(viewModel.uiState.value.error.orEmpty().contains("Start again"))
+        assertTrue(viewModel.uiState.value.error.orEmpty().contains("latest message"))
+        assertFalse(viewModel.uiState.value.loading)
+        assertTrue(savedState.keys().none { it.startsWith("auth.phone_otp.") })
+    }
+
+    @Test
+    fun `cancelled resend clears the ambiguous challenge and requires a restart`() {
+        val repository = PhoneOtpRepository()
+        val clock = MutableElapsedRealtimeClock(1_000_000L)
+        val savedState = SavedStateHandle()
+        val viewModel = viewModel(repository, clock, savedState)
+        viewModel.requestPhoneOtp("0700000002") {}
+        dispatcher.scheduler.advanceUntilIdle()
+
+        clock.advanceSeconds(60)
+        repository.nextPhoneRequestFailure = CancellationException("request cancelled")
+        viewModel.resendPhoneOtp()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(null, viewModel.uiState.value.pendingChallenge)
+        assertTrue(viewModel.uiState.value.error.orEmpty().contains("Start again"))
+        assertTrue(viewModel.uiState.value.error.orEmpty().contains("latest message"))
+        assertFalse(viewModel.uiState.value.loading)
+        assertTrue(savedState.keys().none { it.startsWith("auth.phone_otp.") })
     }
 
     @Test
@@ -464,6 +551,7 @@ class AuthViewModelOtpTest {
         var verificationPending: Boolean = false
             private set
         private var verificationContinuation: Continuation<AuthOutcome>? = null
+        var nextPhoneRequestFailure: Throwable? = null
         var delayNextPhoneRequest: Boolean = false
         var phoneRequestPending: Boolean = false
             private set
@@ -500,6 +588,10 @@ class AuthViewModelOtpTest {
                         challengeIds.last()
                     }
                     requestCount += 1
+                    nextPhoneRequestFailure?.let { failure ->
+                        nextPhoneRequestFailure = null
+                        throw failure
+                    }
                     val challenge = PendingAuthChallenge(
                         id = challengeId,
                         kind = AuthChallengeKind.PHONE_OTP,
@@ -604,6 +696,8 @@ class AuthViewModelOtpTest {
     private companion object {
         const val CHALLENGE_ID = "otp-challenge-id"
         const val REPLACEMENT_CHALLENGE_ID = "replacement-otp-challenge-id"
+        const val STATE_RESEND_IN_FLIGHT_CHALLENGE_ID =
+            "auth.phone_otp.resend_in_flight_challenge_id"
         val CHALLENGE_EXPIRES_AT: Instant = Instant.parse("2026-07-24T15:23:00Z")
     }
 }
