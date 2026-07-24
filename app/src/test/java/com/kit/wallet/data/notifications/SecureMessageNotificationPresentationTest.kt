@@ -15,11 +15,11 @@ class SecureMessageNotificationPresentationTest {
     @Test
     fun `sender and plaintext preview are single-line and sensibly truncated`() {
         val presentation = presentation(
-            senderName = "  Arnold\nPaul  ",
+            senderName = "  Amina\nExample  ",
             text = " First line\n\tsecond line ${"word ".repeat(40)}",
         )
 
-        assertEquals("Arnold Paul", presentation.sender)
+        assertEquals("Amina Example", presentation.sender)
         assertTrue(presentation.preview.startsWith("First line second line word word"))
         assertTrue(presentation.preview.endsWith("…"))
         assertFalse(presentation.preview.contains('\n'))

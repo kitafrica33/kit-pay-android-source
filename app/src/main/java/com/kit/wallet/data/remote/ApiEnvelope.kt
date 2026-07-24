@@ -46,6 +46,11 @@ data class ApiMetaDto(
     @Json(name = "server_time") val serverTime: String? = null,
 )
 
+data class ApiCallResult<T>(
+    val data: T,
+    val meta: ApiMetaDto?,
+)
+
 class KitWalletApiException(
     val code: String,
     override val message: String,
@@ -95,8 +100,17 @@ internal data class ApiFailureEnvelope(
 class ApiCallExecutor @Inject constructor(moshi: Moshi) {
     private val failureAdapter = moshi.adapter(ApiFailureEnvelope::class.java)
 
-    suspend fun <T> execute(call: suspend () -> ApiEnvelope<T>): T = try {
-        call().requireData()
+    suspend fun <T> execute(call: suspend () -> ApiEnvelope<T>): T =
+        executeWithMeta(call).data
+
+    suspend fun <T> executeWithMeta(
+        call: suspend () -> ApiEnvelope<T>,
+    ): ApiCallResult<T> = try {
+        val envelope = call()
+        ApiCallResult(
+            data = envelope.requireData(),
+            meta = envelope.meta,
+        )
     } catch (error: HttpException) {
         val failure = runCatching {
             error.response()?.errorBody()?.string()?.let(failureAdapter::fromJson)

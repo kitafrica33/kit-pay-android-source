@@ -169,7 +169,9 @@ class KeystoreSessionStore @Inject constructor(
         finalMessagingSnapshot: suspend (SessionFence) -> Unit,
     ): Boolean {
         tokens.requireValidCredentials()
+        currentCoroutineContext().ensureActive()
         return mutex.withLock {
+            currentCoroutineContext().ensureActive()
             if (sessionSnapshot != expected) return@withLock false
             val previous = _session.value?.fence()
             persistLocked(tokens) {
@@ -499,14 +501,16 @@ class KeystoreSessionStore @Inject constructor(
         tokens: SessionTokens,
         finalMessagingSnapshot: suspend () -> Unit = {},
     ) {
+        val callerContext = currentCoroutineContext()
+        callerContext.ensureActive()
         val existing = _session.value
         val isSameSession = existing?.fence() == tokens.fence()
         val allowKeyCreation = sessionKeyCreationAllowed(
             hasEncryptedSession = preferences.getString(KEY_SESSION, null) != null,
             hasCurrentSession = existing != null,
         )
+        var erasureFenced = false
         if (!isSameSession) {
-            var erasureFenced = false
             try {
                 messagingLifecycle.beforeSessionSave(
                     isSameSession = false,
@@ -523,6 +527,12 @@ class KeystoreSessionStore @Inject constructor(
                 throw error
             }
         }
+        try {
+            callerContext.ensureActive()
+        } catch (cancelled: CancellationException) {
+            if (!isSameSession && erasureFenced) abandonSessionDuringPendingMessagingErasure()
+            throw cancelled
+        }
         val json = adapter.toJson(tokens.toDiskPayload())
         val encryptedSession = try {
             encrypt(json, allowKeyCreation = allowKeyCreation)
@@ -534,6 +544,12 @@ class KeystoreSessionStore @Inject constructor(
         if (!isSameSession) {
             persistence.remove(KEY_MESSAGING_ERASURE_PENDING)
             persistence.remove(KEY_MESSAGING_RESET_PENDING)
+        }
+        try {
+            callerContext.ensureActive()
+        } catch (cancelled: CancellationException) {
+            if (!isSameSession) abandonSessionDuringPendingMessagingErasure()
+            throw cancelled
         }
         val persisted = persistence.commit()
         if (!persisted) {

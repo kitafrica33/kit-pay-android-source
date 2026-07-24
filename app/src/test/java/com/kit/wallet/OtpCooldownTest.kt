@@ -1,5 +1,7 @@
 package com.kit.wallet
 
+import com.kit.wallet.feature.auth.challengeSecondsRemaining
+import com.kit.wallet.feature.auth.formatChallengeCountdown
 import com.kit.wallet.feature.auth.formatResendCountdown
 import com.kit.wallet.feature.auth.resendSecondsRemaining
 import org.junit.Assert.assertEquals
@@ -19,5 +21,14 @@ class OtpCooldownTest {
         assertEquals("1:00", formatResendCountdown(60L))
         assertEquals("0:09", formatResendCountdown(9L))
         assertEquals("0:00", formatResendCountdown(-1L))
+    }
+
+    @Test
+    fun `challenge expiry rounds up but is unusable at its exact deadline`() {
+        assertEquals(300L, challengeSecondsRemaining(300_000L, 1L))
+        assertEquals(1L, challengeSecondsRemaining(300_000L, 299_999L))
+        assertEquals(0L, challengeSecondsRemaining(300_000L, 300_000L))
+        assertEquals(0L, challengeSecondsRemaining(null, 1L))
+        assertEquals("5:00", formatChallengeCountdown(300L))
     }
 }

@@ -103,8 +103,8 @@ class WalletInteractionPolicyTest {
         receivingWalletId: String? = "wallet-1",
     ) = Contact(
         id = id,
-        name = "Flora Namisi",
-        phone = "0761146015",
+        name = "Amina Example",
+        phone = "0700000001",
         isKitUser = isKitUser,
         receivingWalletId = receivingWalletId,
     )

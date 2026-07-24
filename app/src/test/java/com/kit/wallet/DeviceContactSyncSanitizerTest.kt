@@ -15,21 +15,21 @@ class DeviceContactSyncSanitizerTest {
                 candidate("*165#", "Mobile money service"),
                 candidate("911", "Emergency service"),
                 candidate("flora@example.com", "SIP contact"),
-                candidate("+256761146015,123", "Dial pause"),
-                candidate("256+761146015", "Misplaced plus"),
-                candidate("+256\u00a0761\u2011146\u2011015", "  Flora  ", favorite = true),
+                candidate("+256700000001,123", "Dial pause"),
+                candidate("256+700000001", "Misplaced plus"),
+                candidate("+256\u00a0700\u2011000\u2011001", "  Amina  ", favorite = true),
             ),
         )
 
         assertEquals(
-            listOf(DeviceContactDto("+256761146015", "Flora", favorite = true)),
+            listOf(DeviceContactDto("+256700000001", "Amina", favorite = true)),
             contacts,
         )
     }
 
     @Test
     fun `overlong number is rejected rather than truncated into an existing number`() {
-        val validPhone = "+256761146015"
+        val validPhone = "+256700000001"
         val contacts = sanitizeDeviceContactsForSync(
             sequenceOf(
                 candidate(validPhone + "9".repeat(30), "Wrong contact"),
@@ -44,13 +44,13 @@ class DeviceContactSyncSanitizerTest {
     fun `formatted duplicate numbers retain the first valid address book row`() {
         val contacts = sanitizeDeviceContactsForSync(
             sequenceOf(
-                candidate("+256 (761) 146-015", "Flora", favorite = true),
-                candidate("+256.761.146.015", "Duplicate"),
+                candidate("+256 (700) 000-001", "Amina", favorite = true),
+                candidate("+256.700.000.001", "Duplicate"),
             ),
         )
 
         assertEquals(
-            listOf(DeviceContactDto("+256761146015", "Flora", favorite = true)),
+            listOf(DeviceContactDto("+256700000001", "Amina", favorite = true)),
             contacts,
         )
     }

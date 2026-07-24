@@ -13,12 +13,12 @@ class TerminalAwareTelecomCallRegistryTest {
         val registry = registry()
 
         assertNull(registry.finish("unknown-call", "missed"))
-        assertNotNull(registry.track("unknown-call", "Arnold", TestState.RINGING))
+        assertNotNull(registry.track("unknown-call", "Test Caller", TestState.RINGING))
 
         var connectionCreated = false
         val attached = registry.attachConnection(
             callId = "unknown-call",
-            metadata = "Arnold",
+            metadata = "Test Caller",
             initialState = TestState.RINGING,
             createConnection = {
                 connectionCreated = true
@@ -128,7 +128,7 @@ class TerminalAwareTelecomCallRegistryTest {
         val registry = registry(maxResolvedTombstones = 1)
         val callId = "delayed-call"
 
-        assertNotNull(registry.track(callId, "Arnold", TestState.RINGING))
+        assertNotNull(registry.track(callId, "Test Caller", TestState.RINGING))
         val finished = registry.finish(callId, "missed")
         assertNotNull(finished)
         assertNull(finished?.connection)
@@ -151,7 +151,7 @@ class TerminalAwareTelecomCallRegistryTest {
         var preparedAsLive = false
         val late = registry.attachConnection(
             callId = callId,
-            metadata = "Arnold",
+            metadata = "Test Caller",
             initialState = TestState.RINGING,
             createConnection = {
                 preparedAsLive = true
@@ -163,13 +163,13 @@ class TerminalAwareTelecomCallRegistryTest {
         assertFalse(preparedAsLive)
         assertNull(late.liveCall)
         assertEquals("missed", late.terminalDisconnect)
-        assertNull(registry.track(callId, "Arnold", TestState.RINGING))
+        assertNull(registry.track(callId, "Test Caller", TestState.RINGING))
 
         // A duplicate platform callback is terminal too; resolving the first callback must not
         // immediately reopen the call id.
         val duplicate = registry.attachConnection(
             callId = callId,
-            metadata = "Arnold",
+            metadata = "Test Caller",
             initialState = TestState.RINGING,
             createConnection = {
                 preparedAsLive = true

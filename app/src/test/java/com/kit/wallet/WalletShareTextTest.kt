@@ -14,13 +14,13 @@ class WalletShareTextTest {
     fun `receive details contain only usable Kit identifiers`() {
         val profile = UserProfile(
             name = " Amina ",
-            phone = "0759948200",
+            phone = "0700000002",
             tag = "@amina",
             kycLabel = "Verified",
         )
 
         assertEquals(
-            "Pay Amina on Kit Pay using @amina or 0759948200.",
+            "Pay Amina on Kit Pay using @amina or 0700000002.",
             receiveDetailsShareText(profile),
         )
     }

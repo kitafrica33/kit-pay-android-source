@@ -176,7 +176,13 @@ fun ActiveCallScreen(
     }
 
     LaunchedEffect(Unit) {
-        if (!state.incoming) connectCall()
+        if (!state.incoming) {
+            when (viewModel.consumeOutgoingCallLaunch()) {
+                OutgoingCallLaunchAction.START -> connectCall()
+                OutgoingCallLaunchAction.KEEP_CURRENT_ROUTE -> Unit
+                OutgoingCallLaunchAction.EXIT_STALE_ROUTE -> onEnd()
+            }
+        }
     }
     LaunchedEffect(state.phase) {
         if (state.phase == CallPhase.ENDED) onEnd()

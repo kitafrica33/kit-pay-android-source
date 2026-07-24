@@ -20,6 +20,8 @@ data class PendingAuthChallenge(
     val method: String? = null,
     val destination: String? = null,
     val expiresAtEpochSeconds: Long? = null,
+    /** Relative lifetime derived from backend expires_at minus meta.server_time. */
+    val expiresAfterMillis: Long? = null,
     val resendAfterSeconds: Long? = null,
     /** Binds a multi-step challenge to the local authentication epoch that created it. */
     val expectedSession: SessionSnapshot? = null,

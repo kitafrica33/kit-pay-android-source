@@ -1,5 +1,7 @@
 package com.kit.wallet.feature.auth
 
+import android.os.SystemClock
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -55,40 +57,87 @@ fun OtpScreen(
     destination: String,
     loading: Boolean,
     error: String?,
+    notice: String?,
     resendSupported: Boolean,
     challengeId: String?,
     challengeKind: AuthChallengeKind?,
-    resendNotBeforeEpochMillis: Long?,
+    resendNotBeforeElapsedRealtimeMillis: Long?,
+    challengeExpiresAtElapsedRealtimeMillis: Long?,
     authenticatorChallenge: Boolean,
     onBack: () -> Unit,
     onVerify: (String) -> Unit,
     onResend: () -> Unit,
+    onChallengeUnavailable: (String?) -> Unit,
 ) {
     SecureScreen()
+    // Verification can adopt a signed-in session before its response reaches this screen. Keep
+    // both toolbar and system Back from replacing that side-effecting request mid-flight.
+    BackHandler {
+        if (!loading) onBack()
+    }
     // A route can stay composed while resend or MFA replaces the server challenge. Never carry
     // entered/submitted proof material across either an ID or a challenge-kind boundary.
     var code by remember(challengeId, challengeKind) { mutableStateOf("") }
     var recoveryCode by remember(challengeId, challengeKind) { mutableStateOf("") }
     var submittedCode by remember(challengeId, challengeKind) { mutableStateOf("") }
     var useRecoveryCode by remember(challengeId, challengeKind) { mutableStateOf(false) }
-    var resendSeconds by remember(challengeId, challengeKind, resendNotBeforeEpochMillis) {
+    var resendSeconds by remember(
+        challengeId,
+        challengeKind,
+        resendNotBeforeElapsedRealtimeMillis,
+    ) {
         mutableLongStateOf(
-            resendSecondsRemaining(resendNotBeforeEpochMillis, System.currentTimeMillis()),
+            resendSecondsRemaining(
+                resendNotBeforeElapsedRealtimeMillis,
+                SystemClock.elapsedRealtime(),
+            ),
         )
     }
+    var expirySeconds by remember(
+        challengeId,
+        challengeKind,
+        challengeExpiresAtElapsedRealtimeMillis,
+    ) {
+        mutableLongStateOf(
+            challengeSecondsRemaining(
+                challengeExpiresAtElapsedRealtimeMillis,
+                SystemClock.elapsedRealtime(),
+            ),
+        )
+    }
+    val challengeMetadataUsable = !challengeId.isNullOrBlank() &&
+        challengeKind != null && challengeExpiresAtElapsedRealtimeMillis != null
+    val challengeUsable = challengeMetadataUsable && expirySeconds > 0L
 
-    LaunchedEffect(challengeId, challengeKind, resendNotBeforeEpochMillis) {
+    LaunchedEffect(challengeId, challengeKind, resendNotBeforeElapsedRealtimeMillis) {
         while (resendSeconds > 0L) {
             delay(250L)
             resendSeconds = resendSecondsRemaining(
-                resendNotBeforeEpochMillis,
-                System.currentTimeMillis(),
+                resendNotBeforeElapsedRealtimeMillis,
+                SystemClock.elapsedRealtime(),
             )
         }
     }
 
-    LaunchedEffect(code, useRecoveryCode) {
-        if (!useRecoveryCode && code.length == OTP_LENGTH && code != submittedCode) {
+    LaunchedEffect(challengeId, challengeKind, challengeExpiresAtElapsedRealtimeMillis) {
+        if (!challengeMetadataUsable || expirySeconds == 0L) {
+            onChallengeUnavailable(challengeId)
+            return@LaunchedEffect
+        }
+        while (expirySeconds > 0L) {
+            delay(250L)
+            expirySeconds = challengeSecondsRemaining(
+                challengeExpiresAtElapsedRealtimeMillis,
+                SystemClock.elapsedRealtime(),
+            )
+        }
+        onChallengeUnavailable(challengeId)
+    }
+
+    LaunchedEffect(code, useRecoveryCode, challengeUsable) {
+        if (challengeUsable && !useRecoveryCode && code.length == OTP_LENGTH &&
+            code != submittedCode
+        ) {
             submittedCode = code
             onVerify(code)
         }
@@ -106,7 +155,7 @@ fun OtpScreen(
             TopAppBar(
                 title = {},
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = onBack, enabled = !loading) {
                         Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back")
                     }
                 },
@@ -135,11 +184,19 @@ fun OtpScreen(
                 when {
                     useRecoveryCode -> "Use one of the single-use codes you saved when you enabled two-step verification."
                     authenticatorChallenge -> "Enter the current 6-digit code from your authenticator app."
-                    else -> "Enter the verification code sent to $destination"
+                    else -> "Enter the verification code sent to $destination."
                 },
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (challengeUsable) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Verification expires in ${formatChallengeCountdown(expirySeconds)}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Spacer(Modifier.height(36.dp))
 
             if (useRecoveryCode) {
@@ -155,13 +212,14 @@ fun OtpScreen(
                     label = { Text("Recovery code") },
                     supportingText = { Text("A recovery code works once.") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+                    enabled = challengeUsable && !loading,
                     singleLine = true,
                 )
                 Spacer(Modifier.height(16.dp))
                 KitGreenButton(
                     text = "Continue",
                     loading = loading,
-                    enabled = normalizeMfaFactorCode(recoveryCode) != null,
+                    enabled = challengeUsable && normalizeMfaFactorCode(recoveryCode) != null,
                     onClick = { onVerify(recoveryCode) },
                 )
                 TextButton(
@@ -169,7 +227,7 @@ fun OtpScreen(
                         recoveryCode = ""
                         useRecoveryCode = false
                     },
-                    enabled = !loading,
+                    enabled = challengeUsable && !loading,
                 ) {
                     Text("Use an authenticator code")
                 }
@@ -205,7 +263,14 @@ fun OtpScreen(
             }
 
             Spacer(Modifier.height(20.dp))
-            if (loading && !useRecoveryCode) {
+            if (!challengeUsable) {
+                Text(
+                    "This verification request is no longer available.",
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            } else if (loading && !useRecoveryCode) {
                 CircularProgressIndicator(
                     modifier = Modifier.size(24.dp),
                     strokeWidth = 2.dp,
@@ -217,6 +282,13 @@ fun OtpScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
+            } else if (notice != null) {
+                Text(
+                    notice,
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             if (!useRecoveryCode && authenticatorChallenge) {
@@ -226,19 +298,20 @@ fun OtpScreen(
                         submittedCode = ""
                         useRecoveryCode = true
                     },
-                    enabled = !loading,
+                    enabled = challengeUsable && !loading,
                 ) {
                     Text("Use a recovery code")
                 }
             } else if (!useRecoveryCode && resendSupported) {
                 TextButton(
                     onClick = onResend,
-                    enabled = !loading && resendNotBeforeEpochMillis != null &&
+                    enabled = challengeUsable && !loading &&
+                        resendNotBeforeElapsedRealtimeMillis != null &&
                         resendSeconds == 0L,
                 ) {
                     Text(
                         when {
-                            resendNotBeforeEpochMillis == null ->
+                            resendNotBeforeElapsedRealtimeMillis == null ->
                                 "Resend temporarily unavailable"
                             resendSeconds == 0L -> "Resend code"
                             else -> "Resend code in ${formatResendCountdown(resendSeconds)}"
@@ -249,7 +322,7 @@ fun OtpScreen(
             }
 
             Spacer(Modifier.weight(1f))
-            if (!useRecoveryCode) {
+            if (!useRecoveryCode && challengeUsable) {
                 KitKeypad(
                     onKey = { if (code.length < OTP_LENGTH && !loading) code += it },
                     onBackspace = { if (!loading) code = code.dropLast(1) },
@@ -268,14 +341,18 @@ private fun OtpPreview() {
             destination = DemoData.USER_PHONE,
             loading = false,
             error = null,
+            notice = "This code stays the same until it expires.",
             resendSupported = true,
             challengeId = "preview-challenge",
             challengeKind = AuthChallengeKind.PHONE_OTP,
-            resendNotBeforeEpochMillis = null,
+            resendNotBeforeElapsedRealtimeMillis = null,
+            challengeExpiresAtElapsedRealtimeMillis =
+                SystemClock.elapsedRealtime() + 5 * 60_000L,
             authenticatorChallenge = false,
             onBack = {},
             onVerify = {},
             onResend = {},
+            onChallengeUnavailable = {},
         )
     }
 }
@@ -284,3 +361,14 @@ internal fun formatResendCountdown(seconds: Long): String {
     val safeSeconds = seconds.coerceAtLeast(0L)
     return "%d:%02d".format(safeSeconds / 60L, safeSeconds % 60L)
 }
+
+internal fun challengeSecondsRemaining(
+    expiresAtElapsedRealtimeMillis: Long?,
+    nowElapsedRealtimeMillis: Long,
+): Long {
+    val remainingMillis = (expiresAtElapsedRealtimeMillis ?: nowElapsedRealtimeMillis) -
+        nowElapsedRealtimeMillis
+    return if (remainingMillis <= 0L) 0L else (remainingMillis + 999L) / 1_000L
+}
+
+internal fun formatChallengeCountdown(seconds: Long): String = formatResendCountdown(seconds)

@@ -216,6 +216,13 @@ class ActiveCallViewModel @Inject constructor(
 ) : ViewModel() {
     private val target: String? = savedStateHandle["name"]
     private val incomingCallId: String? = savedStateHandle["callId"]
+
+    private val outgoingCallLaunchGate = if (incomingCallId == null) {
+        OutgoingCallLaunchGate(savedStateHandle)
+    } else {
+        null
+    }
+
     private val initialPresentation = initialCallPresentation(target, contacts.contacts.value)
     private val mutableState = MutableStateFlow(
         ActiveCallUiState(
@@ -229,6 +236,9 @@ class ActiveCallViewModel @Inject constructor(
         ),
     )
     val state = mutableState.asStateFlow()
+
+    internal fun consumeOutgoingCallLaunch(): OutgoingCallLaunchAction =
+        outgoingCallLaunchGate?.consume() ?: OutgoingCallLaunchAction.KEEP_CURRENT_ROUTE
 
     val room: Room = LiveKit.create(
         appContext = context,
@@ -1063,5 +1073,38 @@ class ActiveCallViewModel @Inject constructor(
             }
         }
         super.onCleared()
+    }
+}
+
+private const val OUTGOING_CALL_LAUNCH_CLAIMED = "kit.outgoing_call_launch_claimed"
+
+internal enum class OutgoingCallLaunchAction {
+    START,
+    KEEP_CURRENT_ROUTE,
+    EXIT_STALE_ROUTE,
+}
+
+/**
+ * Treats an outgoing-call destination as a one-shot command across both kinds of restoration.
+ *
+ * The saved marker makes a newly constructed ViewModel reject a process-restored back-stack entry.
+ * The in-memory marker prevents a retained ViewModel from issuing the command again when its
+ * Compose content leaves and re-enters after a configuration or capability change.
+ */
+internal class OutgoingCallLaunchGate(savedStateHandle: SavedStateHandle) {
+    private val freshRoute = savedStateHandle.get<Boolean>(OUTGOING_CALL_LAUNCH_CLAIMED) != true
+    private var consumed = false
+
+    init {
+        savedStateHandle[OUTGOING_CALL_LAUNCH_CLAIMED] = true
+    }
+
+    fun consume(): OutgoingCallLaunchAction = when {
+        !freshRoute -> OutgoingCallLaunchAction.EXIT_STALE_ROUTE
+        consumed -> OutgoingCallLaunchAction.KEEP_CURRENT_ROUTE
+        else -> {
+            consumed = true
+            OutgoingCallLaunchAction.START
+        }
     }
 }

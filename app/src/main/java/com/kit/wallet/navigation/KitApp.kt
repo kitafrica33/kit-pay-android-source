@@ -491,12 +491,16 @@ private fun KitNavHost(
                     ?: "your enrolled verification method",
                 loading = authState.loading,
                 error = authState.error,
+                notice = authState.notice,
                 resendSupported = challenge?.kind in setOf(
                     AuthChallengeKind.PHONE_OTP,
                 ),
                 challengeId = challenge?.id,
                 challengeKind = challenge?.kind,
-                resendNotBeforeEpochMillis = authState.resendNotBeforeEpochMillis,
+                resendNotBeforeElapsedRealtimeMillis =
+                    authState.resendNotBeforeElapsedRealtimeMillis,
+                challengeExpiresAtElapsedRealtimeMillis =
+                    authState.challengeExpiresAtElapsedRealtimeMillis,
                 authenticatorChallenge = challenge?.kind == AuthChallengeKind.TWO_FACTOR &&
                     challenge.method.equals("totp", ignoreCase = true),
                 onBack = {
@@ -505,6 +509,13 @@ private fun KitNavHost(
                 },
                 onVerify = { code -> authViewModel.verifyCode(code, openAuthenticated) },
                 onResend = authViewModel::resendPhoneOtp,
+                onChallengeUnavailable = { routeChallengeId ->
+                    if (authViewModel.clearUnavailableChallenge(routeChallengeId)) {
+                        if (!navController.popBackStack(Dest.PHONE_LOGIN, inclusive = false)) {
+                            navController.resetTo(Dest.PHONE_LOGIN)
+                        }
+                    }
+                },
             )
         }
         composable(Dest.PIN_SETUP) {

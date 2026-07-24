@@ -602,7 +602,7 @@ class EncryptedChatRepositoryTest {
                 Contact(
                     id = USER_ONE.uppercase(),
                     name = "Flora from my phone",
-                    phone = "+256761146015",
+                    phone = "+256700000001",
                     isKitUser = true,
                     registeredName = "Registered Flora",
                     savedInDevice = true,
@@ -637,7 +637,7 @@ class EncryptedChatRepositoryTest {
             Contact(
                 id = USER_ONE,
                 name = "Flora from my phone",
-                phone = "+256761146015",
+                phone = "+256700000001",
                 isKitUser = true,
                 registeredName = USER_ONE,
                 savedInDevice = true,
@@ -659,7 +659,7 @@ class EncryptedChatRepositoryTest {
                 Contact(
                     id = USER_ONE,
                     name = "\u0000\u0007\t",
-                    phone = "+256761146015",
+                    phone = "+256700000001",
                     isKitUser = true,
                     registeredName = USER_ONE,
                     savedInDevice = true,

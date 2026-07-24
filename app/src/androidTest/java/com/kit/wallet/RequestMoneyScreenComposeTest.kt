@@ -23,7 +23,7 @@ class RequestMoneyScreenComposeTest {
     fun only_a_visible_valid_kit_contact_can_enable_and_submit_the_request() {
         val submitted = mutableListOf<Contact>()
         val nonKit = Contact("device:1", "Local Person", "0700000000", isKitUser = false)
-        val valid = Contact("kit-user-1", "Flora Namisi", "0761146015", isKitUser = true)
+        val valid = Contact("kit-user-1", "Amina Example", "0700000001", isKitUser = true)
 
         compose.setContent {
             KitWalletTheme {
@@ -37,7 +37,7 @@ class RequestMoneyScreenComposeTest {
             }
         }
 
-        compose.onNodeWithText("Requesting from Flora Namisi").assertIsDisplayed()
+        compose.onNodeWithText("Requesting from Amina Example").assertIsDisplayed()
         compose.onNodeWithTag("request-contact-kit-user-1").assertIsDisplayed()
         compose.onNodeWithTag("request-submit").assertIsNotEnabled()
         compose.onNodeWithTag("request-amount").performTextInput("2500")

@@ -954,15 +954,31 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 return
             }
 
-            val recovered = state.withProjectionLease {
-                try {
-                    recordRecoveredHistory(authenticated)
-                } catch (unavailable: SecureMessagingStateUnavailableException) {
-                    throw unavailable
-                } catch (_: IllegalArgumentException) {
-                    null
-                } catch (_: IllegalStateException) {
-                    null
+            // A history wrapper can make this installation a donor for another current device.
+            // Use the projection lookup rather than only the inbound record: a message authored on
+            // this installation can already be retained under its outbound client-message key.
+            // Reuse that exact projection instead of materializing a duplicate inbound copy.
+            val retainedSource = state.withProjectionLease {
+                retainedHistorySource(
+                    messageId = authenticated.messageId,
+                    clientMessageId = authenticated.clientMessageId,
+                )
+            }
+            val retainedOutbound = retainedSource?.durableRecord?.direction ==
+                LibSignalCompanionDirection.OUTBOUND
+            val recovered = if (retainedOutbound) {
+                checkNotNull(retainedSource).durableRecord
+            } else {
+                state.withProjectionLease {
+                    try {
+                        recordRecoveredHistory(authenticated)
+                    } catch (unavailable: SecureMessagingStateUnavailableException) {
+                        throw unavailable
+                    } catch (_: IllegalArgumentException) {
+                        null
+                    } catch (_: IllegalStateException) {
+                        null
+                    }
                 }
             }
             if (recovered == null) {
@@ -974,7 +990,18 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 )
                 return
             }
-            publishInboundProjection(state, recovered, authenticated.sentAt)
+            if (!retainedOutbound) {
+                if (retainedSource == null) {
+                    // Invalidate before notification publication. If publication is interrupted
+                    // after its durable projection commit, the retry still reconciles completed
+                    // propagation tasks; a process restart also begins unreconciled.
+                    historyReconciledActivation = null
+                }
+                publishInboundProjection(state, recovered, authenticated.sentAt)
+                if (retainedSource == null) {
+                    scheduleHistoryContinuation(0L)
+                }
+            }
             state.deliveryTokens += historyDeliveryToken(
                 state,
                 envelope,

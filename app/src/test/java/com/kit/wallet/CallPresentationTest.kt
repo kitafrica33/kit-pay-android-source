@@ -13,7 +13,7 @@ class CallPresentationTest {
     private val flora = Contact(
         id = floraId,
         name = "Flora from my contacts",
-        phone = "+256 761 146 015",
+        phone = "+256 700 000 001",
         registeredName = "Flora Registered",
         savedInDevice = true,
     )
@@ -27,7 +27,7 @@ class CallPresentationTest {
         )
 
         assertEquals("Flora from my contacts", presentation.name)
-        assertEquals("+256 761 146 015", presentation.phone)
+        assertEquals("+256 700 000 001", presentation.phone)
     }
 
     @Test

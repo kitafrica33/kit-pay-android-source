@@ -40,7 +40,7 @@ class ActiveCallContactPresentationTest {
             state = initial,
             activeSource = source,
             contacts = listOf(
-                contact(ACTIVE_USER_ID, "Flora saved", "+256761146015"),
+                contact(ACTIVE_USER_ID, "Flora saved", "+256700000001"),
                 contact(WAITING_USER_ID, "Amina saved", "+256700000002"),
                 contact(REMOTE_USER_ID, "Joel saved", "+256700000003"),
             ),
@@ -57,7 +57,7 @@ class ActiveCallContactPresentationTest {
             TelecomPresentationUpdate(
                 ACTIVE_CALL_ID,
                 "Flora saved",
-                "+256761146015",
+                "+256700000001",
                 video = true,
             ),
             refreshed.activeTelecom,
@@ -104,7 +104,7 @@ class ActiveCallContactPresentationTest {
             initial,
             source,
             listOf(
-                contact(ACTIVE_USER_ID, "New Flora", "+256761146015"),
+                contact(ACTIVE_USER_ID, "New Flora", "+256700000001"),
                 contact(WAITING_USER_ID, "New Amina", "+256700000002"),
                 contact(REMOTE_USER_ID, "New Joel", "+256700000003"),
             ),

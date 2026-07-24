@@ -35,6 +35,10 @@ import com.kit.wallet.feature.chat.AndroidMessageSoundPlayer
 import com.kit.wallet.feature.chat.MessageSoundPlayer
 import com.kit.wallet.data.local.RoomWalletCache
 import com.kit.wallet.data.local.WalletCache
+import com.kit.wallet.data.time.AndroidElapsedRealtimeClock
+import com.kit.wallet.data.time.AndroidBootSessionIdProvider
+import com.kit.wallet.data.time.BootSessionIdProvider
+import com.kit.wallet.data.time.ElapsedRealtimeClock
 import dagger.Binds
 import dagger.Module
 import dagger.Provides
@@ -56,6 +60,18 @@ abstract class RepositoryBindingsModule {
     abstract fun bindDeviceIdentityProvider(
         implementation: AndroidDeviceIdentityProvider,
     ): DeviceIdentityProvider
+
+    @Binds
+    @Singleton
+    abstract fun bindElapsedRealtimeClock(
+        implementation: AndroidElapsedRealtimeClock,
+    ): ElapsedRealtimeClock
+
+    @Binds
+    @Singleton
+    abstract fun bindBootSessionIdProvider(
+        implementation: AndroidBootSessionIdProvider,
+    ): BootSessionIdProvider
 
     @Binds
     @Singleton

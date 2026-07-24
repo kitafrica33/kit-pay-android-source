@@ -4,3 +4,11 @@ useDefault = true
 [[allowlists]]
 description = "The release Firebase file is a schema-validated public Android client identifier, not a server credential."
 paths = ['''(^|/)config/firebase/google-services[.]json$''']
+
+[[allowlists]]
+description = "The exported clearance decision pins its public management record by SHA-256; this exact labelled value is a document digest, not a credential."
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)docs/google-fcm-agpl-clearance-decision-app-wide[.]md$''']
+regexes = ['''^- Management authority SHA-256: `[0-9a-f]{64}`$''']

@@ -515,6 +515,253 @@ class SecureMessagingEventProcessorTest {
     }
 
     @Test
+    fun `history wrapper reuses self-authored outbound projection without inbound duplicate`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            recordCurrentIdentity(session)
+            val roster = historyTransferRoster()
+            val transferId = SecureMessagingHistoryBackfillCodec.deterministicTransferId(
+                messageId = OUTBOUND_SERVER_ID,
+                targetDeviceId = CURRENT_DEVICE_ID,
+                targetEnrollmentEpoch = 1,
+                donorDeviceId = OWN_DONOR_DEVICE_ID,
+                donorEnrollmentEpoch = 5,
+                transferRosterRevision = checkNotNull(roster.rosterRevision),
+            )
+            val descriptor = outboundHistoryDescriptor(
+                transferId = transferId,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+            )
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val outbound = stateStore.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = OUTBOUND_CLIENT_ID,
+                clientMessageId = OUTBOUND_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = SELF_AUTHORED_HISTORY_TEXT,
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        PEER,
+                        SecureMessagingEnvelopeKind.SESSION,
+                        byteArrayOf(7, 8, 9),
+                    ),
+                ),
+            )
+            projections.recordOutboundPending(outbound, Instant.parse(TIMESTAMP))
+            val continuationDelays = mutableListOf<Long>()
+            val processor = processor(
+                stateStore = stateStore,
+                crypto = PersistingDecryptionEngine(stateStore, authenticatedText = descriptor),
+                projections = projections,
+                historyContinuationScheduler = SecureMessagingHistoryContinuationScheduler(
+                    continuationDelays::add,
+                ),
+            )
+            enqueueSync(
+                events = listOf(
+                    outboundEvent(roster, eventId = 10),
+                    outboundHistoryIncomingEvent(roster, transferId, eventId = 11),
+                ),
+                nextCursor = "outbound_history_collision_cursor",
+            )
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            enqueueRoster(roster)
+            enqueueDeliveryAcknowledgement(OUTBOUND_SERVER_ID)
+
+            processor.synchronize(session)
+
+            assertNull(projections.readInbound(OUTBOUND_SERVER_ID))
+            assertNotNull(projections.readHistoryInbound(transferId))
+            val visible = projections.readPage(limit = 10).messages().single()
+            assertEquals(LibSignalCompanionDirection.OUTBOUND, visible.durableRecord.direction)
+            assertEquals(OUTBOUND_CLIENT_ID, visible.durableRecord.clientMessageId)
+            assertEquals(OUTBOUND_SERVER_ID, visible.serverMessageId)
+            assertEquals(
+                SecureMessagingProjectionDeliveryState.OUTBOUND_SENT,
+                visible.deliveryState,
+            )
+            assertTrue(continuationDelays.isEmpty())
+            assertTrue(server.takeRequest().path?.contains("/messaging/sync") == true)
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/conversations",
+                server.takeRequest().path,
+            )
+            assertTrue(server.takeRequest().path?.contains("/device-roster/v1:sha256:") == true)
+            val acknowledgement = server.takeRequest()
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/messages/delivery-acks",
+                acknowledgement.path,
+            )
+            assertTrue(acknowledgement.body.readUtf8().contains(OUTBOUND_SERVER_ID))
+        }
+
+    @Test
+    fun `retained inbound history replay completes pending notification publication`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        recordCurrentIdentity(session)
+        val roster = historyTransferRoster()
+        val transferId = SecureMessagingHistoryBackfillCodec.deterministicTransferId(
+            messageId = INCOMING_MESSAGE_ID,
+            targetDeviceId = CURRENT_DEVICE_ID,
+            targetEnrollmentEpoch = 1,
+            donorDeviceId = OWN_DONOR_DEVICE_ID,
+            donorEnrollmentEpoch = 5,
+            transferRosterRevision = checkNotNull(roster.rosterRevision),
+        )
+        val descriptor = historyDescriptor(transferId, checkNotNull(roster.rosterRevision))
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val notifications = FailOnceIdempotentNotificationSink(failAfterPublish = false)
+        val crypto = PersistingDecryptionEngine(stateStore, authenticatedText = descriptor)
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = crypto,
+            projections = projections,
+            notifications = notifications,
+        )
+        enqueueSync(
+            events = listOf(historyIncomingEvent(roster, transferId)),
+            nextCursor = "history_notification_retry_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+
+        val failure = runCatching { processor.synchronize(session) }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingNotificationPublicationException)
+        assertEquals("injected notification failure", failure?.cause?.message)
+        assertEquals(1, crypto.openedTransactions)
+        assertNotNull(projections.readInbound(INCOMING_MESSAGE_ID))
+        assertNull(SecureMessagingSyncCursorStore(stateStore).load())
+        assertEquals(1, notifications.publishAttempts)
+        assertTrue(notifications.visibleNotifications.isEmpty())
+        assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/conversations",
+            server.takeRequest().path,
+        )
+        assertTrue(server.takeRequest().path?.contains("/device-roster/v1:sha256:") == true)
+
+        enqueueDeliveryAcknowledgement()
+        processor.synchronize(session)
+
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/messages/delivery-acks",
+            server.takeRequest().path,
+        )
+        assertEquals(1, crypto.openedTransactions)
+        assertEquals(2, notifications.publishAttempts)
+        assertEquals(setOf(INCOMING_MESSAGE_ID), notifications.visibleNotifications.keys)
+        assertEquals(
+            listOf(INCOMING_MESSAGE_ID),
+            projections.readPage(limit = 10).messages().map { it.serverMessageId },
+        )
+        assertEquals(
+            "history_notification_retry_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(
+                checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+            ),
+        )
+    }
+
+    @Test
+    fun `newly recovered history reopens completed propagation work exactly once`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        recordCurrentIdentity(session)
+        lifecycle.finishActivation(fence)
+        val roster = historyTransferRoster()
+        val transferId = SecureMessagingHistoryBackfillCodec.deterministicTransferId(
+            messageId = INCOMING_MESSAGE_ID,
+            targetDeviceId = CURRENT_DEVICE_ID,
+            targetEnrollmentEpoch = 1,
+            donorDeviceId = OWN_DONOR_DEVICE_ID,
+            donorEnrollmentEpoch = 5,
+            transferRosterRevision = checkNotNull(roster.rosterRevision),
+        )
+        val descriptor = historyDescriptor(transferId, checkNotNull(roster.rosterRevision))
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val continuationDelays = mutableListOf<Long>()
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore, authenticatedText = descriptor),
+            projections = projections,
+            historyContinuationScheduler = SecureMessagingHistoryContinuationScheduler(
+                continuationDelays::add,
+            ),
+        )
+
+        // Establish the one-shot activation reconciliation and complete its currently empty task.
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueEmptyHistoryCandidates(roster, OWN_DONOR_DEVICE_ID, 5)
+        processor.recoverPendingHistory(session)
+        assertTrue(projections.pendingHistoryBackfills(limit = 1).isEmpty())
+        assertTrue(continuationDelays.isEmpty())
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/conversations",
+            server.takeRequest().path,
+        )
+        assertTrue(server.takeRequest().path?.endsWith("/device-roster") == true)
+        assertTrue(server.takeRequest().path?.contains("/history-backfill/candidates") == true)
+
+        // This authenticated wrapper is a new retained source. It must invalidate the completed
+        // reconciliation and persist an immediate continuation without waiting for another login.
+        enqueueSync(
+            events = listOf(historyIncomingEvent(roster, transferId)),
+            nextCursor = "history_propagation_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+        processor.synchronize(session)
+        assertEquals(listOf(0L), continuationDelays)
+        assertTrue(server.takeRequest().path?.contains("/messaging/sync") == true)
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/conversations",
+            server.takeRequest().path,
+        )
+        assertTrue(server.takeRequest().path?.contains("/device-roster/v1:sha256:") == true)
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/messages/delivery-acks",
+            server.takeRequest().path,
+        )
+
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueEmptyHistoryCandidates(roster, OWN_DONOR_DEVICE_ID, 5)
+        processor.recoverPendingHistory(session)
+        assertTrue(projections.pendingHistoryBackfills(limit = 1).isEmpty())
+        assertEquals(listOf(0L), continuationDelays)
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/conversations",
+            server.takeRequest().path,
+        )
+        assertTrue(server.takeRequest().path?.endsWith("/device-roster") == true)
+        assertTrue(server.takeRequest().path?.contains("/history-backfill/candidates") == true)
+
+        // An exact event replay finds the retained source and must not create an endless chain of
+        // zero-delay propagation continuations.
+        enqueueSync(
+            events = listOf(historyIncomingEvent(roster, transferId, eventId = 11)),
+            nextCursor = "history_propagation_replay_cursor",
+        )
+        enqueueDeliveryAcknowledgement()
+        processor.synchronize(session)
+        assertEquals(listOf(0L), continuationDelays)
+        assertTrue(server.takeRequest().path?.contains("/messaging/sync") == true)
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/messages/delivery-acks",
+            server.takeRequest().path,
+        )
+    }
+
+    @Test
     fun `receipt events and an exact send replay cannot regress read state`() =
         runTest {
             val (session, _, _) = openSyncingSession()
@@ -2570,13 +2817,13 @@ class SecureMessagingEventProcessorTest {
         assertEquals(0, erasures)
     }
 
-    private fun enqueueDeliveryAcknowledgement() {
+    private fun enqueueDeliveryAcknowledgement(messageId: String = INCOMING_MESSAGE_ID) {
         val response = MessageDeliveryAcknowledgementDto(
             deliveryState = "delivered_to_device",
             deviceId = CURRENT_DEVICE_ID,
             acknowledgedCount = 1,
             newlyAcknowledgedCount = 1,
-            items = listOf(MessageDeliveryReceiptDto(INCOMING_MESSAGE_ID, TIMESTAMP)),
+            items = listOf(MessageDeliveryReceiptDto(messageId, TIMESTAMP)),
         )
         val encoded = moshi.adapter(MessageDeliveryAcknowledgementDto::class.java).toJson(response)
         server.enqueue(jsonResponse("""{"ok":true,"data":$encoded}"""))
@@ -2724,6 +2971,7 @@ class SecureMessagingEventProcessorTest {
     private fun historyIncomingEvent(
         roster: MessagingDeviceRosterDto,
         transferId: String,
+        eventId: Long = 10,
     ): MessagingSyncEventDto {
         val peer = roster.devices.orEmpty().filterNotNull()
             .single { it.deviceId == PEER_DEVICE_ID }
@@ -2731,7 +2979,7 @@ class SecureMessagingEventProcessorTest {
             .single { it.deviceId == OWN_DONOR_DEVICE_ID }
         val ciphertext = "opaque donor history ciphertext".toByteArray(StandardCharsets.UTF_8)
         return MessagingSyncEventDto(
-            id = "10",
+            id = eventId.toString(),
             type = "message.created",
             conversationId = CONVERSATION_ID,
             resourceType = "message",
@@ -2780,6 +3028,32 @@ class SecureMessagingEventProcessorTest {
         )
     }
 
+    private fun outboundHistoryIncomingEvent(
+        roster: MessagingDeviceRosterDto,
+        transferId: String,
+        eventId: Long,
+    ): MessagingSyncEventDto {
+        val current = roster.devices.orEmpty().filterNotNull()
+            .single { it.deviceId == CURRENT_DEVICE_ID }
+        val original = historyIncomingEvent(roster, transferId, eventId)
+        val data = checkNotNull(original.data)
+        return original.copy(
+            resourceId = OUTBOUND_SERVER_ID,
+            data = data.copy(
+                id = OUTBOUND_SERVER_ID,
+                clientMessageId = OUTBOUND_CLIENT_ID,
+                sender = EncryptedMessageSenderDto(CURRENT_USER_ID, "Current User"),
+                senderDeviceId = CURRENT_DEVICE_ID,
+                senderEnrollmentEpoch = 1,
+                senderSignalDeviceId = current.signalDeviceId,
+                senderRegistrationId = current.registrationId,
+                senderBundleVersion = current.bundleVersion,
+                senderIdentityKeySha256 = current.identityKeySha256,
+                rosterRevision = roster.rosterRevision,
+            ),
+        )
+    }
+
     private fun historyDescriptor(transferId: String, transferRoster: String): String =
         """{"schema":"kit.messaging.history.v1","type":"history_backfill",""" +
             "\"transfer_client_message_id\":\"$transferId\"," +
@@ -2798,6 +3072,25 @@ class SecureMessagingEventProcessorTest {
             "\"reply_to_message_id\":null," +
             "\"sent_at\":\"$TIMESTAMP\"," +
             "\"text\":\"restored only from authenticated ciphertext\"}"
+
+    private fun outboundHistoryDescriptor(transferId: String, rosterRevision: String): String =
+        """{"schema":"kit.messaging.history.v1","type":"history_backfill",""" +
+            "\"transfer_client_message_id\":\"$transferId\"," +
+            "\"target_device_id\":\"$CURRENT_DEVICE_ID\"," +
+            "\"target_enrollment_epoch\":1," +
+            "\"transfer_roster_revision\":\"$rosterRevision\"," +
+            "\"message_id\":\"$OUTBOUND_SERVER_ID\"," +
+            "\"client_message_id\":\"$OUTBOUND_CLIENT_ID\"," +
+            "\"conversation_id\":\"$CONVERSATION_ID\"," +
+            "\"sender_user_id\":\"$CURRENT_USER_ID\"," +
+            "\"sender_device_id\":\"$CURRENT_DEVICE_ID\"," +
+            "\"sender_enrollment_epoch\":1," +
+            "\"sender_signal_device_id\":1," +
+            "\"original_roster_revision\":\"$rosterRevision\"," +
+            "\"kind\":\"$ENCRYPTED_MESSAGE_KIND\"," +
+            "\"reply_to_message_id\":null," +
+            "\"sent_at\":\"$TIMESTAMP\"," +
+            "\"text\":\"$SELF_AUTHORED_HISTORY_TEXT\"}"
 
     private fun outboundEvent(
         roster: MessagingDeviceRosterDto,
@@ -3514,6 +3807,7 @@ class SecureMessagingEventProcessorTest {
         const val INCOMING_MESSAGE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         const val OUTBOUND_SERVER_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         const val SECOND_OUTBOUND_SERVER_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        const val SELF_AUTHORED_HISTORY_TEXT = "self-authored retained history"
         const val TIMESTAMP = "2026-07-20T12:00:00Z"
         val ORIGINAL_HISTORY_ROSTER = "v1:sha256:${"f".repeat(64)}"
         val CURRENT_IDENTITY_HASH = "1".repeat(64)

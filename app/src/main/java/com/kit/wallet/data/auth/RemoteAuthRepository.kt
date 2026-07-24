@@ -39,6 +39,7 @@ import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionSnapshot
 import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.kit.wallet.di.ApplicationScope
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import javax.inject.Inject
@@ -47,6 +48,8 @@ import kotlin.math.ceil
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
@@ -85,7 +88,7 @@ class RemoteAuthRepository @Inject constructor(
 
     override suspend fun loginWithEmail(email: String, password: String): AuthOutcome {
         val expected = sessions.snapshot()
-        return apiCalls.execute {
+        val response = apiCalls.executeWithMeta {
             api.loginWithEmail(
                 EmailLoginRequest(
                     email = email.trim(),
@@ -93,7 +96,9 @@ class RemoteAuthRepository @Inject constructor(
                     device = deviceIdentity.registration(),
                 ),
             )
-        }.toOutcome(expected)
+        }
+        currentCoroutineContext().ensureActive()
+        return response.data.toOutcome(expected, response.meta?.serverTime)
     }
 
     override suspend fun registerWithEmail(
@@ -159,11 +164,15 @@ class RemoteAuthRepository @Inject constructor(
 
     override suspend fun requestPhoneOtp(phone: String): PendingAuthChallenge {
         val expected = sessions.snapshot()
-        val result = apiCalls.execute { api.requestPhoneOtp(
+        val response = apiCalls.executeWithMeta { api.requestPhoneOtp(
             PhoneOtpRequest(phone = phone.trim(), device = deviceIdentity.registration()),
         ) }
-        return requireNotNull(result.challenge) { "OTP response omitted challenge" }
-            .toPending(destination = phone.trim(), expectedSession = expected)
+        return requireNotNull(response.data.challenge) { "OTP response omitted challenge" }
+            .toPending(
+                destination = phone.trim(),
+                expectedSession = expected,
+                serverTime = response.meta?.serverTime,
+            )
     }
 
     override suspend fun phoneAuthCapabilities(): PhoneAuthCapabilities {
@@ -179,7 +188,7 @@ class RemoteAuthRepository @Inject constructor(
         code: String,
     ): AuthOutcome {
         val expected = challenge.requireUnchangedSession()
-        return apiCalls.execute {
+        val response = apiCalls.executeWithMeta {
             api.verifyPhoneOtp(
                 PhoneOtpVerifyRequest(
                     challengeId = challenge.id,
@@ -188,7 +197,9 @@ class RemoteAuthRepository @Inject constructor(
                     device = deviceIdentity.registration(),
                 ),
             )
-        }.toOutcome(expected)
+        }
+        currentCoroutineContext().ensureActive()
+        return response.data.toOutcome(expected, response.meta?.serverTime)
     }
 
     override suspend fun verifyTwoFactor(
@@ -196,11 +207,13 @@ class RemoteAuthRepository @Inject constructor(
         code: String,
     ): AuthOutcome {
         val expected = challenge.requireUnchangedSession()
-        return apiCalls.execute {
+        val response = apiCalls.executeWithMeta {
             api.verifyTwoFactor(
                 TwoFactorVerifyRequest(challengeId = challenge.id, code = code),
             )
-        }.toOutcome(expected)
+        }
+        currentCoroutineContext().ensureActive()
+        return response.data.toOutcome(expected, response.meta?.serverTime)
     }
 
     override suspend fun refreshSession(): AuthOutcome.Authenticated {
@@ -664,8 +677,10 @@ class RemoteAuthRepository @Inject constructor(
 
     private suspend fun AuthResultDto.toOutcome(
         expected: SessionSnapshot,
+        serverTime: String?,
         allowAccountReplacement: Boolean = true,
     ): AuthOutcome {
+        currentCoroutineContext().ensureActive()
         val sessionDto = session
         if (sessionDto != null) {
             val authenticatedUser = requireNotNull(user) { "Authenticated response omitted user" }
@@ -709,10 +724,14 @@ class RemoteAuthRepository @Inject constructor(
                     null
                 },
             )
+            currentCoroutineContext().ensureActive()
             val sessionAdopted = sessions.replaceIfUnchangedAfterFinalMessagingSnapshot(
                 expected = expected,
                 tokens = tokens,
-                finalMessagingSnapshot = messageHistory::snapshotActiveHistory,
+                finalMessagingSnapshot = { fence ->
+                    messageHistory.snapshotActiveHistory(fence)
+                    currentCoroutineContext().ensureActive()
+                },
             )
             if (!sessionAdopted) {
                 throw SessionInvalidatedException()
@@ -725,7 +744,7 @@ class RemoteAuthRepository @Inject constructor(
 
         return AuthOutcome.ChallengeRequired(
             requireNotNull(challenge) { "Authentication response omitted session and challenge" }
-                .toPending(expectedSession = expected),
+                .toPending(expectedSession = expected, serverTime = serverTime),
         )
     }
 
@@ -738,22 +757,32 @@ class RemoteAuthRepository @Inject constructor(
     private fun AuthChallengeDto.toPending(
         destination: String? = null,
         expectedSession: SessionSnapshot,
-    ) = PendingAuthChallenge(
-        id = id,
-        kind = when (type.lowercase()) {
-            "otp", "phone_otp" -> AuthChallengeKind.PHONE_OTP
-            "two_factor" -> AuthChallengeKind.TWO_FACTOR
-            else -> error("The backend returned an unsupported authentication challenge")
-        },
-        method = method,
-        destination = destination ?: this.destination,
-        expiresAtEpochSeconds = expiresAt.toEpochSecondsOrNull(),
-        resendAfterSeconds = resendAfterSeconds.toCooldownSecondsOrNull(),
-        expectedSession = expectedSession,
-    )
+        serverTime: String?,
+    ): PendingAuthChallenge {
+        val expiry = expiresAt.toInstantOrNull()
+        val serverNow = serverTime.toInstantOrNull()
+        return PendingAuthChallenge(
+            id = id,
+            kind = when (type.lowercase()) {
+                "otp", "phone_otp" -> AuthChallengeKind.PHONE_OTP
+                "two_factor" -> AuthChallengeKind.TWO_FACTOR
+                else -> error("The backend returned an unsupported authentication challenge")
+            },
+            method = method,
+            destination = destination ?: this.destination,
+            expiresAtEpochSeconds = expiry?.epochSecond,
+            expiresAfterMillis = challengeLifetimeMillis(expiry, serverNow),
+            resendAfterSeconds = resendAfterSeconds.toCooldownSecondsOrNull(),
+            expectedSession = expectedSession,
+        )
+    }
 
     private fun String?.toEpochSecondsOrNull(): Long? = this?.let {
         runCatching { Instant.parse(it).epochSecond }.getOrNull()
+    }
+
+    private fun String?.toInstantOrNull(): Instant? = this?.let {
+        runCatching { Instant.parse(it) }.getOrNull()
     }
 
     private fun Double?.toCooldownSecondsOrNull(): Long? = this
@@ -775,6 +804,13 @@ class RemoteAuthRepository @Inject constructor(
 
     private fun String?.orFallback(fallback: String): String =
         this?.trim()?.takeIf(String::isNotBlank) ?: fallback
+}
+
+internal fun challengeLifetimeMillis(expiresAt: Instant?, serverTime: Instant?): Long? {
+    if (expiresAt == null || serverTime == null) return null
+    return runCatching { Duration.between(serverTime, expiresAt).toMillis() }
+        .getOrNull()
+        ?.takeIf { it > 0L }
 }
 
 internal fun requiresProfileSetup(name: String?, tag: String?): Boolean {

@@ -2,8 +2,8 @@
 
 Audit snapshot: 2026-07-22  
 Application ID: `com.kit.wallet`  
-Version name: `0.2.11`  
-Version code: `23`  
+Version name: `0.2.12`  
+Version code: `24`  
 Distribution clearance: `true`  
 Distribution review disposition: `CLEARED`  
 Distribution review record type: `APP_WIDE_INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL`  

@@ -78,6 +78,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
+        pendingDeepLink = savedInstanceState?.getString(STATE_PENDING_DEEP_LINK)
         handleIntent(intent)
         enableEdgeToEdge()
         setContent {
@@ -145,6 +146,11 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        pendingDeepLink?.let { outState.putString(STATE_PENDING_DEEP_LINK, it) }
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onStart() {
         super.onStart()
         foregroundStartJob?.cancel()
@@ -209,7 +215,7 @@ class MainActivity : ComponentActivity() {
             authorizer = secureMessageAuthorizer,
             currentSessionEpoch = sessions.current()?.sessionId,
         )?.let { pendingSecureMessage = it }
-        intent?.kitDeepLink()?.let { pendingDeepLink = it }
+        intent?.takeKitDeepLink()?.let { pendingDeepLink = it }
         val incomingTextShare = intent?.takeIncomingTextShare() ?: return
         if (pendingTextShareSending && pendingTextShare != null) {
             // Keep the explicitly confirmed send visible until it resolves. Retain at most the
@@ -465,10 +471,18 @@ private fun Intent.takeIncomingTextShare(): IncomingTextShareRequest? {
 }
 
 /**
+ * Takes one validated external navigation route from this Activity Intent.
+ *
  * Provider-delivered notification taps can carry call data as activity extras rather than as an
  * Intent data URI.
+ *
+ * MainActivity is single-top for call notifications. Leaving the route on its retained Intent
+ * lets a later Activity recreation replay an already-consumed call over whatever screen the user
+ * opened next. Clear the source before navigation; [MainActivity.onSaveInstanceState] retains only
+ * a route that is still legitimately waiting for session/capability readiness.
  */
-private fun Intent.kitDeepLink(): String? {
+@VisibleForTesting
+internal fun Intent.takeKitDeepLink(): String? {
     dataString?.let { raw ->
         val uri = runCatching { Uri.parse(raw) }.getOrNull()
         val isKycReturn = uri?.let {
@@ -478,13 +492,27 @@ private fun Intent.kitDeepLink(): String? {
                 it.query == null &&
                 it.fragment == null
         } == true
-        if (isKycReturn || IncomingCallPayload.fromDeepLink(raw) != null) return raw
+        val callPayload = IncomingCallPayload.fromDeepLink(raw)
+        val canonicalRoute = when {
+            isKycReturn -> KYC_STATUS_DEEP_LINK
+            callPayload != null -> callPayload.deepLinkUri(callPayload.acceptRequested)
+            else -> null
+        }
+        if (canonicalRoute != null) {
+            data = null
+            CALL_PAYLOAD_KEYS.forEach(::removeExtra)
+            action = null
+            return canonicalRoute
+        }
         return null
     }
     val payloadData = CALL_PAYLOAD_KEYS.mapNotNull { key ->
         getStringExtra(key)?.let { value -> key to value }
     }.toMap()
-    return IncomingCallPayload.fromData(payloadData)?.deepLinkUri()
+    val route = IncomingCallPayload.fromData(payloadData)?.deepLinkUri() ?: return null
+    CALL_PAYLOAD_KEYS.forEach(::removeExtra)
+    action = null
+    return route
 }
 
 private val CALL_PAYLOAD_KEYS = listOf(
@@ -493,5 +521,9 @@ private val CALL_PAYLOAD_KEYS = listOf(
     "call_type",
     "video",
     "initiator_name",
+    "initiator_user_id",
     "ring_expires_at",
 )
+
+private const val STATE_PENDING_DEEP_LINK = "kit.pending_deep_link"
+private const val KYC_STATUS_DEEP_LINK = "kitwallet://kyc/status"

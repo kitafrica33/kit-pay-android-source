@@ -7,6 +7,7 @@ import com.kit.wallet.data.auth.PendingAuthChallenge
 import com.kit.wallet.data.auth.RemoteAuthRepository
 import com.kit.wallet.data.auth.RemoteRevocationState
 import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
+import com.kit.wallet.data.auth.challengeLifetimeMillis
 import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
 import com.kit.wallet.data.messaging.AccountMessageArchivePurgeNotDurableException
 import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
@@ -34,7 +35,11 @@ import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import java.time.Instant
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.runTest
@@ -390,7 +395,31 @@ class RemoteAuthRepositoryTest {
 
         assertEquals("challenge-uuid", challenge.id)
         assertEquals("+256772345678", challenge.destination)
+        assertEquals(300_000L, challenge.expiresAfterMillis)
         assertEquals(60L, challenge.resendAfterSeconds)
+    }
+
+    @Test
+    fun `challenge lifetime is derived from server time without a device wall clock`() {
+        assertEquals(
+            300_000L,
+            challengeLifetimeMillis(
+                expiresAt = Instant.parse("2026-07-16T12:05:00Z"),
+                serverTime = Instant.parse("2026-07-16T12:00:00Z"),
+            ),
+        )
+        assertNull(
+            challengeLifetimeMillis(
+                expiresAt = Instant.parse("2026-07-16T11:59:59Z"),
+                serverTime = Instant.parse("2026-07-16T12:00:00Z"),
+            ),
+        )
+        assertNull(
+            challengeLifetimeMillis(
+                expiresAt = Instant.parse("2026-07-16T12:05:00Z"),
+                serverTime = null,
+            ),
+        )
     }
 
     @Test
@@ -447,6 +476,43 @@ class RemoteAuthRepositoryTest {
         assertEquals("/api/kit-wallet/v1/auth/otp/verify", server.takeRequest().path)
         assertEquals("/api/kit-wallet/v1/auth/2fa/verify", server.takeRequest().path)
     }
+
+    @Test
+    fun `cancelling phone and TOTP verification prevents authenticated session adoption`() =
+        runTest {
+            AuthChallengeKind.entries.forEach { kind ->
+                server.enqueue(
+                    jsonResponse(AUTHENTICATED_JSON)
+                        .setBodyDelay(5L, TimeUnit.SECONDS),
+                )
+                val sessions = FakeSessionStore()
+                val repository = repository(sessions, FakeRefreshTrigger())
+                val challenge = PendingAuthChallenge(
+                    id = "challenge-uuid",
+                    kind = kind,
+                    expectedSession = sessions.snapshot(),
+                )
+
+                val verification = async(start = CoroutineStart.UNDISPATCHED) {
+                    when (kind) {
+                        AuthChallengeKind.PHONE_OTP -> repository.verifyPhoneOtp(
+                            challenge = challenge,
+                            phone = "+256772345678",
+                            code = "123456",
+                        )
+                        AuthChallengeKind.TWO_FACTOR -> repository.verifyTwoFactor(
+                            challenge = challenge,
+                            code = "123456",
+                        )
+                    }
+                }
+                assertNotNull(server.takeRequest(5L, TimeUnit.SECONDS))
+
+                verification.cancelAndJoin()
+
+                assertNull("$kind must not adopt an authenticated session", sessions.current())
+            }
+        }
 
     @Test
     fun `phone auth uses only the local SMS capability`() = runTest {

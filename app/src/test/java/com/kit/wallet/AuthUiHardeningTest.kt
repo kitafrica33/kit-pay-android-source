@@ -18,8 +18,14 @@ class AuthUiHardeningTest {
             "app/src/main/java/com/kit/wallet/feature/auth/AuthViewModel.kt",
         )
 
-        assertEquals(61_000L, phoneResendDeadline(now, resendAfterSeconds = null))
-        assertEquals(now, phoneResendDeadline(now, resendAfterSeconds = 0L))
+        assertEquals(
+            61_000L,
+            phoneResendDeadline(nowElapsedRealtimeMillis = now, resendAfterSeconds = null),
+        )
+        assertEquals(
+            now,
+            phoneResendDeadline(nowElapsedRealtimeMillis = now, resendAfterSeconds = 0L),
+        )
         assertFalse(isResendCooldownElapsed(null, now))
         assertFalse(isResendCooldownElapsed(61_000L, 60_999L))
         assertTrue(isResendCooldownElapsed(61_000L, 61_000L))
@@ -52,6 +58,12 @@ class AuthUiHardeningTest {
         }
         assertTrue(navigation.contains("challengeId = challenge?.id"))
         assertTrue(navigation.contains("challengeKind = challenge?.kind"))
+        assertTrue(otp.contains("Verification expires in"))
+        assertTrue(otp.contains("onChallengeUnavailable(challengeId)"))
+        assertTrue(otp.contains("BackHandler"))
+        assertTrue(otp.contains("IconButton(onClick = onBack, enabled = !loading)"))
+        assertTrue(navigation.contains("challengeExpiresAtElapsedRealtimeMillis ="))
+        assertTrue(navigation.contains("clearUnavailableChallenge(routeChallengeId)"))
     }
 
     @Test
@@ -103,7 +115,9 @@ class AuthUiHardeningTest {
     private fun source(relativePath: String): String = File(repositoryRoot(), relativePath).readText()
 
     private fun repositoryRoot(): File {
-        val workingDirectory = File(System.getProperty("user.dir")).canonicalFile
+        val workingDirectory = File(
+            requireNotNull(System.getProperty("user.dir")),
+        ).canonicalFile
         return generateSequence(workingDirectory) { it.parentFile }
             .firstOrNull { File(it, "app/build.gradle.kts").isFile }
             ?: error("Could not locate the Android repository root from $workingDirectory")

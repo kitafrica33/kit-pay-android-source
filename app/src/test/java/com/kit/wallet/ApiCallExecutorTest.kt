@@ -2,6 +2,7 @@ package com.kit.wallet
 
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.ApiEnvelope
+import com.kit.wallet.data.remote.ApiMetaDto
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_CODE
 import com.kit.wallet.data.remote.isKitConnectivityError
@@ -26,6 +27,20 @@ class ApiCallExecutorTest {
     private val executor = ApiCallExecutor(
         Moshi.Builder().add(KotlinJsonAdapterFactory()).build(),
     )
+
+    @Test
+    fun `successful call can retain server timing metadata`() = runTest {
+        val result = executor.executeWithMeta {
+            ApiEnvelope(
+                ok = true,
+                data = "payload",
+                meta = ApiMetaDto(serverTime = "2026-07-16T12:00:00Z"),
+            )
+        }
+
+        assertEquals("payload", result.data)
+        assertEquals("2026-07-16T12:00:00Z", result.meta?.serverTime)
+    }
 
     @Test
     fun `parses canonical error envelope from non-2xx response`() = runTest {
