@@ -33,6 +33,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -64,21 +65,65 @@ private enum class SendStep { PICK_RECIPIENT, ENTER_AMOUNT, SUCCESS }
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SendMoneyScreen(
+    initialContactId: String? = null,
     onBack: () -> Unit,
     onDone: () -> Unit,
     viewModel: SendMoneyViewModel = hiltViewModel(),
+) {
+    val contacts by viewModel.contacts.collectAsStateWithLifecycle()
+    val balanceMinor by viewModel.balanceMinor.collectAsStateWithLifecycle()
+    val sending by viewModel.sending.collectAsStateWithLifecycle()
+    val lastSent by viewModel.lastSent.collectAsStateWithLifecycle()
+    val error by viewModel.error.collectAsStateWithLifecycle()
+
+    SendMoneyContent(
+        initialContactId = initialContactId,
+        contacts = contacts,
+        balanceMinor = balanceMinor,
+        sending = sending,
+        lastSent = lastSent,
+        error = error,
+        onBack = onBack,
+        onDone = onDone,
+        onSend = viewModel::send,
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun SendMoneyContent(
+    initialContactId: String?,
+    contacts: List<Contact>,
+    balanceMinor: Long,
+    sending: Boolean,
+    lastSent: Transaction?,
+    error: String?,
+    onBack: () -> Unit,
+    onDone: () -> Unit,
+    onSend: (Contact, Long, String?, String, () -> Unit) -> Unit,
 ) {
     var step by rememberSaveable { mutableStateOf(SendStep.PICK_RECIPIENT) }
     var recipientId by rememberSaveable { mutableStateOf<String?>(null) }
     var amountText by rememberSaveable { mutableStateOf("") }
     var note by rememberSaveable { mutableStateOf("") }
     var confirmSheet by rememberSaveable { mutableStateOf(false) }
+    var initialContactHandled by rememberSaveable(initialContactId) { mutableStateOf(false) }
 
-    val contacts by viewModel.contacts.collectAsStateWithLifecycle()
-    val balanceMinor by viewModel.balanceMinor.collectAsStateWithLifecycle()
-    val sending by viewModel.sending.collectAsStateWithLifecycle()
-    val lastSent by viewModel.lastSent.collectAsStateWithLifecycle()
-    val error by viewModel.error.collectAsStateWithLifecycle()
+    LaunchedEffect(initialContactId, contacts) {
+        if (!initialContactHandled && recipientId == null && !initialContactId.isNullOrBlank()) {
+            val initialRecipient = contacts.firstOrNull { contact ->
+                contact.id == initialContactId && contact.canReceiveKitTransfer()
+            }
+            if (initialRecipient != null) {
+                recipientId = initialRecipient.id
+                step = SendStep.ENTER_AMOUNT
+                initialContactHandled = true
+            } else if (contacts.isNotEmpty()) {
+                // A stale or forged route argument must not select an ineligible recipient.
+                initialContactHandled = true
+            }
+        }
+    }
 
     val recipient = contacts.find { it.id == recipientId }
     val amountMinor = Money.parseMinor(amountText) ?: 0L
@@ -155,7 +200,7 @@ fun SendMoneyScreen(
                 error = error,
                 onPaymentPin = { paymentPin = it.filter(Char::isDigit).take(4) },
                 onConfirm = {
-                    viewModel.send(recipient, amountMinor, note, paymentPin) {
+                    onSend(recipient, amountMinor, note, paymentPin) {
                         confirmSheet = false
                         step = SendStep.SUCCESS
                     }
@@ -164,6 +209,9 @@ fun SendMoneyScreen(
         }
     }
 }
+
+internal fun Contact.canReceiveKitTransfer(): Boolean =
+    id.isNotBlank() && isKitUser && !receivingWalletId.isNullOrBlank()
 
 @Composable
 private fun RecipientPicker(contacts: List<Contact>, onPick: (Contact) -> Unit) {
@@ -197,7 +245,7 @@ private fun RecipientPicker(contacts: List<Contact>, onPick: (Contact) -> Unit) 
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier
                             .clickable(
-                                enabled = c.isKitUser && c.receivingWalletId != null,
+                                enabled = c.canReceiveKitTransfer(),
                                 onClick = { onPick(c) },
                             )
                             .padding(4.dp),
@@ -216,7 +264,7 @@ private fun RecipientPicker(contacts: List<Contact>, onPick: (Contact) -> Unit) 
                 Modifier
                     .fillMaxWidth()
                     .clickable(
-                        enabled = c.isKitUser && c.receivingWalletId != null,
+                        enabled = c.canReceiveKitTransfer(),
                         onClick = { onPick(c) },
                     )
                     .padding(horizontal = 20.dp, vertical = 10.dp),

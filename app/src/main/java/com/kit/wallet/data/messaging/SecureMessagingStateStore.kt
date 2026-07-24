@@ -249,6 +249,59 @@ internal data class SecureMessagingRecordKeyResolution<T : Any>(
     val createdNow: Boolean,
 )
 
+@VisibleForTesting
+internal enum class SecureMessagingRecordKeyOperation {
+    ENCRYPT,
+    DECRYPT,
+}
+
+/** A successful cipher mode proves only that mode usable; the other mode's proof must survive. */
+@VisibleForTesting
+internal fun shouldClearSecureMessagingRecordKeyFailureEvidence(
+    failedOperation: SecureMessagingRecordKeyOperation,
+    successfulOperation: SecureMessagingRecordKeyOperation,
+): Boolean = failedOperation == successfulOperation
+
+/**
+ * Retains only a key handle that has already completed an authenticated cipher operation.
+ *
+ * Some Android 9 providers return the generated non-exportable handle from [KeyGenerator], use it
+ * successfully, and then report the same alias as absent to a newly loaded [KeyStore]. Keeping the
+ * proven handle for this process closes that provider visibility gap without ever permitting a
+ * replacement key while ciphertext exists.
+ */
+@VisibleForTesting
+internal class SecureMessagingRecordKeyHandleCache<T : Any>(
+    private val canRetain: (T) -> Boolean = { true },
+) {
+    private var retained: T? = null
+
+    @Synchronized
+    fun resolve(
+        resolveUncached: () -> SecureMessagingRecordKeyResolution<T>,
+    ): SecureMessagingRecordKeyResolution<T> {
+        retained?.let { key ->
+            return SecureMessagingRecordKeyResolution(key, createdNow = false)
+        }
+        return resolveUncached()
+    }
+
+    @Synchronized
+    fun retainAfterSuccessfulUse(key: T) {
+        if (canRetain(key)) retained = key
+    }
+
+    @Synchronized
+    fun evictIfSame(key: T) {
+        if (retained === key) retained = null
+    }
+
+    @Synchronized
+    fun clear() {
+        retained = null
+    }
+}
+
 interface SecureMessagingRecordCipher {
     fun encrypt(
         aad: ByteArray,
@@ -265,6 +318,9 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
     @ApplicationContext private val context: Context,
 ) : SecureMessagingRecordCipher {
     private val keyHealth = context.getSharedPreferences(KEY_HEALTH_PREFERENCES, Context.MODE_PRIVATE)
+    private val recordKeyHandles = SecureMessagingRecordKeyHandleCache<SecretKey>(
+        canRetain = ::isNonExportableKeyHandle,
+    )
 
     override fun encrypt(
         aad: ByteArray,
@@ -272,19 +328,37 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
         allowKeyCreation: Boolean,
     ): EncryptedMessagingRecord = try {
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        val resolvedKey = recordKey(allowKeyCreation)
+        val resolvedKey = recordKey(
+            allowCreation = allowKeyCreation,
+            operation = SecureMessagingRecordKeyOperation.ENCRYPT,
+        )
         try {
             cipher.init(Cipher.ENCRYPT_MODE, resolvedKey.key)
         } catch (error: Exception) {
-            throw recordKeyOperationFailure(error, resolvedKey.createdNow)
+            throw recordKeyOperationFailure(
+                error,
+                resolvedKey,
+                SecureMessagingRecordKeyOperation.ENCRYPT,
+            )
         }
         val ciphertext = completeKeystoreCipherOperation(
             operation = {
                 cipher.updateAAD(aad)
                 cipher.doFinal(plaintext)
             },
-            classifyFailure = { recordKeyOperationFailure(it, resolvedKey.createdNow) },
-            onSuccess = ::clearKeyFailureObservations,
+            classifyFailure = {
+                recordKeyOperationFailure(
+                    it,
+                    resolvedKey,
+                    SecureMessagingRecordKeyOperation.ENCRYPT,
+                )
+            },
+            onSuccess = {
+                recordKeyHandles.retainAfterSuccessfulUse(resolvedKey.key)
+                clearKeyFailureObservationsAfter(
+                    SecureMessagingRecordKeyOperation.ENCRYPT,
+                )
+            },
         )
         EncryptedMessagingRecord(
             iv = cipher.iv.copyOf(),
@@ -301,7 +375,10 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
         require(record.iv.size == GCM_IV_BYTES) { "Invalid secure messaging state IV" }
         require(record.ciphertext.size >= GCM_TAG_BYTES) { "Invalid secure messaging ciphertext" }
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        val resolvedKey = recordKey(allowCreation = false)
+        val resolvedKey = recordKey(
+            allowCreation = false,
+            operation = SecureMessagingRecordKeyOperation.DECRYPT,
+        )
         try {
             cipher.init(
                 Cipher.DECRYPT_MODE,
@@ -314,15 +391,30 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
         } catch (error: Exception) {
             // Android 9 providers can defer an alias lookup until Cipher.init(). Feed those
             // alias-specific failures through the same bounded missing-key proof as getKey().
-            throw recordKeyOperationFailure(error, resolvedKey.createdNow)
+            throw recordKeyOperationFailure(
+                error,
+                resolvedKey,
+                SecureMessagingRecordKeyOperation.DECRYPT,
+            )
         }
         completeKeystoreCipherOperation(
             operation = {
                 cipher.updateAAD(aad)
                 cipher.doFinal(record.ciphertext)
             },
-            classifyFailure = { recordKeyOperationFailure(it, resolvedKey.createdNow) },
-            onSuccess = ::clearKeyFailureObservations,
+            classifyFailure = {
+                recordKeyOperationFailure(
+                    it,
+                    resolvedKey,
+                    SecureMessagingRecordKeyOperation.DECRYPT,
+                )
+            },
+            onSuccess = {
+                recordKeyHandles.retainAfterSuccessfulUse(resolvedKey.key)
+                clearKeyFailureObservationsAfter(
+                    SecureMessagingRecordKeyOperation.DECRYPT,
+                )
+            },
         )
     } catch (error: Exception) {
         val classified = if (error.hasGcmAuthenticationFailure()) {
@@ -338,6 +430,9 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
 
     @Synchronized
     override fun eraseKey() {
+        // Once exact erasure begins, no in-process handle may outlive that lifecycle boundary,
+        // including when the provider subsequently fails the physical alias deletion.
+        recordKeyHandles.clear()
         try {
             val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
             deleteKeystoreAliasAndVerifyAbsent(
@@ -356,25 +451,30 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
     @Synchronized
     private fun recordKey(
         allowCreation: Boolean,
+        operation: SecureMessagingRecordKeyOperation,
     ): SecureMessagingRecordKeyResolution<SecretKey> {
         var freshKeyGenerationStarted = false
         return try {
-            resolveSecureMessagingRecordKeyWithCreationStatus(
-                allowCreation = allowCreation,
-                loadExisting = {
-                    val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-                    (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.also {
-                        // A visible handle disproves only alias absence. Recoverability is proved
-                        // separately by successful Cipher.init(), so preserve that observation.
-                        clearMissingKeyObservations()
-                    }
-                },
-                createNew = {
-                    generateKey { freshKeyGenerationStarted = true }
-                },
-                missingKeyFailure = ::missingKeyFailure,
-                classifyExistingAliasFailure = ::classifyRetryableAliasAccessFailure,
-            )
+            recordKeyHandles.resolve {
+                resolveSecureMessagingRecordKeyWithCreationStatus(
+                    allowCreation = allowCreation,
+                    loadExisting = {
+                        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.also {
+                            // A visible handle disproves only alias absence. Recoverability is
+                            // proved separately by a successful complete cipher operation.
+                            clearMissingKeyObservations()
+                        }
+                    },
+                    createNew = {
+                        generateKey { freshKeyGenerationStarted = true }
+                    },
+                    missingKeyFailure = ::missingKeyFailure,
+                    classifyExistingAliasFailure = { error ->
+                        classifyRetryableAliasAccessFailure(error, operation)
+                    },
+                )
+            }
         } catch (error: Exception) {
             // A failure while resolving an already-present alias must not inherit the empty-store
             // permission to create. Only an attempt that reached fresh key generation retains
@@ -382,7 +482,9 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
             throw classifySecureMessagingRecordKeyOperationFailure(
                 error = error,
                 keyCreatedNow = freshKeyGenerationStarted,
-                classifyExistingAliasFailure = ::classifyRetryableAliasAccessFailure,
+                classifyExistingAliasFailure = { failure ->
+                    classifyRetryableAliasAccessFailure(failure, operation)
+                },
             )
         }
     }
@@ -390,45 +492,80 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
     @Synchronized
     private fun recordKeyOperationFailure(
         error: Exception,
-        keyCreatedNow: Boolean,
-    ): Exception = classifySecureMessagingRecordKeyOperationFailure(
-        error = error,
-        keyCreatedNow = keyCreatedNow,
-        classifyExistingAliasFailure = ::classifyRetryableAliasAccessFailure,
-    )
+        resolvedKey: SecureMessagingRecordKeyResolution<SecretKey>,
+        operation: SecureMessagingRecordKeyOperation,
+    ): Exception {
+        val classified = classifySecureMessagingRecordKeyOperationFailure(
+            error = error,
+            keyCreatedNow = resolvedKey.createdNow,
+            classifyExistingAliasFailure = { failure ->
+                classifyRetryableAliasAccessFailure(failure, operation)
+            },
+        )
+        if (isPermanentlyMissingSecureMessagingRecordKey(classified)) {
+            // Authentication and one-off provider failures must retain the only proven Android 9
+            // handle. Evict only after permanent invalidation or the bounded missing/unrecoverable
+            // proof has completed; exact secure-state recovery then clears the lifecycle fully.
+            recordKeyHandles.evictIfSame(resolvedKey.key)
+        }
+        return classified
+    }
+
+    private fun isNonExportableKeyHandle(key: SecretKey): Boolean {
+        val encoded = try {
+            key.encoded
+        } catch (_: Exception) {
+            return false
+        }
+        return if (encoded == null) {
+            true
+        } else {
+            encoded.fill(0)
+            false
+        }
+    }
 
     /**
      * Provider errors alone do not prove that ciphertext lost its key. Advance recovery only for
      * an independently absent alias, or the narrow present-but-UnrecoverableKeyException case.
      */
     @Synchronized
-    private fun classifyRetryableAliasAccessFailure(error: Exception): Exception {
+    private fun classifyRetryableAliasAccessFailure(
+        error: Exception,
+        operation: SecureMessagingRecordKeyOperation,
+    ): Exception {
         val requiresUserAuthentication = generateSequence<Throwable>(error) { it.cause }
             .any { it is UserNotAuthenticatedException }
         if (requiresUserAuthentication) {
-            clearKeyFailureObservations()
+            // Lock state says nothing about whether the same handle supports the other cipher
+            // mode. Restart only this operation's proof while preserving the other mode.
+            clearMissingKeyObservations()
+            clearUnrecoverableKeyObservations(operation)
         }
         val aliasPresent = runCatching {
             KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }.containsAlias(KEY_ALIAS)
         }.getOrNull()
-        val unrecoverableKey = error.hasUnrecoverableSecureMessagingRecordKeyCause()
-        when {
-            aliasPresent == false -> clearUnrecoverableKeyObservations()
-            aliasPresent == true && unrecoverableKey -> clearMissingKeyObservations()
-            aliasPresent == true -> clearKeyFailureObservations()
+        if (aliasPresent == true) {
+            // A visible alias disproves only alias absence. An absent alias does not prove either
+            // cipher mode healthy, so it must not erase an independent ENCRYPT/DECRYPT failure
+            // proof when an Android 9 provider alternates between visibility states.
+            clearMissingKeyObservations()
         }
         return classifySecureMessagingRecordKeyAccessFailure(
             cause = error,
             userAuthenticationRequired = requiresUserAuthentication,
             aliasPresent = aliasPresent,
             observeMissingAlias = ::missingKeyFailure,
-            observeUnrecoverableAlias = ::unrecoverableKeyFailure,
+            observeUnrecoverableAlias = { cause ->
+                unrecoverableKeyFailure(cause, operation)
+            },
         )
     }
 
     @Synchronized
     private fun missingKeyFailure(cause: Throwable? = null): RuntimeException {
-        clearUnrecoverableKeyObservations()
+        // Alias absence and cipher-mode usability are independent provider observations. Preserve
+        // operation evidence so alternating Android 9 failures cannot reset both bounded proofs.
         return observedKeyFailure(
             cause = cause,
             countPreference = KEY_MISSING_COUNT,
@@ -438,12 +575,15 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
     }
 
     @Synchronized
-    private fun unrecoverableKeyFailure(cause: Throwable): RuntimeException {
+    private fun unrecoverableKeyFailure(
+        cause: Throwable,
+        operation: SecureMessagingRecordKeyOperation,
+    ): RuntimeException {
         clearMissingKeyObservations()
         return observedKeyFailure(
             cause = cause,
-            countPreference = KEY_UNRECOVERABLE_COUNT,
-            firstObservedAtPreference = KEY_FIRST_UNRECOVERABLE_AT,
+            countPreference = operation.unrecoverableCountPreference(),
+            firstObservedAtPreference = operation.firstUnrecoverableAtPreference(),
             permanentFailure = ::SecureMessagingRecordKeyPermanentlyUnrecoverableException,
         )
     }
@@ -490,15 +630,44 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
     }
 
     @Synchronized
-    private fun clearUnrecoverableKeyObservations() {
-        if (keyHealth.contains(KEY_UNRECOVERABLE_COUNT) ||
-            keyHealth.contains(KEY_FIRST_UNRECOVERABLE_AT)
-        ) {
-            keyHealth.edit()
-                .remove(KEY_UNRECOVERABLE_COUNT)
-                .remove(KEY_FIRST_UNRECOVERABLE_AT)
-                .apply()
+    private fun clearUnrecoverableKeyObservations(
+        operation: SecureMessagingRecordKeyOperation? = null,
+    ) {
+        val operations = SecureMessagingRecordKeyOperation.entries.filter { failedOperation ->
+            operation == null || shouldClearSecureMessagingRecordKeyFailureEvidence(
+                failedOperation = failedOperation,
+                successfulOperation = operation,
+            )
         }
+        val editor = keyHealth.edit()
+        var changed = false
+        operations.forEach { keyOperation ->
+            val count = keyOperation.unrecoverableCountPreference()
+            val first = keyOperation.firstUnrecoverableAtPreference()
+            if (keyHealth.contains(count) || keyHealth.contains(first)) {
+                editor.remove(count).remove(first)
+                changed = true
+            }
+        }
+        // Code 21 used one mode-agnostic counter. It cannot safely contribute to either new proof.
+        if (keyHealth.contains(KEY_LEGACY_UNRECOVERABLE_COUNT) ||
+            keyHealth.contains(KEY_LEGACY_FIRST_UNRECOVERABLE_AT)
+        ) {
+            editor.remove(KEY_LEGACY_UNRECOVERABLE_COUNT)
+                .remove(KEY_LEGACY_FIRST_UNRECOVERABLE_AT)
+            changed = true
+        }
+        if (changed) editor.apply()
+    }
+
+    @Synchronized
+    private fun clearKeyFailureObservationsAfter(
+        operation: SecureMessagingRecordKeyOperation,
+    ) {
+        // A successful decrypt proves DECRYPT_MODE only. It must not clear evidence that this OEM
+        // consistently rejects ENCRYPT_MODE, which otherwise strands confirmation forever.
+        clearMissingKeyObservations()
+        clearUnrecoverableKeyObservations(operation)
     }
 
     @Synchronized
@@ -506,6 +675,18 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
         clearMissingKeyObservations()
         clearUnrecoverableKeyObservations()
     }
+
+    private fun SecureMessagingRecordKeyOperation.unrecoverableCountPreference(): String =
+        when (this) {
+            SecureMessagingRecordKeyOperation.ENCRYPT -> KEY_ENCRYPT_UNRECOVERABLE_COUNT
+            SecureMessagingRecordKeyOperation.DECRYPT -> KEY_DECRYPT_UNRECOVERABLE_COUNT
+        }
+
+    private fun SecureMessagingRecordKeyOperation.firstUnrecoverableAtPreference(): String =
+        when (this) {
+            SecureMessagingRecordKeyOperation.ENCRYPT -> KEY_ENCRYPT_FIRST_UNRECOVERABLE_AT
+            SecureMessagingRecordKeyOperation.DECRYPT -> KEY_DECRYPT_FIRST_UNRECOVERABLE_AT
+        }
 
     @Synchronized
     private fun generateKey(
@@ -541,8 +722,14 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
         const val KEY_HEALTH_PREFERENCES = "kit_pay_secure_messaging_key_health_v1"
         const val KEY_MISSING_COUNT = "missing_alias_count"
         const val KEY_FIRST_MISSING_AT = "missing_alias_first_seen_at"
-        const val KEY_UNRECOVERABLE_COUNT = "unrecoverable_alias_count"
-        const val KEY_FIRST_UNRECOVERABLE_AT = "unrecoverable_alias_first_seen_at"
+        const val KEY_ENCRYPT_UNRECOVERABLE_COUNT = "encrypt_unrecoverable_alias_count"
+        const val KEY_ENCRYPT_FIRST_UNRECOVERABLE_AT =
+            "encrypt_unrecoverable_alias_first_seen_at"
+        const val KEY_DECRYPT_UNRECOVERABLE_COUNT = "decrypt_unrecoverable_alias_count"
+        const val KEY_DECRYPT_FIRST_UNRECOVERABLE_AT =
+            "decrypt_unrecoverable_alias_first_seen_at"
+        const val KEY_LEGACY_UNRECOVERABLE_COUNT = "unrecoverable_alias_count"
+        const val KEY_LEGACY_FIRST_UNRECOVERABLE_AT = "unrecoverable_alias_first_seen_at"
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val GCM_TAG_BITS = 128

@@ -45,6 +45,7 @@ class HomeDashboardComposeTest {
         )
 
         val unavailableActions = listOf(
+            HomeAction.NOTIFICATIONS,
             HomeAction.SCAN_QR,
             HomeAction.SEND_MONEY,
             HomeAction.RECEIVE_MONEY,
@@ -86,6 +87,7 @@ class HomeDashboardComposeTest {
             name = "Grace Nakato",
             phone = "+256700000001",
             favorite = true,
+            receivingWalletId = "wallet-favorite-1",
         )
         val transaction = Transaction(
             id = "transaction-1",
@@ -107,6 +109,14 @@ class HomeDashboardComposeTest {
         )
 
         click(HomeAction.SCAN_QR)
+        click(HomeAction.NOTIFICATIONS)
+        val notificationMessage = "Coming soon: Notifications."
+        compose.waitUntil(timeoutMillis = 5_000) {
+            snackbar.currentSnackbarData?.visuals?.message == notificationMessage
+        }
+        compose.onNodeWithText(notificationMessage).assertIsDisplayed()
+        compose.runOnIdle { snackbar.currentSnackbarData?.dismiss() }
+        compose.waitUntil(timeoutMillis = 5_000) { snackbar.currentSnackbarData == null }
         compose.onNodeWithContentDescription("Hide balance")
             .assertIsEnabled()
             .assertHasClickAction()
@@ -151,7 +161,7 @@ class HomeDashboardComposeTest {
                     "airtime",
                     "bank",
                     "mobile-money",
-                    "send",
+                    "favorite:${favorite.id}",
                     "transactions",
                     "transaction:${transaction.id}",
                 ),
@@ -201,6 +211,7 @@ class HomeDashboardComposeTest {
                     onKyc = { callbacks += "kyc" },
                     onAllTransactions = { callbacks += "transactions" },
                     onTransaction = { callbacks += "transaction:$it" },
+                    onFavorite = { callbacks += "favorite:$it" },
                 )
             }
         }

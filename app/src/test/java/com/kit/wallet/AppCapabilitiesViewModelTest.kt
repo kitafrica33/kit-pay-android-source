@@ -24,6 +24,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -116,6 +119,40 @@ class AppCapabilitiesViewModelTest {
         assertTrue(viewModel.state.value.messagingProtocolReady)
         assertTrue(viewModel.state.value.messagingUsable)
     }
+
+    @Test
+    fun `foreground loop refreshes immediately and periodically until lifecycle cancellation`() =
+        runTest {
+            val api = RolloutCapabilitiesApi()
+            val viewModel = AppCapabilitiesViewModel(
+                api = api.proxy,
+                apiCalls = ApiCallExecutor(
+                    Moshi.Builder().add(KotlinJsonAdapterFactory()).build(),
+                ),
+                chatRepository = FakeChatRepository(),
+                pushMessagingTransport = FakePushMessagingTransport,
+            )
+            assertEquals(1, api.calls)
+
+            val foregroundJob = backgroundScope.launch {
+                viewModel.refreshWhileForeground(intervalMillis = 1_000)
+            }
+            runCurrent()
+            assertEquals(2, api.calls)
+
+            advanceTimeBy(999)
+            runCurrent()
+            assertEquals(2, api.calls)
+
+            advanceTimeBy(1)
+            runCurrent()
+            assertEquals(3, api.calls)
+
+            foregroundJob.cancel()
+            advanceTimeBy(5_000)
+            runCurrent()
+            assertEquals(3, api.calls)
+        }
 
     private class ScriptedCapabilitiesApi {
         var calls: Int = 0

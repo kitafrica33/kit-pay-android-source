@@ -52,6 +52,9 @@ class CallLifecycleEventBus @Inject constructor() {
 
     fun publish(data: Map<String, String>): Boolean {
         val event = CallLifecycleEvent.fromData(data) ?: return false
-        return mutableEvents.tryEmit(event)
+        return publish(event)
     }
+
+    /** Publishes a locally-derived lifecycle event, such as the server-declared ring deadline. */
+    fun publish(event: CallLifecycleEvent): Boolean = mutableEvents.tryEmit(event)
 }

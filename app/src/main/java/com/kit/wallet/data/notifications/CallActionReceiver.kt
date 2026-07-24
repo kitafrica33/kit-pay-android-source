@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.di.ApplicationScope
+import com.kit.wallet.feature.calls.KitTelecomBridge
+import com.kit.wallet.feature.calls.KitTelecomDisconnect
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
@@ -20,6 +22,10 @@ class CallActionReceiver : BroadcastReceiver() {
 
     @Inject lateinit var calls: CallRepository
 
+    @Inject lateinit var ringDeadlines: CallRingDeadlineCoordinator
+
+    @Inject lateinit var telecom: KitTelecomBridge
+
     @Inject @ApplicationScope lateinit var applicationScope: CoroutineScope
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -27,6 +33,15 @@ class CallActionReceiver : BroadcastReceiver() {
         val callId = IncomingCallPayload.callId(
             mapOf("call_id" to intent.getStringExtra(EXTRA_CALL_ID).orEmpty()),
         ) ?: return
+        ringDeadlines.cancel(callId)
+        telecom.finish(
+            callId,
+            if (intent.action == ACTION_DECLINE) {
+                KitTelecomDisconnect.REJECTED
+            } else {
+                KitTelecomDisconnect.LOCAL
+            },
+        )
         context.getSystemService(NotificationManager::class.java)
             ?.cancel(notificationTag(callId), NOTIFICATION_ID)
         val pending = goAsync()

@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.data.repository.WalletRepository
+import com.kit.wallet.ui.model.Contact
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
@@ -26,6 +27,12 @@ class HomeViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     val favorites = contactRepo.contacts
-        .map { list -> list.filter { it.favorite } }
+        // Every displayed favorite must be able to reach the preselected Send amount screen.
+        // Invite-only or wallet-less contacts remain available in the full recipient picker.
+        .map(::sendableHomeFavorites)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+}
+
+internal fun sendableHomeFavorites(contacts: List<Contact>): List<Contact> = contacts.filter {
+    it.favorite && it.id.isNotBlank() && it.isKitUser && !it.receivingWalletId.isNullOrBlank()
 }

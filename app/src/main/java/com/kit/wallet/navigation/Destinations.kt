@@ -23,6 +23,7 @@ object Dest {
     const val SETTINGS = "settings"
 
     const val SEND = "wallet/send"
+    const val SEND_ROUTE = "$SEND?contactId={contactId}"
     const val RECEIVE = "wallet/receive"
     const val SCAN = "wallet/scan"
     const val REQUEST = "wallet/request"
@@ -43,6 +44,10 @@ object Dest {
     const val PROFILE_EDIT = "settings/profile/edit"
 
     fun txDetail(id: String) = "wallet/tx/$id"
+    fun send(contactId: String? = null) = contactId
+        ?.takeIf(String::isNotBlank)
+        ?.let { "$SEND?contactId=${Uri.encode(it)}" }
+        ?: SEND
     fun billPay(providerId: String) = "bills/pay/$providerId"
     fun conversation(chatId: String) = "chat/${Uri.encode(chatId)}"
     fun voiceCall(name: String) = "call/voice/${Uri.encode(name)}"

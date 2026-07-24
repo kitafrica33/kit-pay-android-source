@@ -205,6 +205,8 @@ data class CallConnection(
     val url: String,
     val token: String,
     val room: String,
+    /** Server-authoritative end of the ringing window; null only for legacy responses. */
+    val ringExpiresAt: String? = null,
 )
 
 interface BillsRepository {

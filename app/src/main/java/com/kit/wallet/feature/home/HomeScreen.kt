@@ -21,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.CallMade
 import androidx.compose.material.icons.automirrored.rounded.CallReceived
 import androidx.compose.material.icons.rounded.AccountBalance
+import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.QrCodeScanner
 import androidx.compose.material.icons.rounded.Receipt
@@ -82,6 +83,7 @@ fun HomeScreen(
     onKyc: () -> Unit,
     onAllTransactions: () -> Unit,
     onTransaction: (String) -> Unit,
+    onFavorite: (String) -> Unit,
     viewModel: HomeViewModel = hiltViewModel(),
 ) {
     val profile by viewModel.profile.collectAsStateWithLifecycle()
@@ -108,6 +110,7 @@ fun HomeScreen(
         onKyc = onKyc,
         onAllTransactions = onAllTransactions,
         onTransaction = onTransaction,
+        onFavorite = onFavorite,
     )
 }
 
@@ -130,6 +133,7 @@ internal fun HomeDashboard(
     onKyc: () -> Unit,
     onAllTransactions: () -> Unit,
     onTransaction: (String) -> Unit,
+    onFavorite: (String) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val dispatch: (HomeAction, () -> Unit) -> Unit = { action, onAvailable ->
@@ -160,7 +164,10 @@ internal fun HomeDashboard(
             onMobileMoney = { dispatch(HomeAction.MOBILE_MONEY, onMobileMoney) },
             onRequest = { dispatch(HomeAction.REQUEST_MONEY, onRequest) },
             onKyc = { dispatch(HomeAction.VERIFY_IDENTITY, onKyc) },
-            onFavorite = { dispatch(HomeAction.FAVORITE_SEND, onSend) },
+            onNotifications = { dispatch(HomeAction.NOTIFICATIONS) {} },
+            onFavorite = { contact ->
+                dispatch(HomeAction.FAVORITE_SEND) { onFavorite(contact.id) }
+            },
             onAllTransactions = {
                 dispatch(HomeAction.ALL_TRANSACTIONS, onAllTransactions)
             },
@@ -194,7 +201,8 @@ private fun HomeContent(
     onMobileMoney: () -> Unit,
     onRequest: () -> Unit,
     onKyc: () -> Unit,
-    onFavorite: () -> Unit,
+    onNotifications: () -> Unit,
+    onFavorite: (Contact) -> Unit,
     onAllTransactions: () -> Unit,
     onTransaction: (String) -> Unit,
 ) {
@@ -225,6 +233,12 @@ private fun HomeContent(
                             profile.name.substringBefore(" "),
                             style = MaterialTheme.typography.titleMedium,
                         )
+                    }
+                    IconButton(
+                        onClick = onNotifications,
+                        modifier = Modifier.testTag(HomeAction.NOTIFICATIONS.testTag),
+                    ) {
+                        Icon(Icons.Rounded.Notifications, contentDescription = "Notifications")
                     }
                     IconButton(
                         onClick = onScan,
@@ -330,7 +344,7 @@ private fun HomeContent(
                                 modifier = Modifier
                                     .clip(MaterialTheme.shapes.medium)
                                     .testTag("${HomeAction.FAVORITE_SEND.testTag}-${contact.id}")
-                                    .clickable(onClick = onFavorite)
+                                    .clickable { onFavorite(contact) }
                                     .padding(6.dp),
                             ) {
                                 KitAvatar(contact.name, size = 52.dp)
@@ -532,7 +546,7 @@ private fun HomePreview() {
             snackbarHostState = remember { SnackbarHostState() },
             onSend = {}, onReceive = {}, onScan = {}, onBills = {}, onAirtime = {},
             onBank = {}, onRequest = {}, onAllTransactions = {}, onTransaction = {},
-            onMobileMoney = {}, onKyc = {},
+            onMobileMoney = {}, onKyc = {}, onFavorite = {},
         )
     }
 }

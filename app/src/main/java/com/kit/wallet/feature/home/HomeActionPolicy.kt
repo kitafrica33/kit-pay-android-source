@@ -6,8 +6,9 @@ import com.kit.wallet.navigation.Dest
 /** Every service-backed action presented by the home dashboard. */
 internal enum class HomeAction(
     val displayName: String,
-    val guardedRoute: String,
+    val guardedRoute: String?,
 ) {
+    NOTIFICATIONS("Notifications", null),
     SCAN_QR("Scan QR", Dest.SCAN),
     SEND_MONEY("Send money", Dest.SEND),
     RECEIVE_MONEY("Receive money", Dest.RECEIVE),
@@ -38,6 +39,8 @@ internal data class HomeActionAccess(
  */
 internal fun AppCapabilities.homeActionAccess(action: HomeAction): HomeActionAccess =
     HomeActionAccess(
-        available = routeUsable(action.guardedRoute),
+        // A null route is a deliberately discoverable client placeholder. It must never become
+        // available just because an unrelated server capability happens to be enabled.
+        available = action.guardedRoute?.let(::routeUsable) == true,
         unavailableMessage = "Coming soon: ${action.displayName}.",
     )

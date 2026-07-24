@@ -13,6 +13,8 @@ import com.kit.wallet.data.messaging.SecureMessagingActivationCoordinator
 import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
 import com.kit.wallet.data.messaging.SecureMessagingAuthBindingResolver
 import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
+import com.kit.wallet.data.messaging.SecureMessagingCommittedResult
+import com.kit.wallet.data.messaging.SecureMessagingCryptoAddress
 import com.kit.wallet.data.messaging.SecureMessagingEventProcessor
 import com.kit.wallet.data.messaging.SecureMessagingFreshAuthenticationRequiredException
 import com.kit.wallet.data.messaging.SecureMessagingKeyReconciliationException
@@ -20,9 +22,12 @@ import com.kit.wallet.data.messaging.SecureMessagingReauthenticationRequiredExce
 import com.kit.wallet.data.messaging.SecureMessagingLocalEnrollmentUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
+import com.kit.wallet.data.messaging.SecureMessagingProvisioningPlan
 import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
 import com.kit.wallet.data.messaging.SecureMessagingRecord
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyHandleCache
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyResolution
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyTemporarilyUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingRecordPage
 import com.kit.wallet.data.messaging.SecureMessagingRecordVersion
@@ -55,6 +60,7 @@ import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.lang.reflect.Proxy
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.Base64
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -66,7 +72,9 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -145,6 +153,180 @@ class LibSignalSecureMessagingKeyActivationTest {
         activation = LibSignalSecureMessagingKeyActivation(engine)
         activation.reconcile(active.session)
         assertEquals(2, keyServer.publishRequests().size)
+    }
+
+    @Test
+    fun `proven generated handle carries activation and later commits past hidden alias`() =
+        runTest {
+            val durableState = TestSecureMessagingStateStore()
+            val hiddenAliasState = HiddenAliasAfterFirstUseStateStore(durableState)
+            val crypto = LibSignalSecureMessagingCryptoEngine(hiddenAliasState)
+            val lifecycle = SecureMessagingLifecycleGuard()
+            val sessionLifecycle = SecureMessagingSessionLifecycle(hiddenAliasState, lifecycle)
+            sessionLifecycle.afterSessionSave()
+            val sessions = ProofSessionStore(resetProof = null)
+            val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+            val projections = SecureMessagingProjectionStore(
+                hiddenAliasState,
+                LibSignalCompanionStateReader(hiddenAliasState),
+            )
+            val processor = SecureMessagingEventProcessor(
+                crypto,
+                projections,
+                SecureMessagingSyncCursorStore(hiddenAliasState),
+            )
+            val coordinator = SecureMessagingActivationCoordinator(
+                transport = remote,
+                lifecycle = lifecycle,
+                sessions = registry,
+                keyActivation = LibSignalSecureMessagingKeyActivation(crypto, sessions),
+                initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+            )
+            val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+            val retrofit = Retrofit.Builder()
+                .baseUrl(server.url("/"))
+                .addConverterFactory(MoshiConverterFactory.create(moshi))
+                .build()
+            val api = retrofit.create(KitWalletApi::class.java)
+            val authRepository = Proxy.newProxyInstance(
+                AuthRepository::class.java.classLoader,
+                arrayOf(AuthRepository::class.java),
+            ) { instance, method, arguments ->
+                when (method.name) {
+                    "toString" -> "UnexpectedRecoveryAuthRepository"
+                    "hashCode" -> System.identityHashCode(instance)
+                    "equals" -> instance === arguments?.firstOrNull()
+                    else -> error("Healthy hidden-alias activation requested ${method.name}")
+                }
+            } as AuthRepository
+            val sync = RealSecureMessagingSyncEngine(
+                bindingResolver = SecureMessagingAuthBindingResolver(
+                    sessions = sessions,
+                    api = api,
+                    apiCalls = ApiCallExecutor(moshi),
+                    deviceIdentity = object : DeviceIdentityProvider {
+                        override fun registration() = DeviceRegistrationDto(
+                            installationId = BINDING.installationId,
+                            name = "Android 9 phone",
+                            appVersion = "0.2.10-r1",
+                            osVersion = "9",
+                            model = "MODIO M56",
+                        )
+                    },
+                ),
+                activation = coordinator,
+                processor = processor,
+                sessions = sessions,
+                sessionLifecycle = sessionLifecycle,
+                authRepository = authRepository,
+            )
+
+            sync.synchronize()
+
+            val active = registry.requireCurrent()
+            assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+            assertEquals(1, keyServer.publishRequests().size)
+            assertTrue(hiddenAliasState.aliasHidden)
+            assertEquals(1, hiddenAliasState.uncachedKeyResolutions)
+
+            // Exercise the same protocol-state rewrite used by later ratchet/key commits.
+            val transaction = crypto.openTransaction(active.activation)
+            val committed = try {
+                transaction.stageProvisioning(
+                    SecureMessagingProvisioningPlan(
+                        ecOneTimePrekeyCount = 1,
+                        pqOneTimePrekeyCount = 1,
+                    ),
+                )
+                transaction.commit()
+            } catch (error: Throwable) {
+                runCatching { transaction.abort() }
+                throw error
+            }
+            assertTrue(committed is SecureMessagingCommittedResult.Provisioned)
+
+            // Commit and reload the projection half of an outgoing message after READY.
+            val durable = durableState.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(CLIENT_MESSAGE_ID),
+                direction = com.kit.wallet.data.messaging.LibSignalCompanionDirection.OUTBOUND,
+                messageId = CLIENT_MESSAGE_ID,
+                clientMessageId = CLIENT_MESSAGE_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = "v1:sha256:${"a".repeat(64)}",
+                sender = SecureMessagingCryptoAddress(
+                    CURRENT_USER_ID,
+                    CURRENT_DEVICE_ID,
+                    signalDeviceId = 1,
+                ),
+                text = "Android 9 stays message-ready",
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        recipient = SecureMessagingCryptoAddress(
+                            PEER_USER_ID,
+                            PEER_DEVICE_ID,
+                            signalDeviceId = 2,
+                        ),
+                        kind = com.kit.wallet.data.messaging.SecureMessagingEnvelopeKind.SESSION,
+                        ciphertext = byteArrayOf(1, 2, 3),
+                    ),
+                ),
+            )
+            projections.recordOutboundPending(durable, Instant.parse(TIMESTAMP))
+
+            assertEquals(
+                CLIENT_MESSAGE_ID,
+                projections.readOutbound(CLIENT_MESSAGE_ID)?.clientMessageId,
+            )
+            assertEquals(1, hiddenAliasState.uncachedKeyResolutions)
+        }
+
+    @Test
+    fun `record key cache reuses only a proven handle and honors eviction and clear`() {
+        val cache = SecureMessagingRecordKeyHandleCache<Any>()
+        val generated = Any()
+        var uncachedResolutions = 0
+
+        val fresh = cache.resolve {
+            uncachedResolutions++
+            SecureMessagingRecordKeyResolution(generated, createdNow = true)
+        }
+        // Resolution alone is insufficient; only a successful complete operation retains it.
+        val beforeProof = cache.resolve {
+            uncachedResolutions++
+            SecureMessagingRecordKeyResolution(generated, createdNow = false)
+        }
+        assertEquals(2, uncachedResolutions)
+        assertFalse(beforeProof.createdNow)
+
+        cache.retainAfterSuccessfulUse(fresh.key)
+        val retained = cache.resolve { error("A hidden Android 9 alias must not be reopened") }
+        assertSame(generated, retained.key)
+        assertFalse(retained.createdNow)
+
+        cache.evictIfSame(Any())
+        assertSame(generated, cache.resolve { error("A different handle cannot evict it") }.key)
+        cache.evictIfSame(generated)
+        val replacement = Any()
+        assertSame(
+            replacement,
+            cache.resolve {
+                uncachedResolutions++
+                SecureMessagingRecordKeyResolution(replacement, createdNow = false)
+            }.key,
+        )
+
+        cache.retainAfterSuccessfulUse(replacement)
+        cache.clear()
+        val afterClear = Any()
+        assertSame(
+            afterClear,
+            cache.resolve {
+                uncachedResolutions++
+                SecureMessagingRecordKeyResolution(afterClear, createdNow = false)
+            }.key,
+        )
+        assertEquals(4, uncachedResolutions)
     }
 
     @Test
@@ -804,6 +986,93 @@ class LibSignalSecureMessagingKeyActivationTest {
             .setBody(body)
     }
 
+    /**
+     * Models the observed API-28 OEM behavior: the first generated handle works, while every
+     * later uncached alias lookup is unavailable. The production handle cache must carry all
+     * enrollment-confirmation, cursor, protocol, and projection operations past that boundary.
+     */
+    private class HiddenAliasAfterFirstUseStateStore(
+        private val delegate: TestSecureMessagingStateStore,
+    ) : SecureMessagingStateStore by delegate {
+        private class KeyHandle
+
+        private val handles = SecureMessagingRecordKeyHandleCache<KeyHandle>()
+        private var generated: KeyHandle? = null
+        var aliasHidden: Boolean = false
+            private set
+        var uncachedKeyResolutions: Int = 0
+            private set
+
+        override suspend fun read(
+            namespace: String,
+            recordKey: String,
+        ): SecureMessagingRecord? {
+            val record = delegate.read(namespace, recordKey) ?: return null
+            return try {
+                withKeyHandle { record }
+            } catch (error: Throwable) {
+                record.bytes.fill(0)
+                throw error
+            }
+        }
+
+        override suspend fun readNamespacePage(
+            namespace: String,
+            afterRecordKey: String?,
+            limit: Int,
+        ): SecureMessagingRecordPage {
+            val page = delegate.readNamespacePage(namespace, afterRecordKey, limit)
+            if (page.records().isEmpty()) return page
+            return try {
+                withKeyHandle { page }
+            } catch (error: Throwable) {
+                page.records().forEach { it.bytes.fill(0) }
+                throw error
+            }
+        }
+
+        override suspend fun write(
+            namespace: String,
+            recordKey: String,
+            expectedVersion: Long?,
+            bytes: ByteArray,
+        ): SecureMessagingRecordVersion = withKeyHandle {
+            delegate.write(namespace, recordKey, expectedVersion, bytes)
+        }
+
+        override suspend fun writeBatch(
+            writes: List<SecureMessagingStateWrite>,
+        ): List<SecureMessagingRecordVersion> = withKeyHandle {
+            delegate.writeBatch(writes)
+        }
+
+        override suspend fun eraseAll() {
+            handles.clear()
+            generated = null
+            aliasHidden = false
+            delegate.eraseAll()
+        }
+
+        private suspend fun <T> withKeyHandle(operation: suspend () -> T): T {
+            val resolved = handles.resolve {
+                uncachedKeyResolutions++
+                if (aliasHidden) {
+                    throw SecureMessagingRecordKeyTemporarilyUnavailableException()
+                }
+                generated?.let {
+                    SecureMessagingRecordKeyResolution(it, createdNow = false)
+                } ?: SecureMessagingRecordKeyResolution(
+                    key = KeyHandle().also { generated = it },
+                    createdNow = true,
+                )
+            }
+            val result = operation()
+            handles.retainAfterSuccessfulUse(resolved.key)
+            aliasHidden = true
+            return result
+        }
+    }
+
     private class KeyActivationStateStore : SecureMessagingStateStore {
         private data class Stored(
             val version: Long,
@@ -994,6 +1263,10 @@ class LibSignalSecureMessagingKeyActivationTest {
     private companion object {
         const val CURRENT_USER_ID = "11111111-1111-4111-8111-111111111111"
         const val CURRENT_DEVICE_ID = "44444444-4444-4444-8444-444444444444"
+        const val PEER_USER_ID = "22222222-2222-4222-8222-222222222222"
+        const val PEER_DEVICE_ID = "55555555-5555-4555-8555-555555555555"
+        const val CONVERSATION_ID = "66666666-6666-4666-8666-666666666666"
+        const val CLIENT_MESSAGE_ID = "77777777-7777-4777-8777-777777777777"
         const val TIMESTAMP = "2026-07-20T08:00:00Z"
         const val PROTOCOL_NAMESPACE = "libsignal-v2"
         const val PROTOCOL_RECORD_KEY = "active-protocol-state"

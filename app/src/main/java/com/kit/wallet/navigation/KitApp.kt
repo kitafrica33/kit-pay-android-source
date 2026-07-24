@@ -52,6 +52,9 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.kit.wallet.data.auth.AuthChallengeKind
 import com.kit.wallet.data.notifications.IncomingCallPayload
 import com.kit.wallet.data.remote.KitFeature
@@ -124,6 +127,12 @@ fun KitApp(
     ) { notificationPermissionRequested.value = true }
     val authState by authViewModel.uiState.collectAsStateWithLifecycle()
     val capabilities by capabilitiesViewModel.state.collectAsStateWithLifecycle()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner, capabilitiesViewModel) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            capabilitiesViewModel.refreshWhileForeground()
+        }
+    }
     val chatsBadgeViewModel: ChatsViewModel = hiltViewModel()
     val totalUnread by chatsBadgeViewModel.totalUnread.collectAsStateWithLifecycle()
     val tabs = buildList {
@@ -558,6 +567,7 @@ private fun KitNavHost(
                     onKyc = { navController.navigate(Dest.KYC) },
                     onAllTransactions = { navController.navigate(Dest.TRANSACTIONS) },
                     onTransaction = { navController.navigate(Dest.txDetail(it)) },
+                    onFavorite = { navController.navigate(Dest.send(it)) },
                 )
             }
         }
@@ -594,9 +604,19 @@ private fun KitNavHost(
         }
 
         // --- Wallet ---
-        composable(Dest.SEND) {
+        composable(
+            route = Dest.SEND_ROUTE,
+            arguments = listOf(
+                navArgument("contactId") {
+                    type = NavType.StringType
+                    nullable = true
+                    defaultValue = null
+                },
+            ),
+        ) { entry ->
             FeatureRouteContent(signedIn, capabilities, Dest.SEND) {
                 SendMoneyScreen(
+                    initialContactId = entry.arguments?.getString("contactId"),
                     onBack = { navController.popBackStack() },
                     onDone = { navController.popBackStack(Dest.HOME, inclusive = false) },
                 )
@@ -604,7 +624,11 @@ private fun KitNavHost(
         }
         composable(Dest.RECEIVE) {
             FeatureRouteContent(signedIn, capabilities, Dest.RECEIVE) {
-                ReceiveScreen(onBack = { navController.popBackStack() })
+                ReceiveScreen(
+                    requestMoneyAvailable = capabilities.routeUsable(Dest.REQUEST),
+                    onRequestAmount = { navController.navigate(Dest.REQUEST) },
+                    onBack = { navController.popBackStack() },
+                )
             }
         }
         composable(Dest.SCAN) {

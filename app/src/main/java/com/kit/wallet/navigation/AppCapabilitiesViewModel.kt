@@ -12,11 +12,14 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+
+internal const val CAPABILITIES_FOREGROUND_REFRESH_INTERVAL_MILLIS = 5 * 60 * 1_000L
 
 data class AppCapabilities(
     val features: Map<String, Boolean> = emptyMap(),
@@ -63,28 +66,36 @@ data class AppCapabilities(
      * Central navigation guard. Unknown feature-backed screens are not inferred from a route;
      * every route listed here mirrors the backend feature names above.
      */
-    fun routeUsable(route: String?): Boolean = when (route) {
-        // The top-level screen is safe to expose because its unavailable state never reads or
-        // sends plaintext. Conversation creation and content remain closed until E2EE is ready.
-        Dest.CHATS -> messagingEntryVisible
-        Dest.CONVERSATION, Dest.CONTACTS -> messagingUsable
-        Dest.CALLS, Dest.CALL_CONTACTS, Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL ->
-            enabled(KitFeature.CALLS)
-        Dest.BILLS, Dest.BILL_PAY -> enabled(KitFeature.BILLS)
-        Dest.AIRTIME -> enabled(KitFeature.AIRTIME)
-        Dest.BANK -> enabled(KitFeature.BANK_TRANSFERS)
-        Dest.MOBILE_MONEY -> enabled(KitFeature.MOBILE_MONEY)
-        Dest.SEND -> allEnabled(KitFeature.WALLETS, KitFeature.INTERNAL_TRANSFERS)
-        // Receive shares the authenticated user's existing Kit tag/phone; it does not depend on
-        // the still-unimplemented QR scanner or a separate client protocol.
-        Dest.RECEIVE -> enabled(KitFeature.WALLETS)
-        Dest.REQUEST -> allEnabled(KitFeature.WALLETS, KitFeature.PAYMENT_REQUESTS)
-        Dest.SCAN -> qrPaymentsUsable
-        Dest.TRANSACTIONS, Dest.TX_DETAIL -> enabled(KitFeature.WALLETS)
-        Dest.KYC -> enabled(KitFeature.KYC)
-        Dest.REGISTER -> enabled(KitFeature.EMAIL_REGISTRATION)
-        Dest.FORGOT_PASSWORD -> enabled(KitFeature.EMAIL_RECOVERY)
-        else -> true
+    fun routeUsable(route: String?): Boolean {
+        if (
+            route == Dest.SEND ||
+            route == Dest.SEND_ROUTE ||
+            route?.startsWith("${Dest.SEND}?contactId=") == true
+        ) {
+            return allEnabled(KitFeature.WALLETS, KitFeature.INTERNAL_TRANSFERS)
+        }
+        return when (route) {
+            // The top-level screen is safe to expose because its unavailable state never reads or
+            // sends plaintext. Conversation creation and content remain closed until E2EE is ready.
+            Dest.CHATS -> messagingEntryVisible
+            Dest.CONVERSATION, Dest.CONTACTS -> messagingUsable
+            Dest.CALLS, Dest.CALL_CONTACTS, Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL ->
+                enabled(KitFeature.CALLS)
+            Dest.BILLS, Dest.BILL_PAY -> enabled(KitFeature.BILLS)
+            Dest.AIRTIME -> enabled(KitFeature.AIRTIME)
+            Dest.BANK -> enabled(KitFeature.BANK_TRANSFERS)
+            Dest.MOBILE_MONEY -> enabled(KitFeature.MOBILE_MONEY)
+            // Receive shares the authenticated user's existing Kit tag/phone; it does not depend
+            // on the still-unimplemented QR scanner or a separate client protocol.
+            Dest.RECEIVE -> enabled(KitFeature.WALLETS)
+            Dest.REQUEST -> allEnabled(KitFeature.WALLETS, KitFeature.PAYMENT_REQUESTS)
+            Dest.SCAN -> qrPaymentsUsable
+            Dest.TRANSACTIONS, Dest.TX_DETAIL -> enabled(KitFeature.WALLETS)
+            Dest.KYC -> enabled(KitFeature.KYC)
+            Dest.REGISTER -> enabled(KitFeature.EMAIL_REGISTRATION)
+            Dest.FORGOT_PASSWORD -> enabled(KitFeature.EMAIL_RECOVERY)
+            else -> true
+        }
     }
 }
 
@@ -115,7 +126,7 @@ class AppCapabilitiesViewModel @Inject constructor(
                 if (becameReady) {
                     // Local activation has just passed its own fresh server capability check.
                     // Replace any older UI discovery response from before a readiness rollout.
-                    startRefresh(cancelInFlight = true)
+                    startRefresh(cancelInFlight = true, invalidateSnapshot = false)
                 }
             }
         }
@@ -123,7 +134,22 @@ class AppCapabilitiesViewModel @Inject constructor(
     }
 
     fun refresh() {
-        startRefresh(cancelInFlight = false)
+        startRefresh(cancelInFlight = false, invalidateSnapshot = false)
+    }
+
+    /**
+     * Refreshes immediately whenever the app enters the foreground, then periodically while it
+     * remains foregrounded. The lifecycle caller owns cancellation, so no polling survives pause.
+     */
+    suspend fun refreshWhileForeground(
+        intervalMillis: Long = CAPABILITIES_FOREGROUND_REFRESH_INTERVAL_MILLIS,
+    ) {
+        require(intervalMillis > 0) { "Capability refresh interval must be positive" }
+        refresh()
+        while (true) {
+            delay(intervalMillis)
+            refresh()
+        }
     }
 
     /**
@@ -131,27 +157,31 @@ class AppCapabilitiesViewModel @Inject constructor(
      * Fence and cancel discovery from the previous session before loading the new session's view.
      */
     fun onSessionChanged() {
-        startRefresh(cancelInFlight = true)
+        startRefresh(cancelInFlight = true, invalidateSnapshot = true)
     }
 
-    private fun startRefresh(cancelInFlight: Boolean) {
+    private fun startRefresh(cancelInFlight: Boolean, invalidateSnapshot: Boolean) {
         if (!cancelInFlight && refreshJob?.isActive == true) return
 
         if (cancelInFlight) refreshJob?.cancel()
         val generation = ++refreshGeneration
 
-        // Never continue presenting a capability from an older discovery result while a new
-        // session is checking whether that feature is still enabled.
-        mutableState.update {
-            it.copy(
-                features = emptyMap(),
-                loaded = false,
-                loadFailed = false,
-                messagingProtocolReady = false,
-                messagingProtocolVersion = null,
-                messagingProtocolSuite = null,
-                messagingProtocolPostQuantum = null,
-            )
+        if (invalidateSnapshot) {
+            // A session boundary must never present another account's capabilities. Same-session
+            // foreground refreshes retain the last successful snapshot until the server replies,
+            // avoiding periodic navigation churn; either a false response or a failure still
+            // replaces it with a fail-closed state below.
+            mutableState.update {
+                it.copy(
+                    features = emptyMap(),
+                    loaded = false,
+                    loadFailed = false,
+                    messagingProtocolReady = false,
+                    messagingProtocolVersion = null,
+                    messagingProtocolSuite = null,
+                    messagingProtocolPostQuantum = null,
+                )
+            }
         }
         refreshJob = viewModelScope.launch {
             try {

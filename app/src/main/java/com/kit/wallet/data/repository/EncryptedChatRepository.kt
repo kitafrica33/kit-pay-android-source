@@ -1043,6 +1043,18 @@ private const val RECOVERY_RETRY_ATTEMPTS = 4
 private const val RECOVERY_RETRY_DELAY_MILLIS = 5_000L
 private const val RECOVERY_RETRY_COOLDOWN_MILLIS = 30_000L
 private const val MAX_RECOVERY_RETRY_COOLDOWN_MILLIS = 5 * 60_000L
+private const val MAX_CHAT_CONTACT_NAME_LENGTH = 160
+private val CHAT_CONTACT_UUID = Regex(
+    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" +
+        "[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+)
+
+private fun String?.safeChatContactName(): String? = this
+    ?.filterNot(Char::isISOControl)
+    ?.trim()
+    ?.take(MAX_CHAT_CONTACT_NAME_LENGTH)
+    ?.takeIf(String::isNotBlank)
+    ?.takeUnless(CHAT_CONTACT_UUID::matches)
 
 @Singleton
 class EncryptedChatRepository @Inject internal constructor(
@@ -1411,7 +1423,7 @@ class EncryptedChatRepository @Inject internal constructor(
         }
         val savedNames = localContacts.asSequence()
             .filter { it.isKitUser && it.savedInDevice }
-            .associate { it.id.lowercase() to it.name.trim() }
+            .associate { it.id.lowercase() to it.name.safeChatContactName() }
         val chats = conversations.sortedWith(
             compareByDescending<AuthenticatedDirectConversation> { conversation ->
                 latestByConversation[conversation.id]?.sentAt?.toEpochMilli() ?: Long.MIN_VALUE
@@ -1420,8 +1432,8 @@ class EncryptedChatRepository @Inject internal constructor(
             val last = latestByConversation[conversation.id]
             ChatPreview(
                 id = conversation.id,
-                name = savedNames[conversation.peerUserId.lowercase()]?.takeIf(String::isNotEmpty)
-                    ?: conversation.peerName?.trim()?.takeIf(String::isNotEmpty)
+                name = savedNames[conversation.peerUserId.lowercase()]
+                    ?: conversation.peerName.safeChatContactName()
                     ?: "Kit Pay contact",
                 lastMessage = last?.text?.let { text ->
                     KitMediaMessage.parse(text)?.let { media -> media.caption ?: "📷 Photo" }

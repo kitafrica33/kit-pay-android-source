@@ -31,6 +31,7 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
     private val incomingCallRelay: IncomingCallRelay,
     private val contacts: ContactRepository,
     private val telecom: KitTelecomBridge,
+    private val ringDeadlines: CallRingDeadlineCoordinator,
     private val messagingSync: SecureMessagingSyncScheduler,
     private val clock: Clock,
 ) : PushEnvelopeReceiver {
@@ -48,6 +49,9 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         val manager = context.getSystemService(NotificationManager::class.java)
         val lifecycleEvent = CallLifecycleEvent.fromData(envelope.data)
         if (lifecycleEvent != null) {
+            if (lifecycleEvent.kind == CallLifecycleKind.ANSWERED || lifecycleEvent.terminal) {
+                ringDeadlines.cancel(lifecycleEvent.callId)
+            }
             callEvents.publish(envelope.data)
             manager.cancel(callTag(lifecycleEvent.callId), CALL_NOTIFICATION_ID)
             when (lifecycleEvent.kind) {
@@ -127,10 +131,17 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
                 video = call.video,
             )
         }
-
         if (deliveryPlan.notificationSurface == IncomingCallNotificationSurface.CALL_WAITING) {
             if (deliveryPlan.relayToActiveCall) incomingCallRelay.publish(call)
-            showCallWaitingNotification(manager, envelope, call, timeoutMillis)
+            showCallWaitingNotification(
+                manager = manager,
+                call = call,
+                timeoutMillis = timeoutMillis,
+                target = deliveryPlan.notificationTarget,
+            )
+            // Schedule after every local surface exists. An already-elapsed deadline can now
+            // remove the banner as well as Telecom instead of firing just before the relay.
+            ringDeadlines.schedule(call.callId, expiresAt)
             return
         }
 
@@ -161,7 +172,11 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
             context,
             call.callId.hashCode(),
             Intent(context, MainActivity::class.java)
-                .setData(Uri.parse(call.deepLinkUri()))
+                .setData(
+                    Uri.parse(
+                        requireNotNull(deliveryPlan.notificationTarget.deepLink(call)),
+                    ),
+                )
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -209,6 +224,7 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
                 .setFullScreenIntent(openCall, true)
                 .build(),
         )
+        ringDeadlines.schedule(call.callId, expiresAt)
     }
 
     /**
@@ -218,9 +234,9 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
      */
     private fun showCallWaitingNotification(
         manager: NotificationManager,
-        envelope: PushEnvelope,
         call: IncomingCallPayload,
         timeoutMillis: Long,
+        target: IncomingCallNotificationTarget,
     ) {
         manager.createNotificationChannel(
             NotificationChannel(
@@ -233,7 +249,10 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
             context,
             call.callId.hashCode(),
             Intent(context, MainActivity::class.java)
-                .setData(Uri.parse(call.deepLinkUri()))
+                // No waiting-call deep link: bring the existing task and its active-call controls
+                // forward instead of constructing a second incoming-call screen/ViewModel.
+                .setAction(ACTION_RETURN_TO_ACTIVE_CALL)
+                .apply { target.deepLink(call)?.let { data = Uri.parse(it) } }
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -269,6 +288,7 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         const val CALLS_CHANNEL_ID = "kit_incoming_calls_v2"
         const val CALL_NOTIFICATION_ID = 4_101
         const val MAX_RING_TIMEOUT_MILLIS = 60_000L
+        const val ACTION_RETURN_TO_ACTIVE_CALL = "com.kit.wallet.action.RETURN_TO_ACTIVE_CALL"
 
         fun callTag(callId: String) = "kit_call:$callId"
     }

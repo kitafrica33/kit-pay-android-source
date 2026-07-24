@@ -86,10 +86,20 @@ class AppCapabilitiesTest {
         )
 
         assertTrue(capabilities.routeUsable(Dest.SEND))
+        assertTrue(capabilities.routeUsable(Dest.SEND_ROUTE))
+        assertTrue(capabilities.routeUsable(Dest.send("kit-user-1")))
         assertTrue(capabilities.routeUsable(Dest.REQUEST))
         assertTrue(capabilities.routeUsable(Dest.TRANSACTIONS))
         assertFalse(capabilities.copy(features = capabilities.features - KitFeature.WALLETS)
             .routeUsable(Dest.SEND))
+        assertFalse(capabilities.copy(features = capabilities.features - KitFeature.WALLETS)
+            .routeUsable(Dest.SEND_ROUTE))
+        assertFalse(capabilities.copy(features = capabilities.features - KitFeature.WALLETS)
+            .routeUsable(Dest.send("kit-user-1")))
+        assertFalse(
+            capabilities.copy(features = capabilities.features - KitFeature.INTERNAL_TRANSFERS)
+                .routeUsable(Dest.SEND_ROUTE),
+        )
         assertFalse(capabilities.copy(features = capabilities.features - KitFeature.WALLETS)
             .routeUsable(Dest.REQUEST))
     }

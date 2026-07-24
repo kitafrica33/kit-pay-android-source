@@ -49,6 +49,8 @@ class RemoteCallRepositoryTest {
         assertEquals("Saved locally", second.name)
         assertEquals(RECIPIENT_PHONE, first.phone)
         assertEquals(RECIPIENT_PHONE, second.phone)
+        assertEquals("2026-07-23T00:00:45Z", first.ringExpiresAt)
+        assertEquals("2026-07-23T00:00:45Z", second.ringExpiresAt)
     }
 
     private class RecordingContactRepository : ContactRepository {

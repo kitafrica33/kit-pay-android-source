@@ -73,6 +73,14 @@ class RequestMoneyViewModel @Inject constructor(
 
     fun request(from: Contact, amountMinor: Long, note: String?, onDone: () -> Unit) {
         if (_sending.value) return
+        if (!from.canReceiveKitPaymentRequest()) {
+            _error.value = "Choose a valid Kit Pay contact"
+            return
+        }
+        if (amountMinor <= 0) {
+            _error.value = "Enter an amount greater than zero"
+            return
+        }
         viewModelScope.launch {
             _sending.value = true
             _error.value = null

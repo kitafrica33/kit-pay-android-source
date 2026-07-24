@@ -14,6 +14,7 @@ class HomeActionPolicyTest {
     @Test
     fun `every dashboard action has an explicit route gate and coming-soon message`() {
         val expectedRoutes = mapOf(
+            HomeAction.NOTIFICATIONS to null,
             HomeAction.SCAN_QR to Dest.SCAN,
             HomeAction.SEND_MONEY to Dest.SEND,
             HomeAction.RECEIVE_MONEY to Dest.RECEIVE,
@@ -42,9 +43,14 @@ class HomeActionPolicyTest {
     fun `server activation opens every implemented dashboard flow`() {
         val activated = fullyActivatedCapabilities()
 
-        HomeAction.entries.forEach { action ->
+        HomeAction.entries.filter { it.guardedRoute != null }.forEach { action ->
             assertTrue(action.name, activated.homeActionAccess(action).available)
         }
+        assertFalse(activated.homeActionAccess(HomeAction.NOTIFICATIONS).available)
+        assertEquals(
+            "Coming soon: Notifications.",
+            activated.homeActionAccess(HomeAction.NOTIFICATIONS).unavailableMessage,
+        )
     }
 
     @Test
@@ -56,7 +62,7 @@ class HomeActionPolicyTest {
         assertFalse(serverActivated.homeActionAccess(HomeAction.SCAN_QR).available)
         assertTrue(serverActivated.homeActionAccess(HomeAction.RECEIVE_MONEY).available)
         HomeAction.entries
-            .filterNot { it == HomeAction.SCAN_QR }
+            .filterNot { it == HomeAction.SCAN_QR || it == HomeAction.NOTIFICATIONS }
             .forEach { action ->
                 assertTrue(action.name, serverActivated.homeActionAccess(action).available)
             }

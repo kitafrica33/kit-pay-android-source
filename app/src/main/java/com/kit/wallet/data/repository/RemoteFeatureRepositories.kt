@@ -566,6 +566,7 @@ class RemoteCallRepository @Inject constructor(
             url = rtc.url,
             token = rtc.token,
             room = rtc.room,
+            ringExpiresAt = call.ringExpiresAt,
         )
     }
 

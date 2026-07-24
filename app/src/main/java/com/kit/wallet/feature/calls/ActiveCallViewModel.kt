@@ -10,6 +10,7 @@ import com.kit.wallet.data.notifications.CallActionReceiver
 import com.kit.wallet.data.notifications.CallLifecycleEvent
 import com.kit.wallet.data.notifications.CallLifecycleEventBus
 import com.kit.wallet.data.notifications.CallLifecycleKind
+import com.kit.wallet.data.notifications.CallRingDeadlineCoordinator
 import com.kit.wallet.data.notifications.IncomingCallRelay
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.isKitConnectivityError
@@ -209,6 +210,7 @@ class ActiveCallViewModel @Inject constructor(
     private val activeCallState: ActiveCallStateHolder,
     private val incomingCalls: IncomingCallRelay,
     private val telecom: KitTelecomBridge,
+    private val ringDeadlines: CallRingDeadlineCoordinator,
     @ApplicationScope private val applicationScope: CoroutineScope,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
@@ -241,6 +243,10 @@ class ActiveCallViewModel @Inject constructor(
     private var terminationJob: Job? = null
     private var timerJob: Job? = null
     private val pendingTerminations = CallTerminationQueue()
+    private var localTelecomTermination = DeferredCallTermination(
+        finish = telecom::finish,
+        initialCallId = incomingCallId,
+    )
     private var terminated = false
 
     /** Kit Pay contacts that can be added to the call, for the in-call "Add people" picker. */
@@ -314,6 +320,7 @@ class ActiveCallViewModel @Inject constructor(
     fun declineWaitingCall() {
         val waiting = mutableState.value.waitingCall ?: return
         mutableState.value = mutableState.value.copy(waitingCall = null, mergingWaitingCall = false)
+        ringDeadlines.cancel(waiting.callId)
         telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
         applicationScope.launch { runCatching { calls.decline(waiting.callId) } }
     }
@@ -331,6 +338,7 @@ class ActiveCallViewModel @Inject constructor(
                 waitingCall = null,
                 error = "This call can't be merged. Ask them to call back after this call.",
             )
+            ringDeadlines.cancel(waiting.callId)
             telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
             applicationScope.launch { runCatching { calls.decline(waiting.callId) } }
             return
@@ -340,6 +348,7 @@ class ActiveCallViewModel @Inject constructor(
             try {
                 calls.invite(currentCallId, listOf(callerUserId))
                 runCatching { calls.decline(waiting.callId) }
+                ringDeadlines.cancel(waiting.callId)
                 telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
                 mutableState.value = mutableState.value.copy(
                     waitingCall = null,
@@ -387,6 +396,11 @@ class ActiveCallViewModel @Inject constructor(
         ) {
             return
         }
+        if (incomingCallId == null && connection == null) {
+            // A successful retry creates a new backend/Telecom call id and needs a fresh one-shot
+            // termination guard; an incoming retry always retains its original call id.
+            localTelecomTermination = DeferredCallTermination(finish = telecom::finish)
+        }
         terminated = false
         startJob = viewModelScope.launch {
             mutableState.value = mutableState.value.copy(
@@ -406,7 +420,17 @@ class ActiveCallViewModel @Inject constructor(
                     telecom.updatePresentation(session.callId, session.name, session.phone, session.video)
                     telecom.markConnecting(session.callId)
                 }
+                // Resolve only after Telecom tracking. If End was tapped while POST /calls was in
+                // flight, this atomically turns the just-tracked call into a terminal tombstone.
+                localTelecomTermination.resolveCallId(session.callId)
                 if (terminated) return@launch
+                if (incomingCallId == null) {
+                    ringDeadlines.schedule(session.callId, session.ringExpiresAt)
+                } else {
+                    // A successful answer response ends the incoming ringing window even if media
+                    // connection takes longer than the original deadline.
+                    ringDeadlines.cancel(session.callId)
+                }
                 mutableState.value = mutableState.value.copy(
                     name = session.name,
                     video = session.video,
@@ -666,11 +690,14 @@ class ActiveCallViewModel @Inject constructor(
                     error = null,
                 )
                 telecom.trackIncoming(callId, incoming.name, incoming.phone, incoming.video)
+                localTelecomTermination.resolveCallId(callId)
+                ringDeadlines.schedule(callId, incoming.ringExpiresAt)
                 applyContactPresentation(contacts.contacts.value)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Throwable) {
                 if (!terminated) {
+                    ringDeadlines.cancel(callId)
                     telecom.finish(callId, KitTelecomDisconnect.ERROR)
                     mutableState.value = mutableState.value.copy(
                         name = "Incoming Kit Pay call",
@@ -771,13 +798,24 @@ class ActiveCallViewModel @Inject constructor(
         val safeReason = reason.takeIf { it in setOf("completed", "cancelled", "network_error") }
             ?: "cancelled"
         val telecomCallId = connection?.callId ?: incomingCallId
+        telecomCallId?.let(ringDeadlines::cancel)
         if (telecomCallId != null) {
             val disconnect = when {
                 safeReason == "network_error" -> KitTelecomDisconnect.ERROR
                 connection == null && incomingCallId != null -> KitTelecomDisconnect.REJECTED
                 else -> KitTelecomDisconnect.LOCAL
             }
-            telecom.finish(telecomCallId, disconnect)
+            localTelecomTermination.terminate(disconnect)
+        } else {
+            // Outgoing POST /calls is still in flight. The deferred transition is delivered once
+            // its response has been tracked with Telecom.
+            localTelecomTermination.terminate(
+                if (safeReason == "network_error") {
+                    KitTelecomDisconnect.ERROR
+                } else {
+                    KitTelecomDisconnect.LOCAL
+                },
+            )
         }
         terminated = true
         validationJob?.cancel()
@@ -821,6 +859,7 @@ class ActiveCallViewModel @Inject constructor(
     }
 
     private fun markConnected() {
+        (connection?.callId ?: incomingCallId)?.let(ringDeadlines::cancel)
         mutableState.value = mutableState.value.copy(phase = CallPhase.CONNECTED)
         (connection?.callId ?: incomingCallId)?.let(telecom::markActive)
         // Mark this device busy so a second incoming call is surfaced as call-waiting, not a
@@ -841,21 +880,26 @@ class ActiveCallViewModel @Inject constructor(
 
         when (event.kind) {
             CallLifecycleKind.ANSWERED -> if (mutableState.value.phase == CallPhase.RINGING) {
+                ringDeadlines.cancel(event.callId)
                 mutableState.value = mutableState.value.copy(phase = CallPhase.CONNECTING)
             }
-            CallLifecycleKind.DECLINED -> if (event.terminal) finishFromRemote(event.callId)
-            CallLifecycleKind.ENDED, CallLifecycleKind.MISSED -> finishFromRemote(event.callId)
+            CallLifecycleKind.DECLINED -> if (event.terminal) {
+                finishFromRemote(event.callId, KitTelecomDisconnect.REJECTED)
+            }
+            CallLifecycleKind.ENDED -> finishFromRemote(event.callId, KitTelecomDisconnect.REMOTE)
+            CallLifecycleKind.MISSED -> finishFromRemote(event.callId, KitTelecomDisconnect.MISSED)
         }
     }
 
-    private fun finishFromRemote(callId: String) {
+    private fun finishFromRemote(callId: String, disconnect: KitTelecomDisconnect) {
         if (terminationJob?.isActive == true ||
             mutableState.value.phase in setOf(CallPhase.ENDING, CallPhase.ENDED)
         ) {
             return
         }
         terminated = true
-        telecom.finish(callId, KitTelecomDisconnect.REMOTE)
+        ringDeadlines.cancel(callId)
+        telecom.finish(callId, disconnect)
         validationJob?.cancel()
         timerJob?.cancel()
         timerJob = null
@@ -942,6 +986,7 @@ class ActiveCallViewModel @Inject constructor(
             return
         }
         terminated = true
+        (connection?.callId ?: incomingCallId)?.let(ringDeadlines::cancel)
         timerJob?.cancel()
         timerJob = null
         room.disconnect()
@@ -996,6 +1041,7 @@ class ActiveCallViewModel @Inject constructor(
         room.release()
         CallForegroundService.stop(context)
         activeCallState.setActiveCall(null)
+        (connection?.callId ?: incomingCallId)?.let(ringDeadlines::cancel)
         connection?.callId?.let { activeCallId ->
             telecom.finish(activeCallId, KitTelecomDisconnect.LOCAL)
             pendingTerminations.enqueue(

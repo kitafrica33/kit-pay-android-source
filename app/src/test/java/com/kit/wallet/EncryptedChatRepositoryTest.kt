@@ -617,6 +617,63 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `viewer scoped peer alias stays visible until a saved contact name arrives`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "My sister")
+        }
+        val localContacts = MutableStateFlow<List<Contact>>(emptyList())
+        val repository = repository(runtime, localContacts)
+        val observedNames = mutableListOf<String>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            repository.chats.collect { chats ->
+                chats.singleOrNull()?.name?.let(observedNames::add)
+            }
+        }
+
+        runCurrent()
+        assertEquals(listOf("My sister"), observedNames)
+
+        localContacts.value = listOf(
+            Contact(
+                id = USER_ONE,
+                name = "Flora from my phone",
+                phone = "+256761146015",
+                isKitUser = true,
+                registeredName = USER_ONE,
+                savedInDevice = true,
+            ),
+        )
+        runCurrent()
+
+        assertEquals(listOf("My sister", "Flora from my phone"), observedNames)
+        assertFalse(observedNames.any { it == USER_ONE })
+    }
+
+    @Test
+    fun `invalid saved and server contact names use the generic fallback`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, USER_ONE.uppercase())
+        }
+        val localContacts = MutableStateFlow(
+            listOf(
+                Contact(
+                    id = USER_ONE,
+                    name = "\u0000\u0007\t",
+                    phone = "+256761146015",
+                    isKitUser = true,
+                    registeredName = USER_ONE,
+                    savedInDevice = true,
+                ),
+            ),
+        )
+        val repository = repository(runtime, localContacts)
+
+        runCurrent()
+
+        assertEquals("Kit Pay contact", repository.chats.value.single().name)
+    }
+
+    @Test
     fun `explicit lost response retry reuses one durable pending projection and normalized text`() = runTest {
         val runtime = FakeRuntime(sendScenario = SendScenario.LOST_RESPONSE).apply {
             conversations += conversation(CONVERSATION_ONE, "Grace")

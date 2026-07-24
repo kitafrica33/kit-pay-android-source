@@ -20,14 +20,19 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
@@ -36,11 +41,15 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.ui.components.KitGreenButton
+import com.kit.wallet.ui.components.KitOutlinedButton
 import com.kit.wallet.ui.model.BillProvider
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.theme.KitWalletTheme
+import kotlinx.coroutines.launch
 
 private val quickAmounts = listOf(1_000, 2_000, 5_000, 10_000, 20_000)
+internal const val AIRTIME_CONTACT_COMING_SOON = "Coming soon: choose an airtime contact."
+internal const val DATA_BUNDLES_COMING_SOON = "Coming soon: Data bundles."
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -57,6 +66,7 @@ fun AirtimeScreen(
         ownPhone = viewModel.ownPhone,
         buying = buying,
         error = error,
+        snackbarHostState = remember { SnackbarHostState() },
         onBack = onBack,
         onBuy = { productId, phone, amountMinor, pin ->
             viewModel.buy(productId, phone, amountMinor, pin, onDone)
@@ -66,11 +76,12 @@ fun AirtimeScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AirtimeContent(
+internal fun AirtimeContent(
     products: List<BillProvider>,
     ownPhone: String,
     buying: Boolean,
     error: String?,
+    snackbarHostState: SnackbarHostState,
     onBack: () -> Unit,
     onBuy: (String, String, Long, String) -> Unit,
 ) {
@@ -81,6 +92,13 @@ private fun AirtimeContent(
     var amount by rememberSaveable { mutableStateOf("") }
     var paymentPin by rememberSaveable { mutableStateOf("") }
     val amountMinor = Money.parseMinor(amount) ?: 0L
+    val scope = rememberCoroutineScope()
+    val showComingSoon: (String) -> Unit = { message ->
+        scope.launch {
+            snackbarHostState.currentSnackbarData?.dismiss()
+            snackbarHostState.showSnackbar(message)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -93,6 +111,7 @@ private fun AirtimeContent(
                 },
             )
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { padding ->
         Column(
             Modifier
@@ -117,6 +136,12 @@ private fun AirtimeContent(
                     )
                 }
             }
+            Spacer(Modifier.height(8.dp))
+            KitOutlinedButton(
+                text = "Data bundles",
+                onClick = { showComingSoon(DATA_BUNDLES_COMING_SOON) },
+                modifier = Modifier.testTag("airtime-data-bundles"),
+            )
             Spacer(Modifier.height(14.dp))
             OutlinedTextField(
                 value = phone,
@@ -124,11 +149,16 @@ private fun AirtimeContent(
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("Phone number") },
                 trailingIcon = {
-                    Icon(
-                        Icons.Rounded.Contacts,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    IconButton(
+                        onClick = { showComingSoon(AIRTIME_CONTACT_COMING_SOON) },
+                        modifier = Modifier.testTag("airtime-choose-contact"),
+                    ) {
+                        Icon(
+                            Icons.Rounded.Contacts,
+                            contentDescription = "Choose airtime contact",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                 singleLine = true,
@@ -196,6 +226,7 @@ private fun AirtimePreview() {
             ownPhone = DemoData.USER_PHONE,
             buying = false,
             error = null,
+            snackbarHostState = remember { SnackbarHostState() },
             onBack = {},
             onBuy = { _, _, _, _ -> },
         )

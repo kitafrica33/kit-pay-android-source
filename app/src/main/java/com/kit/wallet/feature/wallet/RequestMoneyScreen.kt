@@ -30,6 +30,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -63,20 +64,25 @@ fun RequestMoneyScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun RequestMoneyContent(
+internal fun RequestMoneyContent(
     contacts: List<Contact>,
     sending: Boolean,
     error: String?,
     onBack: () -> Unit,
     onRequest: (Contact, Long, String?) -> Unit,
 ) {
-    var selectedId by rememberSaveable { mutableStateOf(contacts.firstOrNull()?.id ?: "") }
+    val eligibleContacts = contacts.filter(Contact::canReceiveKitPaymentRequest)
+    var selectedId by rememberSaveable {
+        mutableStateOf(eligibleContacts.firstOrNull()?.id.orEmpty())
+    }
     var amount by rememberSaveable { mutableStateOf("") }
     var note by rememberSaveable { mutableStateOf("") }
+    val amountMinor = Money.parseMinor(amount) ?: 0L
+    val selectedContact = eligibleContacts.firstOrNull { it.id == selectedId }
 
-    LaunchedEffect(contacts) {
-        if (contacts.none { it.id == selectedId }) {
-            selectedId = contacts.firstOrNull { it.isKitUser }?.id.orEmpty()
+    LaunchedEffect(eligibleContacts) {
+        if (eligibleContacts.none { it.id == selectedId }) {
+            selectedId = eligibleContacts.firstOrNull()?.id.orEmpty()
         }
     }
 
@@ -104,13 +110,13 @@ private fun RequestMoneyContent(
                 modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
             )
             LazyRow(contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp)) {
-                val kitContacts = contacts.filter { it.isKitUser }
-                items(kitContacts.size) { i ->
-                    val c = kitContacts[i]
+                items(eligibleContacts.size) { i ->
+                    val c = eligibleContacts[i]
                     val selected = c.id == selectedId
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier
+                            .testTag("request-contact-${c.id}")
                             .clickable { selectedId = c.id }
                             .padding(horizontal = 6.dp, vertical = 4.dp),
                     ) {
@@ -125,6 +131,25 @@ private fun RequestMoneyContent(
                     }
                 }
             }
+            if (selectedContact == null) {
+                Text(
+                    "No Kit Pay contact is available. Add or sync a Kit Pay contact first.",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier
+                        .padding(horizontal = 24.dp, vertical = 8.dp)
+                        .testTag("request-contact-feedback"),
+                )
+            } else {
+                Text(
+                    "Requesting from ${selectedContact.name}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .padding(horizontal = 24.dp, vertical = 8.dp)
+                        .testTag("request-selected-contact"),
+                )
+            }
 
             Spacer(Modifier.height(20.dp))
             OutlinedTextField(
@@ -132,7 +157,8 @@ private fun RequestMoneyContent(
                 onValueChange = { v -> amount = v.filter { it.isDigit() || it == '.' } },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 24.dp),
+                    .padding(horizontal = 24.dp)
+                    .testTag("request-amount"),
                 label = { Text("Amount (${Money.SYMBOL})") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
@@ -175,17 +201,26 @@ private fun RequestMoneyContent(
                 text = "Send request",
                 loading = sending,
                 onClick = {
-                    val from = contacts.find { it.id == selectedId } ?: return@KitGreenButton
-                    val amountMinor = Money.parseMinor(amount) ?: return@KitGreenButton
-                    onRequest(from, amountMinor, note.ifBlank { null })
+                    // The button cannot be enabled without both values. Re-resolve the contact
+                    // from the visible eligible set so an asynchronous refresh cannot submit a
+                    // hidden, removed, or non-Kit identity.
+                    eligibleContacts.firstOrNull { it.id == selectedId }?.let { from ->
+                        if (amountMinor > 0) {
+                            onRequest(from, amountMinor, note.ifBlank { null })
+                        }
+                    }
                 },
-                enabled = (Money.parseMinor(amount) ?: 0L) > 0,
-                modifier = Modifier.padding(horizontal = 24.dp),
+                enabled = selectedContact != null && amountMinor > 0,
+                modifier = Modifier
+                    .padding(horizontal = 24.dp)
+                    .testTag("request-submit"),
             )
             Spacer(Modifier.height(24.dp))
         }
     }
 }
+
+internal fun Contact.canReceiveKitPaymentRequest(): Boolean = isKitUser && id.isNotBlank()
 
 @Preview(showBackground = true)
 @Composable
