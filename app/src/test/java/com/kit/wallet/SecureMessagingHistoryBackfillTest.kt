@@ -3,6 +3,7 @@ package com.kit.wallet
 import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
 import com.kit.wallet.data.messaging.SecureMessagingHistoryBackfillCodec
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
+import com.kit.wallet.data.messaging.drainSecureMessagingHistoryWork
 import com.kit.wallet.data.remote.CursorPageDto
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
 import com.kit.wallet.data.remote.EncryptedMessageCryptoSenderDto
@@ -281,6 +282,177 @@ class SecureMessagingHistoryBackfillTest {
         }
 
     @Test
+    fun `completed history task reopens from its first page only when reconciliation requests it`() =
+        runTest {
+            val state = TestSecureMessagingStateStore()
+            val projections = SecureMessagingProjectionStore(
+                state,
+                LibSignalCompanionStateReader(state),
+            )
+
+            projections.enqueueHistoryBackfill(CONVERSATION_ID, TARGET_DEVICE_ID, 7)
+            val initial = projections.pendingHistoryBackfills(limit = 1).single()
+            val advanced = projections.updateHistoryBackfill(
+                initial,
+                nextCursor = "old_cursor",
+                completed = false,
+            )
+            projections.updateHistoryBackfill(advanced, nextCursor = null, completed = true)
+            assertTrue(projections.pendingHistoryBackfills(limit = 1).isEmpty())
+
+            projections.enqueueHistoryBackfill(CONVERSATION_ID, TARGET_DEVICE_ID, 7)
+            assertTrue(projections.pendingHistoryBackfills(limit = 1).isEmpty())
+
+            projections.enqueueHistoryBackfill(
+                CONVERSATION_ID,
+                TARGET_DEVICE_ID,
+                7,
+                reopenCompleted = true,
+            )
+            val reopened = projections.pendingHistoryBackfills(limit = 1).single()
+            assertEquals(null, reopened.nextCursor)
+            assertFalse(reopened.completed)
+        }
+
+    @Test
+    fun `history drain gives more than four tasks work in the same run`() = runTest {
+        val state = TestSecureMessagingStateStore()
+        val projections = SecureMessagingProjectionStore(
+            state,
+            LibSignalCompanionStateReader(state),
+        )
+        (1..5).forEach { index ->
+            projections.enqueueHistoryBackfill(
+                CONVERSATION_ID,
+                historyTargetDevice(index),
+                index.toLong(),
+            )
+        }
+        val attempted = mutableListOf<String>()
+
+        val result = drainSecureMessagingHistoryWork(
+            maxWorkUnits = 5,
+            batchSize = 4,
+            loadPending = projections::pendingHistoryBackfills,
+            attempt = { task ->
+                attempted += task.recordKey
+                projections.updateHistoryBackfill(task, nextCursor = null, completed = true)
+                true
+            },
+        )
+
+        assertEquals(5, attempted.distinct().size)
+        assertEquals(5, result.workUnits)
+        assertTrue(result.madeProgress)
+        assertFalse(result.hadFailure)
+        assertFalse(result.pending)
+    }
+
+    @Test
+    fun `history drain completes five fifty item pages beyond the former two hundred candidate cap`() =
+        runTest {
+            val state = TestSecureMessagingStateStore()
+            val projections = SecureMessagingProjectionStore(
+                state,
+                LibSignalCompanionStateReader(state),
+            )
+            projections.enqueueHistoryBackfill(CONVERSATION_ID, TARGET_DEVICE_ID, 7)
+            var pages = 0
+
+            val result = drainSecureMessagingHistoryWork(
+                maxWorkUnits = 5,
+                batchSize = 4,
+                loadPending = projections::pendingHistoryBackfills,
+                attempt = { task ->
+                    pages++
+                    projections.updateHistoryBackfill(
+                        task,
+                        nextCursor = if (pages < 5) "cursor_$pages" else null,
+                        completed = pages == 5,
+                    )
+                    true
+                },
+            )
+
+            assertEquals(5, pages)
+            assertEquals(5, result.workUnits)
+            assertFalse(result.pending)
+            assertTrue(projections.pendingHistoryBackfills(limit = 1).isEmpty())
+        }
+
+    @Test
+    fun `four failing history tasks do not starve the fifth healthy task`() = runTest {
+        val state = TestSecureMessagingStateStore()
+        val projections = SecureMessagingProjectionStore(
+            state,
+            LibSignalCompanionStateReader(state),
+        )
+        (1..5).forEach { index ->
+            projections.enqueueHistoryBackfill(
+                CONVERSATION_ID,
+                historyTargetDevice(index),
+                index.toLong(),
+            )
+        }
+        val ordered = projections.pendingHistoryBackfills(limit = 5)
+        val failing = ordered.take(4).mapTo(mutableSetOf()) { it.recordKey }
+        val healthy = ordered.last().recordKey
+        val attempted = mutableListOf<String>()
+
+        val result = drainSecureMessagingHistoryWork(
+            maxWorkUnits = 5,
+            batchSize = 4,
+            loadPending = projections::pendingHistoryBackfills,
+            attempt = { task ->
+                attempted += task.recordKey
+                if (task.recordKey in failing) {
+                    false
+                } else {
+                    projections.updateHistoryBackfill(task, nextCursor = null, completed = true)
+                    true
+                }
+            },
+        )
+
+        assertEquals(healthy, attempted.last())
+        assertTrue(result.hadFailure)
+        assertTrue(result.madeProgress)
+        assertTrue(result.pending)
+        assertEquals(failing, projections.pendingHistoryBackfills(limit = 5).mapTo(mutableSetOf()) { it.recordKey })
+    }
+
+    @Test
+    fun `history drain reports pending continuation when its work budget is exhausted`() = runTest {
+        val state = TestSecureMessagingStateStore()
+        val projections = SecureMessagingProjectionStore(
+            state,
+            LibSignalCompanionStateReader(state),
+        )
+        projections.enqueueHistoryBackfill(CONVERSATION_ID, TARGET_DEVICE_ID, 7)
+        var pages = 0
+
+        val result = drainSecureMessagingHistoryWork(
+            maxWorkUnits = 16,
+            batchSize = 4,
+            loadPending = projections::pendingHistoryBackfills,
+            attempt = { task ->
+                pages++
+                projections.updateHistoryBackfill(
+                    task,
+                    nextCursor = "continuation_$pages",
+                    completed = false,
+                )
+                true
+            },
+        )
+
+        assertEquals(16, pages)
+        assertEquals(16, result.workUnits)
+        assertTrue(result.madeProgress)
+        assertTrue(result.pending)
+    }
+
+    @Test
     fun `history upload is ciphertext only and flat replay result is validated`() {
         val request = StoreMessagingHistoryEnvelopeRequest(
             targetDeviceId = TARGET_DEVICE_ID,
@@ -359,9 +531,33 @@ class SecureMessagingHistoryBackfillTest {
 
     private fun historyCandidateRoster(): MessagingDeviceRosterDto {
         val devices = listOf(
-            rosterDevice(TARGET_DEVICE_ID, CURRENT_USER_ID, 1, 45, 7, 0x41),
-            rosterDevice(DONOR_DEVICE_ID, CURRENT_USER_ID, 3, 44, 6, 0x31),
-            rosterDevice(PEER_DEVICE_ID, PEER_USER_ID, 2, 43, 4, 0x21),
+            rosterDevice(
+                TARGET_DEVICE_ID,
+                CURRENT_USER_ID,
+                1,
+                45,
+                7,
+                0x41,
+                enrollmentEpoch = 7,
+            ),
+            rosterDevice(
+                DONOR_DEVICE_ID,
+                CURRENT_USER_ID,
+                3,
+                44,
+                6,
+                0x31,
+                enrollmentEpoch = 1,
+            ),
+            rosterDevice(
+                PEER_DEVICE_ID,
+                PEER_USER_ID,
+                2,
+                43,
+                4,
+                0x21,
+                enrollmentEpoch = 3,
+            ),
         )
         val hash = sha256(canonicalRosterBytes(devices))
         return MessagingDeviceRosterDto(
@@ -380,11 +576,13 @@ class SecureMessagingHistoryBackfillTest {
         registrationId: Int,
         bundleVersion: Int,
         seed: Int,
+        enrollmentEpoch: Long? = null,
     ): MessagingDeviceRosterEntryDto {
         val identityKey = signalValue(5, seed, 33)
         val signedKey = signalValue(5, seed + 1, 33)
         return MessagingDeviceRosterEntryDto(
             deviceId = deviceId,
+            enrollmentEpoch = enrollmentEpoch,
             signalDeviceId = signalDeviceId,
             userId = userId,
             registrationId = registrationId,
@@ -431,6 +629,9 @@ class SecureMessagingHistoryBackfillTest {
             }
             append("]}")
         }.toByteArray(StandardCharsets.UTF_8)
+
+    private fun historyTargetDevice(index: Int): String =
+        "40000000-0000-4000-8000-${index.toString().padStart(12, '0')}"
 
     private fun signalValue(type: Int, fill: Int, size: Int): String = Base64.getEncoder()
         .encodeToString(ByteArray(size) { fill.toByte() }.also { it[0] = type.toByte() })

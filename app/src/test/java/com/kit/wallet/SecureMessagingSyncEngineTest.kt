@@ -202,14 +202,14 @@ class SecureMessagingSyncEngineTest {
             server.enqueue(jsonResponse(PROFILE))
             server.enqueue(jsonResponse(DEVICES))
             enqueueEmptySync(server, moshi, "initial_cursor")
-            enqueueEmptySync(server, moshi, "wake_cursor")
+            enqueueWakeSync(server, moshi, "wake_cursor")
 
             assertTrue(engine.isReady)
             assertTrue(registry.currentOrNull() == null)
             engine.synchronize()
 
             assertEquals(TOKENS.sessionId, registry.requireCurrent().binding.sessionEpoch)
-            assertEquals(7, server.requestCount)
+            assertEquals(8, server.requestCount)
 
             val active = registry.requireCurrent()
             val staleFence = com.kit.wallet.data.messaging.SecureMessagingSessionFence(
@@ -219,7 +219,7 @@ class SecureMessagingSyncEngineTest {
             val redirected = runCatching { engine.synchronize(staleFence) }.exceptionOrNull()
 
             assertTrue(redirected is SecureMessagingAuthenticationEpochChangedException)
-            assertEquals(7, server.requestCount)
+            assertEquals(8, server.requestCount)
 
             val expectedSession = TOKENS.fence()
             sessions.replace(TOKENS.copy(sessionId = "replacement-session"))
@@ -230,7 +230,7 @@ class SecureMessagingSyncEngineTest {
             assertTrue(
                 staleSessionContinuation is SecureMessagingAuthenticationEpochChangedException,
             )
-            assertEquals(7, server.requestCount)
+            assertEquals(8, server.requestCount)
         } finally {
             server.shutdown()
         }
@@ -395,14 +395,14 @@ class SecureMessagingSyncEngineTest {
                 server.enqueue(jsonResponse(DEVICES))
             }
             enqueueEmptySync(server, moshi, "initial_cursor")
-            enqueueEmptySync(server, moshi, "wake_cursor")
+            enqueueWakeSync(server, moshi, "wake_cursor")
 
             engine.synchronize()
 
             assertEquals(4, keyAttempts)
             assertEquals(15_000L, currentTime)
             assertEquals(SecureMessagingRuntimeStage.READY, guard.snapshot().stage)
-            assertEquals(13, server.requestCount)
+            assertEquals(14, server.requestCount)
         } finally {
             server.shutdown()
         }
@@ -500,7 +500,7 @@ class SecureMessagingSyncEngineTest {
                 server.enqueue(jsonResponse(PROFILE))
                 server.enqueue(jsonResponse(DEVICES))
                 enqueueEmptySync(server, moshi, "a_initial_cursor")
-                enqueueEmptySync(server, moshi, "a_wake_cursor")
+                enqueueWakeSync(server, moshi, "a_wake_cursor")
 
                 engine.synchronize()
                 val initial = registry.requireCurrent()
@@ -518,7 +518,7 @@ class SecureMessagingSyncEngineTest {
                     server.enqueue(jsonResponse(PROFILE))
                     server.enqueue(jsonResponse(DEVICES))
                     enqueueEmptySync(server, moshi, "initial_cursor_$activationIndex")
-                    enqueueEmptySync(server, moshi, "wake_cursor_$activationIndex")
+                    enqueueWakeSync(server, moshi, "wake_cursor_$activationIndex")
                 }
 
                 val failedReopen = runCatching {
@@ -540,7 +540,7 @@ class SecureMessagingSyncEngineTest {
                 val successor = registry.requireCurrent()
                 assertTrue(successor.fence !== initial.fence)
                 assertEquals(TOKENS.sessionId, successor.binding.sessionEpoch)
-                assertEquals(17, server.requestCount)
+                assertEquals(19, server.requestCount)
             } finally {
                 server.shutdown()
             }
@@ -625,7 +625,7 @@ class SecureMessagingSyncEngineTest {
             server.enqueue(jsonResponse(PROFILE))
             server.enqueue(jsonResponse(DEVICES))
             enqueueEmptySync(server, moshi, "a_initial_cursor")
-            enqueueEmptySync(server, moshi, "a_wake_cursor")
+            enqueueWakeSync(server, moshi, "a_wake_cursor")
             engine.synchronize()
             val initial = registry.requireCurrent()
 
@@ -651,7 +651,7 @@ class SecureMessagingSyncEngineTest {
             assertEquals(3, cursorWrites)
             assertEquals(SecureMessagingRuntimeStage.NO_SESSION, guard.snapshot().stage)
             assertTrue(registry.currentOrNull() == null)
-            assertEquals(10, server.requestCount)
+            assertEquals(11, server.requestCount)
         } finally {
             server.shutdown()
         }
@@ -731,7 +731,7 @@ class SecureMessagingSyncEngineTest {
             server.enqueue(jsonResponse(PROFILE))
             server.enqueue(jsonResponse(DEVICES))
             enqueueEmptySync(server, moshi, "a_initial_cursor")
-            enqueueEmptySync(server, moshi, "a_wake_cursor")
+            enqueueWakeSync(server, moshi, "a_wake_cursor")
             engine.synchronize()
             val initial = registry.requireCurrent()
 
@@ -1042,6 +1042,11 @@ class SecureMessagingSyncEngineTest {
 
     private fun enqueueEmptySync(server: MockWebServer, moshi: Moshi, cursor: String) {
         server.enqueue(emptySyncResponse(moshi, cursor))
+    }
+
+    private fun enqueueWakeSync(server: MockWebServer, moshi: Moshi, cursor: String) {
+        enqueueEmptySync(server, moshi, cursor)
+        server.enqueue(jsonResponse("""{"ok":true,"data":{"items":[]}}"""))
     }
 
     private fun emptySyncResponse(moshi: Moshi, cursor: String): MockResponse {

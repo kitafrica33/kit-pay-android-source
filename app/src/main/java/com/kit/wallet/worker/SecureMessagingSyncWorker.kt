@@ -60,15 +60,27 @@ class SecureMessagingSyncScheduler @Inject constructor(
     private val wakeCoalescer: SecureMessagingWakeCoalescer,
 ) {
     fun schedule() {
+        enqueue(initialDelayMillis = 0L)
+    }
+
+    fun scheduleHistoryContinuation(delayMillis: Long) {
+        require(delayMillis >= 0L)
+        enqueue(initialDelayMillis = delayMillis)
+    }
+
+    private fun enqueue(initialDelayMillis: Long) {
         wakeCoalescer.enqueueOnce {
-            val request = OneTimeWorkRequestBuilder<SecureMessagingSyncWorker>()
+            val builder = OneTimeWorkRequestBuilder<SecureMessagingSyncWorker>()
                 .setConstraints(
                     Constraints.Builder()
                         .setRequiredNetworkType(NetworkType.CONNECTED)
                         .build(),
                 )
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                .build()
+            if (initialDelayMillis > 0L) {
+                builder.setInitialDelay(initialDelayMillis, TimeUnit.MILLISECONDS)
+            }
+            val request = builder.build()
             workManager.enqueueUniqueWork(WORK_NAME, SECURE_MESSAGING_WORK_POLICY, request)
         }
     }

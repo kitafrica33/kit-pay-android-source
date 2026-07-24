@@ -880,6 +880,9 @@ object SecureMessagingWireValidator {
         val prefix = "roster device $index"
         val deviceId = required(device.deviceId, "$prefix device ID")
         requireUuid(deviceId, "$prefix device ID")
+        device.enrollmentEpoch?.let {
+            requireWire(it > 0L, "$prefix enrollment epoch")
+        }
         val signalDeviceId = requireSignalDeviceId(device.signalDeviceId, "$prefix Signal device ID")
         val userId = required(device.userId, "$prefix user ID")
         requireUuid(userId, "$prefix user ID")
@@ -914,6 +917,7 @@ object SecureMessagingWireValidator {
         return ValidatedMessagingRosterDeviceValue(
             deviceId = deviceId,
             userId = userId,
+            enrollmentEpoch = device.enrollmentEpoch,
             signalDeviceId = signalDeviceId,
             registrationId = registrationId,
             protocolVersion = SECURE_MESSAGING_PROTOCOL_VERSION,
@@ -1362,6 +1366,7 @@ sealed interface ValidatedMessagingDeviceRoster {
 sealed interface ValidatedMessagingRosterDevice {
     val deviceId: String
     val userId: String
+    val enrollmentEpoch: Long?
     val signalDeviceId: Int
     val registrationId: Int
     val protocolVersion: String
@@ -1430,6 +1435,7 @@ private class ValidatedMessagingDeviceRosterValue(
 private class ValidatedMessagingRosterDeviceValue(
     override val deviceId: String,
     override val userId: String,
+    override val enrollmentEpoch: Long?,
     override val signalDeviceId: Int,
     override val registrationId: Int,
     override val protocolVersion: String,

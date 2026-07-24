@@ -50,6 +50,91 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 
+private const val MAX_CONTACTS = 1_000
+private const val MAX_CONTACT_PHONE_BYTES = 32
+private const val MIN_CONTACT_PHONE_DIGITS = 7
+private const val MAX_CONTACT_PHONE_DIGITS = 15
+private const val MAX_CONTACT_NAME_CODE_POINTS = 160
+
+internal data class DeviceContactSyncCandidate(
+    val phone: String?,
+    val name: String?,
+    val favorite: Boolean,
+)
+
+/**
+ * Converts an address-book snapshot into the bounded, phone-only shape accepted by contact sync.
+ * Invalid rows are omitted individually so a service code or malformed OEM contact cannot prevent
+ * later valid contacts from being uploaded. Phone digits are never truncated: an overlong value is
+ * rejected instead of being turned into a different person's number.
+ */
+internal fun sanitizeDeviceContactsForSync(
+    candidates: Sequence<DeviceContactSyncCandidate>,
+    limit: Int = MAX_CONTACTS,
+): List<DeviceContactDto> {
+    require(limit >= 0) { "Contact limit cannot be negative" }
+    val effectiveLimit = limit.coerceAtMost(MAX_CONTACTS)
+    if (effectiveLimit == 0) return emptyList()
+
+    val seenNumbers = mutableSetOf<String>()
+    val sanitizedContacts = ArrayList<DeviceContactDto>(effectiveLimit)
+    for (candidate in candidates) {
+        val phone = sanitizeDeviceContactPhone(candidate.phone) ?: continue
+        val numberKey = phone.filter { it in '0'..'9' }
+        if (!seenNumbers.add(numberKey)) continue
+
+        sanitizedContacts.add(
+            DeviceContactDto(
+                phone = phone,
+                name = sanitizeDeviceContactName(candidate.name, fallback = phone),
+                favorite = candidate.favorite,
+            ),
+        )
+        if (sanitizedContacts.size == effectiveLimit) break
+    }
+    return sanitizedContacts
+}
+
+private fun sanitizeDeviceContactPhone(rawPhone: String?): String? {
+    val raw = rawPhone?.trim().orEmpty()
+    if (raw.isEmpty() || raw.toByteArray(Charsets.UTF_8).size > MAX_CONTACT_PHONE_BYTES) {
+        return null
+    }
+
+    val compact = StringBuilder(raw.length)
+    for (character in raw) {
+        when {
+            character in '0'..'9' -> compact.append(character)
+            character == '+' && compact.isEmpty() -> compact.append(character)
+            character.isSupportedPhoneSeparator() -> Unit
+            else -> return null
+        }
+    }
+
+    val sanitized = compact.toString()
+    val digits = sanitized.removePrefix("+")
+    if (digits.length !in MIN_CONTACT_PHONE_DIGITS..MAX_CONTACT_PHONE_DIGITS) return null
+    if (digits.all { it == '0' }) return null
+    return sanitized
+}
+
+private fun Char.isSupportedPhoneSeparator(): Boolean = when (this) {
+    ' ', '\t', '\u00a0', '\u202f',
+    '-', '\u2010', '\u2011', '\u2012', '\u2013', '\u2212',
+    '(', ')', '.',
+    -> true
+    else -> false
+}
+
+private fun sanitizeDeviceContactName(rawName: String?, fallback: String): String {
+    val trimmed = rawName?.trim().orEmpty()
+    if (trimmed.isEmpty()) return fallback
+    val codePointCount = trimmed.codePointCount(0, trimmed.length)
+    if (codePointCount <= MAX_CONTACT_NAME_CODE_POINTS) return trimmed
+    val endIndex = trimmed.offsetByCodePoints(0, MAX_CONTACT_NAME_CODE_POINTS)
+    return trimmed.substring(0, endIndex).trimEnd().ifEmpty { fallback }
+}
+
 @Singleton
 class RemoteContactRepository @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -184,28 +269,29 @@ class RemoteContactRepository @Inject constructor(
             ContactsContract.CommonDataKinds.Phone.NUMBER,
             ContactsContract.CommonDataKinds.Phone.STARRED,
         )
-        val localContacts = buildList {
-            context.contentResolver.query(
-                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                projection,
-                null,
-                null,
-                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY + " COLLATE NOCASE ASC",
-            )?.use { cursor ->
-                val nameIndex = cursor.getColumnIndexOrThrow(projection[0])
-                val numberIndex = cursor.getColumnIndexOrThrow(projection[1])
-                val starredIndex = cursor.getColumnIndexOrThrow(projection[2])
-                val seen = mutableSetOf<String>()
-                while (cursor.moveToNext() && size < MAX_CONTACTS) {
-                    val name = cursor.getString(nameIndex)?.trim().orEmpty()
-                    val phone = cursor.getString(numberIndex)?.trim().orEmpty()
-                    val key = phone.filter(Char::isDigit)
-                    if (name.isNotEmpty() && phone.isNotEmpty() && key.isNotEmpty() && seen.add(key)) {
-                        add(DeviceContactDto(phone, name, cursor.getInt(starredIndex) == 1))
-                    }
+        val localContacts = context.contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            projection,
+            null,
+            null,
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY + " COLLATE NOCASE ASC",
+        )?.use { cursor ->
+            val nameIndex = cursor.getColumnIndexOrThrow(projection[0])
+            val numberIndex = cursor.getColumnIndexOrThrow(projection[1])
+            val starredIndex = cursor.getColumnIndexOrThrow(projection[2])
+            val candidates: Sequence<DeviceContactSyncCandidate> = generateSequence {
+                if (!cursor.moveToNext()) {
+                    null
+                } else {
+                    DeviceContactSyncCandidate(
+                        phone = cursor.getString(numberIndex),
+                        name = cursor.getString(nameIndex),
+                        favorite = cursor.getInt(starredIndex) == 1,
+                    )
                 }
             }
-        }
+            sanitizeDeviceContactsForSync(candidates)
+        }.orEmpty()
         val deviceNames = localContacts.associate { contactNumberKey(it.phone) to it.name }
         val registered = apiCalls.execute {
             api.syncContacts(ContactSyncRequest(localContacts))
@@ -268,10 +354,6 @@ class RemoteContactRepository @Inject constructor(
     private fun hasContactPermission(): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) ==
             PackageManager.PERMISSION_GRANTED
-
-    private companion object {
-        const val MAX_CONTACTS = 1_000
-    }
 }
 
 @Singleton

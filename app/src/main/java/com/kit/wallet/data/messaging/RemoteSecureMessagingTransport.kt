@@ -90,6 +90,12 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             internal val issuanceIdentity: Any,
         )
 
+        /** Non-secret current-enrollment address for another device owned by this account. */
+        class HistoryBackfillTarget internal constructor(
+            val deviceId: String,
+            val enrollmentEpoch: Long,
+        )
+
         /** Opaque, single-use position in this session's validated sync stream. */
         class SyncCheckpoint internal constructor(
             private val owner: Session,
@@ -641,6 +647,35 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 ),
                 use = RosterUse.CURRENT_OUTBOUND,
             )
+        }
+
+        /**
+         * Derives current same-account history targets only from an exact current roster. Historical
+         * roster snapshots predate enrollment epochs and are deliberately rejected by this path.
+         */
+        fun historyBackfillTargets(
+            conversation: DirectConversation,
+            roster: AuthoritativeRoster,
+        ): List<HistoryBackfillTarget> {
+            val issued = requireRoster(roster, conversation)
+            check(issued.use == RosterUse.CURRENT_OUTBOUND) {
+                "History backfill targets require a current authoritative roster"
+            }
+            return issued.validated.devices()
+                .asSequence()
+                .filter { device ->
+                    device.userId == context.currentUserId &&
+                        device.deviceId != context.currentDeviceId
+                }
+                .map { device ->
+                    HistoryBackfillTarget(
+                        deviceId = device.deviceId,
+                        enrollmentEpoch = requireNotNull(device.enrollmentEpoch) {
+                            "Current history target omitted its enrollment epoch"
+                        },
+                    )
+                }
+                .toList()
         }
 
         /** Retrieves the immutable roster that authenticated an older offline envelope. */

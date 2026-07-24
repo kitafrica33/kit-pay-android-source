@@ -1,5 +1,8 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.messaging.AccountArchivedMessage
+import com.kit.wallet.data.messaging.AccountMessageHistoryAccess
+import com.kit.wallet.data.messaging.CapturedAccountMessageHistory
 import com.kit.wallet.data.messaging.FailClosedSecureMessagingCryptoTransaction
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
@@ -29,11 +32,13 @@ import com.kit.wallet.data.messaging.SecureMessagingEventProcessor
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotification
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotificationSink
 import com.kit.wallet.data.messaging.SecureMessagingHistoryBackfillCodec
+import com.kit.wallet.data.messaging.SecureMessagingHistoryContinuationScheduler
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGate
 import com.kit.wallet.data.messaging.SecureMessagingNotificationPublicationException
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
+import com.kit.wallet.data.messaging.SecureMessagingProjectedMessage
 import com.kit.wallet.data.messaging.SecureMessagingPreparedEnvelope
 import com.kit.wallet.data.messaging.SecureMessagingPreparedFanout
 import com.kit.wallet.data.messaging.SecureMessagingProvisioningPlan
@@ -73,6 +78,8 @@ import com.kit.wallet.data.remote.MessageDeliveryAcknowledgementDto
 import com.kit.wallet.data.remote.MessageDeliveryReceiptDto
 import com.kit.wallet.data.remote.MessagingDeviceRosterDto
 import com.kit.wallet.data.remote.MessagingDeviceRosterEntryDto
+import com.kit.wallet.data.remote.MessagingHistoryBackfillCandidatesDto
+import com.kit.wallet.data.remote.MessagingHistoryTargetCryptoBundleDto
 import com.kit.wallet.data.remote.MessagingSignedPrekeyDto
 import com.kit.wallet.data.remote.MessagingSyncDto
 import com.kit.wallet.data.remote.MessagingSyncEventDataDto
@@ -94,6 +101,7 @@ import java.time.ZoneOffset
 import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -1675,14 +1683,136 @@ class SecureMessagingEventProcessorTest {
         assertEquals(1, projections.pendingHistoryBackfills(limit = 4).size)
 
         lifecycle.finishActivation(fence)
+        val roster = historyTransferRoster(donorEnrollmentEpoch = 2)
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
         server.enqueue(apiErrorResponse(503, "TEMPORARY_FAILURE"))
         processor.recoverPendingHistory(session)
         assertEquals(1, projections.pendingHistoryBackfills(limit = 4).size)
 
-        server.enqueue(jsonResponse("""{"ok":true,"data":{"items":[]}}"""))
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueEmptyHistoryCandidates(
+            roster = roster,
+            targetDeviceId = OWN_DONOR_DEVICE_ID,
+            targetEnrollmentEpoch = 2,
+        )
         processor.recoverPendingHistory(session)
         assertTrue(projections.pendingHistoryBackfills(limit = 4).isEmpty())
     }
+
+    @Test
+    fun `current roster creates history work after an old client already consumed enrollment`() =
+        runTest {
+            val (session, lifecycle, fence) = openSyncingSession()
+            recordCurrentIdentity(session)
+            lifecycle.finishActivation(fence)
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val continuationDelays = mutableListOf<Long>()
+            val processor = processor(
+                stateStore = stateStore,
+                crypto = PersistingDecryptionEngine(stateStore),
+                projections = projections,
+                historyContinuationScheduler = SecureMessagingHistoryContinuationScheduler(
+                    continuationDelays::add,
+                ),
+            )
+            val roster = historyTransferRoster()
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            enqueueRoster(roster)
+            server.enqueue(apiErrorResponse(503, "TEMPORARY_FAILURE"))
+
+            // No sync event is supplied: this is the upgrade case after the old client persisted
+            // a cursor beyond device.enrolled.
+            processor.recoverPendingHistory(session)
+
+            val task = projections.pendingHistoryBackfills(limit = 1).single()
+            assertEquals(CONVERSATION_ID, task.conversationId)
+            assertEquals(OWN_DONOR_DEVICE_ID, task.targetDeviceId)
+            assertEquals(5L, task.targetEnrollmentEpoch)
+            assertEquals(listOf(30_000L), continuationDelays)
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/conversations",
+                server.takeRequest().path,
+            )
+            assertTrue(server.takeRequest().path?.endsWith("/device-roster") == true)
+            val candidates = server.takeRequest().path.orEmpty()
+            assertTrue(candidates.contains("/history-backfill/candidates"))
+            assertTrue(candidates.contains("target_enrollment_epoch=5"))
+        }
+
+    @Test
+    fun `archive restoration precedes roster reconciliation and reopens a completed task`() =
+        runTest {
+            val (session, lifecycle, fence) = openSyncingSession()
+            recordCurrentIdentity(session)
+            lifecycle.finishActivation(fence)
+            val archiveRestored = AtomicBoolean(false)
+            val rosterObservedAfterRestore = AtomicBoolean(false)
+            val historyArchive = object : AccountMessageHistoryAccess {
+                override fun capture(
+                    expectedOwnerAccountId: String,
+                    expectedSessionFence: SessionFence?,
+                ): CapturedAccountMessageHistory = object : CapturedAccountMessageHistory {
+                    override suspend fun archive(projected: SecureMessagingProjectedMessage) = Unit
+
+                    override suspend fun readAll(): List<AccountArchivedMessage> {
+                        archiveRestored.set(true)
+                        return emptyList()
+                    }
+
+                    override suspend fun readAllAndMaterialize(
+                        materialize: suspend (List<AccountArchivedMessage>) -> Unit,
+                    ) {
+                        archiveRestored.set(true)
+                        materialize(emptyList())
+                    }
+                }
+            }
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = SecureMessagingProjectionStore(
+                stateStore,
+                LibSignalCompanionStateReader(stateStore),
+                historyArchive,
+            )
+            projections.enqueueHistoryBackfill(CONVERSATION_ID, OWN_DONOR_DEVICE_ID, 5)
+            projections.updateHistoryBackfill(
+                projections.pendingHistoryBackfills(limit = 1).single(),
+                nextCursor = null,
+                completed = true,
+            )
+            assertTrue(projections.pendingHistoryBackfills(limit = 1).isEmpty())
+            val processor = processor(
+                stateStore,
+                PersistingDecryptionEngine(stateStore),
+                projections,
+            )
+            val roster = historyTransferRoster()
+            val encodedRoster = moshi.adapter(MessagingDeviceRosterDto::class.java).toJson(roster)
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when {
+                    request.path == "/api/kit-wallet/v1/messaging/conversations" ->
+                        jsonResponse(DIRECT_CONVERSATIONS)
+                    request.path?.endsWith("/device-roster") == true -> {
+                        rosterObservedAfterRestore.set(archiveRestored.get())
+                        jsonResponse("""{"ok":true,"data":$encodedRoster}""")
+                    }
+                    request.path?.contains("/history-backfill/candidates") == true ->
+                        apiErrorResponse(503, "TEMPORARY_FAILURE")
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            processor.recoverPendingHistory(session)
+
+            assertTrue(archiveRestored.get())
+            assertTrue(rosterObservedAfterRestore.get())
+            val reopened = projections.pendingHistoryBackfills(limit = 1).single()
+            assertEquals(OWN_DONOR_DEVICE_ID, reopened.targetDeviceId)
+            assertEquals(5L, reopened.targetEnrollmentEpoch)
+            assertEquals(null, reopened.nextCursor)
+        }
 
     @Test
     fun `stale process outbox is resent as exact committed ciphertext after sync reconciliation`() =
@@ -2137,12 +2267,15 @@ class SecureMessagingEventProcessorTest {
             com.kit.wallet.data.messaging.NoOpSecureMessagingIncomingNotificationSink,
         currentActivationRevocation: SecureMessagingCurrentActivationRevocation =
             com.kit.wallet.data.messaging.NoOpSecureMessagingCurrentActivationRevocation,
+        historyContinuationScheduler: SecureMessagingHistoryContinuationScheduler =
+            SecureMessagingHistoryContinuationScheduler { },
     ) = SecureMessagingEventProcessor(
         crypto,
         projections,
         SecureMessagingSyncCursorStore(stateStore),
         notifications,
         currentActivationRevocation,
+        historyContinuationScheduler,
     )
 
     private fun projectionStore(stateStore: SecureMessagingStateStore) =
@@ -2156,6 +2289,34 @@ class SecureMessagingEventProcessorTest {
 
     private fun enqueueRoster(roster: MessagingDeviceRosterDto) {
         val encoded = moshi.adapter(MessagingDeviceRosterDto::class.java).toJson(roster)
+        server.enqueue(jsonResponse("""{"ok":true,"data":$encoded}"""))
+    }
+
+    private fun enqueueEmptyHistoryCandidates(
+        roster: MessagingDeviceRosterDto,
+        targetDeviceId: String,
+        targetEnrollmentEpoch: Long,
+    ) {
+        val target = roster.devices.orEmpty().filterNotNull()
+            .single { it.deviceId == targetDeviceId }
+        val response = MessagingHistoryBackfillCandidatesDto(
+            conversationId = CONVERSATION_ID,
+            rosterRevision = roster.rosterRevision,
+            targetCryptoBundle = MessagingHistoryTargetCryptoBundleDto(
+                deviceId = targetDeviceId,
+                userId = target.userId,
+                enrollmentEpoch = targetEnrollmentEpoch,
+                signalDeviceId = target.signalDeviceId,
+                registrationId = target.registrationId,
+                protocolVersion = target.protocolVersion,
+                bundleVersion = target.bundleVersion,
+                identityKeySha256 = target.identityKeySha256,
+            ),
+            messages = emptyList(),
+            page = CursorPageDto(nextCursor = null, hasMore = false, limit = 50),
+        )
+        val encoded = moshi.adapter(MessagingHistoryBackfillCandidatesDto::class.java)
+            .toJson(response)
         server.enqueue(jsonResponse("""{"ok":true,"data":$encoded}"""))
     }
 
@@ -2637,8 +2798,22 @@ class SecureMessagingEventProcessorTest {
 
     private fun authoritativeRoster(): MessagingDeviceRosterDto {
         val devices = listOf(
-            rosterDevice(CURRENT_DEVICE_ID, CURRENT_USER_ID, 1, 42, 0x11),
-            rosterDevice(PEER_DEVICE_ID, PEER_USER_ID, 2, 43, 0x21),
+            rosterDevice(
+                CURRENT_DEVICE_ID,
+                CURRENT_USER_ID,
+                1,
+                42,
+                0x11,
+                enrollmentEpoch = 1,
+            ),
+            rosterDevice(
+                PEER_DEVICE_ID,
+                PEER_USER_ID,
+                2,
+                43,
+                0x21,
+                enrollmentEpoch = 3,
+            ),
         )
         val hash = sha256(canonicalRosterBytes(devices))
         return MessagingDeviceRosterDto(
@@ -2650,11 +2825,32 @@ class SecureMessagingEventProcessorTest {
         )
     }
 
-    private fun historyTransferRoster(): MessagingDeviceRosterDto {
+    private fun historyTransferRoster(donorEnrollmentEpoch: Long = 5): MessagingDeviceRosterDto {
         val devices = listOf(
-            rosterDevice(CURRENT_DEVICE_ID, CURRENT_USER_ID, 1, 42, 0x11),
-            rosterDevice(OWN_DONOR_DEVICE_ID, CURRENT_USER_ID, 3, 44, 0x31),
-            rosterDevice(PEER_DEVICE_ID, PEER_USER_ID, 2, 43, 0x21),
+            rosterDevice(
+                CURRENT_DEVICE_ID,
+                CURRENT_USER_ID,
+                1,
+                42,
+                0x11,
+                enrollmentEpoch = 1,
+            ),
+            rosterDevice(
+                OWN_DONOR_DEVICE_ID,
+                CURRENT_USER_ID,
+                3,
+                44,
+                0x31,
+                enrollmentEpoch = donorEnrollmentEpoch,
+            ),
+            rosterDevice(
+                PEER_DEVICE_ID,
+                PEER_USER_ID,
+                2,
+                43,
+                0x21,
+                enrollmentEpoch = 3,
+            ),
         )
         val hash = sha256(canonicalRosterBytes(devices))
         return MessagingDeviceRosterDto(
@@ -2672,11 +2868,13 @@ class SecureMessagingEventProcessorTest {
         signalDeviceId: Int,
         registrationId: Int,
         seed: Int,
+        enrollmentEpoch: Long? = null,
     ): MessagingDeviceRosterEntryDto {
         val identityKey = signalValue(5, seed, 33)
         val signedKey = signalValue(5, seed + 1, 33)
         return MessagingDeviceRosterEntryDto(
             deviceId = deviceId,
+            enrollmentEpoch = enrollmentEpoch,
             signalDeviceId = signalDeviceId,
             userId = userId,
             registrationId = registrationId,

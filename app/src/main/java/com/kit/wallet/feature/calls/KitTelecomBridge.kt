@@ -37,8 +37,12 @@ class KitTelecomBridge @Inject constructor(
         ComponentName(context, KitCallConnectionService::class.java),
         ACCOUNT_ID,
     )
-    private val lock = Any()
-    private val calls = mutableMapOf<String, TrackedCall>()
+    private val calls = TerminalAwareTelecomCallRegistry<
+        TelecomCallMetadata,
+        TelecomCallState,
+        KitTelecomConnection,
+        KitTelecomDisconnect,
+    >()
 
     fun registerPhoneAccount(): Boolean {
         if (!context.packageManager.hasSystemFeature(PackageManager.FEATURE_TELECOM)) return false
@@ -72,7 +76,11 @@ class KitTelecomBridge @Inject constructor(
             runCatching { telecom.isOutgoingCallPermitted(accountHandle) }.getOrDefault(false)
         if (!permitted) return
         val metadata = TelecomCallMetadata(callId, name, phone, video, incoming = false)
-        synchronized(lock) { calls[callId] = TrackedCall(metadata, TelecomCallState.DIALING) }
+        val tracked = calls.track(callId, metadata, TelecomCallState.DIALING) ?: return
+        if (tracked.alreadyTracked) {
+            tracked.call.connection?.applyPresentation(metadata)
+            return
+        }
         val customExtras = metadata.toBundle()
         val extras = Bundle().apply {
             putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, accountHandle)
@@ -80,7 +88,7 @@ class KitTelecomBridge @Inject constructor(
             putBundle(TelecomManager.EXTRA_OUTGOING_CALL_EXTRAS, customExtras)
         }
         if (!placeSelfManagedCall(metadata.address, extras)) {
-            synchronized(lock) { calls.remove(callId) }
+            registrationFailed(callId)
         }
     }
 
@@ -110,14 +118,9 @@ class KitTelecomBridge @Inject constructor(
             runCatching { telecom.isIncomingCallPermitted(accountHandle) }.getOrDefault(false)
         if (!permitted) return
         val metadata = TelecomCallMetadata(callId, name, phone, video, incoming = true)
-        val (alreadyTracked, existingConnection) = synchronized(lock) {
-            val previous = calls[callId]
-            calls[callId] = previous?.copy(metadata = metadata)
-                ?: TrackedCall(metadata, TelecomCallState.RINGING)
-            (previous != null) to previous?.connection
-        }
-        if (alreadyTracked) {
-            existingConnection?.applyPresentation(metadata)
+        val tracked = calls.track(callId, metadata, TelecomCallState.RINGING) ?: return
+        if (tracked.alreadyTracked) {
+            tracked.call.connection?.applyPresentation(metadata)
             return
         }
         val extras = metadata.toBundle().apply {
@@ -125,47 +128,55 @@ class KitTelecomBridge @Inject constructor(
             putInt(TelecomManager.EXTRA_INCOMING_VIDEO_STATE, metadata.videoState)
         }
         runCatching { telecom.addNewIncomingCall(accountHandle, extras) }
-            .onFailure { synchronized(lock) { calls.remove(callId) } }
+            .onFailure { registrationFailed(callId) }
     }
 
     fun updatePresentation(callId: String, name: String, phone: String?, video: Boolean) {
-        val metadata = synchronized(lock) {
-            val current = calls[callId] ?: return
-            val updated = current.metadata.copy(name = name, phone = phone, video = video)
-            calls[callId] = current.copy(metadata = updated)
-            updated
-        }
-        synchronized(lock) { calls[callId]?.connection }?.applyPresentation(metadata)
+        calls.updateMetadata(
+            callId = callId,
+            transform = { metadata ->
+                metadata.copy(name = name, phone = phone, video = video)
+            },
+            applyToConnection = { connection, metadata ->
+                connection.applyPresentation(metadata)
+            },
+        )
     }
 
-    fun markConnecting(callId: String) = updateState(callId, TelecomCallState.DIALING)
+    fun markConnecting(callId: String) {
+        updateState(callId, TelecomCallState.DIALING)
+    }
 
-    fun markActive(callId: String) = updateState(callId, TelecomCallState.ACTIVE)
+    fun markActive(callId: String) {
+        updateState(callId, TelecomCallState.ACTIVE)
+    }
 
     fun finish(callId: String, disconnect: KitTelecomDisconnect) {
-        val tracked = synchronized(lock) { calls.remove(callId) } ?: return
-        tracked.connection?.complete(disconnect.cause)
+        val tracked = calls.finish(callId, disconnect)
+        tracked?.connection?.complete(disconnect.cause)
+    }
+
+    private fun registrationFailed(callId: String) {
+        val tracked = calls.registrationFailed(callId, KitTelecomDisconnect.ERROR)
+        tracked?.connection?.complete(KitTelecomDisconnect.ERROR.cause)
     }
 
     internal fun createConnection(request: ConnectionRequest, incoming: Boolean): Connection {
         val metadata = TelecomCallMetadata.fromRequest(request, incoming)
             ?: return Connection.createFailedConnection(DisconnectCause(DisconnectCause.ERROR))
-        val tracked = synchronized(lock) {
-            val existing = calls[metadata.callId]
-            val next = (existing ?: TrackedCall(
-                metadata,
-                if (incoming) TelecomCallState.RINGING else TelecomCallState.DIALING,
-            )).copy(metadata = metadata)
-            calls[metadata.callId] = next
-            next
+        val resolution = calls.attachConnection(
+            callId = metadata.callId,
+            metadata = metadata,
+            initialState = if (incoming) TelecomCallState.RINGING else TelecomCallState.DIALING,
+            createConnection = { KitTelecomConnection(metadata, this) },
+            prepareLiveConnection = { liveConnection, state ->
+                liveConnection.applyState(state)
+            },
+        )
+        resolution.terminalDisconnect?.let { disconnect ->
+            return Connection.createFailedConnection(disconnect.cause)
         }
-        val connection = KitTelecomConnection(metadata, this)
-        synchronized(lock) {
-            val current = calls[metadata.callId] ?: return Connection.createCanceledConnection()
-            calls[metadata.callId] = current.copy(connection = connection)
-        }
-        connection.applyState(tracked.state)
-        return connection
+        return checkNotNull(resolution.liveCall?.connection)
     }
 
     internal fun systemAnswered(callId: String) {
@@ -179,12 +190,12 @@ class KitTelecomBridge @Inject constructor(
     }
 
     internal fun systemDeclined(callId: String) {
-        synchronized(lock) { calls.remove(callId) }
+        calls.finish(callId, KitTelecomDisconnect.REJECTED)
         runCatching { context.sendBroadcast(CallActionReceiver.declineIntent(context, callId)) }
     }
 
     internal fun systemDisconnected(callId: String) {
-        val tracked = synchronized(lock) { calls.remove(callId) } ?: return
+        val tracked = calls.finish(callId, KitTelecomDisconnect.LOCAL) ?: return
         val intent = if (tracked.metadata.incoming && tracked.state == TelecomCallState.RINGING) {
             CallActionReceiver.declineIntent(context, callId)
         } else {
@@ -194,19 +205,14 @@ class KitTelecomBridge @Inject constructor(
     }
 
     private fun updateState(callId: String, state: TelecomCallState) {
-        val connection = synchronized(lock) {
-            val current = calls[callId] ?: return
-            calls[callId] = current.copy(state = state)
-            current.connection
-        }
-        connection?.applyState(state)
+        calls.updateState(
+            callId = callId,
+            state = state,
+            applyToConnection = { connection, updatedState ->
+                connection.applyState(updatedState)
+            },
+        )
     }
-
-    private data class TrackedCall(
-        val metadata: TelecomCallMetadata,
-        val state: TelecomCallState,
-        val connection: KitTelecomConnection? = null,
-    )
 
     private companion object {
         const val ACCOUNT_ID = "kit-pay-self-managed-v1"

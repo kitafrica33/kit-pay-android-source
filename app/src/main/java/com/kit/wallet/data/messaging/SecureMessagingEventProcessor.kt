@@ -1,8 +1,10 @@
 package com.kit.wallet.data.messaging
 
+import androidx.annotation.VisibleForTesting
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
 import com.kit.wallet.data.remote.KitWalletApiException
+import java.io.IOException
 import java.time.Instant
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -11,6 +13,74 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+
+fun interface SecureMessagingHistoryContinuationScheduler {
+    fun schedule(delayMillis: Long)
+}
+
+internal object NoOpSecureMessagingHistoryContinuationScheduler :
+    SecureMessagingHistoryContinuationScheduler {
+    override fun schedule(delayMillis: Long) = Unit
+}
+
+@VisibleForTesting
+internal data class SecureMessagingHistoryDrainResult(
+    val workUnits: Int,
+    val madeProgress: Boolean,
+    val hadFailure: Boolean,
+    val pending: Boolean,
+)
+
+/** Round-robins page-sized history work and gives every non-failing task a chance in this run. */
+@VisibleForTesting
+internal suspend fun drainSecureMessagingHistoryWork(
+    maxWorkUnits: Int,
+    batchSize: Int,
+    loadPending: suspend (limit: Int, excludedRecordKeys: Set<String>) ->
+        List<SecureMessagingHistoryBackfillTask>,
+    attempt: suspend (SecureMessagingHistoryBackfillTask) -> Boolean,
+): SecureMessagingHistoryDrainResult {
+    require(maxWorkUnits > 0)
+    require(batchSize > 0)
+    val failed = mutableSetOf<String>()
+    val deferredUntilNextRound = mutableSetOf<String>()
+    var workUnits = 0
+    var madeProgress = false
+
+    while (workUnits < maxWorkUnits) {
+        val tasks = loadPending(
+            minOf(batchSize, maxWorkUnits - workUnits),
+            failed + deferredUntilNextRound,
+        )
+        if (tasks.isEmpty()) {
+            if (deferredUntilNextRound.isEmpty() ||
+                loadPending(1, failed).isEmpty()
+            ) {
+                break
+            }
+            deferredUntilNextRound.clear()
+            continue
+        }
+        tasks.forEach { task ->
+            if (workUnits == maxWorkUnits) return@forEach
+            workUnits++
+            if (attempt(task)) {
+                madeProgress = true
+                deferredUntilNextRound += task.recordKey
+            } else {
+                failed += task.recordKey
+                deferredUntilNextRound -= task.recordKey
+            }
+        }
+    }
+
+    return SecureMessagingHistoryDrainResult(
+        workUnits = workUnits,
+        madeProgress = madeProgress,
+        hadFailure = failed.isNotEmpty(),
+        pending = loadPending(1, emptySet()).isNotEmpty(),
+    )
+}
 
 /**
  * Serial, crash-safe consumer for the validated encrypted event stream.
@@ -29,6 +99,8 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     @Suppress("UNUSED_PARAMETER")
     currentActivationRevocation: SecureMessagingCurrentActivationRevocation =
         NoOpSecureMessagingCurrentActivationRevocation,
+    private val historyContinuationScheduler: SecureMessagingHistoryContinuationScheduler =
+        NoOpSecureMessagingHistoryContinuationScheduler,
 ) {
     private class SessionState(
         val session: RemoteSecureMessagingTransport.Session,
@@ -88,6 +160,8 @@ internal class SecureMessagingEventProcessor @Inject constructor(
 
     private val mutex = Mutex()
     private var currentState: SessionState? = null
+    private var historyPreparedActivation: SecureMessagingActivationCapability? = null
+    private var historyReconciledActivation: SecureMessagingActivationCapability? = null
 
     private suspend fun <T> RemoteSecureMessagingTransport.Session.withProjectionLease(
         operation: suspend SecureMessagingProjectionStore.() -> T,
@@ -228,50 +302,146 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     }
 
     /**
-     * Advances a bounded amount of durable history work after ordinary sync is safely committed.
-     * History failures remain pending and never hold the live message cursor or current outbox.
+     * Restores retained sources first, reconciles every current same-account target, then advances
+     * bounded round-robin history work after ordinary sync is safely committed. Failures remain
+     * pending without starving later conversations or holding the live cursor/current outbox.
      */
     suspend fun recoverPendingHistory(
         session: RemoteSecureMessagingTransport.Session,
     ) = mutex.withLock {
-        val pending = try {
-            session.withProjectionLease { pendingHistoryBackfills(MAX_HISTORY_TASKS_PER_RUN) }
+        val conversations = try {
+            session.directConversations()
+                .associateBy(RemoteSecureMessagingTransport.Session.DirectConversation::conversationId)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
             if (isRecoverableSecureMessagingStateLoss(error)) throw error
             return@withLock
         }
-        pending.forEach { task ->
-            try {
-                backfillRetainedHistory(session, task)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (changed: SecureMessagingAuthenticationEpochChangedException) {
-                throw changed
-            } catch (error: KitWalletApiException) {
-                if (error.code in TERMINAL_HISTORY_TASK_CODES) {
-                    updateHistoryTaskBestEffort(
-                        session,
-                        task,
-                        nextCursor = null,
-                        completed = true,
-                    )
-                } else if (error.code == HISTORY_CURSOR_INVALID) {
-                    updateHistoryTaskBestEffort(
-                        session,
-                        task,
-                        nextCursor = null,
-                        completed = false,
+
+        if (!prepareHistorySources(session, conversations.keys)) return@withLock
+        val rosters = reconcileHistoryTargets(session, conversations).toMutableMap()
+        val result = drainSecureMessagingHistoryWork(
+            maxWorkUnits = MAX_HISTORY_WORK_UNITS_PER_RUN,
+            batchSize = MAX_HISTORY_TASKS_PER_BATCH,
+            loadPending = { limit, excluded ->
+                session.withProjectionLease {
+                    pendingHistoryBackfills(limit, excluded)
+                }
+            },
+            attempt = { task ->
+                attemptHistoryTask(session, task, conversations, rosters)
+            },
+        )
+        if (result.pending) {
+            scheduleHistoryContinuation(
+                if (result.madeProgress) 0L else HISTORY_FAILURE_RETRY_DELAY_MILLIS,
+            )
+        }
+    }
+
+    private suspend fun prepareHistorySources(
+        session: RemoteSecureMessagingTransport.Session,
+        allowedConversationIds: Set<String>,
+    ): Boolean {
+        val activation = session.activationCapability()
+        if (historyPreparedActivation === activation) return true
+        try {
+            projections.restoreArchivedHistory(
+                activation = activation,
+                currentUserId = session.binding.userId,
+                allowedConversationIds = allowedConversationIds,
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            if (isRetryableHistoryArchiveRestoreFailure(error)) {
+                scheduleHistoryContinuation(HISTORY_FAILURE_RETRY_DELAY_MILLIS)
+                return false
+            }
+            // A permanently missing/corrupt optional display archive has no recoverable source.
+            // Continue with any live retained projections rather than blocking ordinary messaging.
+        }
+        historyPreparedActivation = activation
+        return true
+    }
+
+    private suspend fun reconcileHistoryTargets(
+        session: RemoteSecureMessagingTransport.Session,
+        conversations: Map<String, RemoteSecureMessagingTransport.Session.DirectConversation>,
+    ): Map<String, RemoteSecureMessagingTransport.Session.AuthoritativeRoster> {
+        val activation = session.activationCapability()
+        if (historyReconciledActivation === activation) return emptyMap()
+        val rosters = mutableMapOf<String, RemoteSecureMessagingTransport.Session.AuthoritativeRoster>()
+        conversations.values.forEach { conversation ->
+            val roster = session.roster(conversation)
+            rosters[conversation.conversationId] = roster
+            session.historyBackfillTargets(conversation, roster).forEach { target ->
+                session.withProjectionLease {
+                    enqueueHistoryBackfill(
+                        conversationId = conversation.conversationId,
+                        targetDeviceId = target.deviceId,
+                        targetEnrollmentEpoch = target.enrollmentEpoch,
+                        // Code 20 could complete this before the account archive was restored.
+                        reopenCompleted = true,
                     )
                 }
-                // Retry every other remote failure on a later sync. The ordinary stream and
-                // outbox have already completed before this best-effort stage begins.
-            } catch (error: Exception) {
-                if (isRecoverableSecureMessagingStateLoss(error)) throw error
-                // Malformed retained history, target-only crypto failures, state contention and
-                // transport validation are isolated to this durable task and retried later.
             }
+        }
+        historyReconciledActivation = activation
+        return rosters
+    }
+
+    private suspend fun attemptHistoryTask(
+        session: RemoteSecureMessagingTransport.Session,
+        task: SecureMessagingHistoryBackfillTask,
+        conversations: Map<String, RemoteSecureMessagingTransport.Session.DirectConversation>,
+        rosters: MutableMap<String, RemoteSecureMessagingTransport.Session.AuthoritativeRoster>,
+    ): Boolean = try {
+        backfillRetainedHistoryPage(session, task, conversations, rosters)
+        true
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (changed: SecureMessagingAuthenticationEpochChangedException) {
+        throw changed
+    } catch (error: KitWalletApiException) {
+        when {
+            error.code in TERMINAL_HISTORY_TASK_CODES -> {
+                updateHistoryTaskBestEffort(
+                    session,
+                    task,
+                    nextCursor = null,
+                    completed = true,
+                )
+                true
+            }
+            error.code == HISTORY_CURSOR_INVALID && task.nextCursor != null -> {
+                updateHistoryTaskBestEffort(
+                    session,
+                    task,
+                    nextCursor = null,
+                    completed = false,
+                )
+                true
+            }
+            else -> false
+        }
+    } catch (error: Exception) {
+        if (isRecoverableSecureMessagingStateLoss(error)) throw error
+        false
+    }
+
+    private fun scheduleHistoryContinuation(delayMillis: Long) {
+        runCatching { historyContinuationScheduler.schedule(delayMillis) }
+    }
+
+    private fun isRetryableHistoryArchiveRestoreFailure(error: Throwable): Boolean {
+        val causes = generateSequence(error) { it.cause }.toList()
+        if (error.hasPermanentlyMissingAccountMessageArchiveKey()) return false
+        return causes.any {
+            it is AccountMessageArchiveKeyUnavailableException ||
+                it is AccountMessageArchiveConflictException ||
+                it is IOException
         }
     }
 
@@ -452,99 +622,98 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         }
     }
 
-    private suspend fun backfillRetainedHistory(
+    private suspend fun backfillRetainedHistoryPage(
         session: RemoteSecureMessagingTransport.Session,
-        initialTask: SecureMessagingHistoryBackfillTask,
+        task: SecureMessagingHistoryBackfillTask,
+        conversations: Map<String, RemoteSecureMessagingTransport.Session.DirectConversation>,
+        rosters: MutableMap<String, RemoteSecureMessagingTransport.Session.AuthoritativeRoster>,
     ) {
-        val conversations = session.directConversations()
-            .associateBy(RemoteSecureMessagingTransport.Session.DirectConversation::conversationId)
-        val conversation = conversations[initialTask.conversationId]
+        val conversation = conversations[task.conversationId]
         if (conversation == null) {
             session.withProjectionLease {
-                updateHistoryBackfill(initialTask, nextCursor = null, completed = true)
+                updateHistoryBackfill(task, nextCursor = null, completed = true)
             }
             return
         }
-        val roster = session.roster(conversation)
-        var task = initialTask
-        repeat(MAX_HISTORY_PAGES_PER_RUN) {
-            val page = session.historyBackfillCandidates(
-                conversation = conversation,
-                roster = roster,
+        val roster = rosters[task.conversationId] ?: session.roster(conversation).also {
+            rosters[task.conversationId] = it
+        }
+        val page = session.historyBackfillCandidates(
+            conversation = conversation,
+            roster = roster,
+            targetDeviceId = task.targetDeviceId,
+            targetEnrollmentEpoch = task.targetEnrollmentEpoch,
+            after = task.nextCursor,
+            limit = HISTORY_PAGE_SIZE,
+        )
+        val plan = session.historyBackfillEncryptionPlan(conversation, roster, page)
+        page.candidates().forEach { candidate ->
+            val projected = session.withProjectionLease {
+                retainedHistorySource(
+                    messageId = candidate.messageId,
+                    clientMessageId = candidate.clientMessageId,
+                )
+            } ?: return@forEach
+            val transferId = SecureMessagingHistoryBackfillCodec.deterministicTransferId(
+                messageId = candidate.messageId,
                 targetDeviceId = task.targetDeviceId,
                 targetEnrollmentEpoch = task.targetEnrollmentEpoch,
-                after = task.nextCursor,
-                limit = HISTORY_PAGE_SIZE,
+                donorDeviceId = session.binding.serverDeviceId,
+                donorEnrollmentEpoch = session
+                    .reconciledKeyIdentityResetTarget()
+                    .enrollmentEpoch,
+                transferRosterRevision = page.rosterRevision,
             )
-            val plan = session.historyBackfillEncryptionPlan(conversation, roster, page)
-            page.candidates().forEach { candidate ->
-                val projected = session.withProjectionLease {
-                    retainedHistorySource(
-                        messageId = candidate.messageId,
-                        clientMessageId = candidate.clientMessageId,
-                    )
-                } ?: return@forEach
-                val transferId = SecureMessagingHistoryBackfillCodec.deterministicTransferId(
-                    messageId = candidate.messageId,
-                    targetDeviceId = task.targetDeviceId,
-                    targetEnrollmentEpoch = task.targetEnrollmentEpoch,
-                    donorDeviceId = session.binding.serverDeviceId,
-                    donorEnrollmentEpoch = session
-                        .reconciledKeyIdentityResetTarget()
-                        .enrollmentEpoch,
-                    transferRosterRevision = page.rosterRevision,
-                )
-                val encrypted = session.withProjectionLease {
-                    readHistoryOutbound(transferId)
-                }?.let { durable ->
-                    SecureMessagingCryptoWireMapper.retryEncryption(durable, plan)
-                } ?: run {
-                    val descriptor = try {
-                        SecureMessagingHistoryBackfillCodec.encode(
-                            transferClientMessageId = transferId,
-                            targetDeviceId = task.targetDeviceId,
-                            targetEnrollmentEpoch = task.targetEnrollmentEpoch,
-                            transferRosterRevision = page.rosterRevision,
-                            candidate = candidate,
-                            projected = projected,
-                        )
-                    } catch (_: IllegalArgumentException) {
-                        return@forEach
-                    } catch (_: IllegalStateException) {
-                        return@forEach
-                    }
-                    commitHistoryEncryption(
-                        session = session,
-                        conversation = conversation,
-                        roster = roster,
-                        plan = plan,
+            val encrypted = session.withProjectionLease {
+                readHistoryOutbound(transferId)
+            }?.let { durable ->
+                SecureMessagingCryptoWireMapper.retryEncryption(durable, plan)
+            } ?: run {
+                val descriptor = try {
+                    SecureMessagingHistoryBackfillCodec.encode(
                         transferClientMessageId = transferId,
-                        descriptor = descriptor,
+                        targetDeviceId = task.targetDeviceId,
+                        targetEnrollmentEpoch = task.targetEnrollmentEpoch,
+                        transferRosterRevision = page.rosterRevision,
+                        candidate = candidate,
+                        projected = projected,
                     )
+                } catch (_: IllegalArgumentException) {
+                    return@forEach
+                } catch (_: IllegalStateException) {
+                    return@forEach
                 }
-                session.storeHistoryEnvelope(
+                commitHistoryEncryption(
                     conversation = conversation,
                     roster = roster,
-                    page = page,
-                    candidate = candidate,
-                    encryptedSend = encrypted,
+                    session = session,
+                    plan = plan,
+                    transferClientMessageId = transferId,
+                    descriptor = descriptor,
                 )
             }
-            if (!page.hasMore) {
-                session.withProjectionLease {
-                    updateHistoryBackfill(task, nextCursor = null, completed = true)
-                }
-                return
+            session.storeHistoryEnvelope(
+                conversation = conversation,
+                roster = roster,
+                page = page,
+                candidate = candidate,
+                encryptedSend = encrypted,
+            )
+        }
+        if (!page.hasMore) {
+            session.withProjectionLease {
+                updateHistoryBackfill(task, nextCursor = null, completed = true)
             }
-            val next = checkNotNull(page.nextAfter) {
-                "History candidate page omitted its continuation"
-            }
-            check(task.nextCursor == null || next != task.nextCursor) {
-                "History candidate pagination did not advance"
-            }
-            task = session.withProjectionLease {
-                updateHistoryBackfill(task, nextCursor = next, completed = false)
-            }
+            return
+        }
+        val next = checkNotNull(page.nextAfter) {
+            "History candidate page omitted its continuation"
+        }
+        check(task.nextCursor == null || next != task.nextCursor) {
+            "History candidate pagination did not advance"
+        }
+        session.withProjectionLease {
+            updateHistoryBackfill(task, nextCursor = next, completed = false)
         }
     }
 
@@ -1020,8 +1189,9 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         const val OUTBOX_PAGE_SIZE = 100
         const val MAX_OUTBOX_PAGES = 100
         const val HISTORY_PAGE_SIZE = 50
-        const val MAX_HISTORY_PAGES_PER_RUN = 4
-        const val MAX_HISTORY_TASKS_PER_RUN = 4
+        const val MAX_HISTORY_TASKS_PER_BATCH = 4
+        const val MAX_HISTORY_WORK_UNITS_PER_RUN = 16
+        const val HISTORY_FAILURE_RETRY_DELAY_MILLIS = 30_000L
         const val DEVICE_REVOKED_EVENT = "device.revoked"
         const val DEVICE_ENROLLED_EVENT = "device.enrolled"
         const val ALL_DEVICES_REVOKED_EVENT = "devices.revoked"

@@ -16,7 +16,9 @@ import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.CallConnection
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ContactRepository
+import com.kit.wallet.data.repository.IncomingCallDetails
 import com.kit.wallet.data.repository.initialCallPresentation
+import com.kit.wallet.data.repository.resolveCallPresentation
 import com.kit.wallet.data.repository.resolveRoomParticipantName
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.ui.model.Contact
@@ -68,6 +70,8 @@ data class RemoteCallParticipant(
     val name: String,
     val videoTrack: VideoTrack? = null,
     val speaking: Boolean = false,
+    /** Stable backend/LiveKit fallback used if a saved contact is renamed or removed. */
+    val serverName: String? = name,
 )
 
 /** A second call ringing in while this call is connected (call-waiting). */
@@ -76,6 +80,8 @@ data class WaitingCall(
     val name: String,
     val video: Boolean,
     val callerUserId: String?,
+    /** Stable fallback; [name] may change whenever the address book changes. */
+    val serverName: String = name,
 )
 
 data class ActiveCallUiState(
@@ -100,6 +106,98 @@ data class ActiveCallUiState(
 
     /** True once more than one other participant is on the call. */
     val isGroup: Boolean get() = remoteParticipants.size > 1
+}
+
+internal data class ActiveCallContactPresentationSource(
+    val callId: String?,
+    val serverName: String?,
+    val participantUserIds: List<String>,
+    val fallbackPhone: String? = null,
+)
+
+internal data class TelecomPresentationUpdate(
+    val callId: String,
+    val name: String,
+    val phone: String?,
+    val video: Boolean,
+)
+
+internal data class ActiveCallContactPresentationRefresh(
+    val state: ActiveCallUiState,
+    val activeTelecom: TelecomPresentationUpdate?,
+    val waitingTelecom: TelecomPresentationUpdate?,
+)
+
+/**
+ * Re-resolves viewer-specific call labels from an already-loaded contact snapshot. This function
+ * is presentation-only: it cannot refresh/upload contacts or alter any call lifecycle state.
+ */
+internal fun refreshActiveCallContactPresentation(
+    state: ActiveCallUiState,
+    activeSource: ActiveCallContactPresentationSource?,
+    contacts: List<Contact>,
+): ActiveCallContactPresentationRefresh {
+    val activePresentation = activeSource?.let { source ->
+        resolveCallPresentation(
+            serverName = source.serverName,
+            participantUserIds = source.participantUserIds,
+            contacts = contacts,
+        )
+    }
+    val activePhone = activePresentation?.phone
+        ?: activeSource?.fallbackPhone?.trim()?.takeIf(String::isNotEmpty)
+
+    val waiting = state.waitingCall
+    val waitingPresentation = waiting?.let {
+        resolveCallPresentation(
+            serverName = it.serverName,
+            participantUserIds = listOfNotNull(it.callerUserId),
+            contacts = contacts,
+        )
+    }
+    val refreshedWaiting = if (waiting != null && waitingPresentation != null) {
+        waiting.copy(name = waitingPresentation.name)
+    } else {
+        waiting
+    }
+    val refreshedParticipants = state.remoteParticipants.map { participant ->
+        participant.copy(
+            name = resolveRoomParticipantName(
+                identity = participant.id,
+                serverName = participant.serverName,
+                contacts = contacts,
+            ),
+        )
+    }
+    val refreshedState = state.copy(
+        name = activePresentation?.name ?: state.name,
+        waitingCall = refreshedWaiting,
+        remoteParticipants = refreshedParticipants,
+    )
+
+    return ActiveCallContactPresentationRefresh(
+        state = refreshedState,
+        activeTelecom = activeSource?.callId?.let { callId ->
+            activePresentation?.let { presentation ->
+                TelecomPresentationUpdate(
+                    callId = callId,
+                    name = presentation.name,
+                    phone = activePhone,
+                    video = state.video,
+                )
+            }
+        },
+        waitingTelecom = if (waiting != null && waitingPresentation != null) {
+            TelecomPresentationUpdate(
+                callId = waiting.callId,
+                name = waitingPresentation.name,
+                phone = waitingPresentation.phone,
+                video = waiting.video,
+            )
+        } else {
+            null
+        },
+    )
 }
 
 @HiltViewModel
@@ -136,6 +234,7 @@ class ActiveCallViewModel @Inject constructor(
     )
 
     private var connection: CallConnection? = null
+    private var verifiedIncomingCall: IncomingCallDetails? = null
     private var validationJob: Job? = null
     private var startJob: Job? = null
     private var cleanupJob: Job? = null
@@ -150,6 +249,9 @@ class ActiveCallViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     init {
+        viewModelScope.launch {
+            contacts.contacts.collect(::applyContactPresentation)
+        }
         viewModelScope.launch {
             room.events.collect { event ->
                 when (event) {
@@ -201,6 +303,7 @@ class ActiveCallViewModel @Inject constructor(
                             callerUserId = incoming.callerUserId,
                         ),
                     )
+                    applyContactPresentation(contacts.contacts.value)
                 }
             }
         }
@@ -309,7 +412,8 @@ class ActiveCallViewModel @Inject constructor(
                     video = session.video,
                     cameraEnabled = session.video,
                 )
-                CallForegroundService.start(context, session.name, session.video)
+                applyContactPresentation(contacts.contacts.value)
+                CallForegroundService.start(context, mutableState.value.name, session.video)
                 room.connect(url = session.url, token = session.token)
                 if (terminated) {
                     room.disconnect()
@@ -494,6 +598,7 @@ class ActiveCallViewModel @Inject constructor(
                 ),
                 videoTrack = video,
                 speaking = participant.isSpeaking,
+                serverName = participant.name,
             )
         }
         val showsVideo = mutableState.value.cameraEnabled ||
@@ -503,6 +608,7 @@ class ActiveCallViewModel @Inject constructor(
             remoteParticipants = participants,
             video = showsVideo,
         )
+        applyContactPresentation(contacts.contacts.value)
     }
 
     fun flipCamera() {
@@ -534,6 +640,7 @@ class ActiveCallViewModel @Inject constructor(
     private fun validateIncomingCall() {
         val callId = incomingCallId ?: return
         if (validationJob?.isActive == true || terminated) return
+        verifiedIncomingCall = null
         // The ringing status-bar banner is owned by this screen once the user is looking at it.
         context.getSystemService(android.app.NotificationManager::class.java)?.cancel(
             CallActionReceiver.notificationTag(callId),
@@ -550,6 +657,7 @@ class ActiveCallViewModel @Inject constructor(
             try {
                 val incoming = calls.incoming(callId)
                 if (terminated) return@launch
+                verifiedIncomingCall = incoming
                 mutableState.value = mutableState.value.copy(
                     name = incoming.name,
                     video = incoming.video,
@@ -558,6 +666,7 @@ class ActiveCallViewModel @Inject constructor(
                     error = null,
                 )
                 telecom.trackIncoming(callId, incoming.name, incoming.phone, incoming.video)
+                applyContactPresentation(contacts.contacts.value)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Throwable) {
@@ -573,6 +682,54 @@ class ActiveCallViewModel @Inject constructor(
                 }
             }
         }
+    }
+
+    private fun applyContactPresentation(availableContacts: List<Contact>) {
+        if (terminated || mutableState.value.phase in setOf(CallPhase.ENDING, CallPhase.ENDED)) return
+        val refresh = refreshActiveCallContactPresentation(
+            state = mutableState.value,
+            activeSource = activeContactPresentationSource(),
+            contacts = availableContacts,
+        )
+        if (refresh.state != mutableState.value) mutableState.value = refresh.state
+        refresh.activeTelecom?.apply {
+            telecom.updatePresentation(callId, name, phone, video)
+        }
+        refresh.waitingTelecom?.apply {
+            telecom.updatePresentation(callId, name, phone, video)
+        }
+    }
+
+    private fun activeContactPresentationSource(): ActiveCallContactPresentationSource? {
+        val liveParticipantIds = mutableState.value.remoteParticipants
+            .map { it.id.substringBefore(':').trim() }
+            .filter(String::isNotEmpty)
+        connection?.let { active ->
+            return ActiveCallContactPresentationSource(
+                callId = active.callId,
+                serverName = active.name,
+                participantUserIds = (
+                    active.participantUserIds + liveParticipantIds + listOfNotNull(target)
+                ).distinctBy(String::lowercase),
+                fallbackPhone = active.phone,
+            )
+        }
+        verifiedIncomingCall?.let { incoming ->
+            return ActiveCallContactPresentationSource(
+                callId = incoming.callId,
+                serverName = incoming.name,
+                participantUserIds = (incoming.participantUserIds + liveParticipantIds)
+                    .distinctBy(String::lowercase),
+                fallbackPhone = incoming.phone,
+            )
+        }
+        if (incomingCallId != null || target == null) return null
+        return ActiveCallContactPresentationSource(
+            callId = null,
+            serverName = target,
+            participantUserIds = listOf(target),
+            fallbackPhone = initialPresentation.phone,
+        )
     }
 
     private suspend fun resolveRecipient(): String {

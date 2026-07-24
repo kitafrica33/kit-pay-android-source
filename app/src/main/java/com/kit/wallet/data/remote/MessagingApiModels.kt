@@ -156,6 +156,7 @@ data class CreateDirectMessagingConversationRequest(
 @JsonClass(generateAdapter = false)
 data class MessagingDeviceRosterEntryDto(
     @Json(name = "device_id") val deviceId: String? = null,
+    @Json(name = "enrollment_epoch") val enrollmentEpoch: Long? = null,
     @Json(name = "signal_device_id") val signalDeviceId: Int? = null,
     @Json(name = "user_id") val userId: String? = null,
     @Json(name = "registration_id") val registrationId: Int? = null,

@@ -204,6 +204,7 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         conversationId: String,
         targetDeviceId: String,
         targetEnrollmentEpoch: Long,
+        reopenCompleted: Boolean = false,
     ) {
         val key = SecureMessagingHistoryBackfillTaskCodec.recordKey(
             conversationId,
@@ -212,7 +213,18 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         )
         val existing = stateStore.read(HISTORY_TASK_NAMESPACE, key)
         if (existing != null) {
-            existing.bytes.fill(0)
+            val task = try {
+                SecureMessagingHistoryBackfillTaskCodec.decode(
+                    recordKey = existing.recordKey,
+                    recordVersion = existing.version,
+                    bytes = existing.bytes,
+                )
+            } finally {
+                existing.bytes.fill(0)
+            }
+            if (reopenCompleted && task.completed) {
+                updateHistoryBackfill(task, nextCursor = null, completed = false)
+            }
             return
         }
         val encoded = SecureMessagingHistoryBackfillTaskCodec.encode(
@@ -240,8 +252,14 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         }
     }
 
-    suspend fun pendingHistoryBackfills(limit: Int): List<SecureMessagingHistoryBackfillTask> {
+    suspend fun pendingHistoryBackfills(
+        limit: Int,
+        excludedRecordKeys: Set<String> = emptySet(),
+    ): List<SecureMessagingHistoryBackfillTask> {
         require(limit in 1..MAX_PENDING_HISTORY_TASKS) { "Invalid history-task read limit" }
+        excludedRecordKeys.forEach { key ->
+            require(key.startsWith("task:")) { "Invalid excluded history-task key" }
+        }
         val pending = mutableListOf<SecureMessagingHistoryBackfillTask>()
         var after: String? = null
         repeat(MAX_HISTORY_TASK_SCAN_PAGES) {
@@ -260,7 +278,7 @@ internal class SecureMessagingProjectionStore @Inject constructor(
                 } finally {
                     record.bytes.fill(0)
                 }
-                if (!task.completed) pending += task
+                if (!task.completed && task.recordKey !in excludedRecordKeys) pending += task
                 if (pending.size == limit) return pending
             }
             after = page.nextAfterRecordKey ?: return pending
@@ -273,7 +291,9 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         nextCursor: String?,
         completed: Boolean,
     ): SecureMessagingHistoryBackfillTask {
-        check(!task.completed) { "A completed history task cannot be advanced" }
+        check(!task.completed || (!completed && nextCursor == null)) {
+            "A completed history task can only be reopened from its first page"
+        }
         val encoded = SecureMessagingHistoryBackfillTaskCodec.encode(
             conversationId = task.conversationId,
             targetDeviceId = task.targetDeviceId,

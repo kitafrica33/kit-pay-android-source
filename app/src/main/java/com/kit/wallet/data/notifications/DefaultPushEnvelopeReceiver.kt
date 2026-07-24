@@ -113,23 +113,26 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         }.getOrNull()?.coerceAtMost(MAX_RING_TIMEOUT_MILLIS) ?: return
         if (timeoutMillis <= 0) return
 
-        // If the user is already on another call, this is a call-waiting call: hand it to the
-        // active call screen (banner + call-waiting tone) instead of ringing full-screen over it.
         val activeCallId = activeCallState.activeCallId.value
-        if (activeCallId != null && activeCallId != call.callId) {
-            incomingCallRelay.publish(call)
+        val deliveryPlan = incomingCallDeliveryPlan(activeCallId, call.callId)
+
+        // Telecom tracking is common to both surfaces so call-waiting calls participate in audio
+        // arbitration and can reach system Recents. The plan keeps that lifecycle registration
+        // separate from the app-owned notification, which remains quiet for call waiting.
+        if (deliveryPlan.trackWithTelecom) {
+            telecom.trackIncoming(
+                callId = call.callId,
+                name = call.callerName,
+                phone = phone,
+                video = call.video,
+            )
+        }
+
+        if (deliveryPlan.notificationSurface == IncomingCallNotificationSurface.CALL_WAITING) {
+            if (deliveryPlan.relayToActiveCall) incomingCallRelay.publish(call)
             showCallWaitingNotification(manager, envelope, call, timeoutMillis)
             return
         }
-
-        // Only register calls that passed ring-expiry validation and will use the normal incoming
-        // call UI. Waiting calls stay in the active-call banner so Telecom cannot ring over them.
-        telecom.trackIncoming(
-            callId = call.callId,
-            name = call.callerName,
-            phone = phone,
-            video = call.video,
-        )
 
         val ringtoneUri = RingtoneManager.getActualDefaultRingtoneUri(
             context,
