@@ -64,7 +64,7 @@ class KeystoreSessionStore @Inject constructor(
 
     init {
         if (_session.value == null) {
-            retryPendingMessagingErasure()
+            retryPendingMessagingCleanup()
         } else {
             activateRestoredMessagingSession()
         }
@@ -80,29 +80,50 @@ class KeystoreSessionStore @Inject constructor(
 
     override suspend fun retryRestore(): Boolean = mutex.withLock {
         _session.value?.let { published ->
-            if (!_restorationPending.value && messagingLifecycle.stateAvailable.value) {
+            if (!_restorationPending.value &&
+                !messagingResetPending() &&
+                messagingLifecycle.stateAvailable.value
+            ) {
                 return@withLock true
             }
-            return@withLock activatePublishedMessagingForRestoreLocked(published)
+            return@withLock restorePublishedMessagingLocked(published)
         }
         val encrypted = preferences.getString(KEY_SESSION, null)
-        val attempt = retryRetainedEncryptedSession(
-            encryptedSession = encrypted,
-            messagingErasurePending = preferences.getBoolean(
-                KEY_MESSAGING_ERASURE_PENDING,
-                false,
-            ),
-            finishPendingMessagingErasure = {
-                // This marker fences an interrupted logout/session replacement. Once cleanup
-                // succeeds, delete the fenced credential rather than resurrecting a prior login.
-                messagingLifecycle.beforeSessionClear()
-                preferences.edit()
-                    .remove(KEY_SESSION)
-                    .remove(KEY_MESSAGING_ERASURE_PENDING)
-                    .commit()
-            },
-            decode = ::decodeSession,
+        val logoutErasurePending = preferences.getBoolean(
+            KEY_MESSAGING_ERASURE_PENDING,
+            false,
         )
+        val localResetPending = messagingResetPending()
+        val attempt = if (localResetPending && !logoutErasurePending) {
+            retryRetainedEncryptedSessionAfterMessagingReset(
+                encryptedSession = encrypted,
+                messagingResetPending = true,
+                finishPendingMessagingReset = {
+                    // This marker retains the credential but refuses to decode or publish it over
+                    // a possibly partial key/database erase. Cleanup is idempotent across death.
+                    messagingLifecycle.beforeSessionClear()
+                    clearMessagingResetPending()
+                    true
+                },
+                decode = ::decodeSession,
+            )
+        } else {
+            retryRetainedEncryptedSession(
+                encryptedSession = encrypted,
+                messagingErasurePending = logoutErasurePending,
+                finishPendingMessagingErasure = {
+                    // This marker fences an interrupted logout/session replacement. Once cleanup
+                    // succeeds, delete the fenced credential rather than resurrecting a prior login.
+                    messagingLifecycle.beforeSessionClear()
+                    preferences.edit()
+                        .remove(KEY_SESSION)
+                        .remove(KEY_MESSAGING_ERASURE_PENDING)
+                        .remove(KEY_MESSAGING_RESET_PENDING)
+                        .commit()
+                },
+                decode = ::decodeSession,
+            )
+        }
         val restored = attempt.tokens
         if (restored == null) {
             _restorationPending.value = attempt.pending
@@ -292,49 +313,82 @@ class KeystoreSessionStore @Inject constructor(
         allowPermanentlyUnavailableSnapshot: Boolean,
         finalMessagingSnapshot: suspend () -> Unit,
     ): Boolean = mutex.withLock {
-        if (_session.value?.fence() != expected) return@withLock false
+        resetSecureMessagingStateLocked(
+            expected = expected,
+            activationFence = activationFence,
+            allowPermanentlyUnavailableSnapshot = allowPermanentlyUnavailableSnapshot,
+            finalMessagingSnapshot = finalMessagingSnapshot,
+        )
+    }
 
-        var erasureFenced = false
+    override suspend fun resetSecureMessagingStateAfterProvenRemoteResetIfCurrent(
+        expected: SessionFence,
+        activationFence: SecureMessagingSessionFence,
+        proof: SecureMessagingResetProofFence,
+        allowPermanentlyUnavailableSnapshot: Boolean,
+        finalMessagingSnapshot: suspend () -> Unit,
+    ): Boolean = mutex.withLock {
+        val current = _session.value ?: return@withLock false
+        if (!proof.proved ||
+            current.fence() != expected ||
+            current.messagingResetProof != proof
+        ) {
+            return@withLock false
+        }
+        resetSecureMessagingStateLocked(
+            expected = expected,
+            activationFence = activationFence,
+            allowPermanentlyUnavailableSnapshot = allowPermanentlyUnavailableSnapshot,
+            finalMessagingSnapshot = finalMessagingSnapshot,
+        )
+    }
+
+    private suspend fun resetSecureMessagingStateLocked(
+        expected: SessionFence,
+        activationFence: SecureMessagingSessionFence,
+        allowPermanentlyUnavailableSnapshot: Boolean,
+        finalMessagingSnapshot: suspend () -> Unit,
+    ): Boolean {
+        if (_session.value?.fence() != expected) return false
+
         try {
-            messagingLifecycle.resetForRecovery(
-                fence = activationFence,
-                allowPermanentlyUnavailableSnapshot =
-                    allowPermanentlyUnavailableSnapshot,
-                finalSnapshot = finalMessagingSnapshot,
-                beforeErasure = {
-                    markMessagingErasurePending()
-                    erasureFenced = true
+            val reset = resetMessagingStateForPublishedSession(
+                expected = expected,
+                currentSession = { _session.value?.fence() },
+                persistResetFence = ::markMessagingResetPending,
+                clearResetFence = ::clearMessagingResetPending,
+                reset = { onErasureStarted ->
+                    messagingLifecycle.resetForRecovery(
+                        fence = activationFence,
+                        allowPermanentlyUnavailableSnapshot =
+                            allowPermanentlyUnavailableSnapshot,
+                        finalSnapshot = finalMessagingSnapshot,
+                        beforeErasure = onErasureStarted,
+                    )
+                },
+                reopen = {
+                    val current = _session.value
+                        ?.takeIf { it.fence() == expected }
+                        ?: return@resetMessagingStateForPublishedSession false
+                    activatePublishedMessagingLocked(current)
                 },
             )
+            if (!reset) return false
         } catch (error: Throwable) {
-            // Before the fence is durable, both the authenticated owner and readable messaging
-            // state remain intact so a transient archive/Keystore failure can be retried.
-            if (erasureFenced) abandonSessionDuringPendingMessagingErasure()
-            throw error
-        }
-
-        if (!preferences.edit().remove(KEY_MESSAGING_ERASURE_PENDING).commit()) {
-            abandonSessionDuringPendingMessagingErasure()
-            error("The secure messaging erasure marker could not be cleared")
-        }
-        try {
-            val current = _session.value
-                ?.takeIf { it.fence() == expected }
-                ?: throw SessionInvalidatedException()
-            check(activatePublishedMessagingLocked(current)) {
-                "Secure messaging recovery lost its authenticated session"
-            }
-        } catch (error: Throwable) {
-            // The reset and durable marker removal already completed. Keep the exact authenticated
-            // session behind the restoration gate and retry reopening; resurrecting the erasure
-            // marker here would make process restart destroy a successfully reset session.
-            if (_restorationPending.value && _session.value?.fence() == expected) {
-                retryPublishedMessagingActivation(expected)
+            // Messaging recovery is not logout or credential revocation. Once the reset fence is
+            // durable, retain the exact credential but keep messaging closed until an idempotent
+            // cleanup removes every partially erased row. Never reopen partial state.
+            if (_session.value?.fence() == expected) {
+                if (messagingResetPending()) {
+                    _restorationPending.value = true
+                    _restorationRetryable.value = true
+                }
+                if (_restorationPending.value) retryPublishedMessagingActivation(expected)
             }
             throw error
         }
         runCatching { messagingSyncScheduler.get().schedule() }
-        true
+        return true
     }
 
     override suspend fun recordMessagingResetPendingIfCurrent(
@@ -426,6 +480,7 @@ class KeystoreSessionStore @Inject constructor(
             if (erasureFenced) {
                 val removed = preferences.edit()
                     .remove(KEY_SESSION)
+                    .remove(KEY_MESSAGING_RESET_PENDING)
                     .putBoolean(KEY_MESSAGING_ERASURE_PENDING, !erasureSucceeded)
                     .commit()
                 var invalidationFailure: Throwable? = null
@@ -478,6 +533,7 @@ class KeystoreSessionStore @Inject constructor(
         val persistence = preferences.edit().putString(KEY_SESSION, encryptedSession)
         if (!isSameSession) {
             persistence.remove(KEY_MESSAGING_ERASURE_PENDING)
+            persistence.remove(KEY_MESSAGING_RESET_PENDING)
         }
         val persisted = persistence.commit()
         if (!persisted) {
@@ -485,6 +541,15 @@ class KeystoreSessionStore @Inject constructor(
             error("The secure session could not be persisted")
         }
         publishSessionLocked(tokens)
+        if (messagingResetPending()) {
+            // A token refresh/profile write may race only after the recovery call releases this
+            // mutex. It may update the retained credential, but it must not reopen partially
+            // erased messaging state while the distinct reset fence still owns cleanup.
+            _restorationPending.value = true
+            _restorationRetryable.value = true
+            retryPublishedMessagingActivation(tokens.fence())
+            return
+        }
         try {
             val messagingActivated = activatePublishedMessagingLocked(tokens)
             if (messagingActivated) {
@@ -502,10 +567,9 @@ class KeystoreSessionStore @Inject constructor(
         val encrypted = preferences.getString(KEY_SESSION, null)
         return restoreRetainingEncryptedSession(
             encryptedSession = encrypted,
-            messagingErasurePending = preferences.getBoolean(
-                KEY_MESSAGING_ERASURE_PENDING,
-                false,
-            ),
+            messagingErasurePending =
+                preferences.getBoolean(KEY_MESSAGING_ERASURE_PENDING, false) ||
+                    messagingResetPending(),
             decode = ::decodeSession,
         )
     }
@@ -528,37 +592,56 @@ class KeystoreSessionStore @Inject constructor(
             },
         )
 
-    private fun retryPendingMessagingErasure() {
-        if (!preferences.getBoolean(KEY_MESSAGING_ERASURE_PENDING, false)) return
+    private fun retryPendingMessagingCleanup() {
+        if (!preferences.getBoolean(KEY_MESSAGING_ERASURE_PENDING, false) &&
+            !messagingResetPending()
+        ) {
+            return
+        }
         applicationScope.launch {
-            mutex.withLock {
-                if (_session.value != null ||
-                    !preferences.getBoolean(KEY_MESSAGING_ERASURE_PENDING, false)
-                ) {
-                    return@withLock
-                }
-                runCatching { messagingLifecycle.beforeSessionClear() }
-                    .onSuccess {
-                        preferences.edit()
-                            .remove(KEY_SESSION)
-                            .remove(KEY_MESSAGING_ERASURE_PENDING)
-                            .commit()
-                    }
-            }
+            runCatching { retryRestore() }
         }
     }
 
     private fun markMessagingErasurePending() {
         check(
             preferences.edit()
+                .remove(KEY_MESSAGING_RESET_PENDING)
                 .putBoolean(KEY_MESSAGING_ERASURE_PENDING, true)
                 .commit(),
         ) { "The secure messaging erasure marker could not be persisted" }
     }
 
+    private fun markMessagingResetPending() {
+        check(!preferences.getBoolean(KEY_MESSAGING_ERASURE_PENDING, false)) {
+            "Credential erasure already owns secure messaging cleanup"
+        }
+        check(preferences.getString(KEY_SESSION, null) != null) {
+            "A secure messaging reset cannot outlive its retained credential"
+        }
+        check(
+            preferences.edit()
+                .putBoolean(KEY_MESSAGING_RESET_PENDING, true)
+                .commit(),
+        ) { "The secure messaging reset marker could not be persisted" }
+    }
+
+    private fun clearMessagingResetPending() {
+        if (!preferences.edit().remove(KEY_MESSAGING_RESET_PENDING).commit()) {
+            // SharedPreferences applies a failed commit to its in-memory map. Re-arm the fence in
+            // memory as well as on disk so this process cannot reopen state without durability.
+            preferences.edit().putBoolean(KEY_MESSAGING_RESET_PENDING, true).commit()
+            error("The secure messaging reset marker could not be cleared")
+        }
+    }
+
+    private fun messagingResetPending(): Boolean =
+        preferences.getBoolean(KEY_MESSAGING_RESET_PENDING, false)
+
     private fun abandonSessionDuringPendingMessagingErasure() {
         preferences.edit()
             .remove(KEY_SESSION)
+            .remove(KEY_MESSAGING_RESET_PENDING)
             .putBoolean(KEY_MESSAGING_ERASURE_PENDING, true)
             .commit()
         publishSessionLocked(null)
@@ -609,6 +692,22 @@ class KeystoreSessionStore @Inject constructor(
         false
     }
 
+    private suspend fun restorePublishedMessagingLocked(tokens: SessionTokens): Boolean = try {
+        if (messagingResetPending()) {
+            // A same-process post-fence failure and a process-restart recovery meet here. Finish
+            // the full key-and-record erase before clearing the fence or reopening this session.
+            messagingLifecycle.beforeSessionClear()
+            clearMessagingResetPending()
+        }
+        activatePublishedMessagingForRestoreLocked(tokens)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        _restorationPending.value = true
+        _restorationRetryable.value = true
+        false
+    }
+
     private suspend fun activatePublishedMessagingLocked(tokens: SessionTokens): Boolean =
         activateMessagingForPublishedSession(
             expected = tokens.fence(),
@@ -634,7 +733,7 @@ class KeystoreSessionStore @Inject constructor(
                         val current = _session.value
                             ?.takeIf { it.fence() == expected }
                             ?: return@withLock null
-                        activatePublishedMessagingForRestoreLocked(current)
+                        restorePublishedMessagingLocked(current)
                     }
                 },
                 waitBeforeNextAttempt = { delay(it) },
@@ -701,6 +800,7 @@ class KeystoreSessionStore @Inject constructor(
         const val PREFERENCES = "kit_wallet_secure_session"
         const val KEY_SESSION = "session_v1"
         const val KEY_MESSAGING_ERASURE_PENDING = "messaging_erasure_pending_v1"
+        const val KEY_MESSAGING_RESET_PENDING = "messaging_reset_pending_v1"
         const val KEY_ALIAS = "kit_wallet_session_aes_v1"
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
@@ -786,6 +886,42 @@ internal suspend fun retryRetainedEncryptedSession(
     )
 }
 
+/**
+ * Completes a crash-fenced local messaging reset before decoding the retained Kit credential.
+ * Unlike logout cleanup, successful reset cleanup restores that exact credential; failed cleanup
+ * keeps both the marker and ciphertext pending for another idempotent attempt.
+ */
+@VisibleForTesting
+internal suspend fun retryRetainedEncryptedSessionAfterMessagingReset(
+    encryptedSession: String?,
+    messagingResetPending: Boolean,
+    finishPendingMessagingReset: suspend () -> Boolean,
+    decode: (String) -> SessionTokens,
+): InitialSessionRestore {
+    if (!messagingResetPending) {
+        return restoreRetainingEncryptedSession(
+            encryptedSession = encryptedSession,
+            messagingErasurePending = false,
+            decode = decode,
+        )
+    }
+    val cleanupSucceeded = try {
+        finishPendingMessagingReset()
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        false
+    }
+    if (!cleanupSucceeded) {
+        return InitialSessionRestore(tokens = null, retryRequired = true)
+    }
+    return restoreRetainingEncryptedSession(
+        encryptedSession = encryptedSession,
+        messagingErasurePending = false,
+        decode = decode,
+    )
+}
+
 /** Selects an existing decrypt key without ever replacing a temporarily hidden Keystore alias. */
 @VisibleForTesting
 internal fun <T : Any> resolveSessionKey(
@@ -844,6 +980,29 @@ internal suspend fun activateMessagingForPublishedSession(
         throw cancelled
     }
     return activation.getOrThrow()
+}
+
+/**
+ * Resets only messaging state while retaining the exact authenticated Kit session.
+ *
+ * Logout/session replacement owns the durable credential-erasure marker. A local messaging reset
+ * uses a separate fence that retains the Kit credential while preventing partial state from being
+ * reopened. The reset fence is cleared only after the complete key-and-record erase succeeds.
+ */
+@VisibleForTesting
+internal suspend fun resetMessagingStateForPublishedSession(
+    expected: SessionFence,
+    currentSession: () -> SessionFence?,
+    persistResetFence: () -> Unit,
+    clearResetFence: () -> Unit,
+    reset: suspend (onErasureStarted: () -> Unit) -> Unit,
+    reopen: suspend () -> Boolean,
+): Boolean {
+    reset(persistResetFence)
+    if (currentSession() != expected) return false
+    clearResetFence()
+    if (currentSession() != expected) return false
+    return reopen() && currentSession() == expected
 }
 
 /** Bounded exact-session gate retries used after a published session fails to reopen messaging. */

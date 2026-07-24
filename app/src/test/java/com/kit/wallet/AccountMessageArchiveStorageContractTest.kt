@@ -2,27 +2,40 @@ package com.kit.wallet
 
 import com.kit.wallet.data.local.AccountMessageArchiveEntity
 import com.kit.wallet.data.messaging.AccountMessageArchiveKeyUnavailableException
+import com.kit.wallet.data.messaging.AccountMessageArchiveBootstrapKeyValidationException
 import com.kit.wallet.data.messaging.AccountMessageArchiveKeyPermanentlyMissingException
 import com.kit.wallet.data.messaging.AccountMessageArchiveKeyPermanentlyUnrecoverableException
 import com.kit.wallet.data.messaging.AccountMessageArchiveKeyResolution
 import com.kit.wallet.data.messaging.AccountMessageArchiveOwner
+import com.kit.wallet.data.messaging.AccountMessageArchiveStorageFormat
 import com.kit.wallet.data.messaging.AccountMessageArchiveUnavailableException
+import com.kit.wallet.data.messaging.EncryptedAccountMessageArchiveRecord
+import com.kit.wallet.data.messaging.MAX_ACCOUNT_MESSAGE_ARCHIVE_RECORD_BYTES
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyMissState
 import com.kit.wallet.data.messaging.accountMessageArchiveAad
 import com.kit.wallet.data.messaging.accountMessageArchiveKeyAlias
 import com.kit.wallet.data.messaging.accountMessageArchiveKeyCreationAllowed
+import com.kit.wallet.data.messaging.accountMessageArchiveStorageFormat
 import com.kit.wallet.data.messaging.classifyAccountMessageArchiveKeyAccessFailure
 import com.kit.wallet.data.messaging.classifyAccountMessageArchiveKeyOperationFailure
+import com.kit.wallet.data.messaging.decryptAccountMessageArchiveRecordEnvelope
+import com.kit.wallet.data.messaging.decryptLegacyAccountMessageArchiveRecord
+import com.kit.wallet.data.messaging.encryptAccountMessageArchiveRecordEnvelope
 import com.kit.wallet.data.messaging.hasPermanentlyMissingAccountMessageArchiveKey
 import com.kit.wallet.data.messaging.isRetryableAccountMessageArchiveKeyFailure
 import com.kit.wallet.data.messaging.observeSecureMessagingRecordKeyMiss
 import com.kit.wallet.data.messaging.resolveAccountMessageArchiveKey
 import com.kit.wallet.data.messaging.resolveAccountMessageArchiveKeyWithCreationStatus
+import com.kit.wallet.data.messaging.validateBootstrapAccountMessageArchiveKeyRoundTrip
 import java.lang.reflect.Modifier
 import java.security.InvalidKeyException
 import java.security.ProviderException
+import java.security.SecureRandom
 import java.security.UnrecoverableKeyException
 import javax.crypto.AEADBadTagException
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -33,6 +46,156 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 class AccountMessageArchiveStorageContractTest {
+    @Test
+    fun `hybrid archive envelope round trips the maximum row without large keystore input`() {
+        val aad = accountMessageArchiveAad(OWNER_A, "message:maximum", 1L)
+
+        listOf(65_536, 77_248, MAX_ACCOUNT_MESSAGE_ARCHIVE_RECORD_BYTES).forEach { size ->
+            val plaintext = ByteArray(size) { index -> (index * 31 + size).toByte() }
+            val generatedDek = ByteArray(32) { index -> (index + size).toByte() }
+            val generatedDataIv = ByteArray(12) { index -> (index + 7).toByte() }
+            val keystorePlaintextSizes = mutableListOf<Int>()
+            val keystoreCiphertextSizes = mutableListOf<Int>()
+
+            val encrypted = encryptAccountMessageArchiveRecordEnvelope(
+                aad = aad,
+                plaintext = plaintext,
+                createDek = { generatedDek },
+                createDataIv = { generatedDataIv },
+                wrapDek = { wrapAad, dek ->
+                    keystorePlaintextSizes += dek.size
+                    testWrapArchiveDek(wrapAad, dek)
+                },
+            )
+
+            assertEquals(
+                AccountMessageArchiveStorageFormat.DEK_ENVELOPE_V1,
+                accountMessageArchiveStorageFormat(encrypted),
+            )
+            assertEquals(32, encrypted.iv.size)
+            assertEquals(size + 64, encrypted.ciphertext.size)
+            assertEquals(listOf(32), keystorePlaintextSizes)
+            assertTrue(generatedDek.all { it == 0.toByte() })
+            assertTrue(generatedDataIv.all { it == 0.toByte() })
+
+            var recoveredDek: ByteArray? = null
+            val decrypted = decryptAccountMessageArchiveRecordEnvelope(
+                aad = aad,
+                record = encrypted,
+                unwrapDek = { wrapAad, wrappedDek ->
+                    keystoreCiphertextSizes += wrappedDek.ciphertext.size
+                    testUnwrapArchiveDek(wrapAad, wrappedDek).also { recoveredDek = it }
+                },
+            )
+            try {
+                assertArrayEquals(plaintext, decrypted)
+                assertEquals(listOf(48), keystoreCiphertextSizes)
+                assertEquals(32, recoveredDek?.size)
+                assertTrue(checkNotNull(recoveredDek).all { it == 0.toByte() })
+            } finally {
+                plaintext.fill(0)
+                decrypted.fill(0)
+                encrypted.iv.fill(0)
+                encrypted.ciphertext.fill(0)
+            }
+        }
+        aad.fill(0)
+    }
+
+    @Test
+    fun `archive envelope rejects an over-limit row before generating key material`() {
+        val aad = accountMessageArchiveAad(OWNER_A, "message:oversized", 1L)
+        val oversized = ByteArray(MAX_ACCOUNT_MESSAGE_ARCHIVE_RECORD_BYTES + 1)
+        var generated = false
+
+        val observed = runCatching {
+            encryptAccountMessageArchiveRecordEnvelope(
+                aad = aad,
+                plaintext = oversized,
+                createDek = {
+                    generated = true
+                    ByteArray(32)
+                },
+                createDataIv = { ByteArray(12) },
+                wrapDek = ::testWrapArchiveDek,
+            )
+        }.exceptionOrNull()
+
+        assertTrue(observed is IllegalArgumentException)
+        assertFalse(generated)
+        oversized.fill(0)
+        aad.fill(0)
+    }
+
+    @Test
+    fun `legacy archive rows with twelve byte IVs remain directly decryptable`() {
+        val aad = accountMessageArchiveAad(OWNER_A, "message:legacy", 7L)
+        val plaintext = ByteArray(1_024) { index -> (index * 17).toByte() }
+        val legacy = testEncryptLegacyArchiveRecord(aad, plaintext)
+
+        assertEquals(
+            AccountMessageArchiveStorageFormat.LEGACY_DIRECT_V1,
+            accountMessageArchiveStorageFormat(legacy),
+        )
+        val decrypted = decryptLegacyAccountMessageArchiveRecord(
+            aad = aad,
+            record = legacy,
+            decryptDirect = ::testDecryptLegacyArchiveRecord,
+        )
+
+        assertArrayEquals(plaintext, decrypted)
+        plaintext.fill(0)
+        decrypted.fill(0)
+        legacy.iv.fill(0)
+        legacy.ciphertext.fill(0)
+        aad.fill(0)
+    }
+
+    @Test
+    fun `archive envelope authenticates routing wrapped key and full payload`() {
+        val aad = accountMessageArchiveAad(OWNER_A, "message:authenticated", 3L)
+        val plaintext = ByteArray(2_048) { it.toByte() }
+        val encrypted = testEncryptArchiveEnvelope(aad, plaintext)
+        val corruptions = listOf(
+            aad.copyOf().also { it[it.lastIndex] = (it.last() + 1).toByte() } to encrypted,
+            aad to encrypted.copy(
+                ciphertext = encrypted.ciphertext.copyOf().also {
+                    it[0] = (it[0] + 1).toByte()
+                },
+            ),
+            aad to encrypted.copy(
+                ciphertext = encrypted.ciphertext.copyOf().also {
+                    it[48] = (it[48] + 1).toByte()
+                },
+            ),
+            aad to encrypted.copy(
+                iv = encrypted.iv.copyOf().also { it[20] = (it[20] + 1).toByte() },
+            ),
+        )
+
+        corruptions.forEach { (corruptAad, corruptRecord) ->
+            assertTrue(
+                runCatching {
+                    decryptAccountMessageArchiveRecordEnvelope(
+                        corruptAad,
+                        corruptRecord,
+                        ::testUnwrapArchiveDek,
+                    )
+                }.isFailure,
+            )
+            if (corruptAad !== aad) corruptAad.fill(0)
+            if (corruptRecord !== encrypted) {
+                corruptRecord.iv.fill(0)
+                corruptRecord.ciphertext.fill(0)
+            }
+        }
+
+        plaintext.fill(0)
+        encrypted.iv.fill(0)
+        encrypted.ciphertext.fill(0)
+        aad.fill(0)
+    }
+
     @Test
     fun `archive AAD is deterministic and binds every routing and version field`() {
         val baseline = accountMessageArchiveAad(OWNER_A, "message:one", 7L)
@@ -252,6 +415,160 @@ class AccountMessageArchiveStorageContractTest {
     }
 
     @Test
+    fun `empty owner rejects a null independent alias reload before commit`() {
+        val events = mutableListOf<String>()
+
+        val failure = runCatching {
+            validateBootstrapAccountMessageArchiveKeyRoundTrip(
+                resolution = AccountMessageArchiveKeyResolution(Any(), createdNow = true),
+                bootstrapProbeRequired = true,
+                expectedDek = ByteArray(32) { (it + 1).toByte() },
+                reloadBootstrapKey = {
+                    events += "reload"
+                    null
+                },
+                authenticatedUnwrap = {
+                    events += "authenticate"
+                    error("A missing alias cannot authenticate")
+                },
+                eraseUncommittedBootstrapKey = { events += "erase-exact-alias" },
+            )
+            events += "commit"
+        }.exceptionOrNull()
+
+        assertTrue(failure is AccountMessageArchiveBootstrapKeyValidationException)
+        assertEquals(listOf("reload", "erase-exact-alias"), events)
+    }
+
+    @Test
+    fun `empty owner rejects a wrong reloaded DEK and wipes it before commit`() {
+        val expected = ByteArray(32) { (it + 3).toByte() }
+        val wrong = ByteArray(32) { (it + 4).toByte() }
+        val events = mutableListOf<String>()
+
+        val failure = runCatching {
+            validateBootstrapAccountMessageArchiveKeyRoundTrip(
+                resolution = AccountMessageArchiveKeyResolution(Any(), createdNow = true),
+                bootstrapProbeRequired = true,
+                expectedDek = expected,
+                reloadBootstrapKey = {
+                    events += "reload"
+                    Any()
+                },
+                authenticatedUnwrap = {
+                    events += "authenticate"
+                    wrong
+                },
+                eraseUncommittedBootstrapKey = { events += "erase-exact-alias" },
+            )
+            events += "commit"
+        }.exceptionOrNull()
+
+        assertTrue(failure is AccountMessageArchiveBootstrapKeyValidationException)
+        assertEquals(listOf("reload", "authenticate", "erase-exact-alias"), events)
+        assertTrue(wrong.all { it == 0.toByte() })
+        assertTrue(expected.indices.all { expected[it] == (it + 3).toByte() })
+    }
+
+    @Test
+    fun `empty owner authentication failure erases exact alias before commit`() {
+        val authenticationFailure = AEADBadTagException(
+            "Reloaded Android 9 archive alias cannot authenticate the wrapped DEK",
+        )
+        val events = mutableListOf<String>()
+
+        val failure = runCatching {
+            validateBootstrapAccountMessageArchiveKeyRoundTrip(
+                resolution = AccountMessageArchiveKeyResolution(Any(), createdNow = true),
+                bootstrapProbeRequired = true,
+                expectedDek = ByteArray(32) { (it + 5).toByte() },
+                reloadBootstrapKey = {
+                    events += "reload"
+                    Any()
+                },
+                authenticatedUnwrap = {
+                    events += "authenticate"
+                    throw authenticationFailure
+                },
+                eraseUncommittedBootstrapKey = { events += "erase-exact-alias" },
+            )
+            events += "commit"
+        }.exceptionOrNull()
+
+        assertTrue(failure is AccountMessageArchiveBootstrapKeyValidationException)
+        assertSame(authenticationFailure, failure?.cause)
+        assertEquals(listOf("reload", "authenticate", "erase-exact-alias"), events)
+    }
+
+    @Test
+    fun `bootstrap cleanup failure is suppressed without permitting commit`() {
+        val authenticationFailure = AEADBadTagException("bootstrap authentication failed")
+        val cleanupFailure = IllegalStateException("exact archive alias deletion failed")
+        val events = mutableListOf<String>()
+
+        val failure = runCatching {
+            validateBootstrapAccountMessageArchiveKeyRoundTrip(
+                resolution = AccountMessageArchiveKeyResolution(Any(), createdNow = false),
+                bootstrapProbeRequired = true,
+                expectedDek = ByteArray(32) { (it + 6).toByte() },
+                reloadBootstrapKey = {
+                    events += "reload"
+                    Any()
+                },
+                authenticatedUnwrap = {
+                    events += "authenticate"
+                    throw authenticationFailure
+                },
+                eraseUncommittedBootstrapKey = {
+                    events += "erase-exact-alias"
+                    throw cleanupFailure
+                },
+            )
+            events += "commit"
+        }.exceptionOrNull()
+
+        assertTrue(failure is AccountMessageArchiveBootstrapKeyValidationException)
+        assertSame(authenticationFailure, failure?.cause)
+        assertEquals(listOf(cleanupFailure), failure?.suppressed?.toList())
+        assertEquals(listOf("reload", "authenticate", "erase-exact-alias"), events)
+    }
+
+    @Test
+    fun `every empty owner first write authenticates an existing alias before commit`() {
+        val generatedHandle = Any()
+        val independentlyReloadedHandle = Any()
+        val expected = ByteArray(32) { (it + 7).toByte() }
+        val authenticated = expected.copyOf()
+        val events = mutableListOf<String>()
+
+        val proven = validateBootstrapAccountMessageArchiveKeyRoundTrip(
+            resolution = AccountMessageArchiveKeyResolution(
+                generatedHandle,
+                // Empty-owner proof is required even for an alias left by an earlier attempt.
+                createdNow = false,
+            ),
+            bootstrapProbeRequired = true,
+            expectedDek = expected,
+            reloadBootstrapKey = {
+                events += "reload"
+                independentlyReloadedHandle
+            },
+            authenticatedUnwrap = { key ->
+                assertSame(independentlyReloadedHandle, key)
+                events += "authenticate"
+                authenticated
+            },
+            eraseUncommittedBootstrapKey = { events += "erase-exact-alias" },
+        )
+        events += "commit"
+
+        assertSame(independentlyReloadedHandle, proven)
+        assertEquals(listOf("reload", "authenticate", "commit"), events)
+        assertTrue(authenticated.all { it == 0.toByte() })
+        assertTrue(expected.indices.all { expected[it] == (it + 7).toByte() })
+    }
+
+    @Test
     fun `archive alias abandonment requires explicit permanent missing key proof`() {
         val transient = AccountMessageArchiveUnavailableException(
             "archive read failed",
@@ -419,6 +736,73 @@ class AccountMessageArchiveStorageContractTest {
         }
     }
 
+    private fun testEncryptArchiveEnvelope(
+        aad: ByteArray,
+        plaintext: ByteArray,
+    ): EncryptedAccountMessageArchiveRecord = encryptAccountMessageArchiveRecordEnvelope(
+        aad = aad,
+        plaintext = plaintext,
+        createDek = { ByteArray(32).also(TEST_RANDOM::nextBytes) },
+        createDataIv = { ByteArray(12).also(TEST_RANDOM::nextBytes) },
+        wrapDek = ::testWrapArchiveDek,
+    )
+
+    private fun testWrapArchiveDek(
+        aad: ByteArray,
+        dek: ByteArray,
+    ): EncryptedAccountMessageArchiveRecord {
+        val iv = ByteArray(12).also(TEST_RANDOM::nextBytes)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            Cipher.ENCRYPT_MODE,
+            SecretKeySpec(TEST_KEK_BYTES, "AES"),
+            GCMParameterSpec(128, iv),
+        )
+        cipher.updateAAD(aad)
+        return EncryptedAccountMessageArchiveRecord(iv, cipher.doFinal(dek))
+    }
+
+    private fun testUnwrapArchiveDek(
+        aad: ByteArray,
+        wrapped: EncryptedAccountMessageArchiveRecord,
+    ): ByteArray = Cipher.getInstance("AES/GCM/NoPadding").run {
+        init(
+            Cipher.DECRYPT_MODE,
+            SecretKeySpec(TEST_KEK_BYTES, "AES"),
+            GCMParameterSpec(128, wrapped.iv),
+        )
+        updateAAD(aad)
+        doFinal(wrapped.ciphertext)
+    }
+
+    private fun testEncryptLegacyArchiveRecord(
+        aad: ByteArray,
+        plaintext: ByteArray,
+    ): EncryptedAccountMessageArchiveRecord {
+        val iv = ByteArray(12).also(TEST_RANDOM::nextBytes)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            Cipher.ENCRYPT_MODE,
+            SecretKeySpec(TEST_KEK_BYTES, "AES"),
+            GCMParameterSpec(128, iv),
+        )
+        cipher.updateAAD(aad)
+        return EncryptedAccountMessageArchiveRecord(iv, cipher.doFinal(plaintext))
+    }
+
+    private fun testDecryptLegacyArchiveRecord(
+        aad: ByteArray,
+        record: EncryptedAccountMessageArchiveRecord,
+    ): ByteArray = Cipher.getInstance("AES/GCM/NoPadding").run {
+        init(
+            Cipher.DECRYPT_MODE,
+            SecretKeySpec(TEST_KEK_BYTES, "AES"),
+            GCMParameterSpec(128, record.iv),
+        )
+        updateAAD(aad)
+        doFinal(record.ciphertext)
+    }
+
     private inline fun <reified T : Throwable> assertFails(block: () -> Unit) {
         val error = runCatching(block).exceptionOrNull()
         if (error !is T) {
@@ -434,5 +818,7 @@ class AccountMessageArchiveStorageContractTest {
         val OWNER_A = AccountMessageArchiveOwner(ACCOUNT_A, INSTALLATION_A)
         val OWNER_B = AccountMessageArchiveOwner(ACCOUNT_B, INSTALLATION_A)
         val OWNER_A_OTHER_INSTALLATION = AccountMessageArchiveOwner(ACCOUNT_A, INSTALLATION_B)
+        val TEST_RANDOM = SecureRandom()
+        val TEST_KEK_BYTES = ByteArray(32) { index -> (index * 13 + 5).toByte() }
     }
 }

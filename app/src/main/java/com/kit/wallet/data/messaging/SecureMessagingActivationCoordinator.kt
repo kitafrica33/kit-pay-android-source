@@ -279,7 +279,9 @@ class SecureMessagingActivationCoordinator @Inject constructor(
             pendingAttempt = null
             active
         } catch (error: Throwable) {
-            val recoverableStateLoss = isRecoverableSecureMessagingStateLoss(error)
+            val freshProvisioningFailure = freshProvisioningFailure(attempt, error)
+            val recoverableStateLoss = freshProvisioningFailure != null ||
+                isRecoverableSecureMessagingStateLoss(error)
             if (recoverableStateLoss) {
                 // Initial roster/projection recovery can discover a lost Android-Keystore alias or
                 // migration-fenced unreadable pre-code-19 state after key reconciliation. Convert
@@ -297,6 +299,13 @@ class SecureMessagingActivationCoordinator @Inject constructor(
             }
             sessions.clearIfOwnedBy(attempt.fence)
             if (!isCurrent(attempt)) pendingAttempt = null
+            if (freshProvisioningFailure != null) {
+                throw SecureMessagingLocalEnrollmentResetRequiredException(
+                    activationFence = attempt.fence,
+                    message = "Fresh secure messaging provisioning state is unreadable",
+                    cause = freshProvisioningFailure,
+                )
+            }
             if (
                 recoverableStateLoss &&
                 error !is SecureMessagingReauthenticationRequiredException &&
@@ -311,6 +320,34 @@ class SecureMessagingActivationCoordinator @Inject constructor(
             }
             throw error
         }
+    }
+
+    private fun freshProvisioningFailure(
+        attempt: Attempt,
+        error: Throwable,
+    ): SecureMessagingFreshProvisioningUnreadableException? {
+        // Reconciliation control-flow exceptions already carry the exact recovery authority.
+        // Never reinterpret a nested legacy marker as unpublished local provisioning loss: doing
+        // so would discard the pinned remote-reset target and bypass its durable server proof.
+        if (error is SecureMessagingReauthenticationRequiredException ||
+            error is SecureMessagingLocalEnrollmentResetRequiredException ||
+            error is SecureMessagingFreshAuthenticationRequiredException
+        ) {
+            return null
+        }
+        if (!isInitialSecureMessagingEnrollmentStateUnreadableFailure(error)) return null
+        val snapshot = lifecycle.snapshot()
+        val legacyValidationFailure =
+            isLegacyInitialSecureMessagingEnrollmentUnreadableFailure(error)
+        val unpublishedStage = snapshot.stage in UNPUBLISHED_PROVISIONING_STAGES ||
+            (legacyValidationFailure && snapshot.stage == SecureMessagingRuntimeStage.ACTIVATING)
+        if (snapshot.binding != attempt.binding ||
+            !unpublishedStage ||
+            !isCurrent(attempt)
+        ) {
+            return null
+        }
+        return SecureMessagingFreshProvisioningUnreadableException(error)
     }
 
     private fun currentOrNewAttempt(binding: SecureMessagingSessionBinding): Attempt {
@@ -397,4 +434,11 @@ class SecureMessagingActivationCoordinator @Inject constructor(
     private fun isCurrent(attempt: Attempt): Boolean = runCatching {
         lifecycle.assertCurrent(attempt.fence)
     }.isSuccess
+
+    private companion object {
+        val UNPUBLISHED_PROVISIONING_STAGES = setOf(
+            SecureMessagingRuntimeStage.PREPARING_KEYS,
+            SecureMessagingRuntimeStage.SYNCING_ROSTER,
+        )
+    }
 }

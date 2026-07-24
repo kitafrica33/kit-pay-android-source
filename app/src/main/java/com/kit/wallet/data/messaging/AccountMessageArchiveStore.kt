@@ -12,17 +12,20 @@ import com.kit.wallet.data.local.AccountMessageArchiveEntity
 import com.kit.wallet.data.local.KitWalletDatabase
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.nio.ByteBuffer
+import java.security.GeneralSecurityException
 import java.security.InvalidKeyException
 import java.security.KeyStore
 import java.security.KeyStoreException
 import java.security.MessageDigest
 import java.security.ProviderException
+import java.security.SecureRandom
 import java.security.UnrecoverableKeyException
 import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.sync.Mutex
@@ -75,11 +78,299 @@ data class EncryptedAccountMessageArchiveRecord(
     val ciphertext: ByteArray,
 )
 
+/** On-disk archive format selected without invoking Android Keystore. */
+@VisibleForTesting
+internal enum class AccountMessageArchiveStorageFormat {
+    LEGACY_DIRECT_V1,
+    DEK_ENVELOPE_V1,
+}
+
+/**
+ * Keeps all existing 12-byte-IV archive rows readable. New rows use a 32-byte IV field containing
+ * an 8-byte marker/version, the Keystore-wrapped DEK IV, and the software data IV.
+ */
+@VisibleForTesting
+internal fun accountMessageArchiveStorageFormat(
+    record: EncryptedAccountMessageArchiveRecord,
+): AccountMessageArchiveStorageFormat = when {
+    record.iv.size == ARCHIVE_LEGACY_GCM_IV_BYTES -> {
+        require(
+            record.ciphertext.size in ARCHIVE_GCM_TAG_BYTES..
+                MAX_LEGACY_ARCHIVE_CIPHERTEXT_BYTES,
+        ) { "Invalid legacy account message archive ciphertext length" }
+        AccountMessageArchiveStorageFormat.LEGACY_DIRECT_V1
+    }
+
+    record.iv.size == ARCHIVE_ENVELOPE_IV_BYTES &&
+        record.iv.copyOfRange(0, ARCHIVE_ENVELOPE_MARKER_BYTES).contentEquals(
+            ACCOUNT_MESSAGE_ARCHIVE_ENVELOPE_MARKER,
+        ) -> {
+        require(
+            record.ciphertext.size in MIN_ARCHIVE_ENVELOPE_CIPHERTEXT_BYTES..
+                MAX_ARCHIVE_ENVELOPE_CIPHERTEXT_BYTES,
+        ) { "Invalid account message archive envelope length" }
+        AccountMessageArchiveStorageFormat.DEK_ENVELOPE_V1
+    }
+
+    else -> throw IllegalArgumentException("Unknown account message archive record format")
+}
+
+/** Executes the unchanged direct-AES-GCM path for code-22-and-earlier archive rows. */
+@VisibleForTesting
+internal fun decryptLegacyAccountMessageArchiveRecord(
+    aad: ByteArray,
+    record: EncryptedAccountMessageArchiveRecord,
+    decryptDirect: (
+        aad: ByteArray,
+        record: EncryptedAccountMessageArchiveRecord,
+    ) -> ByteArray,
+): ByteArray {
+    require(
+        accountMessageArchiveStorageFormat(record) ==
+            AccountMessageArchiveStorageFormat.LEGACY_DIRECT_V1,
+    ) { "An account message archive envelope cannot enter legacy decryption" }
+    val plaintext = decryptDirect(aad, record)
+    if (plaintext.size !in 1..MAX_ACCOUNT_MESSAGE_ARCHIVE_RECORD_BYTES) {
+        plaintext.fill(0)
+        throw IllegalArgumentException("Invalid legacy account message archive plaintext length")
+    }
+    return plaintext
+}
+
+/**
+ * Domain-separates the wrapped record key and encrypted archive data while retaining the original
+ * owner, installation, record-key, and record-version binding in both authenticated layers.
+ */
+private fun accountMessageArchiveEnvelopeLayerAad(
+    aad: ByteArray,
+    layer: Byte,
+): ByteArray {
+    require(aad.size in 1..MAX_ACCOUNT_MESSAGE_ARCHIVE_AAD_BYTES) {
+        "Invalid account message archive AAD length"
+    }
+    return ByteBuffer.allocate(
+        ARCHIVE_ENVELOPE_MARKER_BYTES + 1 + Int.SIZE_BYTES + aad.size,
+    )
+        .put(ACCOUNT_MESSAGE_ARCHIVE_ENVELOPE_MARKER)
+        .put(layer)
+        .putInt(aad.size)
+        .put(aad)
+        .array()
+}
+
+/** Full archive payloads use an ordinary in-memory AES key and never AndroidKeyStore. */
+private fun softwareAccountMessageArchiveAesGcm(
+    mode: Int,
+    dek: ByteArray,
+    iv: ByteArray,
+    aad: ByteArray,
+    input: ByteArray,
+): ByteArray {
+    require(dek.size == ARCHIVE_RECORD_DEK_BYTES) {
+        "Invalid account message archive record DEK"
+    }
+    require(iv.size == ARCHIVE_SOFTWARE_DATA_IV_BYTES) {
+        "Invalid account message archive data IV"
+    }
+    val key = SecretKeySpec(dek, KeyProperties.KEY_ALGORITHM_AES)
+    return try {
+        Cipher.getInstance(ARCHIVE_TRANSFORMATION).run {
+            // Do not ask for provider before init: JCA selects the software implementation from
+            // the ordinary in-memory SecretKeySpec only after seeing the key and parameters.
+            init(mode, key, GCMParameterSpec(ARCHIVE_GCM_TAG_BITS, iv))
+            check(!provider.name.startsWith(ANDROID_KEYSTORE_PROVIDER_PREFIX)) {
+                "Account message archive payload was routed through AndroidKeyStore"
+            }
+            updateAAD(aad)
+            doFinal(input)
+        }
+    } finally {
+        runCatching { key.destroy() }
+    }
+}
+
+/**
+ * Encrypts one bounded archive row under a fresh per-record DEK. Android Keystore receives only
+ * that 32-byte DEK; software AES-GCM handles the complete payload, including the 128 KiB maximum.
+ */
+@VisibleForTesting
+internal fun encryptAccountMessageArchiveRecordEnvelope(
+    aad: ByteArray,
+    plaintext: ByteArray,
+    createDek: () -> ByteArray,
+    createDataIv: () -> ByteArray,
+    wrapDek: (
+        wrapAad: ByteArray,
+        dek: ByteArray,
+    ) -> EncryptedAccountMessageArchiveRecord,
+    validateWrappedDek: (
+        wrapAad: ByteArray,
+        wrappedDek: EncryptedAccountMessageArchiveRecord,
+        expectedDek: ByteArray,
+    ) -> Unit = { _, _, _ -> },
+): EncryptedAccountMessageArchiveRecord {
+    require(plaintext.size in 1..MAX_ACCOUNT_MESSAGE_ARCHIVE_RECORD_BYTES) {
+        "Invalid account message archive plaintext length"
+    }
+    val wrapAad = accountMessageArchiveEnvelopeLayerAad(
+        aad,
+        ARCHIVE_ENVELOPE_WRAP_AAD_LAYER,
+    )
+    val dataAad = accountMessageArchiveEnvelopeLayerAad(
+        aad,
+        ARCHIVE_ENVELOPE_DATA_AAD_LAYER,
+    )
+    var dek: ByteArray? = null
+    var dataIv: ByteArray? = null
+    var dataCiphertext: ByteArray? = null
+    var wrappedDek: EncryptedAccountMessageArchiveRecord? = null
+    try {
+        val generatedDek = createDek()
+        dek = generatedDek
+        require(generatedDek.size == ARCHIVE_RECORD_DEK_BYTES) {
+            "Invalid generated account message archive DEK"
+        }
+        val generatedDataIv = createDataIv()
+        dataIv = generatedDataIv
+        require(generatedDataIv.size == ARCHIVE_SOFTWARE_DATA_IV_BYTES) {
+            "Invalid generated account message archive data IV"
+        }
+        val encryptedData = softwareAccountMessageArchiveAesGcm(
+            mode = Cipher.ENCRYPT_MODE,
+            dek = generatedDek,
+            iv = generatedDataIv,
+            aad = dataAad,
+            input = plaintext,
+        )
+        dataCiphertext = encryptedData
+        require(encryptedData.size == plaintext.size + ARCHIVE_GCM_TAG_BYTES) {
+            "Software account message archive encryption returned a truncated payload"
+        }
+
+        val encryptedDek = wrapDek(wrapAad, generatedDek)
+        wrappedDek = encryptedDek
+        require(encryptedDek.iv.size == ARCHIVE_KEK_WRAP_IV_BYTES) {
+            "Invalid account message archive wrapped-DEK IV"
+        }
+        require(encryptedDek.ciphertext.size == ARCHIVE_WRAPPED_DEK_CIPHERTEXT_BYTES) {
+            "Invalid account message archive wrapped-DEK ciphertext"
+        }
+        validateWrappedDek(wrapAad, encryptedDek, generatedDek)
+
+        val envelopeIv = ByteBuffer.allocate(ARCHIVE_ENVELOPE_IV_BYTES)
+            .put(ACCOUNT_MESSAGE_ARCHIVE_ENVELOPE_MARKER)
+            .put(encryptedDek.iv)
+            .put(generatedDataIv)
+            .array()
+        val envelopeCiphertext = ByteBuffer.allocate(
+            ARCHIVE_WRAPPED_DEK_CIPHERTEXT_BYTES + encryptedData.size,
+        )
+            .put(encryptedDek.ciphertext)
+            .put(encryptedData)
+            .array()
+        return EncryptedAccountMessageArchiveRecord(envelopeIv, envelopeCiphertext)
+    } finally {
+        dek?.fill(0)
+        dataIv?.fill(0)
+        dataCiphertext?.fill(0)
+        wrappedDek?.iv?.fill(0)
+        wrappedDek?.ciphertext?.fill(0)
+        wrapAad.fill(0)
+        dataAad.fill(0)
+    }
+}
+
+/** Unwraps only the small DEK in Android Keystore, then decrypts the full archive row in software. */
+@VisibleForTesting
+internal fun decryptAccountMessageArchiveRecordEnvelope(
+    aad: ByteArray,
+    record: EncryptedAccountMessageArchiveRecord,
+    unwrapDek: (
+        wrapAad: ByteArray,
+        wrappedDek: EncryptedAccountMessageArchiveRecord,
+    ) -> ByteArray,
+): ByteArray {
+    require(
+        accountMessageArchiveStorageFormat(record) ==
+            AccountMessageArchiveStorageFormat.DEK_ENVELOPE_V1,
+    ) { "A legacy account message archive row cannot enter envelope decryption" }
+
+    val wrapIv = record.iv.copyOfRange(
+        ARCHIVE_ENVELOPE_MARKER_BYTES,
+        ARCHIVE_ENVELOPE_MARKER_BYTES + ARCHIVE_KEK_WRAP_IV_BYTES,
+    )
+    val dataIv = record.iv.copyOfRange(
+        ARCHIVE_ENVELOPE_MARKER_BYTES + ARCHIVE_KEK_WRAP_IV_BYTES,
+        ARCHIVE_ENVELOPE_IV_BYTES,
+    )
+    val wrappedDekCiphertext = record.ciphertext.copyOfRange(
+        0,
+        ARCHIVE_WRAPPED_DEK_CIPHERTEXT_BYTES,
+    )
+    val dataCiphertext = record.ciphertext.copyOfRange(
+        ARCHIVE_WRAPPED_DEK_CIPHERTEXT_BYTES,
+        record.ciphertext.size,
+    )
+    val wrapAad = accountMessageArchiveEnvelopeLayerAad(
+        aad,
+        ARCHIVE_ENVELOPE_WRAP_AAD_LAYER,
+    )
+    val dataAad = accountMessageArchiveEnvelopeLayerAad(
+        aad,
+        ARCHIVE_ENVELOPE_DATA_AAD_LAYER,
+    )
+    val wrappedDek = EncryptedAccountMessageArchiveRecord(wrapIv, wrappedDekCiphertext)
+    var recoveredDek: ByteArray? = null
+    var plaintext: ByteArray? = null
+    try {
+        val unwrapped = unwrapDek(wrapAad, wrappedDek)
+        recoveredDek = unwrapped
+        require(unwrapped.size == ARCHIVE_RECORD_DEK_BYTES) {
+            "Invalid unwrapped account message archive DEK"
+        }
+        val expectedPlaintextBytes = dataCiphertext.size - ARCHIVE_GCM_TAG_BYTES
+        require(expectedPlaintextBytes in 1..MAX_ACCOUNT_MESSAGE_ARCHIVE_RECORD_BYTES) {
+            "Invalid account message archive envelope payload length"
+        }
+        val decrypted = softwareAccountMessageArchiveAesGcm(
+            mode = Cipher.DECRYPT_MODE,
+            dek = unwrapped,
+            iv = dataIv,
+            aad = dataAad,
+            input = dataCiphertext,
+        )
+        plaintext = decrypted
+        require(decrypted.size == expectedPlaintextBytes) {
+            "Software account message archive decryption returned a truncated payload"
+        }
+        plaintext = null
+        return decrypted
+    } finally {
+        recoveredDek?.fill(0)
+        plaintext?.fill(0)
+        wrapIv.fill(0)
+        dataIv.fill(0)
+        wrappedDekCiphertext.fill(0)
+        dataCiphertext.fill(0)
+        wrapAad.fill(0)
+        dataAad.fill(0)
+    }
+}
+
 /** Distinguishes a genuinely new archive alias from an existing handle found during bootstrap. */
 @VisibleForTesting
 internal data class AccountMessageArchiveKeyResolution<T : Any>(
     val key: T,
     val createdNow: Boolean,
+)
+
+/** Empty-owner bootstrap failed its independent authenticated alias reload proof. */
+@VisibleForTesting
+internal class AccountMessageArchiveBootstrapKeyValidationException(
+    cause: Throwable,
+) : GeneralSecurityException(
+    "Account message archive bootstrap key failed independent authenticated reload",
+    cause,
 )
 
 class AccountMessageArchiveConflictException(message: String) : IllegalStateException(message)
@@ -142,39 +433,98 @@ class AndroidKeystoreAccountMessageArchiveCipher @Inject constructor(
         KEY_HEALTH_PREFERENCES,
         Context.MODE_PRIVATE,
     )
+    private val archiveRandom = SecureRandom()
 
     override fun encrypt(
         owner: AccountMessageArchiveOwner,
         aad: ByteArray,
         plaintext: ByteArray,
         allowKeyCreation: Boolean,
-    ): EncryptedAccountMessageArchiveRecord = try {
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        val resolvedKey = archiveKey(owner, allowKeyCreation)
-        try {
-            cipher.init(Cipher.ENCRYPT_MODE, resolvedKey.key)
+    ): EncryptedAccountMessageArchiveRecord {
+        // An empty owner has no ciphertext whose key must be retained. Its first write must prove
+        // the alias through an independent reload even when the alias pre-existed this invocation.
+        val bootstrapProbeRequired = allowKeyCreation
+        var bootstrapCleanupAttempted = false
+        return try {
+            val resolvedKey = archiveKey(owner, allowKeyCreation)
+            val encrypted = encryptAccountMessageArchiveRecordEnvelope(
+                aad = aad,
+                plaintext = plaintext,
+                createDek = {
+                    ByteArray(ARCHIVE_RECORD_DEK_BYTES).also(archiveRandom::nextBytes)
+                },
+                createDataIv = {
+                    ByteArray(ARCHIVE_SOFTWARE_DATA_IV_BYTES).also(archiveRandom::nextBytes)
+                },
+                wrapDek = { wrapAad, dek ->
+                    val cipher = Cipher.getInstance(TRANSFORMATION)
+                    try {
+                        cipher.init(Cipher.ENCRYPT_MODE, resolvedKey.key)
+                    } catch (error: Exception) {
+                        throw archiveKeyOperationFailure(owner, error, resolvedKey.createdNow)
+                    }
+                    val wrapped = completeKeystoreCipherOperation(
+                        operation = {
+                            cipher.updateAAD(wrapAad)
+                            cipher.doFinal(dek)
+                        },
+                        classifyFailure = {
+                            archiveKeyOperationFailure(owner, it, resolvedKey.createdNow)
+                        },
+                        onSuccess = {},
+                    )
+                    EncryptedAccountMessageArchiveRecord(
+                        iv = cipher.iv.copyOf(),
+                        ciphertext = wrapped,
+                    )
+                },
+                validateWrappedDek = { wrapAad, wrappedDek, expectedDek ->
+                    validateBootstrapAccountMessageArchiveKeyRoundTrip(
+                        resolution = resolvedKey,
+                        bootstrapProbeRequired = bootstrapProbeRequired,
+                        expectedDek = expectedDek,
+                        reloadBootstrapKey = {
+                            // A new KeyStore instance bypasses KeyGenerator's returned handle.
+                            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply {
+                                load(null)
+                            }
+                            keyStore.getKey(accountMessageArchiveKeyAlias(owner), null)
+                                as? SecretKey
+                        },
+                        authenticatedUnwrap = { reloadedKey ->
+                            Cipher.getInstance(TRANSFORMATION).run {
+                                init(
+                                    Cipher.DECRYPT_MODE,
+                                    reloadedKey,
+                                    GCMParameterSpec(GCM_TAG_BITS, wrappedDek.iv),
+                                )
+                                updateAAD(wrapAad)
+                                doFinal(wrappedDek.ciphertext)
+                            }
+                        },
+                        eraseUncommittedBootstrapKey = {
+                            bootstrapCleanupAttempted = true
+                            eraseUncommittedBootstrapKeyAfterFailedProbe(owner)
+                        },
+                    )
+                },
+            )
+            clearKeyFailureObservations(owner)
+            encrypted
         } catch (error: Exception) {
-            throw archiveKeyOperationFailure(owner, error, resolvedKey.createdNow)
+            if (bootstrapProbeRequired && !bootstrapCleanupAttempted) {
+                bootstrapCleanupAttempted = true
+                try {
+                    eraseUncommittedBootstrapKeyAfterFailedProbe(owner)
+                } catch (cleanupFailure: Throwable) {
+                    if (cleanupFailure !== error) error.addSuppressed(cleanupFailure)
+                }
+            }
+            throw AccountMessageArchiveUnavailableException(
+                "Account message archive could not be encrypted",
+                error,
+            )
         }
-        val ciphertext = completeKeystoreCipherOperation(
-            operation = {
-                cipher.updateAAD(aad)
-                cipher.doFinal(plaintext)
-            },
-            classifyFailure = {
-                archiveKeyOperationFailure(owner, it, resolvedKey.createdNow)
-            },
-            onSuccess = { clearKeyFailureObservations(owner) },
-        )
-        EncryptedAccountMessageArchiveRecord(
-            iv = cipher.iv.copyOf(),
-            ciphertext = ciphertext,
-        )
-    } catch (error: Exception) {
-        throw AccountMessageArchiveUnavailableException(
-            "Account message archive could not be encrypted",
-            error,
-        )
     }
 
     override fun decrypt(
@@ -182,35 +532,43 @@ class AndroidKeystoreAccountMessageArchiveCipher @Inject constructor(
         aad: ByteArray,
         record: EncryptedAccountMessageArchiveRecord,
     ): ByteArray = try {
-        require(record.iv.size == GCM_IV_BYTES) { "Invalid account message archive IV" }
-        require(record.ciphertext.size >= GCM_TAG_BYTES) {
-            "Invalid account message archive ciphertext"
-        }
-        val cipher = Cipher.getInstance(TRANSFORMATION)
+        val format = accountMessageArchiveStorageFormat(record)
         val resolvedKey = archiveKey(owner, allowCreation = false)
-        try {
-            cipher.init(
-                Cipher.DECRYPT_MODE,
-                // Retained archive ciphertext must never be rebound to a replacement Android 9 key.
-                resolvedKey.key,
-                GCMParameterSpec(GCM_TAG_BITS, record.iv),
+        val keystoreDecrypt: (
+            ByteArray,
+            EncryptedAccountMessageArchiveRecord,
+        ) -> ByteArray = { operationAad, encrypted ->
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            try {
+                cipher.init(
+                    Cipher.DECRYPT_MODE,
+                    // Retained ciphertext must never be rebound to a replacement Android 9 key.
+                    resolvedKey.key,
+                    GCMParameterSpec(GCM_TAG_BITS, encrypted.iv),
+                )
+            } catch (error: Exception) {
+                // Some Android 9 providers return a handle, then report permanent loss only when
+                // Cipher.init asks Keystore to use the underlying key material.
+                throw archiveKeyOperationFailure(owner, error, resolvedKey.createdNow)
+            }
+            completeKeystoreCipherOperation(
+                operation = {
+                    cipher.updateAAD(operationAad)
+                    cipher.doFinal(encrypted.ciphertext)
+                },
+                classifyFailure = {
+                    archiveKeyOperationFailure(owner, it, resolvedKey.createdNow)
+                },
+                onSuccess = { clearKeyFailureObservations(owner) },
             )
-        } catch (error: Exception) {
-            // Some Android 9 providers return an alias-backed key handle, then report its permanent
-            // loss only when Cipher.init asks Keystore to use it. Classify that exact path through
-            // the same bounded proof as an unrecoverable getKey result.
-            throw archiveKeyOperationFailure(owner, error, resolvedKey.createdNow)
         }
-        completeKeystoreCipherOperation(
-            operation = {
-                cipher.updateAAD(aad)
-                cipher.doFinal(record.ciphertext)
-            },
-            classifyFailure = {
-                archiveKeyOperationFailure(owner, it, resolvedKey.createdNow)
-            },
-            onSuccess = { clearKeyFailureObservations(owner) },
-        )
+        when (format) {
+            AccountMessageArchiveStorageFormat.LEGACY_DIRECT_V1 ->
+                decryptLegacyAccountMessageArchiveRecord(aad, record, keystoreDecrypt)
+
+            AccountMessageArchiveStorageFormat.DEK_ENVELOPE_V1 ->
+                decryptAccountMessageArchiveRecordEnvelope(aad, record, keystoreDecrypt)
+        }
     } catch (error: Exception) {
         throw AccountMessageArchiveUnavailableException(
             "Account message archive failed authenticated decryption",
@@ -233,6 +591,25 @@ class AndroidKeystoreAccountMessageArchiveCipher @Inject constructor(
         } catch (error: Exception) {
             throw AccountMessageArchiveUnavailableException(
                 "Account message archive key could not be erased",
+                error,
+            )
+        }
+    }
+
+    @Synchronized
+    private fun eraseUncommittedBootstrapKeyAfterFailedProbe(
+        owner: AccountMessageArchiveOwner,
+    ) {
+        try {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            val alias = accountMessageArchiveKeyAlias(owner)
+            deleteKeystoreAliasAndVerifyAbsent(
+                deleteEntry = { keyStore.deleteEntry(alias) },
+                aliasExists = { keyStore.containsAlias(alias) },
+            )
+        } catch (error: Exception) {
+            throw AccountMessageArchiveUnavailableException(
+                "Uncommitted account message archive bootstrap key could not be erased",
                 error,
             )
         }
@@ -480,8 +857,6 @@ class AndroidKeystoreAccountMessageArchiveCipher @Inject constructor(
         const val KEY_HEALTH_PREFERENCES = "kit_pay_account_message_archive_key_health_v1"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val GCM_TAG_BITS = 128
-        const val GCM_TAG_BYTES = GCM_TAG_BITS / 8
-        const val GCM_IV_BYTES = 12
     }
 }
 
@@ -898,6 +1273,62 @@ internal fun <T : Any> resolveAccountMessageArchiveKeyWithCreationStatus(
     return createNew()
 }
 
+/**
+ * Proves that an empty-owner archive alias survives an independent authenticated provider reload.
+ *
+ * The first row is not committed merely because the originally returned handle can wrap its DEK:
+ * affected Android 9 providers can subsequently return no handle or unrelated/unusable material.
+ * Every empty-owner first write performs this proof, including when it finds an alias left by a
+ * failed earlier cleanup. Any failed reload, unwrap, or constant-time DEK comparison attempts exact
+ * uncommitted-alias erasure before returning; the recovered DEK is wiped on every path.
+ */
+@VisibleForTesting
+internal fun <T : Any> validateBootstrapAccountMessageArchiveKeyRoundTrip(
+    resolution: AccountMessageArchiveKeyResolution<T>,
+    bootstrapProbeRequired: Boolean,
+    expectedDek: ByteArray,
+    reloadBootstrapKey: () -> T?,
+    authenticatedUnwrap: (T) -> ByteArray,
+    eraseUncommittedBootstrapKey: () -> Unit,
+): T {
+    if (!bootstrapProbeRequired) return resolution.key
+    require(expectedDek.size == ARCHIVE_RECORD_DEK_BYTES) {
+        "Invalid bootstrap account message archive DEK"
+    }
+
+    var validationDek: ByteArray? = null
+    try {
+        val reloadedKey = reloadBootstrapKey()
+            ?: throw GeneralSecurityException(
+                "Fresh account message archive key is absent after provider reload",
+            )
+        val unwrapped = authenticatedUnwrap(reloadedKey)
+        validationDek = unwrapped
+        if (unwrapped.size != ARCHIVE_RECORD_DEK_BYTES ||
+            !MessageDigest.isEqual(expectedDek, unwrapped)
+        ) {
+            throw GeneralSecurityException(
+                "Reloaded account message archive key produced a different bootstrap DEK",
+            )
+        }
+        return reloadedKey
+    } catch (error: Exception) {
+        val retryable = if (error is AccountMessageArchiveBootstrapKeyValidationException) {
+            error
+        } else {
+            AccountMessageArchiveBootstrapKeyValidationException(error)
+        }
+        try {
+            eraseUncommittedBootstrapKey()
+        } catch (cleanupFailure: Throwable) {
+            if (cleanupFailure !== retryable) retryable.addSuppressed(cleanupFailure)
+        }
+        throw retryable
+    } finally {
+        validationDek?.fill(0)
+    }
+}
+
 /** Existing archive aliases use bounded Android-9 recovery even when their table is empty. */
 @VisibleForTesting
 internal fun classifyAccountMessageArchiveKeyOperationFailure(
@@ -1008,8 +1439,44 @@ private fun AccountMessageArchiveEntity.wipeEncryptedBytes() {
     ciphertext.fill(0)
 }
 
+/** `KIT-ARC` plus format version 1; its eight-byte length cannot be a legacy GCM IV. */
+private val ACCOUNT_MESSAGE_ARCHIVE_ENVELOPE_MARKER = byteArrayOf(
+    0x4b,
+    0x49,
+    0x54,
+    0x2d,
+    0x41,
+    0x52,
+    0x43,
+    0x01,
+)
+
+private const val ARCHIVE_TRANSFORMATION = "AES/GCM/NoPadding"
+private const val ANDROID_KEYSTORE_PROVIDER_PREFIX = "AndroidKeyStore"
+private const val ARCHIVE_GCM_TAG_BITS = 128
+private const val ARCHIVE_GCM_TAG_BYTES = ARCHIVE_GCM_TAG_BITS / 8
+private const val ARCHIVE_LEGACY_GCM_IV_BYTES = 12
+private const val ARCHIVE_KEK_WRAP_IV_BYTES = 12
+private const val ARCHIVE_SOFTWARE_DATA_IV_BYTES = 12
+private const val ARCHIVE_RECORD_DEK_BYTES = 32
+private const val ARCHIVE_WRAPPED_DEK_CIPHERTEXT_BYTES =
+    ARCHIVE_RECORD_DEK_BYTES + ARCHIVE_GCM_TAG_BYTES
+private const val ARCHIVE_ENVELOPE_MARKER_BYTES = 8
+private const val ARCHIVE_ENVELOPE_IV_BYTES =
+    ARCHIVE_ENVELOPE_MARKER_BYTES +
+        ARCHIVE_KEK_WRAP_IV_BYTES + ARCHIVE_SOFTWARE_DATA_IV_BYTES
+private const val ARCHIVE_ENVELOPE_WRAP_AAD_LAYER: Byte = 1
+private const val ARCHIVE_ENVELOPE_DATA_AAD_LAYER: Byte = 2
+private const val MAX_ACCOUNT_MESSAGE_ARCHIVE_AAD_BYTES = 512
 private const val MAX_ACCOUNT_MESSAGE_ARCHIVE_PAGE_SIZE = 100
-private const val MAX_ACCOUNT_MESSAGE_ARCHIVE_RECORD_BYTES = 128 * 1024
+internal const val MAX_ACCOUNT_MESSAGE_ARCHIVE_RECORD_BYTES = 128 * 1024
+private const val MAX_LEGACY_ARCHIVE_CIPHERTEXT_BYTES =
+    MAX_ACCOUNT_MESSAGE_ARCHIVE_RECORD_BYTES + ARCHIVE_GCM_TAG_BYTES
+private const val MIN_ARCHIVE_ENVELOPE_CIPHERTEXT_BYTES =
+    ARCHIVE_WRAPPED_DEK_CIPHERTEXT_BYTES + ARCHIVE_GCM_TAG_BYTES + 1
+private const val MAX_ARCHIVE_ENVELOPE_CIPHERTEXT_BYTES =
+    ARCHIVE_WRAPPED_DEK_CIPHERTEXT_BYTES +
+        MAX_ACCOUNT_MESSAGE_ARCHIVE_RECORD_BYTES + ARCHIVE_GCM_TAG_BYTES
 private const val MAX_PERMANENT_KEY_WRITE_RECOVERY_ATTEMPTS = 2
 private const val ARCHIVE_AAD_SCHEMA_VERSION = 1
 private val ARCHIVE_AAD_MAGIC = "kit.account-message-archive".toByteArray(Charsets.US_ASCII)

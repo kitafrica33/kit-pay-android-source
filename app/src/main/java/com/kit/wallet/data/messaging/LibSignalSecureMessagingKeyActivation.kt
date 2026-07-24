@@ -16,6 +16,15 @@ internal class SecureMessagingKeyReconciliationException(
     message: String,
 ) : IllegalStateException(message)
 
+internal fun SecureMessagingResetProofFence.provesExactResetTarget(
+    target: SecureMessagingEnrollmentResetTarget,
+): Boolean = proved &&
+    serverDeviceId == target.serverDeviceId &&
+    previousEnrollmentEpoch == target.enrollmentEpoch &&
+    previousRegistrationId == target.registrationId &&
+    previousIdentityKeySha256 == target.identityKeySha256 &&
+    previousBundleVersion == target.bundleVersion
+
 /**
  * The authenticated server enrollment cannot safely continue in this local session.
  *
@@ -35,7 +44,20 @@ internal class SecureMessagingLocalEnrollmentResetRequiredException(
     val activationFence: SecureMessagingSessionFence,
     message: String,
     cause: Throwable? = null,
-) : IllegalStateException(message, cause)
+    val provenResetTarget: SecureMessagingEnrollmentResetTarget? = null,
+    val provenResetProof: SecureMessagingResetProofFence? = null,
+) : IllegalStateException(message, cause) {
+    init {
+        require((provenResetTarget == null) == (provenResetProof == null)) {
+            "A local enrollment reset must carry both its remote target and proof"
+        }
+        provenResetTarget?.let { target ->
+            require(checkNotNull(provenResetProof).provesExactResetTarget(target)) {
+                "A local enrollment reset carried mismatched remote proof"
+            }
+        }
+    }
+}
 
 internal class SecureMessagingFreshAuthenticationRequiredException(
     val activationFence: SecureMessagingSessionFence,
@@ -89,6 +111,12 @@ class LibSignalSecureMessagingKeyActivation @Inject constructor(
             }
             if (resetProof != null) {
                 throw proofRecoveryException(session, remote, resetProof, error)
+            }
+            if (!error.hasExplicitEnrollmentResetAuthority()) {
+                // Authenticated corruption in a new envelope, and unknown non-retryable storage
+                // failures, must not revoke an otherwise healthy server enrollment. Preserve the
+                // Kit login and the encrypted row for an explicit/future recovery decision.
+                throw error
             }
             if (remote.enrolled) {
                 throw SecureMessagingReauthenticationRequiredException(
@@ -169,10 +197,13 @@ class LibSignalSecureMessagingKeyActivation @Inject constructor(
             remote.enrollmentEpoch == resultingEpoch &&
             session.binding.serverDeviceId == proof.serverDeviceId
         ) {
+            val resetTarget = proof.resetTarget()
             SecureMessagingLocalEnrollmentResetRequiredException(
                 activationFence = session.activationFence(),
                 message = "Reset enrollment has unavailable residual local state",
                 cause = cause,
+                provenResetTarget = resetTarget,
+                provenResetProof = proof,
             )
         } else {
             SecureMessagingFreshAuthenticationRequiredException(
@@ -200,9 +231,12 @@ class LibSignalSecureMessagingKeyActivation @Inject constructor(
         }
         if (!remote.enrolled) {
             if (local != null) {
+                val resetTarget = proof.resetTarget()
                 throw SecureMessagingLocalEnrollmentResetRequiredException(
-                    session.activationFence(),
-                    "Residual local state must be erased after enrollment reset",
+                    activationFence = session.activationFence(),
+                    message = "Residual local state must be erased after enrollment reset",
+                    provenResetTarget = resetTarget,
+                    provenResetProof = proof,
                 )
             }
             return
@@ -239,6 +273,14 @@ class LibSignalSecureMessagingKeyActivation @Inject constructor(
             identityKeySha256 = previousIdentityKeySha256,
             bundleVersion = previousBundleVersion,
         )
+
+    /** Only bounded, provenance-bearing loss can revoke an enrolled server bundle automatically. */
+    private fun Throwable.hasExplicitEnrollmentResetAuthority(): Boolean =
+        isLegacyConfirmedSecureMessagingEnrollmentUnreadableFailure(this) ||
+            isPermanentlyMissingSecureMessagingRecordKey(this) ||
+            isLegacyInitialSecureMessagingEnrollmentUnreadableFailure(this) ||
+            generateSequence(this) { it.cause }
+                .any { it is SecureMessagingLegacyStateUnreadableException }
 
     private suspend fun finishReconciliation(
         session: RemoteSecureMessagingTransport.Session,

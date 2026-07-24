@@ -293,6 +293,33 @@ interface SessionStore {
         "This session store cannot reset secure messaging state",
     )
 
+    /**
+     * Exact-proof variant used after the server has durably advanced one pinned enrollment.
+     * Production storage rechecks [proof] while holding the same session mutex that fences the
+     * destructive local reset, so a removed or replaced proof cannot race into local erasure.
+     */
+    suspend fun resetSecureMessagingStateAfterProvenRemoteResetIfCurrent(
+        expected: SessionFence,
+        activationFence: SecureMessagingSessionFence,
+        proof: SecureMessagingResetProofFence,
+        allowPermanentlyUnavailableSnapshot: Boolean = false,
+        finalMessagingSnapshot: suspend () -> Unit = {},
+    ): Boolean {
+        val current = current() ?: return false
+        if (!proof.proved ||
+            current.fence() != expected ||
+            current.messagingResetProof != proof
+        ) {
+            return false
+        }
+        return resetSecureMessagingStateIfCurrent(
+            expected = expected,
+            activationFence = activationFence,
+            allowPermanentlyUnavailableSnapshot = allowPermanentlyUnavailableSnapshot,
+            finalMessagingSnapshot = finalMessagingSnapshot,
+        )
+    }
+
     suspend fun recordMessagingResetPendingIfCurrent(
         expected: SessionFence,
         pending: SecureMessagingResetProofFence,

@@ -58,8 +58,29 @@ data class AppCapabilities(
     val messagingUsable: Boolean
         get() = messagingServerCompatible && secureMessagingClientReady
 
+    /**
+     * Wallet-backed service surfaces only become usable when both the service rollout and the
+     * wallet they operate on are enabled. Keeping these dependencies here gives the dashboard,
+     * navigation guard, and deep-link handling one server-driven source of truth.
+     */
+    val billPaymentsUsable: Boolean
+        get() = allEnabled(KitFeature.WALLETS, KitFeature.BILLS)
+
+    val airtimeUsable: Boolean
+        get() = allEnabled(KitFeature.WALLETS, KitFeature.AIRTIME)
+
+    val bankTransfersUsable: Boolean
+        get() = allEnabled(KitFeature.WALLETS, KitFeature.BANK_TRANSFERS)
+
+    val mobileMoneyUsable: Boolean
+        get() = allEnabled(KitFeature.WALLETS, KitFeature.MOBILE_MONEY)
+
     val qrPaymentsUsable: Boolean
-        get() = allEnabled(KitFeature.MERCHANT_PAYMENTS, KitFeature.QR_PAYMENTS) &&
+        get() = allEnabled(
+            KitFeature.WALLETS,
+            KitFeature.MERCHANT_PAYMENTS,
+            KitFeature.QR_PAYMENTS,
+        ) &&
             qrScannerClientReady
 
     /**
@@ -81,10 +102,10 @@ data class AppCapabilities(
             Dest.CONVERSATION, Dest.CONTACTS -> messagingUsable
             Dest.CALLS, Dest.CALL_CONTACTS, Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL ->
                 enabled(KitFeature.CALLS)
-            Dest.BILLS, Dest.BILL_PAY -> enabled(KitFeature.BILLS)
-            Dest.AIRTIME -> enabled(KitFeature.AIRTIME)
-            Dest.BANK -> enabled(KitFeature.BANK_TRANSFERS)
-            Dest.MOBILE_MONEY -> enabled(KitFeature.MOBILE_MONEY)
+            Dest.BILLS, Dest.BILL_PAY -> billPaymentsUsable
+            Dest.AIRTIME -> airtimeUsable
+            Dest.BANK -> bankTransfersUsable
+            Dest.MOBILE_MONEY -> mobileMoneyUsable
             // Receive shares the authenticated user's existing Kit tag/phone; it does not depend
             // on the still-unimplemented QR scanner or a separate client protocol.
             Dest.RECEIVE -> enabled(KitFeature.WALLETS)

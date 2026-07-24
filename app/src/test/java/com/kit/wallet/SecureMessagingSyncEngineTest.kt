@@ -16,13 +16,16 @@ import com.kit.wallet.data.messaging.SecureMessagingCryptoEngine
 import com.kit.wallet.data.messaging.SecureMessagingCryptoTransaction
 import com.kit.wallet.data.messaging.SecureMessagingEventProcessor
 import com.kit.wallet.data.messaging.SecureMessagingFreshAuthenticationRequiredException
+import com.kit.wallet.data.messaging.SecureMessagingFreshProvisioningUnreadableException
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
-import com.kit.wallet.data.messaging.SecureMessagingLegacyStateUnreadableException
+import com.kit.wallet.data.messaging.SecureMessagingLegacyConfirmedEnrollmentUnreadableException
+import com.kit.wallet.data.messaging.SecureMessagingLegacyInitialEnrollmentUnreadableException
+import com.kit.wallet.data.messaging.SecureMessagingLocalEnrollmentResetRequiredException
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingReauthenticationRequiredException
-import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
 import com.kit.wallet.data.messaging.SecureMessagingRecordAuthenticationFailedException
+import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyTemporarilyUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingRecordVersion
 import com.kit.wallet.data.messaging.SecureMessagingRevalidationRetryException
@@ -40,13 +43,16 @@ import com.kit.wallet.data.remote.DeviceRegistrationDto
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.MessagingSyncDto
 import com.kit.wallet.data.remote.SecureMessagingWireApi
+import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.lang.reflect.Proxy
+import java.security.ProviderException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
@@ -778,6 +784,151 @@ class SecureMessagingSyncEngineTest {
     }
 
     @Test
+    fun `legacy v1 local reset advances remote enrollment before successor activation`() =
+        runTest {
+            val server = MockWebServer().apply { start() }
+            try {
+                val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+                val retrofit = Retrofit.Builder()
+                    .baseUrl(server.url("/"))
+                    .addConverterFactory(MoshiConverterFactory.create(moshi))
+                    .build()
+                val api = retrofit.create(KitWalletApi::class.java)
+                val transport = RemoteSecureMessagingTransport(
+                    api,
+                    retrofit.create(SecureMessagingWireApi::class.java),
+                    ApiCallExecutor(moshi),
+                )
+                val sessions = FakeSessionStore(TOKENS)
+                val guard = SecureMessagingLifecycleGuard()
+                val registry = SecureMessagingActiveSessionRegistry(guard)
+                val stateStore = TestSecureMessagingStateStore()
+                val processor = SecureMessagingEventProcessor(
+                    UnusedCryptoEngine,
+                    SecureMessagingProjectionStore(
+                        stateStore,
+                        com.kit.wallet.data.messaging.LibSignalCompanionStateReader(stateStore),
+                    ),
+                    SecureMessagingSyncCursorStore(stateStore),
+                )
+                val recoveryOrder = mutableListOf<String>()
+                val localResetFences = mutableListOf<
+                    com.kit.wallet.data.messaging.SecureMessagingSessionFence,
+                    >()
+                var activationAttempts = 0
+                var legacyFailureFence:
+                    com.kit.wallet.data.messaging.SecureMessagingSessionFence? = null
+                var remoteResetFence:
+                    com.kit.wallet.data.messaging.SecureMessagingSessionFence? = null
+                val legacyV1Failure = SecureMessagingFreshProvisioningUnreadableException(
+                    SecureMessagingLegacyInitialEnrollmentUnreadableException(
+                        ProviderException("Android 9 failed to reopen the legacy v1 record"),
+                    ),
+                )
+                val coordinator = SecureMessagingActivationCoordinator(
+                    transport = transport,
+                    lifecycle = guard,
+                    sessions = registry,
+                    keyActivation = SecureMessagingKeyActivation { session ->
+                        when (activationAttempts++) {
+                            0 -> {
+                                legacyFailureFence = session.activationFence()
+                                recoveryOrder += "legacy-v1-failure"
+                                throw SecureMessagingLocalEnrollmentResetRequiredException(
+                                    activationFence = session.activationFence(),
+                                    message = "Legacy v1 enrollment must be erased",
+                                    cause = legacyV1Failure,
+                                )
+                            }
+
+                            1 -> {
+                                check(localResetFences.size == 1) {
+                                    "Remote recovery must observe the completed local reset"
+                                }
+                                remoteResetFence = session.activationFence()
+                                recoveryOrder += "missing-local-enrollment"
+                                throw SecureMessagingReauthenticationRequiredException(
+                                    target = RESET_TARGET,
+                                    activationFence = session.activationFence(),
+                                    message = "The enrolled server bundle has no local identity",
+                                )
+                            }
+
+                            2 -> recoveryOrder += "successor-activated"
+                            else -> error("Unexpected secure-messaging activation attempt")
+                        }
+                    },
+                    initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+                )
+                val localStateLifecycle = SecureMessagingSessionLifecycle(stateStore, guard)
+                localStateLifecycle.afterSessionSave()
+                sessions.messagingReset = { fence ->
+                    recoveryOrder += "local-reset"
+                    localStateLifecycle.resetForRecovery(fence)
+                    localStateLifecycle.afterSessionSave()
+                    localResetFences += fence
+                }
+                var remoteResets = 0
+                val engine = RealSecureMessagingSyncEngine(
+                    bindingResolver = SecureMessagingAuthBindingResolver(
+                        sessions,
+                        api,
+                        ApiCallExecutor(moshi),
+                        deviceIdentity(),
+                    ),
+                    activation = coordinator,
+                    processor = processor,
+                    sessions = sessions,
+                    sessionLifecycle = localStateLifecycle,
+                    authRepository = unusedAuthRepository { epoch, target ->
+                        assertEquals(TOKENS.sessionId, epoch)
+                        assertEquals(RESET_TARGET, target)
+                        assertEquals(1, localResetFences.size)
+                        recoveryOrder += "remote-reset"
+                        remoteResets++
+                        sessions.recordProvedReset(target)
+                    },
+                )
+                server.dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest): MockResponse = when {
+                        request.path == "/api/kit-wallet/v1/profile" -> jsonResponse(PROFILE)
+                        request.path == "/api/kit-wallet/v1/devices" -> jsonResponse(DEVICES)
+                        request.path == "/api/kit-wallet/v1/capabilities" ->
+                            jsonResponse(READY_CAPABILITIES)
+                        request.path?.startsWith("/api/kit-wallet/v1/messaging/sync") == true ->
+                            emptySyncResponse(moshi, "successor_cursor")
+                        else -> MockResponse().setResponseCode(404)
+                    }
+                }
+
+                engine.synchronize()
+
+                assertEquals(3, activationAttempts)
+                assertEquals(1, remoteResets)
+                assertEquals(2, localResetFences.size)
+                assertTrue(localResetFences[0] === legacyFailureFence)
+                assertTrue(localResetFences[1] === remoteResetFence)
+                assertEquals(
+                    listOf(
+                        "legacy-v1-failure",
+                        "local-reset",
+                        "missing-local-enrollment",
+                        "remote-reset",
+                        "local-reset",
+                        "successor-activated",
+                    ),
+                    recoveryOrder,
+                )
+                val successor = registry.requireCurrent()
+                assertTrue(successor.fence !== legacyFailureFence)
+                assertTrue(successor.fence !== remoteResetFence)
+                assertEquals(SecureMessagingRuntimeStage.READY, guard.snapshot().stage)
+            } finally {
+                server.shutdown()
+            }
+        }
+
+    @Test
     fun `legacy unreadable state bypasses snapshot after exact reset and reactivates`() =
         runTest {
             val server = MockWebServer().apply { start() }
@@ -805,10 +956,8 @@ class SecureMessagingSyncEngineTest {
                     SecureMessagingSyncCursorStore(stateStore),
                 )
                 var activationAttempts = 0
-                val legacyUnreadable = SecureMessagingLegacyStateUnreadableException(
-                    SecureMessagingRecordAuthenticationFailedException(
-                        IllegalStateException("legacy projection has another at-rest key"),
-                    ),
+                val legacyUnreadable = SecureMessagingLegacyInitialEnrollmentUnreadableException(
+                    ProviderException("Android 9 cannot reopen the legacy direct record"),
                 )
                 val coordinator = SecureMessagingActivationCoordinator(
                     transport = transport,
@@ -853,6 +1002,7 @@ class SecureMessagingSyncEngineTest {
                         recoveredEpochs += epoch
                         assertEquals(RESET_TARGET, target)
                         if (recoveryAttempts++ == 0) throw retryableResetFailure
+                        sessions.recordProvedReset(target)
                     },
                     messageHistory = object : AccountMessageHistoryRetention {
                         override suspend fun snapshotActiveHistory(
@@ -883,7 +1033,7 @@ class SecureMessagingSyncEngineTest {
 
                 assertEquals(retryableResetFailure, retryable)
                 assertEquals(
-                    com.kit.wallet.data.messaging.SecureMessagingRuntimeStage.QUARANTINED,
+                    com.kit.wallet.data.messaging.SecureMessagingRuntimeStage.PREPARING_KEYS,
                     guard.snapshot().stage,
                 )
 
@@ -893,6 +1043,380 @@ class SecureMessagingSyncEngineTest {
                 assertEquals(1, snapshotAttempts)
                 assertEquals(1, localResets)
                 assertEquals(com.kit.wallet.data.messaging.SecureMessagingRuntimeStage.READY, guard.snapshot().stage)
+            } finally {
+                server.shutdown()
+            }
+        }
+
+    @Test
+    fun `proved reset bypass rejects missing proof corruption cancellation and changed owner`() =
+        runTest {
+            val server = MockWebServer().apply { start() }
+            try {
+                val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+                val retrofit = Retrofit.Builder()
+                    .baseUrl(server.url("/"))
+                    .addConverterFactory(MoshiConverterFactory.create(moshi))
+                    .build()
+                val api = retrofit.create(KitWalletApi::class.java)
+                val transport = RemoteSecureMessagingTransport(
+                    api,
+                    retrofit.create(SecureMessagingWireApi::class.java),
+                    ApiCallExecutor(moshi),
+                )
+                val sessions = FakeSessionStore(TOKENS)
+                val guard = SecureMessagingLifecycleGuard()
+                val stateStore = TestSecureMessagingStateStore()
+                val processor = SecureMessagingEventProcessor(
+                    UnusedCryptoEngine,
+                    SecureMessagingProjectionStore(
+                        stateStore,
+                        com.kit.wallet.data.messaging.LibSignalCompanionStateReader(stateStore),
+                    ),
+                    SecureMessagingSyncCursorStore(stateStore),
+                )
+                val legacyUnreadable = SecureMessagingLegacyInitialEnrollmentUnreadableException(
+                    ProviderException("Android 9 cannot reopen the legacy direct record"),
+                )
+                val coordinator = SecureMessagingActivationCoordinator(
+                    transport = transport,
+                    lifecycle = guard,
+                    sessions = SecureMessagingActiveSessionRegistry(guard),
+                    keyActivation = SecureMessagingKeyActivation { session ->
+                        throw SecureMessagingReauthenticationRequiredException(
+                            target = RESET_TARGET,
+                            activationFence = session.activationFence(),
+                            message = "missing private key",
+                            cause = legacyUnreadable,
+                        )
+                    },
+                    initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+                )
+                val localStateLifecycle = SecureMessagingSessionLifecycle(stateStore, guard)
+                localStateLifecycle.afterSessionSave()
+                var localResets = 0
+                sessions.messagingReset = { localResets++ }
+                var recoveryAttempts = 0
+                var snapshotAttempts = 0
+                var replaceOwnerBeforeSnapshotFailure = false
+                val authenticatedCorruption = SecureMessagingRecordAuthenticationFailedException(
+                    IllegalStateException("authenticated projection corruption"),
+                )
+                var snapshotFailure: Throwable = authenticatedCorruption
+                val engine = RealSecureMessagingSyncEngine(
+                    bindingResolver = SecureMessagingAuthBindingResolver(
+                        sessions,
+                        api,
+                        ApiCallExecutor(moshi),
+                        deviceIdentity(),
+                    ),
+                    activation = coordinator,
+                    processor = processor,
+                    sessions = sessions,
+                    sessionLifecycle = localStateLifecycle,
+                    authRepository = unusedAuthRepository { _, target ->
+                        when (recoveryAttempts++) {
+                            0 -> Unit
+                            1 -> sessions.recordProvedReset(
+                                target.copy(registrationId = target.registrationId + 1),
+                            )
+                            else -> sessions.recordProvedReset(target)
+                        }
+                    },
+                    messageHistory = object : AccountMessageHistoryRetention {
+                        override suspend fun snapshotActiveHistory(
+                            target: com.kit.wallet.data.session.SessionFence,
+                        ) {
+                            snapshotAttempts++
+                            assertEquals(TOKENS.fence(), target)
+                            if (replaceOwnerBeforeSnapshotFailure) {
+                                sessions.replace(
+                                    TOKENS.copy(
+                                        sessionId = "replacement-session",
+                                        cacheScopeId = "replacement-cache",
+                                    ),
+                                )
+                            }
+                            throw snapshotFailure
+                        }
+
+                        override suspend fun eraseAccount(
+                            target: com.kit.wallet.data.session.SessionFence,
+                        ) = Unit
+                    },
+                )
+                server.dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest): MockResponse = when {
+                        request.path == "/api/kit-wallet/v1/profile" -> jsonResponse(PROFILE)
+                        request.path == "/api/kit-wallet/v1/devices" -> jsonResponse(DEVICES)
+                        request.path == "/api/kit-wallet/v1/capabilities" ->
+                            jsonResponse(READY_CAPABILITIES)
+                        else -> MockResponse().setResponseCode(404)
+                    }
+                }
+
+                val missingProof = runCatching { engine.synchronize() }.exceptionOrNull()
+                assertTrue(missingProof is IllegalStateException)
+                assertEquals(
+                    "The exact server messaging reset did not leave a durable proof",
+                    missingProof?.message,
+                )
+                assertEquals(0, snapshotAttempts)
+
+                val mismatchedProof = runCatching { engine.synchronize() }.exceptionOrNull()
+                assertTrue(mismatchedProof is IllegalStateException)
+                assertEquals(
+                    "The exact server messaging reset did not leave a durable proof",
+                    mismatchedProof?.message,
+                )
+                assertEquals(0, snapshotAttempts)
+
+                val corruption = runCatching { engine.synchronize() }.exceptionOrNull()
+                assertSame(authenticatedCorruption, corruption)
+                assertEquals(1, snapshotAttempts)
+
+                val cancelledSnapshot = CancellationException("snapshot cancelled")
+                snapshotFailure = cancelledSnapshot
+                val cancellation = runCatching { engine.synchronize() }.exceptionOrNull()
+                assertSame(cancelledSnapshot, cancellation)
+                assertEquals(2, snapshotAttempts)
+
+                snapshotFailure = legacyUnreadable
+                replaceOwnerBeforeSnapshotFailure = true
+                val replaced = runCatching { engine.synchronize() }.exceptionOrNull()
+                assertTrue(replaced is SecureMessagingAuthenticationEpochChangedException)
+                assertEquals(3, recoveryAttempts)
+                assertEquals(3, snapshotAttempts)
+                assertEquals(0, localResets)
+            } finally {
+                server.shutdown()
+            }
+        }
+
+    @Test
+    fun `process restart adopts exact reset proof before erasing unreadable legacy state`() =
+        runTest {
+            val server = MockWebServer().apply { start() }
+            try {
+                val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+                val retrofit = Retrofit.Builder()
+                    .baseUrl(server.url("/"))
+                    .addConverterFactory(MoshiConverterFactory.create(moshi))
+                    .build()
+                val api = retrofit.create(KitWalletApi::class.java)
+                val transport = RemoteSecureMessagingTransport(
+                    api,
+                    retrofit.create(SecureMessagingWireApi::class.java),
+                    ApiCallExecutor(moshi),
+                )
+                val proof = provedReset(RESET_TARGET)
+                val retainedLogin = TOKENS.copy(messagingResetProof = proof)
+                val sessions = FakeSessionStore(retainedLogin)
+                val guard = SecureMessagingLifecycleGuard()
+                val registry = SecureMessagingActiveSessionRegistry(guard)
+                val stateStore = TestSecureMessagingStateStore()
+                val processor = SecureMessagingEventProcessor(
+                    UnusedCryptoEngine,
+                    SecureMessagingProjectionStore(
+                        stateStore,
+                        com.kit.wallet.data.messaging.LibSignalCompanionStateReader(stateStore),
+                    ),
+                    SecureMessagingSyncCursorStore(stateStore),
+                )
+                val unreadable = SecureMessagingLegacyConfirmedEnrollmentUnreadableException(
+                    IllegalStateException("authenticated API-28 legacy truncation"),
+                )
+                var activationAttempts = 0
+                var resetFence:
+                    com.kit.wallet.data.messaging.SecureMessagingSessionFence? = null
+                val coordinator = SecureMessagingActivationCoordinator(
+                    transport = transport,
+                    lifecycle = guard,
+                    sessions = registry,
+                    keyActivation = SecureMessagingKeyActivation { session ->
+                        when (activationAttempts++) {
+                            0 -> throw SecureMessagingLocalEnrollmentResetRequiredException(
+                                activationFence = session.activationFence(),
+                                message = "Adopt the proved reset after process restart",
+                                cause = unreadable,
+                                provenResetTarget = RESET_TARGET,
+                                provenResetProof = proof,
+                            )
+
+                            1 -> Unit
+                            else -> error("Unexpected post-reset activation attempt")
+                        }
+                    },
+                    initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+                )
+                val localStateLifecycle = SecureMessagingSessionLifecycle(stateStore, guard)
+                localStateLifecycle.afterSessionSave()
+                var localResets = 0
+                sessions.messagingReset = { fence ->
+                    localStateLifecycle.resetForRecovery(fence)
+                    localStateLifecycle.afterSessionSave()
+                    resetFence = fence
+                    localResets++
+                }
+                var snapshotAttempts = 0
+                val engine = RealSecureMessagingSyncEngine(
+                    bindingResolver = SecureMessagingAuthBindingResolver(
+                        sessions,
+                        api,
+                        ApiCallExecutor(moshi),
+                        deviceIdentity(),
+                    ),
+                    activation = coordinator,
+                    processor = processor,
+                    sessions = sessions,
+                    sessionLifecycle = localStateLifecycle,
+                    authRepository = unusedAuthRepository(),
+                    messageHistory = object : AccountMessageHistoryRetention {
+                        override suspend fun snapshotActiveHistory(
+                            target: com.kit.wallet.data.session.SessionFence,
+                        ) {
+                            snapshotAttempts++
+                            assertEquals(retainedLogin.fence(), target)
+                            throw unreadable
+                        }
+
+                        override suspend fun eraseAccount(
+                            target: com.kit.wallet.data.session.SessionFence,
+                        ) = Unit
+                    },
+                )
+                server.dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest): MockResponse = when {
+                        request.path == "/api/kit-wallet/v1/profile" -> jsonResponse(PROFILE)
+                        request.path == "/api/kit-wallet/v1/devices" -> jsonResponse(DEVICES)
+                        request.path == "/api/kit-wallet/v1/capabilities" ->
+                            jsonResponse(READY_CAPABILITIES)
+                        request.path?.startsWith("/api/kit-wallet/v1/messaging/sync") == true ->
+                            emptySyncResponse(moshi, "proved_restart_cursor")
+                        else -> MockResponse().setResponseCode(404)
+                    }
+                }
+
+                engine.synchronize()
+
+                assertEquals(retainedLogin.fence(), sessions.current()?.fence())
+                assertEquals(proof, sessions.current()?.messagingResetProof)
+                assertEquals(1, snapshotAttempts)
+                assertEquals(1, localResets)
+                assertEquals(1, sessions.provedMessagingResetCalls)
+                assertTrue(resetFence != null)
+                assertEquals(2, activationAttempts)
+                assertEquals(SecureMessagingRuntimeStage.READY, guard.snapshot().stage)
+                assertTrue(registry.requireCurrent().fence !== resetFence)
+            } finally {
+                server.shutdown()
+            }
+        }
+
+    @Test
+    fun `process restart rejects removed or replaced reset proof before local erasure`() =
+        runTest {
+            val server = MockWebServer().apply { start() }
+            try {
+                val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+                val retrofit = Retrofit.Builder()
+                    .baseUrl(server.url("/"))
+                    .addConverterFactory(MoshiConverterFactory.create(moshi))
+                    .build()
+                val api = retrofit.create(KitWalletApi::class.java)
+                val transport = RemoteSecureMessagingTransport(
+                    api,
+                    retrofit.create(SecureMessagingWireApi::class.java),
+                    ApiCallExecutor(moshi),
+                )
+                val proof = provedReset(RESET_TARGET)
+                val mismatchedProof = provedReset(
+                    RESET_TARGET.copy(registrationId = RESET_TARGET.registrationId + 1),
+                )
+                val replacements = listOf<SecureMessagingResetProofFence?>(
+                    null,
+                    mismatchedProof,
+                )
+                server.dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest): MockResponse = when {
+                        request.path == "/api/kit-wallet/v1/profile" -> jsonResponse(PROFILE)
+                        request.path == "/api/kit-wallet/v1/devices" -> jsonResponse(DEVICES)
+                        request.path == "/api/kit-wallet/v1/capabilities" ->
+                            jsonResponse(READY_CAPABILITIES)
+                        else -> MockResponse().setResponseCode(404)
+                    }
+                }
+
+                replacements.forEach { replacement ->
+                    val retainedLogin = TOKENS.copy(messagingResetProof = proof)
+                    val sessions = FakeSessionStore(retainedLogin)
+                    val guard = SecureMessagingLifecycleGuard()
+                    val stateStore = TestSecureMessagingStateStore()
+                    val processor = SecureMessagingEventProcessor(
+                        UnusedCryptoEngine,
+                        SecureMessagingProjectionStore(
+                            stateStore,
+                            com.kit.wallet.data.messaging.LibSignalCompanionStateReader(stateStore),
+                        ),
+                        SecureMessagingSyncCursorStore(stateStore),
+                    )
+                    val coordinator = SecureMessagingActivationCoordinator(
+                        transport = transport,
+                        lifecycle = guard,
+                        sessions = SecureMessagingActiveSessionRegistry(guard),
+                        keyActivation = SecureMessagingKeyActivation { session ->
+                            throw SecureMessagingLocalEnrollmentResetRequiredException(
+                                activationFence = session.activationFence(),
+                                message = "Adopt the proved reset after process restart",
+                                provenResetTarget = RESET_TARGET,
+                                provenResetProof = proof,
+                            )
+                        },
+                        initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+                    )
+                    val localStateLifecycle = SecureMessagingSessionLifecycle(stateStore, guard)
+                    localStateLifecycle.afterSessionSave()
+                    var localResets = 0
+                    sessions.messagingReset = { localResets++ }
+                    sessions.beforeProvedMessagingReset = {
+                        val current = checkNotNull(sessions.current())
+                        sessions.replace(current.copy(messagingResetProof = replacement))
+                    }
+                    var snapshotAttempts = 0
+                    val engine = RealSecureMessagingSyncEngine(
+                        bindingResolver = SecureMessagingAuthBindingResolver(
+                            sessions,
+                            api,
+                            ApiCallExecutor(moshi),
+                            deviceIdentity(),
+                        ),
+                        activation = coordinator,
+                        processor = processor,
+                        sessions = sessions,
+                        sessionLifecycle = localStateLifecycle,
+                        authRepository = unusedAuthRepository(),
+                        messageHistory = object : AccountMessageHistoryRetention {
+                            override suspend fun snapshotActiveHistory(
+                                target: com.kit.wallet.data.session.SessionFence,
+                            ) {
+                                snapshotAttempts++
+                            }
+
+                            override suspend fun eraseAccount(
+                                target: com.kit.wallet.data.session.SessionFence,
+                            ) = Unit
+                        },
+                    )
+
+                    val failure = runCatching { engine.synchronize() }.exceptionOrNull()
+
+                    assertTrue(failure is SecureMessagingAuthenticationEpochChangedException)
+                    assertEquals(retainedLogin.fence(), sessions.current()?.fence())
+                    assertEquals(replacement, sessions.current()?.messagingResetProof)
+                    assertEquals(0, snapshotAttempts)
+                    assertEquals(0, localResets)
+                    assertEquals(1, sessions.provedMessagingResetCalls)
+                }
             } finally {
                 server.shutdown()
             }
@@ -1059,6 +1583,17 @@ class SecureMessagingSyncEngineTest {
         return jsonResponse("""{"ok":true,"data":$encoded}""")
     }
 
+    private fun provedReset(
+        target: SecureMessagingEnrollmentResetTarget,
+    ) = SecureMessagingResetProofFence(
+        serverDeviceId = target.serverDeviceId,
+        previousEnrollmentEpoch = target.enrollmentEpoch,
+        resultingEnrollmentEpoch = target.enrollmentEpoch + 1L,
+        previousRegistrationId = target.registrationId,
+        previousIdentityKeySha256 = target.identityKeySha256,
+        previousBundleVersion = target.bundleVersion,
+    )
+
     private fun jsonResponse(body: String) = MockResponse()
         .setResponseCode(200)
         .setHeader("Content-Type", "application/json")
@@ -1071,6 +1606,9 @@ class SecureMessagingSyncEngineTest {
         override val session = mutable
         override val restorationPending = mutableRestorationPending
         var messagingReset: suspend (com.kit.wallet.data.messaging.SecureMessagingSessionFence) -> Unit = {}
+        var beforeProvedMessagingReset: () -> Unit = {}
+        var provedMessagingResetCalls: Int = 0
+            private set
 
         override fun current(): SessionTokens? = mutable.value
 
@@ -1141,6 +1679,30 @@ class SecureMessagingSyncEngineTest {
             return true
         }
 
+        override suspend fun resetSecureMessagingStateAfterProvenRemoteResetIfCurrent(
+            expected: com.kit.wallet.data.session.SessionFence,
+            activationFence: com.kit.wallet.data.messaging.SecureMessagingSessionFence,
+            proof: SecureMessagingResetProofFence,
+            allowPermanentlyUnavailableSnapshot: Boolean,
+            finalMessagingSnapshot: suspend () -> Unit,
+        ): Boolean {
+            provedMessagingResetCalls++
+            beforeProvedMessagingReset()
+            val current = mutable.value ?: return false
+            if (!proof.proved ||
+                current.fence() != expected ||
+                current.messagingResetProof != proof
+            ) {
+                return false
+            }
+            return resetSecureMessagingStateIfCurrent(
+                expected = expected,
+                activationFence = activationFence,
+                allowPermanentlyUnavailableSnapshot = allowPermanentlyUnavailableSnapshot,
+                finalMessagingSnapshot = finalMessagingSnapshot,
+            )
+        }
+
         override suspend fun clear() {
             mutable.value = null
             revision++
@@ -1153,6 +1715,22 @@ class SecureMessagingSyncEngineTest {
 
         fun setRestorationPending(pending: Boolean) {
             mutableRestorationPending.value = pending
+        }
+
+        fun recordProvedReset(target: SecureMessagingEnrollmentResetTarget) {
+            val current = checkNotNull(mutable.value)
+            replace(
+                current.copy(
+                    messagingResetProof = SecureMessagingResetProofFence(
+                        serverDeviceId = target.serverDeviceId,
+                        previousEnrollmentEpoch = target.enrollmentEpoch,
+                        resultingEnrollmentEpoch = target.enrollmentEpoch + 1L,
+                        previousRegistrationId = target.registrationId,
+                        previousIdentityKeySha256 = target.identityKeySha256,
+                        previousBundleVersion = target.bundleVersion,
+                    ),
+                ),
+            )
         }
     }
 

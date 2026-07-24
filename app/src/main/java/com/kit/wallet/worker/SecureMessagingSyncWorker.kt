@@ -1,6 +1,7 @@
 package com.kit.wallet.worker
 
 import android.content.Context
+import android.util.Log
 import androidx.annotation.VisibleForTesting
 import androidx.hilt.work.HiltWorker
 import androidx.work.BackoffPolicy
@@ -11,6 +12,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
 import com.kit.wallet.data.messaging.SecureMessagingCryptographicFailureException
@@ -44,6 +46,7 @@ class SecureMessagingSyncWorker @AssistedInject constructor(
             syncEngine.synchronize()
             Result.success()
         } catch (error: Throwable) {
+            debugSecureMessagingWorkerFailure(error)
             when (secureMessagingSyncFailureDisposition(error)) {
                 SecureMessagingSyncFailureDisposition.SUCCESS -> Result.success()
                 SecureMessagingSyncFailureDisposition.RETRY -> Result.retry()
@@ -53,6 +56,24 @@ class SecureMessagingSyncWorker @AssistedInject constructor(
         }
     }
 }
+
+/** Debug builds report only exception class names; no account, message, or key data is logged. */
+private fun debugSecureMessagingWorkerFailure(error: Throwable) {
+    if (!BuildConfig.DEBUG) return
+    val causes = generateSequence(error) { current ->
+        current.cause?.takeUnless { it === current }
+    }
+        .take(MAX_WORKER_DIAGNOSTIC_CAUSES)
+        .toList()
+    val classes = causes.joinToString(" <- ") { it::class.java.simpleName }
+    val api = causes.filterIsInstance<KitWalletApiException>().firstOrNull()
+    val apiStatus = api?.let { " status=${it.statusCode} connectivity=${it.connectivity}" }
+        .orEmpty()
+    Log.w(WORKER_DIAGNOSTIC_TAG, "Secure messaging sync failure: $classes$apiStatus")
+}
+
+private const val WORKER_DIAGNOSTIC_TAG = "KitMessagingWorker"
+private const val MAX_WORKER_DIAGNOSTIC_CAUSES = 8
 
 @Singleton
 class SecureMessagingSyncScheduler @Inject constructor(

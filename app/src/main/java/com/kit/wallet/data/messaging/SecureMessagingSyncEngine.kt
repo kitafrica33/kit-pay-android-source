@@ -6,6 +6,7 @@ import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.SecureMessagingTransportValidator
+import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
@@ -233,6 +234,12 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
         ALLOW_PROVEN_PERMANENTLY_UNAVAILABLE_STATE,
     }
 
+    /** Exact durable authority created only after the server advances one fenced enrollment. */
+    private data class ProvenRemoteReset(
+        val target: SecureMessagingEnrollmentResetTarget,
+        val proof: SecureMessagingResetProofFence,
+    )
+
     private sealed interface PendingEnrollmentRecovery {
         val session: SessionFence
         val activationFence: SecureMessagingSessionFence
@@ -249,6 +256,7 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
             override val session: SessionFence,
             override val activationFence: SecureMessagingSessionFence,
             override val snapshotPolicy: RecoverySnapshotPolicy,
+            val provenRemoteReset: ProvenRemoteReset? = null,
         ) : PendingEnrollmentRecovery
 
         data class FreshAuthentication(
@@ -375,6 +383,7 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                         session = sessionTarget,
                         activationFence = required.activationFence,
                         snapshotPolicy = required.recoverySnapshotPolicy(),
+                        provenRemoteReset = required.provenRemoteReset(),
                     )
                     continue
                 } catch (required: SecureMessagingFreshAuthenticationRequiredException) {
@@ -411,6 +420,7 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                         session = sessionTarget,
                         activationFence = required.activationFence,
                         snapshotPolicy = required.recoverySnapshotPolicy(),
+                        provenRemoteReset = required.provenRemoteReset(),
                     )
                     continue
                 } catch (required: SecureMessagingFreshAuthenticationRequiredException) {
@@ -635,10 +645,12 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                         activationFence = pending.activationFence,
                         target = pending.target,
                     )
+                    val provenRemoteReset = requireProvenRemoteReset(pending)
                     val localReset = PendingEnrollmentRecovery.LocalReset(
                         session = pending.session,
                         activationFence = pending.activationFence,
                         snapshotPolicy = pending.snapshotPolicy,
+                        provenRemoteReset = provenRemoteReset,
                     )
                     // Once the server reset is proved, a local snapshot retry must never replay
                     // that remote mutation or retarget it to a newer session generation.
@@ -700,7 +712,7 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
         return false
     }
 
-    private suspend fun resetLocalState(pending: PendingEnrollmentRecovery) {
+    private suspend fun resetLocalState(pending: PendingEnrollmentRecovery.LocalReset) {
         try {
             resetLocalStateOnce(pending)
         } catch (error: Throwable) {
@@ -713,6 +725,7 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                     activationFence = pending.activationFence,
                     snapshotPolicy = RecoverySnapshotPolicy
                         .ALLOW_PROVEN_PERMANENTLY_UNAVAILABLE_STATE,
+                    provenRemoteReset = pending.provenRemoteReset,
                 )
                 pendingEnrollmentRecovery = promoted
                 resetLocalStateOnce(promoted)
@@ -722,23 +735,118 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
         }
     }
 
-    private suspend fun resetLocalStateOnce(pending: PendingEnrollmentRecovery) {
-        if (sessions.current()?.fence() != pending.session ||
-            !sessions.resetSecureMessagingStateIfCurrent(
-                expected = pending.session,
-                activationFence = pending.activationFence,
-                allowPermanentlyUnavailableSnapshot =
-                    pending.snapshotPolicy == RecoverySnapshotPolicy
-                        .ALLOW_PROVEN_PERMANENTLY_UNAVAILABLE_STATE,
-                finalMessagingSnapshot = {
-                    messageHistory.snapshotActiveHistory(pending.session)
-                },
-            )
-        ) {
+    private suspend fun resetLocalStateOnce(pending: PendingEnrollmentRecovery.LocalReset) {
+        val finalSnapshot: suspend () -> Unit = {
+            snapshotHistoryForLocalReset(pending)
+            // This callback runs under SessionStore's mutex and the state store's exclusive
+            // lease. It is the final non-suspending authority check before the lifecycle
+            // persists its erasure crash fence and destroys local state.
+            pending.provenRemoteReset?.let {
+                assertProvenRemoteResetCurrent(pending, it)
+            }
+        }
+        val reset = if (sessions.current()?.fence() != pending.session) {
+            false
+        } else {
+            val authority = pending.provenRemoteReset
+            if (authority == null) {
+                sessions.resetSecureMessagingStateIfCurrent(
+                    expected = pending.session,
+                    activationFence = pending.activationFence,
+                    allowPermanentlyUnavailableSnapshot =
+                        pending.snapshotPolicy == RecoverySnapshotPolicy
+                            .ALLOW_PROVEN_PERMANENTLY_UNAVAILABLE_STATE,
+                    finalMessagingSnapshot = finalSnapshot,
+                )
+            } else {
+                sessions.resetSecureMessagingStateAfterProvenRemoteResetIfCurrent(
+                    expected = pending.session,
+                    activationFence = pending.activationFence,
+                    proof = authority.proof,
+                    allowPermanentlyUnavailableSnapshot =
+                        pending.snapshotPolicy == RecoverySnapshotPolicy
+                            .ALLOW_PROVEN_PERMANENTLY_UNAVAILABLE_STATE,
+                    finalMessagingSnapshot = finalSnapshot,
+                )
+            }
+        }
+        if (!reset) {
             throw SecureMessagingAuthenticationEpochChangedException(
-                "Authentication changed before secure-messaging state reset",
+                "Authentication or reset authority changed before secure-messaging state reset",
             )
         }
+    }
+
+    private fun requireProvenRemoteReset(
+        pending: PendingEnrollmentRecovery.RemoteReset,
+    ): ProvenRemoteReset {
+        val current = sessions.current()
+        if (current?.fence() != pending.session ||
+            !activation.ownsGeneration(pending.activationFence)
+        ) {
+            throw SecureMessagingAuthenticationEpochChangedException(
+                "Authentication changed before the messaging reset proof was adopted",
+            )
+        }
+        val proof = current.messagingResetProof
+        check(proof != null && proof.provesExactResetTarget(pending.target)) {
+            "The exact server messaging reset did not leave a durable proof"
+        }
+        return ProvenRemoteReset(pending.target, proof)
+    }
+
+    private suspend fun snapshotHistoryForLocalReset(
+        pending: PendingEnrollmentRecovery.LocalReset,
+    ) {
+        val authority = pending.provenRemoteReset
+        authority?.let { assertProvenRemoteResetCurrent(pending, it) }
+        try {
+            messageHistory.snapshotActiveHistory(pending.session)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            if (authority == null) throw error
+            assertProvenRemoteResetCurrent(pending, authority)
+            if (!isLegacyInitialSecureMessagingEnrollmentUnreadableFailure(error) &&
+                !isLegacyConfirmedSecureMessagingEnrollmentUnreadableFailure(error)
+            ) {
+                throw error
+            }
+        }
+        authority?.let { assertProvenRemoteResetCurrent(pending, it) }
+    }
+
+    private fun assertProvenRemoteResetCurrent(
+        pending: PendingEnrollmentRecovery.LocalReset,
+        authority: ProvenRemoteReset,
+    ) {
+        check(authority.proof.provesExactResetTarget(authority.target)) {
+            "Invalid secure-messaging reset authority"
+        }
+        val current = sessions.current()
+        if (current?.fence() != pending.session ||
+            current.messagingResetProof != authority.proof ||
+            !activation.ownsGeneration(pending.activationFence)
+        ) {
+            throw SecureMessagingAuthenticationEpochChangedException(
+                "Secure-messaging reset authority changed before local erasure",
+            )
+        }
+    }
+
+    private fun SecureMessagingLocalEnrollmentResetRequiredException.provenRemoteReset():
+        ProvenRemoteReset? {
+        val target = provenResetTarget
+        val proof = provenResetProof
+        check((target == null) == (proof == null)) {
+            "Local secure-messaging reset authority is incomplete"
+        }
+        if (target == null) return null
+        val exactProof = checkNotNull(proof)
+        check(exactProof.provesExactResetTarget(target)) {
+            "Local secure-messaging reset authority does not match its durable proof"
+        }
+        return ProvenRemoteReset(target, exactProof)
     }
 
     private fun Throwable.recoverySnapshotPolicy(): RecoverySnapshotPolicy =

@@ -20,6 +20,7 @@ class PhoneCallLogIntegrationContractTest {
         assertTrue(manifest.contains("android.telecom.ConnectionService"))
         assertFalse(manifest.contains("android.permission.READ_CALL_LOG"))
         assertFalse(manifest.contains("android.permission.WRITE_CALL_LOG"))
+        assertTrue(bridge.contains("PackageManager.FEATURE_CONNECTION_SERVICE"))
         assertTrue(bridge.contains("Build.VERSION.SDK_INT >= Build.VERSION_CODES.P"))
         assertTrue(bridge.contains("PhoneAccount.EXTRA_LOG_SELF_MANAGED_CALLS"))
         assertTrue(bridge.contains("PhoneAccount.CAPABILITY_SELF_MANAGED"))

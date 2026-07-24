@@ -9,11 +9,19 @@ import java.util.Base64
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/** Metadata surfaced only after authenticated ciphertext and ratchet state commit together. */
+/**
+ * Notification input surfaced only after authenticated ciphertext and ratchet state commit
+ * together. [senderName] must come from the authoritative direct conversation whose peer ID was
+ * matched to the durable authenticated sender; [authenticatedText] is the committed Signal
+ * plaintext, never server push content; and [sentAt] is authenticated message ordering metadata.
+ */
 internal data class SecureMessagingIncomingNotification(
     val messageId: String,
     val conversationId: String,
     val sessionEpoch: String,
+    val senderName: String?,
+    val authenticatedText: String,
+    val sentAt: Instant,
 )
 
 internal class SecureMessagingNotificationPublicationException(cause: Exception) : IOException(

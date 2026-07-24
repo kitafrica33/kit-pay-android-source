@@ -5,6 +5,7 @@ import com.kit.wallet.data.messaging.SecureMessagingActivationCoordinator
 import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
 import com.kit.wallet.data.messaging.SecureMessagingCryptographicFailureException
 import com.kit.wallet.data.messaging.SecureMessagingInitialSyncActivation
+import com.kit.wallet.data.messaging.SecureMessagingFreshProvisioningUnreadableException
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingKeyReconciliationException
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
@@ -17,6 +18,9 @@ import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingE
 import com.kit.wallet.data.messaging.SecureMessagingRecordAuthenticationFailedException
 import com.kit.wallet.data.messaging.SecureMessagingRuntimeStage
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
+import com.kit.wallet.data.messaging.SecureMessagingStateUnavailableException
+import com.kit.wallet.data.messaging.classifySecureMessagingStoredRecordFailure
+import com.kit.wallet.data.messaging.isRecoverableSecureMessagingStateLoss
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.SecureMessagingWireApi
@@ -233,6 +237,64 @@ class SecureMessagingActivationCoordinatorTest {
         }
 
     @Test
+    fun `unreadable fresh provisioning row requests fenced local recovery`() = runTest {
+        val initialAuthenticationFailure = classifySecureMessagingStoredRecordFailure(
+            namespace = "libsignal-v2",
+            recordKey = "active-protocol-state",
+            version = 1L,
+            error = SecureMessagingStateUnavailableException(
+                "authenticated decryption failed",
+                SecureMessagingRecordAuthenticationFailedException(
+                    IllegalStateException("Android 9 MAC verification failed"),
+                ),
+            ),
+        )
+        val coordinator = coordinator(keys = { throw initialAuthenticationFailure })
+        enqueueRemoteActivation()
+
+        val failure = runCatching {
+            coordinator.ensureActivated(BINDING)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingLocalEnrollmentResetRequiredException)
+        assertTrue(failure?.cause is SecureMessagingFreshProvisioningUnreadableException)
+        assertTrue(isRecoverableSecureMessagingStateLoss(checkNotNull(failure?.cause)))
+        assertEquals(SecureMessagingRuntimeStage.QUARANTINED, lifecycle.snapshot().stage)
+        assertEquals(
+            SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+            lifecycle.snapshot().quarantineReason,
+        )
+        assertNull(registry.currentOrNull())
+    }
+
+    @Test
+    fun `confirmed protocol authentication corruption remains fail closed`() = runTest {
+        val confirmedAuthenticationFailure = classifySecureMessagingStoredRecordFailure(
+            namespace = "libsignal-v2",
+            recordKey = "active-protocol-state",
+            version = 2L,
+            error = SecureMessagingStateUnavailableException(
+                "authenticated decryption failed",
+                SecureMessagingRecordAuthenticationFailedException(
+                    IllegalStateException("confirmed state MAC verification failed"),
+                ),
+            ),
+        )
+        val coordinator = coordinator(keys = { throw confirmedAuthenticationFailure })
+        enqueueRemoteActivation()
+
+        val failure = runCatching {
+            coordinator.ensureActivated(BINDING)
+        }.exceptionOrNull()
+
+        assertSame(confirmedAuthenticationFailure, failure)
+        assertFalse(isRecoverableSecureMessagingStateLoss(checkNotNull(failure)))
+        assertEquals(SecureMessagingRuntimeStage.PREPARING_KEYS, lifecycle.snapshot().stage)
+        assertNull(lifecycle.snapshot().quarantineReason)
+        assertNull(registry.currentOrNull())
+    }
+
+    @Test
     fun `migration-fenced unreadable state is reset before activation can write`() = runTest {
         var keyCalls = 0
         var syncCalls = 0
@@ -253,6 +315,43 @@ class SecureMessagingActivationCoordinatorTest {
 
         assertTrue(failure is SecureMessagingLocalEnrollmentResetRequiredException)
         assertSame(unreadable, failure?.cause)
+        assertEquals(0, keyCalls)
+        assertEquals(0, syncCalls)
+        assertEquals(0, server.requestCount)
+        assertEquals(SecureMessagingRuntimeStage.QUARANTINED, lifecycle.snapshot().stage)
+        assertEquals(
+            SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+            lifecycle.snapshot().quarantineReason,
+        )
+        assertNull(registry.currentOrNull())
+    }
+
+    @Test
+    fun `legacy version one provider failure during preflight requests fenced recovery`() = runTest {
+        var keyCalls = 0
+        var syncCalls = 0
+        val legacyInitialFailure = classifySecureMessagingStoredRecordFailure(
+            namespace = "libsignal-v2",
+            recordKey = "active-protocol-state",
+            version = 1L,
+            legacyDirectRecord = true,
+            error = SecureMessagingStateUnavailableException(
+                "Android 9 provider could not reopen legacy state",
+                java.security.ProviderException("legacy direct GCM operation failed"),
+            ),
+        )
+        val coordinator = coordinator(
+            keys = { keyCalls++ },
+            initialSync = { syncCalls++ },
+            legacyValidation = { throw legacyInitialFailure },
+        )
+
+        val failure = runCatching {
+            coordinator.ensureActivated(BINDING)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingLocalEnrollmentResetRequiredException)
+        assertTrue(failure?.cause is SecureMessagingFreshProvisioningUnreadableException)
         assertEquals(0, keyCalls)
         assertEquals(0, syncCalls)
         assertEquals(0, server.requestCount)

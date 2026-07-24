@@ -9,9 +9,11 @@ import com.kit.wallet.data.session.activateMessagingForPublishedSession
 import com.kit.wallet.data.session.fenceThenEraseMessagingAndClearSession
 import com.kit.wallet.data.session.pendingRestorationDiscardTarget
 import com.kit.wallet.data.session.resolveSessionKey
+import com.kit.wallet.data.session.resetMessagingStateForPublishedSession
 import com.kit.wallet.data.session.restoreRetainingEncryptedSession
 import com.kit.wallet.data.session.retryPublishedMessagingActivationWithRetries
 import com.kit.wallet.data.session.retryRetainedEncryptedSession
+import com.kit.wallet.data.session.retryRetainedEncryptedSessionAfterMessagingReset
 import com.kit.wallet.data.session.sessionKeyCreationAllowed
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -288,6 +290,166 @@ class KeystoreSessionRestorationTest {
     }
 
     @Test
+    fun `post-fence messaging erase failure retains session and keeps partial state closed`() = runTest {
+        val eraseFailure = IllegalStateException("Android 9 alias deletion failed")
+        val events = mutableListOf<String>()
+        var resetPending = false
+        var current: SessionFence? = SESSION.fence()
+
+        val observed = runCatching {
+            resetMessagingStateForPublishedSession(
+                expected = SESSION.fence(),
+                currentSession = { current },
+                persistResetFence = {
+                    events += "fence"
+                    resetPending = true
+                },
+                clearResetFence = {
+                    events += "clear"
+                    resetPending = false
+                },
+                reset = { onErasureStarted ->
+                    events += "reset"
+                    onErasureStarted()
+                    events += "erase"
+                    throw eraseFailure
+                },
+                reopen = {
+                    events += "reopen"
+                    true
+                },
+            )
+        }.exceptionOrNull()
+
+        assertSame(eraseFailure, observed)
+        assertEquals(SESSION.fence(), current)
+        assertTrue(resetPending)
+        assertEquals(listOf("reset", "fence", "erase"), events)
+    }
+
+    @Test
+    fun `successful messaging reset reopens exact session without credential replacement`() =
+        runTest {
+            val events = mutableListOf<String>()
+            val expected = SESSION.fence()
+            var resetPending = false
+            var current: SessionFence? = expected
+
+            val reset = resetMessagingStateForPublishedSession(
+                expected = expected,
+                currentSession = { current },
+                persistResetFence = {
+                    events += "fence"
+                    resetPending = true
+                },
+                clearResetFence = {
+                    events += "clear"
+                    resetPending = false
+                },
+                reset = { onErasureStarted ->
+                    events += "snapshot"
+                    onErasureStarted()
+                    events += "erase"
+                },
+                reopen = {
+                    events += "reopen"
+                    true
+                },
+            )
+
+            assertTrue(reset)
+            assertEquals(expected, current)
+            assertFalse(resetPending)
+            assertEquals(listOf("snapshot", "fence", "erase", "clear", "reopen"), events)
+        }
+
+    @Test
+    fun `failed local reset fence aborts before key or record erasure`() = runTest {
+        val markerFailure = IllegalStateException("preferences commit failed")
+        val events = mutableListOf<String>()
+
+        val observed = runCatching {
+            resetMessagingStateForPublishedSession(
+                expected = SESSION.fence(),
+                currentSession = { SESSION.fence() },
+                persistResetFence = {
+                    events += "fence"
+                    throw markerFailure
+                },
+                clearResetFence = { events += "clear" },
+                reset = { persistResetFence ->
+                    events += "snapshot"
+                    persistResetFence()
+                    events += "erase"
+                },
+                reopen = { events += "reopen"; true },
+            )
+        }.exceptionOrNull()
+
+        assertSame(markerFailure, observed)
+        assertEquals(listOf("snapshot", "fence"), events)
+    }
+
+    @Test
+    fun `process death window after erase remains fenced until durable marker clear`() = runTest {
+        val clearFailure = IllegalStateException("marker clear interrupted")
+        val events = mutableListOf<String>()
+        var resetPending = false
+
+        val observed = runCatching {
+            resetMessagingStateForPublishedSession(
+                expected = SESSION.fence(),
+                currentSession = { SESSION.fence() },
+                persistResetFence = {
+                    events += "fence"
+                    resetPending = true
+                },
+                clearResetFence = {
+                    events += "clear"
+                    throw clearFailure
+                },
+                reset = { persistResetFence ->
+                    persistResetFence()
+                    events += "erase-key"
+                    events += "erase-records"
+                },
+                reopen = { events += "reopen"; true },
+            )
+        }.exceptionOrNull()
+
+        assertSame(clearFailure, observed)
+        assertTrue(resetPending)
+        assertEquals(listOf("fence", "erase-key", "erase-records", "clear"), events)
+    }
+
+    @Test
+    fun `session replacement during reset is never cleared or reopened as the old owner`() = runTest {
+        val expected = SESSION.fence()
+        var current: SessionFence? = expected
+        var resetPending = false
+        val events = mutableListOf<String>()
+
+        val reset = resetMessagingStateForPublishedSession(
+            expected = expected,
+            currentSession = { current },
+            persistResetFence = { resetPending = true },
+            clearResetFence = {
+                resetPending = false
+                events += "clear"
+            },
+            reset = { persistResetFence ->
+                persistResetFence()
+                current = expected.copy(sessionId = "replacement-session")
+            },
+            reopen = { events += "reopen"; true },
+        )
+
+        assertFalse(reset)
+        assertTrue(resetPending)
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
     fun `published session with a failed messaging gate can be explicitly discarded`() {
         assertEquals(
             PendingRestorationDiscardTarget.PUBLISHED_CREDENTIAL,
@@ -530,6 +692,78 @@ class KeystoreSessionRestorationTest {
         assertNull(retry.tokens)
         assertFalse(retry.retryRequired)
         assertTrue(cleanupCalled)
+        assertFalse(decodeCalled)
+    }
+
+    @Test
+    fun `process restart never decodes reset credential before partial state cleanup succeeds`() =
+        runTest {
+            val events = mutableListOf<String>()
+
+            val retry = retryRetainedEncryptedSessionAfterMessagingReset(
+                encryptedSession = "retained-session",
+                messagingResetPending = true,
+                finishPendingMessagingReset = {
+                    events += "erase-key"
+                    events += "erase-records-failed"
+                    false
+                },
+                decode = {
+                    events += "decode"
+                    SESSION
+                },
+            )
+
+            assertNull(retry.tokens)
+            assertTrue(retry.retryRequired)
+            assertEquals(listOf("erase-key", "erase-records-failed"), events)
+        }
+
+    @Test
+    fun `process restart finishes reset then restores the exact retained credential`() = runTest {
+        val events = mutableListOf<String>()
+
+        val retry = retryRetainedEncryptedSessionAfterMessagingReset(
+            encryptedSession = "retained-session",
+            messagingResetPending = true,
+            finishPendingMessagingReset = {
+                events += "erase-key"
+                events += "erase-records"
+                events += "clear-marker"
+                true
+            },
+            decode = {
+                events += "decode:$it"
+                SESSION
+            },
+        )
+
+        assertEquals(SESSION, retry.tokens)
+        assertFalse(retry.retryRequired)
+        assertEquals(
+            listOf("erase-key", "erase-records", "clear-marker", "decode:retained-session"),
+            events,
+        )
+    }
+
+    @Test
+    fun `process restart reset cleanup cancellation preserves fenced credential`() = runTest {
+        val cancellation = CancellationException("process recovery cancelled")
+        var decodeCalled = false
+
+        val observed = runCatching {
+            retryRetainedEncryptedSessionAfterMessagingReset(
+                encryptedSession = "retained-session",
+                messagingResetPending = true,
+                finishPendingMessagingReset = { throw cancellation },
+                decode = {
+                    decodeCalled = true
+                    SESSION
+                },
+            )
+        }.exceptionOrNull()
+
+        assertSame(cancellation, observed)
         assertFalse(decodeCalled)
     }
 

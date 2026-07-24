@@ -45,7 +45,7 @@ class KitTelecomBridge @Inject constructor(
     >()
 
     fun registerPhoneAccount(): Boolean {
-        if (!context.packageManager.hasSystemFeature(PackageManager.FEATURE_TELECOM)) return false
+        if (!supportsTelecomRegistration(context.packageManager::hasSystemFeature)) return false
         return runCatching {
             val extras = Bundle().apply {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -218,6 +218,11 @@ class KitTelecomBridge @Inject constructor(
         const val ACCOUNT_ID = "kit-pay-self-managed-v1"
     }
 }
+
+@Suppress("DEPRECATION")
+internal fun supportsTelecomRegistration(hasSystemFeature: (String) -> Boolean): Boolean =
+    hasSystemFeature(PackageManager.FEATURE_TELECOM) ||
+        hasSystemFeature(PackageManager.FEATURE_CONNECTION_SERVICE)
 
 enum class KitTelecomDisconnect(internal val cause: DisconnectCause) {
     LOCAL(DisconnectCause(DisconnectCause.LOCAL)),

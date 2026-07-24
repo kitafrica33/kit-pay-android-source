@@ -79,6 +79,59 @@ class HomeDashboardComposeTest {
     }
 
     @Test
+    fun unavailable_dynamic_dashboard_actions_show_feedback_instead_of_navigating() {
+        val snackbar = SnackbarHostState()
+        val callbacks = mutableListOf<String>()
+        val favorite = Contact(
+            id = "favorite-disabled",
+            name = "Grace Nakato",
+            phone = "+256700000001",
+            favorite = true,
+            receivingWalletId = "wallet-favorite-disabled",
+        )
+        val transaction = Transaction(
+            id = "transaction-disabled",
+            counterparty = "Kit Pay Power",
+            note = "Electricity",
+            amountMinor = -10_000,
+            time = "10:00 AM",
+            dateGroup = "Today",
+            type = TxType.BILL,
+            status = TxStatus.COMPLETED,
+            reference = "KIT-DISABLED",
+        )
+        setDashboard(
+            capabilities = AppCapabilities(loaded = true),
+            snackbar = snackbar,
+            callbacks = callbacks,
+            favorites = listOf(favorite),
+            recent = listOf(transaction),
+        )
+
+        clickDynamicAndExpectSnackbar(
+            tag = "${HomeAction.FAVORITE_SEND.testTag}-${favorite.id}",
+            action = HomeAction.FAVORITE_SEND,
+            snackbar = snackbar,
+        )
+        compose.onNodeWithText("See all")
+            .performScrollTo()
+            .assertIsEnabled()
+            .assertHasClickAction()
+            .performClick()
+        expectSnackbar(HomeAction.ALL_TRANSACTIONS, snackbar)
+
+        val transactionTag = "${HomeAction.TRANSACTION_DETAIL.testTag}-${transaction.id}"
+        compose.onNode(hasScrollAction()).performScrollToNode(hasTestTag(transactionTag))
+        clickDynamicAndExpectSnackbar(
+            tag = transactionTag,
+            action = HomeAction.TRANSACTION_DETAIL,
+            snackbar = snackbar,
+        )
+
+        compose.runOnIdle { assertEquals(emptyList<String>(), callbacks) }
+    }
+
+    @Test
     fun activated_dashboard_invokes_every_existing_flow() {
         val snackbar = SnackbarHostState()
         val callbacks = mutableListOf<String>()
@@ -177,6 +230,29 @@ class HomeDashboardComposeTest {
             .assertIsEnabled()
             .assertHasClickAction()
             .performClick()
+    }
+
+    private fun clickDynamicAndExpectSnackbar(
+        tag: String,
+        action: HomeAction,
+        snackbar: SnackbarHostState,
+    ) {
+        compose.onNodeWithTag(tag)
+            .performScrollTo()
+            .assertIsEnabled()
+            .assertHasClickAction()
+            .performClick()
+        expectSnackbar(action, snackbar)
+    }
+
+    private fun expectSnackbar(action: HomeAction, snackbar: SnackbarHostState) {
+        val expectedMessage = "Coming soon: ${action.displayName}."
+        compose.waitUntil(timeoutMillis = 5_000) {
+            snackbar.currentSnackbarData?.visuals?.message == expectedMessage
+        }
+        compose.onNodeWithText(expectedMessage).assertIsDisplayed()
+        compose.runOnIdle { snackbar.currentSnackbarData?.dismiss() }
+        compose.waitUntil(timeoutMillis = 5_000) { snackbar.currentSnackbarData == null }
     }
 
     private fun setDashboard(

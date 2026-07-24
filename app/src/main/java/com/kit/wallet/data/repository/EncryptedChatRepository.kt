@@ -1,5 +1,7 @@
 package com.kit.wallet.data.repository
 
+import android.util.Log
+import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
@@ -1170,6 +1172,7 @@ class EncryptedChatRepository @Inject internal constructor(
                 clearPublishedStateIfOwnedBy(session)
                 throw cancelled
             } catch (error: Exception) {
+                debugProjectionBaselineFailure(error)
                 if (!runtime.isCurrent(session)) {
                     clearPublishedStateIfOwnedBy(session)
                     return
@@ -1555,3 +1558,17 @@ class EncryptedChatRepository @Inject internal constructor(
         const val MAX_BASELINE_REFRESH_COOLDOWN_MILLIS = 5 * 60_000L
     }
 }
+
+/** Debug builds report only exception class names; no account, message, or key data is logged. */
+private fun debugProjectionBaselineFailure(error: Throwable) {
+    if (!BuildConfig.DEBUG) return
+    val classes = generateSequence(error) { current ->
+        current.cause?.takeUnless { it === current }
+    }
+        .take(MAX_PROJECTION_DIAGNOSTIC_CAUSES)
+        .joinToString(" <- ") { it::class.java.simpleName }
+    Log.w(PROJECTION_DIAGNOSTIC_TAG, "Projection baseline failure: $classes")
+}
+
+private const val PROJECTION_DIAGNOSTIC_TAG = "KitMessagingBaseline"
+private const val MAX_PROJECTION_DIAGNOSTIC_CAUSES = 8

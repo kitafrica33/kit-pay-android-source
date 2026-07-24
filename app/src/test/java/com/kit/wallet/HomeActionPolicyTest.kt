@@ -73,6 +73,32 @@ class HomeActionPolicyTest {
         assertTrue(clientActivated.homeActionAccess(HomeAction.SCAN_QR).available)
     }
 
+    @Test
+    fun `provider tiles need the wallet dependency as well as their service capability`() {
+        val activated = fullyActivatedCapabilities()
+        val providerActions = listOf(
+            HomeAction.PAY_BILLS,
+            HomeAction.BUY_AIRTIME,
+            HomeAction.BANK,
+            HomeAction.MOBILE_MONEY,
+        )
+
+        providerActions.forEach { action ->
+            assertTrue(action.name, activated.homeActionAccess(action).available)
+        }
+
+        val noWallet = activated.copy(
+            features = activated.features - KitFeature.WALLETS,
+        )
+        providerActions.forEach { action ->
+            assertFalse(action.name, noWallet.homeActionAccess(action).available)
+            assertEquals(
+                "Coming soon: ${action.displayName}.",
+                noWallet.homeActionAccess(action).unavailableMessage,
+            )
+        }
+    }
+
     private fun fullyActivatedCapabilities() = AppCapabilities(
         features = mapOf(
             KitFeature.WALLETS to true,

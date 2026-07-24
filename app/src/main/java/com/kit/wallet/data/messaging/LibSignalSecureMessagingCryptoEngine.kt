@@ -3,12 +3,15 @@ package com.kit.wallet.data.messaging
 import java.io.ByteArrayInputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.EOFException
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.security.MessageDigest
+import java.security.ProviderException
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.crypto.BadPaddingException
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.sync.Mutex
@@ -167,7 +170,27 @@ class LibSignalSecureMessagingCryptoEngine @Inject constructor(
                         ?: return@withActivationLease null
                     var state: BoundLibSignalState? = null
                     try {
-                        val decoded = decodeBoundProtocolState(record.bytes)
+                        val decoded = try {
+                            decodeBoundProtocolState(record.bytes)
+                        } catch (error: Exception) {
+                            val classified = classifySecureMessagingDecodedRecordFailure(
+                                record,
+                                error,
+                                authenticatedAndroid9LegacyTruncationProof =
+                                    SecureMessagingAuthenticatedAndroid9LegacyTruncationProof
+                                        .validate(record.bytes, error),
+                            )
+                            if (isLegacyConfirmedSecureMessagingEnrollmentUnreadableFailure(
+                                    classified,
+                                )
+                            ) {
+                                throw SecureMessagingLocalEnrollmentUnavailableException(
+                                    "Confirmed legacy enrollment state is unavailable",
+                                    classified,
+                                )
+                            }
+                            throw classified
+                        }
                         state = decoded
                         if (decoded.binding != provenance.binding) {
                             throw cryptographicFailure(
@@ -353,6 +376,31 @@ internal class SecureMessagingLocalEnrollmentUnavailableException(
     message: String,
     cause: Throwable,
 ) : java.io.IOException(message, cause)
+
+/**
+ * Unforgeable recovery evidence issued only by the exact authenticated API-28 codec-prefix check.
+ * Keeping construction private prevents metadata-only callers from asserting the destructive
+ * remote-reset branch.
+ */
+internal class SecureMessagingAuthenticatedAndroid9LegacyTruncationProof private constructor() {
+    companion object {
+        fun validate(
+            bytes: ByteArray,
+            decodeFailure: Throwable,
+        ): SecureMessagingAuthenticatedAndroid9LegacyTruncationProof? {
+            val validated = BoundLibSignalStateCodec
+                .provesAuthenticatedAndroid9PlaintextTruncation(
+                    bytes,
+                    decodeFailure,
+                )
+            return if (validated) {
+                SecureMessagingAuthenticatedAndroid9LegacyTruncationProof()
+            } else {
+                null
+            }
+        }
+    }
+}
 
 internal class LibSignalLocalEnrollment(
     val registrationId: Int,
@@ -1861,6 +1909,95 @@ private object BoundLibSignalStateCodec {
             owned.fill(0)
         }
     }
+
+    /**
+     * Recognizes only the API-28 failure observed after a successful legacy AES-GCM operation.
+     *
+     * Metadata and the legacy IV shape are insufficient: this proof also requires the exact OEM
+     * plaintext boundary, the complete bound-state prefix used by code 22, and an otherwise valid
+     * libsignal store prefix whose parser reaches EOF inside a declared payload. The confirmed
+     * server state has no pending publication; accepting a cut inside that separate codec would
+     * make malformed or half-written publication state look remotely recoverable.
+     */
+    fun provesAuthenticatedAndroid9PlaintextTruncation(
+        bytes: ByteArray,
+        decodeFailure: Throwable,
+    ): Boolean {
+        val structuralFailure = decodeFailure as? SecureMessagingCryptographicFailureException
+            ?: return false
+        if (bytes.size != ANDROID_9_LEGACY_PLAINTEXT_TRUNCATION_BYTES ||
+            structuralFailure.quarantineReason !=
+            SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK ||
+            !structuralFailure.hasEofRootCause() ||
+            isSecureMessagingRecordAuthenticationFailure(structuralFailure) ||
+            structuralFailure.hasNonCodecFailureCause()
+        ) {
+            return false
+        }
+        return runCatching {
+            val input = ByteArrayInputStream(bytes)
+            DataInputStream(input).use { data ->
+                require(data.readExact(STATE_MAGIC.size).contentEquals(STATE_MAGIC)) {
+                    "Invalid bound libsignal state header"
+                }
+                require(data.readInt() == STATE_SCHEMA_WITH_PENDING) {
+                    "Only the code-22 bound-state schema can carry truncation proof"
+                }
+                val binding = SecureMessagingSessionBinding(
+                    sessionEpoch = data.readString(),
+                    userId = data.readString(),
+                    serverDeviceId = data.readString(),
+                    installationId = data.readString(),
+                )
+                val local = if (data.readStrictBoolean()) data.readCryptoAddress() else null
+                local?.let {
+                    require(
+                        it.userId == binding.userId &&
+                            it.serverDeviceId == binding.serverDeviceId,
+                    ) { "Persisted local Signal address does not match its binding" }
+                }
+                val remoteCount = data.readBoundedCount(MAX_REMOTE_BINDINGS)
+                val remoteAddresses = HashSet<Pair<String, Int>>(remoteCount)
+                repeat(remoteCount) {
+                    val userId = data.readString()
+                    val signalDeviceId = data.readInt()
+                    val serverDeviceId = data.readString()
+                    val address = SecureMessagingCryptoAddress(
+                        userId = userId,
+                        serverDeviceId = serverDeviceId,
+                        signalDeviceId = signalDeviceId,
+                    )
+                    require(remoteAddresses.add(address.userId to address.signalDeviceId)) {
+                        "Duplicate persisted Signal address binding"
+                    }
+                }
+                require(!data.readStrictBoolean()) {
+                    "A pending publication cannot prove confirmed enrollment truncation"
+                }
+                val declaredProtocolBytes = data.readInt()
+                require(declaredProtocolBytes in 1..MAX_SERIALIZED_PROTOCOL_STATE_BYTES) {
+                    "Invalid serialized libsignal protocol-state size"
+                }
+                val availableProtocolBytes = input.available()
+                val endsInsideProtocolPayload = availableProtocolBytes in
+                    MIN_SERIALIZED_PROTOCOL_STATE_PREFIX_BYTES until declaredProtocolBytes
+                require(endsInsideProtocolPayload) {
+                    "The bound state does not end inside its protocol-state payload"
+                }
+                val protocolPrefix = data.readExact(availableProtocolBytes)
+                try {
+                    val unexpectedlyComplete = runCatching {
+                        LibSignalProtocolStore.deserialize(protocolPrefix)
+                    }
+                    unexpectedlyComplete.getOrNull()?.close()
+                    val protocolFailure = unexpectedlyComplete.exceptionOrNull()
+                    protocolFailure != null && protocolFailure.hasEofRootCause()
+                } finally {
+                    protocolPrefix.fill(0)
+                }
+            }
+        }.getOrDefault(false)
+    }
 }
 
 private object LibSignalCompanionRecordCodec {
@@ -2291,6 +2428,9 @@ private const val MAX_BOUND_STATE_BYTES = 65 * 1024 * 1024
 private const val MAX_PROTOCOL_STATE_BYTES = 64 * 1024 * 1024
 private const val MAX_PENDING_PUBLICATION_BYTES = 2 * 1024 * 1024
 private const val MAX_REMOTE_BINDINGS = 10_000
+private const val ANDROID_9_LEGACY_PLAINTEXT_TRUNCATION_BYTES = 65_536
+private const val MAX_SERIALIZED_PROTOCOL_STATE_BYTES = 16 * 1024 * 1024
+private const val MIN_SERIALIZED_PROTOCOL_STATE_PREFIX_BYTES = 16
 private val CANONICAL_UUID =
     Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 private val COMPANION_MAGIC = byteArrayOf(0x4b, 0x49, 0x54, 0x4d, 0x53, 0x47, 0x32)
@@ -2301,3 +2441,27 @@ private const val MAX_COMPANION_ENVELOPES = 99
 private const val MIN_COMPANION_RECORD_BYTES = 64
 private const val MAX_COMPANION_RECORD_BYTES = 16 * 1024 * 1024
 private const val MAX_CODEC_STRING_BYTES = 512
+
+private fun Throwable.hasEofRootCause(): Boolean {
+    var current = this
+    repeat(MAX_CAUSE_CHAIN_DEPTH) {
+        val cause = current.cause ?: return current is EOFException
+        if (cause === current) return false
+        current = cause
+    }
+    return false
+}
+
+private fun Throwable.hasNonCodecFailureCause(): Boolean =
+    generateSequence(this) { current ->
+        current.cause?.takeUnless { it === current }
+    }
+        .take(MAX_CAUSE_CHAIN_DEPTH)
+        .any {
+            it is ProviderException ||
+                it is BadPaddingException ||
+                it is SecureMessagingStateRetryableException ||
+                it is SecureMessagingStateUnavailableException
+        }
+
+private const val MAX_CAUSE_CHAIN_DEPTH = 16

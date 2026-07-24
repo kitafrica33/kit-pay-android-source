@@ -15,10 +15,13 @@ import com.kit.wallet.data.local.SecureMessagingRecordEntity
 import com.kit.wallet.data.session.CoroutineOwnedMutex
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.nio.ByteBuffer
+import java.security.GeneralSecurityException
 import java.security.InvalidKeyException
 import java.security.KeyStore
 import java.security.KeyStoreException
+import java.security.MessageDigest
 import java.security.ProviderException
+import java.security.SecureRandom
 import java.security.UnrecoverableKeyException
 import javax.crypto.AEADBadTagException
 import javax.crypto.BadPaddingException
@@ -26,6 +29,7 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
@@ -34,12 +38,20 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 
+enum class SecureMessagingRecordAtRestProvenance {
+    UNSPECIFIED,
+    LEGACY_DIRECT_V1,
+    DEK_ENVELOPE_V1,
+}
+
 data class SecureMessagingRecord(
     val namespace: String,
     val recordKey: String,
     val version: Long,
     val bytes: ByteArray,
     val updatedAtEpochMillis: Long = 0,
+    val atRestProvenance: SecureMessagingRecordAtRestProvenance =
+        SecureMessagingRecordAtRestProvenance.UNSPECIFIED,
 )
 
 class SecureMessagingRecordPage(
@@ -89,7 +101,13 @@ class SecureMessagingStateWrite(
     bytes: ByteArray,
 ) {
     private val lock = Any()
-    private val immutableBytes = bytes.copyOf()
+    internal val byteSize: Int = bytes.size
+    private val immutableBytes = bytes.also {
+        require(it.size in 1..MAX_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES) {
+            "Invalid secure messaging state write length ${it.size}; maximum " +
+                MAX_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES
+        }
+    }.copyOf()
     private var consumed = false
 
     fun copyBytes(): ByteArray = synchronized(lock) {
@@ -139,6 +157,56 @@ internal class SecureMessagingRecordAuthenticationFailedException(
     cause: Throwable,
 ) : java.security.GeneralSecurityException(
     "Secure messaging at-rest record authentication failed",
+    cause,
+)
+
+/**
+ * The first protocol-state commit is still an unpublished activation baseline: READY has not been
+ * reached and no message can have been accepted under it. If Android 9 cannot authenticate that
+ * exact version-1 row, the fenced enrollment reset may discard it without treating later protocol
+ * or message corruption as recoverable state loss.
+ */
+@VisibleForTesting
+internal class SecureMessagingInitialEnrollmentAuthenticationFailedException(
+    cause: Throwable,
+) : java.security.GeneralSecurityException(
+    "Initial secure messaging enrollment failed authenticated restoration",
+    cause,
+)
+
+/**
+ * Code 22 stored the complete initial libsignal state directly through AndroidKeyStore. Some
+ * Android 9 providers can encrypt that large version-1 row but later fail its first read with a
+ * generic provider/key error rather than an authenticated-tag error. That row is still an
+ * unpublished enrollment baseline, so the activation owner may discard it and reprovision; later
+ * versions and every envelope-format row remain outside this compatibility recovery marker.
+ */
+@VisibleForTesting
+internal class SecureMessagingLegacyInitialEnrollmentUnreadableException(
+    cause: Throwable,
+) : java.security.GeneralSecurityException(
+    "Legacy initial secure messaging enrollment state is unreadable",
+    cause,
+)
+
+/**
+ * A confirmed code-22 enrollment row was stored through the legacy direct AndroidKeyStore path.
+ * This marker is issued only after authenticated decryption returns the narrowly proved API-28
+ * 65,536-byte codec truncation. Only the remote enrollment owner may reset this state; it must
+ * never authorize an uncoordinated local reprovision.
+ */
+internal class SecureMessagingLegacyConfirmedEnrollmentUnreadableException(
+    cause: Throwable,
+) : java.security.GeneralSecurityException(
+    "Confirmed legacy secure messaging enrollment state is unreadable",
+    cause,
+)
+
+/** Issued only while the coordinator still owns an unpublished fresh-provisioning activation. */
+internal class SecureMessagingFreshProvisioningUnreadableException(
+    cause: Throwable,
+) : java.security.GeneralSecurityException(
+    "Fresh secure messaging provisioning state is unreadable",
     cause,
 )
 
@@ -242,6 +310,285 @@ data class EncryptedMessagingRecord(
     val ciphertext: ByteArray,
 )
 
+/** On-disk format selected without attempting any cryptographic operation. */
+@VisibleForTesting
+internal enum class SecureMessagingRecordStorageFormat {
+    LEGACY_DIRECT_V1,
+    DEK_ENVELOPE_V1,
+}
+
+@VisibleForTesting
+internal fun secureMessagingRecordAtRestProvenance(
+    iv: ByteArray,
+): SecureMessagingRecordAtRestProvenance = when {
+    iv.size == LEGACY_GCM_IV_BYTES -> SecureMessagingRecordAtRestProvenance.LEGACY_DIRECT_V1
+    iv.size == ENVELOPE_IV_BYTES &&
+        iv.copyOfRange(0, ENVELOPE_MARKER_BYTES).contentEquals(
+            SECURE_MESSAGING_ENVELOPE_MARKER,
+        ) -> SecureMessagingRecordAtRestProvenance.DEK_ENVELOPE_V1
+    else -> SecureMessagingRecordAtRestProvenance.UNSPECIFIED
+}
+
+/** Legacy code-22 rows retain their previous codec ceiling; only new envelopes use the API-28 cap. */
+@VisibleForTesting
+internal fun maximumSecureMessagingRecordPlaintextBytes(
+    format: SecureMessagingRecordStorageFormat,
+): Int = when (format) {
+    SecureMessagingRecordStorageFormat.LEGACY_DIRECT_V1 ->
+        MAX_LEGACY_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES
+    SecureMessagingRecordStorageFormat.DEK_ENVELOPE_V1 ->
+        MAX_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES
+}
+
+/**
+ * Keeps code-21-and-earlier 12-byte-IV records readable while rejecting every ambiguous shape.
+ * New envelopes use a 32-byte IV field: 8-byte magic/version, KEK-wrap IV, then data IV.
+ */
+@VisibleForTesting
+internal fun secureMessagingRecordStorageFormat(
+    record: EncryptedMessagingRecord,
+): SecureMessagingRecordStorageFormat = when {
+    record.iv.size == LEGACY_GCM_IV_BYTES -> {
+        require(
+            record.ciphertext.size in GCM_TAG_BYTES..MAX_LEGACY_RECORD_CIPHERTEXT_BYTES,
+        ) { "Invalid legacy secure messaging ciphertext length" }
+        SecureMessagingRecordStorageFormat.LEGACY_DIRECT_V1
+    }
+
+    record.iv.size == ENVELOPE_IV_BYTES &&
+        record.iv.copyOfRange(0, ENVELOPE_MARKER_BYTES).contentEquals(
+            SECURE_MESSAGING_ENVELOPE_MARKER,
+        ) -> {
+        require(
+            record.ciphertext.size in MIN_ENVELOPE_CIPHERTEXT_BYTES..
+                MAX_ENVELOPE_CIPHERTEXT_BYTES,
+        ) { "Invalid secure messaging envelope length" }
+        SecureMessagingRecordStorageFormat.DEK_ENVELOPE_V1
+    }
+
+    else -> throw IllegalArgumentException("Unknown secure messaging record format")
+}
+
+/** Executes the unchanged direct-AES-GCM legacy path with strict plaintext ownership on failure. */
+@VisibleForTesting
+internal fun decryptSecureMessagingLegacyRecord(
+    aad: ByteArray,
+    record: EncryptedMessagingRecord,
+    decryptDirect: (aad: ByteArray, record: EncryptedMessagingRecord) -> ByteArray,
+): ByteArray {
+    require(
+        secureMessagingRecordStorageFormat(record) ==
+            SecureMessagingRecordStorageFormat.LEGACY_DIRECT_V1,
+    ) { "An envelope record cannot enter legacy decryption" }
+    val plaintext = decryptDirect(aad, record)
+    val maximumPlaintextBytes = maximumSecureMessagingRecordPlaintextBytes(
+        SecureMessagingRecordStorageFormat.LEGACY_DIRECT_V1,
+    )
+    if (plaintext.size !in 1..maximumPlaintextBytes) {
+        plaintext.fill(0)
+        throw IllegalArgumentException("Invalid legacy secure messaging plaintext length")
+    }
+    return plaintext
+}
+
+/**
+ * Creates the domain-separated AAD for one envelope layer. The fixed marker carries the format
+ * version; the layer byte prevents a wrapped DEK from being accepted as record data (or reverse),
+ * and the original AAD retains namespace/key/record-version binding.
+ */
+private fun secureMessagingEnvelopeLayerAad(aad: ByteArray, layer: Byte): ByteArray {
+    require(aad.size in 1..MAX_SECURE_MESSAGING_RECORD_AAD_BYTES) {
+        "Invalid secure messaging record AAD length"
+    }
+    return ByteBuffer.allocate(
+        ENVELOPE_MARKER_BYTES + 1 + Int.SIZE_BYTES + aad.size,
+    )
+        .put(SECURE_MESSAGING_ENVELOPE_MARKER)
+        .put(layer)
+        .putInt(aad.size)
+        .put(aad)
+        .array()
+}
+
+/** Software AES-GCM is selected by the ordinary in-memory key rather than AndroidKeyStore. */
+private fun softwareAesGcm(
+    mode: Int,
+    dek: ByteArray,
+    iv: ByteArray,
+    aad: ByteArray,
+    input: ByteArray,
+): ByteArray {
+    require(dek.size == RECORD_DEK_BYTES) { "Invalid secure messaging record DEK" }
+    require(iv.size == SOFTWARE_DATA_IV_BYTES) { "Invalid secure messaging data IV" }
+    val key = SecretKeySpec(dek, KeyProperties.KEY_ALGORITHM_AES)
+    return try {
+        Cipher.getInstance(TRANSFORMATION).run {
+            // Keep JCA's delayed provider selection active until it sees the ordinary in-memory
+            // key. Calling getProvider() first can pin an OEM AndroidKeyStore workaround provider
+            // that advertises AES/GCM but rejects SecretKeySpec during init.
+            init(mode, key, GCMParameterSpec(GCM_TAG_BITS, iv))
+            check(!provider.name.startsWith(ANDROID_KEYSTORE_PROVIDER_PREFIX)) {
+                "Large secure messaging payload was routed through AndroidKeyStore"
+            }
+            updateAAD(aad)
+            doFinal(input)
+        }
+    } finally {
+        runCatching { key.destroy() }
+    }
+}
+
+/**
+ * Encrypts arbitrary bounded record plaintext under a fresh per-record DEK. AndroidKeyStore sees
+ * only the 32-byte DEK; the full payload is handled by software AES-GCM. Every callback-returned
+ * buffer is owned here and wiped after its bytes are copied into the immutable result.
+ */
+@VisibleForTesting
+internal fun encryptSecureMessagingRecordEnvelope(
+    aad: ByteArray,
+    plaintext: ByteArray,
+    createDek: () -> ByteArray,
+    createDataIv: () -> ByteArray,
+    wrapDek: (wrapAad: ByteArray, dek: ByteArray) -> EncryptedMessagingRecord,
+    validateWrappedDek: (
+        wrapAad: ByteArray,
+        wrappedDek: EncryptedMessagingRecord,
+        expectedDek: ByteArray,
+    ) -> Unit = { _, _, _ -> },
+): EncryptedMessagingRecord {
+    require(plaintext.size in 1..MAX_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES) {
+        "Invalid secure messaging record plaintext length"
+    }
+    val wrapAad = secureMessagingEnvelopeLayerAad(aad, ENVELOPE_WRAP_AAD_LAYER)
+    val dataAad = secureMessagingEnvelopeLayerAad(aad, ENVELOPE_DATA_AAD_LAYER)
+    var dek: ByteArray? = null
+    var dataIv: ByteArray? = null
+    var dataCiphertext: ByteArray? = null
+    var wrappedDek: EncryptedMessagingRecord? = null
+    try {
+        val generatedDek = createDek()
+        dek = generatedDek
+        require(generatedDek.size == RECORD_DEK_BYTES) {
+            "Invalid generated secure messaging DEK"
+        }
+        val generatedDataIv = createDataIv()
+        dataIv = generatedDataIv
+        require(generatedDataIv.size == SOFTWARE_DATA_IV_BYTES) {
+            "Invalid generated secure messaging data IV"
+        }
+        dataCiphertext = softwareAesGcm(
+            mode = Cipher.ENCRYPT_MODE,
+            dek = generatedDek,
+            iv = generatedDataIv,
+            aad = dataAad,
+            input = plaintext,
+        )
+        require(dataCiphertext.size == plaintext.size + GCM_TAG_BYTES) {
+            "Software secure messaging encryption returned a truncated payload"
+        }
+
+        wrappedDek = wrapDek(wrapAad, generatedDek)
+        require(wrappedDek.iv.size == KEK_WRAP_IV_BYTES) {
+            "Invalid secure messaging wrapped-DEK IV"
+        }
+        require(wrappedDek.ciphertext.size == WRAPPED_DEK_CIPHERTEXT_BYTES) {
+            "Invalid secure messaging wrapped-DEK ciphertext"
+        }
+        validateWrappedDek(wrapAad, wrappedDek, generatedDek)
+
+        val envelopeIv = ByteBuffer.allocate(ENVELOPE_IV_BYTES)
+            .put(SECURE_MESSAGING_ENVELOPE_MARKER)
+            .put(wrappedDek.iv)
+            .put(generatedDataIv)
+            .array()
+        val envelopeCiphertext = ByteBuffer.allocate(
+            WRAPPED_DEK_CIPHERTEXT_BYTES + dataCiphertext.size,
+        )
+            .put(wrappedDek.ciphertext)
+            .put(dataCiphertext)
+            .array()
+        return EncryptedMessagingRecord(envelopeIv, envelopeCiphertext)
+    } finally {
+        dek?.fill(0)
+        dataIv?.fill(0)
+        dataCiphertext?.fill(0)
+        wrappedDek?.iv?.fill(0)
+        wrappedDek?.ciphertext?.fill(0)
+        wrapAad.fill(0)
+        dataAad.fill(0)
+    }
+}
+
+/**
+ * Authenticates and unwraps a DEK with AndroidKeyStore, then decrypts the large payload in
+ * software. The recovered DEK and any plaintext that fails strict length validation are wiped.
+ */
+@VisibleForTesting
+internal fun decryptSecureMessagingRecordEnvelope(
+    aad: ByteArray,
+    record: EncryptedMessagingRecord,
+    unwrapDek: (wrapAad: ByteArray, wrappedDek: EncryptedMessagingRecord) -> ByteArray,
+): ByteArray {
+    require(
+        secureMessagingRecordStorageFormat(record) ==
+            SecureMessagingRecordStorageFormat.DEK_ENVELOPE_V1,
+    ) { "A legacy record cannot enter envelope decryption" }
+
+    val wrapIv = record.iv.copyOfRange(
+        ENVELOPE_MARKER_BYTES,
+        ENVELOPE_MARKER_BYTES + KEK_WRAP_IV_BYTES,
+    )
+    val dataIv = record.iv.copyOfRange(
+        ENVELOPE_MARKER_BYTES + KEK_WRAP_IV_BYTES,
+        ENVELOPE_IV_BYTES,
+    )
+    val wrappedDekCiphertext = record.ciphertext.copyOfRange(
+        0,
+        WRAPPED_DEK_CIPHERTEXT_BYTES,
+    )
+    val dataCiphertext = record.ciphertext.copyOfRange(
+        WRAPPED_DEK_CIPHERTEXT_BYTES,
+        record.ciphertext.size,
+    )
+    val wrapAad = secureMessagingEnvelopeLayerAad(aad, ENVELOPE_WRAP_AAD_LAYER)
+    val dataAad = secureMessagingEnvelopeLayerAad(aad, ENVELOPE_DATA_AAD_LAYER)
+    val wrappedDek = EncryptedMessagingRecord(wrapIv, wrappedDekCiphertext)
+    var recoveredDek: ByteArray? = null
+    var plaintext: ByteArray? = null
+    try {
+        recoveredDek = unwrapDek(wrapAad, wrappedDek)
+        require(recoveredDek.size == RECORD_DEK_BYTES) {
+            "Invalid unwrapped secure messaging DEK"
+        }
+        val expectedPlaintextBytes = dataCiphertext.size - GCM_TAG_BYTES
+        require(expectedPlaintextBytes in 1..MAX_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES) {
+            "Invalid secure messaging envelope payload length"
+        }
+        val decrypted = softwareAesGcm(
+            mode = Cipher.DECRYPT_MODE,
+            dek = recoveredDek,
+            iv = dataIv,
+            aad = dataAad,
+            input = dataCiphertext,
+        )
+        plaintext = decrypted
+        require(decrypted.size == expectedPlaintextBytes) {
+            "Software secure messaging decryption returned a truncated payload"
+        }
+        plaintext = null
+        return decrypted
+    } finally {
+        recoveredDek?.fill(0)
+        plaintext?.fill(0)
+        wrapIv.fill(0)
+        dataIv.fill(0)
+        wrappedDekCiphertext.fill(0)
+        dataCiphertext.fill(0)
+        wrapAad.fill(0)
+        dataAad.fill(0)
+    }
+}
+
 /** Distinguishes a genuinely new alias from an existing handle found during bootstrap. */
 @VisibleForTesting
 internal data class SecureMessagingRecordKeyResolution<T : Any>(
@@ -318,6 +665,7 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
     @ApplicationContext private val context: Context,
 ) : SecureMessagingRecordCipher {
     private val keyHealth = context.getSharedPreferences(KEY_HEALTH_PREFERENCES, Context.MODE_PRIVATE)
+    private val recordRandom = SecureRandom()
     private val recordKeyHandles = SecureMessagingRecordKeyHandleCache<SecretKey>(
         canRetain = ::isNonExportableKeyHandle,
     )
@@ -327,43 +675,85 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
         plaintext: ByteArray,
         allowKeyCreation: Boolean,
     ): EncryptedMessagingRecord = try {
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        val resolvedKey = recordKey(
-            allowCreation = allowKeyCreation,
-            operation = SecureMessagingRecordKeyOperation.ENCRYPT,
-        )
-        try {
-            cipher.init(Cipher.ENCRYPT_MODE, resolvedKey.key)
-        } catch (error: Exception) {
-            throw recordKeyOperationFailure(
-                error,
-                resolvedKey,
-                SecureMessagingRecordKeyOperation.ENCRYPT,
+        withSecureMessagingBootstrapKeyCleanup(
+            cleanupRequired = allowKeyCreation,
+            eraseUncommittedBootstrapKey = ::eraseUncommittedBootstrapKey,
+        ) {
+            val resolvedKey = recordKey(
+                allowCreation = allowKeyCreation,
+                operation = SecureMessagingRecordKeyOperation.ENCRYPT,
             )
+            val bootstrapProbeRequired = allowKeyCreation
+            var provenKey = resolvedKey.key
+            val encrypted = encryptSecureMessagingRecordEnvelope(
+                aad = aad,
+                plaintext = plaintext,
+                createDek = {
+                    ByteArray(RECORD_DEK_BYTES).also(recordRandom::nextBytes)
+                },
+                createDataIv = {
+                    ByteArray(SOFTWARE_DATA_IV_BYTES).also(recordRandom::nextBytes)
+                },
+                wrapDek = { wrapAad, dek ->
+                    val cipher = Cipher.getInstance(TRANSFORMATION)
+                    try {
+                        cipher.init(Cipher.ENCRYPT_MODE, resolvedKey.key)
+                    } catch (error: Exception) {
+                        throw recordKeyOperationFailure(
+                            error,
+                            resolvedKey,
+                            SecureMessagingRecordKeyOperation.ENCRYPT,
+                        )
+                    }
+                    val wrapped = completeKeystoreCipherOperation(
+                        operation = {
+                            cipher.updateAAD(wrapAad)
+                            cipher.doFinal(dek)
+                        },
+                        classifyFailure = {
+                            recordKeyOperationFailure(
+                                it,
+                                resolvedKey,
+                                SecureMessagingRecordKeyOperation.ENCRYPT,
+                            )
+                        },
+                        onSuccess = {},
+                    )
+                    EncryptedMessagingRecord(cipher.iv.copyOf(), wrapped)
+                },
+                validateWrappedDek = { wrapAad, wrappedDek, expectedDek ->
+                    provenKey = validateBootstrapSecureMessagingRecordKeyRoundTrip(
+                        resolution = resolvedKey,
+                        bootstrapProbeRequired = bootstrapProbeRequired,
+                        expectedDek = expectedDek,
+                        reloadBootstrapKey = {
+                            // Bypass the process cache: the independently loaded alias must unwrap
+                            // the exact DEK before any record or server bundle can be committed.
+                            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                            keyStore.getKey(KEY_ALIAS, null) as? SecretKey
+                        },
+                        authenticatedUnwrap = { reloadedKey ->
+                            Cipher.getInstance(TRANSFORMATION).run {
+                                init(
+                                    Cipher.DECRYPT_MODE,
+                                    reloadedKey,
+                                    GCMParameterSpec(GCM_TAG_BITS, wrappedDek.iv),
+                                )
+                                updateAAD(wrapAad)
+                                doFinal(wrappedDek.ciphertext)
+                            }
+                        },
+                    )
+                },
+            )
+            recordKeyHandles.retainAfterSuccessfulUse(provenKey)
+            if (bootstrapProbeRequired) {
+                clearKeyFailureObservations()
+            } else {
+                clearKeyFailureObservationsAfter(SecureMessagingRecordKeyOperation.ENCRYPT)
+            }
+            encrypted
         }
-        val ciphertext = completeKeystoreCipherOperation(
-            operation = {
-                cipher.updateAAD(aad)
-                cipher.doFinal(plaintext)
-            },
-            classifyFailure = {
-                recordKeyOperationFailure(
-                    it,
-                    resolvedKey,
-                    SecureMessagingRecordKeyOperation.ENCRYPT,
-                )
-            },
-            onSuccess = {
-                recordKeyHandles.retainAfterSuccessfulUse(resolvedKey.key)
-                clearKeyFailureObservationsAfter(
-                    SecureMessagingRecordKeyOperation.ENCRYPT,
-                )
-            },
-        )
-        EncryptedMessagingRecord(
-            iv = cipher.iv.copyOf(),
-            ciphertext = ciphertext,
-        )
     } catch (error: Exception) {
         throw secureMessagingStateAccessFailure(
             "Secure messaging state could not be encrypted",
@@ -372,50 +762,59 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
     }
 
     override fun decrypt(aad: ByteArray, record: EncryptedMessagingRecord): ByteArray = try {
-        require(record.iv.size == GCM_IV_BYTES) { "Invalid secure messaging state IV" }
-        require(record.ciphertext.size >= GCM_TAG_BYTES) { "Invalid secure messaging ciphertext" }
-        val cipher = Cipher.getInstance(TRANSFORMATION)
+        val format = secureMessagingRecordStorageFormat(record)
         val resolvedKey = recordKey(
             allowCreation = false,
             operation = SecureMessagingRecordKeyOperation.DECRYPT,
         )
-        try {
-            cipher.init(
-                Cipher.DECRYPT_MODE,
-                // Never manufacture a replacement key while ciphertext is present. Some Android 9
-                // Keystore providers briefly hide an existing alias while locked or recovering; a
-                // replacement would make every retained messaging record permanently undecryptable.
-                resolvedKey.key,
-                GCMParameterSpec(GCM_TAG_BITS, record.iv),
-            )
-        } catch (error: Exception) {
-            // Android 9 providers can defer an alias lookup until Cipher.init(). Feed those
-            // alias-specific failures through the same bounded missing-key proof as getKey().
-            throw recordKeyOperationFailure(
-                error,
-                resolvedKey,
-                SecureMessagingRecordKeyOperation.DECRYPT,
-            )
+        val keystoreDecrypt: (ByteArray, EncryptedMessagingRecord) -> ByteArray =
+            { operationAad, encrypted ->
+                val cipher = Cipher.getInstance(TRANSFORMATION)
+                try {
+                    cipher.init(
+                        Cipher.DECRYPT_MODE,
+                        // Decrypt/unwrap never creates a replacement for retained ciphertext.
+                        resolvedKey.key,
+                        GCMParameterSpec(GCM_TAG_BITS, encrypted.iv),
+                    )
+                } catch (error: Exception) {
+                    throw recordKeyOperationFailure(
+                        error,
+                        resolvedKey,
+                        SecureMessagingRecordKeyOperation.DECRYPT,
+                    )
+                }
+                completeKeystoreCipherOperation(
+                    operation = {
+                        cipher.updateAAD(operationAad)
+                        cipher.doFinal(encrypted.ciphertext)
+                    },
+                    classifyFailure = {
+                        recordKeyOperationFailure(
+                            it,
+                            resolvedKey,
+                            SecureMessagingRecordKeyOperation.DECRYPT,
+                        )
+                    },
+                    onSuccess = {
+                        recordKeyHandles.retainAfterSuccessfulUse(resolvedKey.key)
+                        clearKeyFailureObservationsAfter(
+                            SecureMessagingRecordKeyOperation.DECRYPT,
+                        )
+                    },
+                )
+            }
+        when (format) {
+            SecureMessagingRecordStorageFormat.LEGACY_DIRECT_V1 ->
+                decryptSecureMessagingLegacyRecord(aad, record, keystoreDecrypt)
+
+            SecureMessagingRecordStorageFormat.DEK_ENVELOPE_V1 ->
+                decryptSecureMessagingRecordEnvelope(
+                    aad = aad,
+                    record = record,
+                    unwrapDek = keystoreDecrypt,
+                )
         }
-        completeKeystoreCipherOperation(
-            operation = {
-                cipher.updateAAD(aad)
-                cipher.doFinal(record.ciphertext)
-            },
-            classifyFailure = {
-                recordKeyOperationFailure(
-                    it,
-                    resolvedKey,
-                    SecureMessagingRecordKeyOperation.DECRYPT,
-                )
-            },
-            onSuccess = {
-                recordKeyHandles.retainAfterSuccessfulUse(resolvedKey.key)
-                clearKeyFailureObservationsAfter(
-                    SecureMessagingRecordKeyOperation.DECRYPT,
-                )
-            },
-        )
     } catch (error: Exception) {
         val classified = if (error.hasGcmAuthenticationFailure()) {
             SecureMessagingRecordAuthenticationFailedException(error)
@@ -443,6 +842,25 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
         } catch (error: Exception) {
             throw SecureMessagingStateUnavailableException(
                 "Secure messaging state key could not be erased",
+                error,
+            )
+        }
+    }
+
+    @Synchronized
+    private fun eraseUncommittedBootstrapKey() {
+        // No record has committed while empty-store bootstrap owns this path. Preserve retry
+        // evidence while removing any partially generated, wrapped, or reload-failed alias.
+        recordKeyHandles.clear()
+        try {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            deleteKeystoreAliasAndVerifyAbsent(
+                deleteEntry = { keyStore.deleteEntry(KEY_ALIAS) },
+                aliasExists = { keyStore.containsAlias(KEY_ALIAS) },
+            )
+        } catch (error: Exception) {
+            throw SecureMessagingStateUnavailableException(
+                "Uncommitted secure messaging bootstrap key could not be erased",
                 error,
             )
         }
@@ -731,10 +1149,6 @@ class AndroidKeystoreMessagingRecordCipher @Inject constructor(
         const val KEY_LEGACY_UNRECOVERABLE_COUNT = "unrecoverable_alias_count"
         const val KEY_LEGACY_FIRST_UNRECOVERABLE_AT = "unrecoverable_alias_first_seen_at"
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
-        const val TRANSFORMATION = "AES/GCM/NoPadding"
-        const val GCM_TAG_BITS = 128
-        const val GCM_TAG_BYTES = GCM_TAG_BITS / 8
-        const val GCM_IV_BYTES = 12
     }
 }
 
@@ -808,6 +1222,7 @@ class RoomSecureMessagingStateStore @Inject constructor(
     ): SecureMessagingRecord? = lifecycleGate.withOperation {
         validateRecordAddress(namespace, recordKey)
         val stored = records.get(namespace, recordKey) ?: return@withOperation null
+        var atRestProvenance = SecureMessagingRecordAtRestProvenance.UNSPECIFIED
         val bytes = try {
             require(
                 stored.namespace == namespace &&
@@ -815,6 +1230,7 @@ class RoomSecureMessagingStateStore @Inject constructor(
                     stored.version > 0 &&
                     stored.updatedAtEpochMillis > 0,
             ) { "Secure messaging record query returned invalid metadata" }
+            atRestProvenance = secureMessagingRecordAtRestProvenance(stored.iv)
             decryptStoredRecord(stored)
         } finally {
             stored.iv.fill(0)
@@ -827,6 +1243,7 @@ class RoomSecureMessagingStateStore @Inject constructor(
                 version = stored.version,
                 bytes = bytes,
                 updatedAtEpochMillis = stored.updatedAtEpochMillis,
+                atRestProvenance = atRestProvenance,
             )
         } catch (error: Throwable) {
             bytes.fill(0)
@@ -867,6 +1284,7 @@ class RoomSecureMessagingStateStore @Inject constructor(
                 previousKey = stored.recordKey
             }
             selectedRows.forEach { stored ->
+                val atRestProvenance = secureMessagingRecordAtRestProvenance(stored.iv)
                 val bytes = decryptStoredRecord(stored)
                 try {
                     decrypted += SecureMessagingRecord(
@@ -875,6 +1293,7 @@ class RoomSecureMessagingStateStore @Inject constructor(
                         version = stored.version,
                         bytes = bytes,
                         updatedAtEpochMillis = stored.updatedAtEpochMillis,
+                        atRestProvenance = atRestProvenance,
                     )
                 } catch (error: Throwable) {
                     bytes.fill(0)
@@ -913,6 +1332,10 @@ class RoomSecureMessagingStateStore @Inject constructor(
         writes: List<SecureMessagingStateWrite>,
     ): List<SecureMessagingRecordVersion> = try {
         lifecycleGate.withOperation {
+            validateSecureMessagingAtomicWriteBounds(
+                writeCount = writes.size,
+                totalPlaintextBytes = writes.sumOf { it.byteSize.toLong() },
+            )
             val snapshots = ArrayList<SecureMessagingStateWriteSnapshot>(writes.size)
             try {
                 writes.forEach { write ->
@@ -922,9 +1345,6 @@ class RoomSecureMessagingStateStore @Inject constructor(
                         expectedVersion = write.expectedVersion,
                         bytes = write.consumeBytes(),
                     )
-                }
-                require(snapshots.size in 1..MAX_ATOMIC_WRITES) {
-                    "A secure messaging state transaction requires 1 to $MAX_ATOMIC_WRITES records"
                 }
                 snapshots.forEach {
                     validateRecordAddress(it.namespace, it.recordKey)
@@ -1073,12 +1493,24 @@ class RoomSecureMessagingStateStore @Inject constructor(
                 EncryptedMessagingRecord(stored.iv, stored.ciphertext),
             )
         } catch (error: Exception) {
+            val classified = classifySecureMessagingStoredRecordFailure(
+                namespace = stored.namespace,
+                recordKey = stored.recordKey,
+                version = stored.version,
+                atRestProvenance = secureMessagingRecordAtRestProvenance(stored.iv),
+                error = error,
+            )
+            // A confirmed server enrollment must use its exact remote-reset target even while an
+            // older migration marker remains. Never downgrade this provenance to local erasure.
+            if (isLegacyConfirmedSecureMessagingEnrollmentUnreadableFailure(classified)) {
+                throw classified
+            }
             if (isSecureMessagingRecordAuthenticationFailure(error) &&
                 legacyKeyContinuityPending()
             ) {
                 throw SecureMessagingLegacyStateUnreadableException(error)
             }
-            throw error
+            throw classified
         } finally {
             aad.fill(0)
         }
@@ -1385,6 +1817,83 @@ internal fun <T : Any> resolveSecureMessagingRecordKeyWithCreationStatus(
     return createNew()
 }
 
+/**
+ * Proves that the first empty-store Android-Keystore key survives an independent provider reload.
+ *
+ * The first encrypted row is not safe to commit merely because KeyGenerator's returned handle can
+ * encrypt it: affected Android 9 providers can subsequently resolve the alias to no key or to key
+ * material that cannot authenticate that ciphertext. The same probe is required when an empty
+ * store finds an existing alias, because it may be an unproved alias left after an earlier cleanup
+ * failure. Existing aliases are not probed once retained ciphertext exists. This probe unwraps
+ * only the small DEK; its caller owns the single cleanup boundary for every empty-store failure.
+ * The recovered DEK is destroyed on every path; the large payload never enters AndroidKeyStore.
+ */
+@VisibleForTesting
+internal fun <T : Any> validateBootstrapSecureMessagingRecordKeyRoundTrip(
+    resolution: SecureMessagingRecordKeyResolution<T>,
+    bootstrapProbeRequired: Boolean,
+    expectedDek: ByteArray,
+    reloadBootstrapKey: () -> T?,
+    authenticatedUnwrap: (T) -> ByteArray,
+): T {
+    if (!bootstrapProbeRequired) return resolution.key
+    require(expectedDek.size == RECORD_DEK_BYTES) { "Invalid bootstrap secure messaging DEK" }
+
+    var validationDek: ByteArray? = null
+    try {
+        val reloadedKey = reloadBootstrapKey()
+            ?: throw GeneralSecurityException(
+                "Fresh secure messaging key is absent after provider reload",
+            )
+        val unwrapped = authenticatedUnwrap(reloadedKey)
+        validationDek = unwrapped
+        if (unwrapped.size != RECORD_DEK_BYTES ||
+            !MessageDigest.isEqual(expectedDek, unwrapped)
+        ) {
+            throw GeneralSecurityException(
+                "Reloaded secure messaging key produced a different bootstrap DEK",
+            )
+        }
+        return reloadedKey
+    } catch (error: Exception) {
+        throw if (error is SecureMessagingBootstrapRecordKeyValidationException) {
+            error
+        } else {
+            SecureMessagingBootstrapRecordKeyValidationException(error)
+        }
+    } finally {
+        validationDek?.fill(0)
+    }
+}
+
+/**
+ * Owns the only empty-store alias cleanup boundary around bootstrap resolution, wrapping and probe.
+ * No ciphertext can have committed while [cleanupRequired] is true, so every failure may erase the
+ * exact alias safely. Validation and wrap failures share this owner and therefore delete at most
+ * once; cleanup failures remain suppressed on the retryable bootstrap cause.
+ */
+@VisibleForTesting
+internal inline fun <T> withSecureMessagingBootstrapKeyCleanup(
+    cleanupRequired: Boolean,
+    eraseUncommittedBootstrapKey: () -> Unit,
+    operation: () -> T,
+): T = try {
+    operation()
+} catch (error: Throwable) {
+    if (!cleanupRequired) throw error
+    val retryable = if (error is SecureMessagingBootstrapRecordKeyValidationException) {
+        error
+    } else {
+        SecureMessagingBootstrapRecordKeyValidationException(error)
+    }
+    try {
+        eraseUncommittedBootstrapKey()
+    } catch (eraseFailure: Throwable) {
+        if (eraseFailure !== retryable) retryable.addSuppressed(eraseFailure)
+    }
+    throw retryable
+}
+
 /** Existing aliases use the bounded Android-9 recovery proof even on an empty-store write. */
 @VisibleForTesting
 internal fun classifySecureMessagingRecordKeyOperationFailure(
@@ -1432,6 +1941,15 @@ internal fun classifySecureMessagingRecordKeyAccessFailure(
 internal class SecureMessagingRecordKeyTemporarilyUnavailableException(
     cause: Throwable? = null,
 ) : IllegalStateException("The secure messaging record key is temporarily unavailable", cause)
+
+/** An empty-store alias failed its pre-commit reload proof and entered safe erase/retry. */
+@VisibleForTesting
+internal class SecureMessagingBootstrapRecordKeyValidationException(
+    cause: Throwable,
+) : GeneralSecurityException(
+    "Bootstrap secure messaging key failed independent authenticated reload",
+    cause,
+)
 
 /** The device is unlocked and repeated observations prove that retained ciphertext lost its key. */
 @VisibleForTesting
@@ -1504,10 +2022,14 @@ internal fun observeSecureMessagingRecordKeyMiss(
 @VisibleForTesting
 internal fun isRetryableSecureMessagingStateFailure(error: Throwable): Boolean {
     val causes = generateSequence(error) { it.cause }.toList()
+    // No ciphertext was committed under this empty-store alias and the failure path attempted to
+    // erase it. Nested provider details therefore describe bootstrap, not retained data.
+    if (causes.any { it is SecureMessagingBootstrapRecordKeyValidationException }) return true
     if (causes.any {
             it is KeyPermanentlyInvalidatedException ||
                 it is SecureMessagingRecordKeyPermanentlyMissingException ||
-                it is SecureMessagingRecordKeyPermanentlyUnrecoverableException
+                it is SecureMessagingRecordKeyPermanentlyUnrecoverableException ||
+                it is SecureMessagingRecordAuthenticationFailedException
         }
     ) {
         return false
@@ -1551,9 +2073,13 @@ internal fun isTransientSecureMessagingRecordKeyFailure(error: Throwable): Boole
     val causes = generateSequence(error) { it.cause }.toList()
     return causes.none {
         it is SecureMessagingRecordKeyPermanentlyMissingException ||
-            it is SecureMessagingRecordKeyPermanentlyUnrecoverableException
+            it is SecureMessagingRecordKeyPermanentlyUnrecoverableException ||
+            it is SecureMessagingRecordAuthenticationFailedException
     } &&
-        causes.any { it is SecureMessagingRecordKeyTemporarilyUnavailableException }
+        causes.any {
+            it is SecureMessagingRecordKeyTemporarilyUnavailableException ||
+                it is SecureMessagingBootstrapRecordKeyValidationException
+        }
 }
 
 /** Distinguishes permanently unavailable at-rest keys from authenticated ciphertext corruption. */
@@ -1575,7 +2101,115 @@ internal fun isPermanentlyMissingSecureMessagingRecordKey(error: Throwable): Boo
 internal fun isRecoverableSecureMessagingStateLoss(error: Throwable): Boolean =
     isPermanentlyMissingSecureMessagingRecordKey(error) ||
         generateSequence(error) { it.cause }
-            .any { it is SecureMessagingLegacyStateUnreadableException }
+            .any {
+                it is SecureMessagingLegacyStateUnreadableException ||
+                    it is SecureMessagingFreshProvisioningUnreadableException
+            }
+
+internal fun isInitialSecureMessagingEnrollmentStateUnreadableFailure(
+    error: Throwable,
+): Boolean = generateSequence(error) { it.cause }
+    .any {
+        it is SecureMessagingInitialEnrollmentAuthenticationFailedException ||
+            it is SecureMessagingLegacyInitialEnrollmentUnreadableException
+    }
+
+internal fun isLegacyInitialSecureMessagingEnrollmentUnreadableFailure(
+    error: Throwable,
+): Boolean = generateSequence(error) { it.cause }
+    .any { it is SecureMessagingLegacyInitialEnrollmentUnreadableException }
+
+internal fun isLegacyConfirmedSecureMessagingEnrollmentUnreadableFailure(
+    error: Throwable,
+): Boolean = generateSequence(error) { it.cause }
+    .any { it is SecureMessagingLegacyConfirmedEnrollmentUnreadableException }
+
+/**
+ * Version 1 retains the narrow unpublished local-reprovision marker. A stored-row failure never
+ * proves the distinct confirmed-enrollment recovery case: a 12-byte IV and protocol-row metadata
+ * cannot distinguish transient provider trouble, an authentication failure, malformed storage,
+ * or Android 9's successfully decrypted 65,536-byte plaintext truncation.
+ */
+@VisibleForTesting
+internal fun classifySecureMessagingStoredRecordFailure(
+    namespace: String,
+    recordKey: String,
+    version: Long,
+    atRestProvenance: SecureMessagingRecordAtRestProvenance =
+        SecureMessagingRecordAtRestProvenance.UNSPECIFIED,
+    error: Exception,
+): Exception {
+    val isProtocolState = namespace == INITIAL_PROTOCOL_NAMESPACE &&
+        recordKey == INITIAL_PROTOCOL_RECORD_KEY
+    val isUnconfirmedEnrollmentBaseline = isProtocolState &&
+        version == INITIAL_PROTOCOL_VERSION
+    val isLegacyDirect = atRestProvenance ==
+        SecureMessagingRecordAtRestProvenance.LEGACY_DIRECT_V1
+    return if (isUnconfirmedEnrollmentBaseline && isLegacyDirect) {
+        SecureMessagingStateUnavailableException(
+            "Legacy initial secure messaging enrollment state is unreadable",
+            SecureMessagingLegacyInitialEnrollmentUnreadableException(error),
+        )
+    } else if (
+        isUnconfirmedEnrollmentBaseline && isSecureMessagingRecordAuthenticationFailure(error)
+    ) {
+        SecureMessagingStateUnavailableException(
+            "Initial secure messaging enrollment state is unreadable",
+            SecureMessagingInitialEnrollmentAuthenticationFailedException(error),
+        )
+    } else {
+        error
+    }
+}
+
+/** Compatibility seam for focused pre-provenance tests; production passes the typed value. */
+@VisibleForTesting
+internal fun classifySecureMessagingStoredRecordFailure(
+    namespace: String,
+    recordKey: String,
+    version: Long,
+    legacyDirectRecord: Boolean,
+    error: Exception,
+): Exception = classifySecureMessagingStoredRecordFailure(
+    namespace = namespace,
+    recordKey = recordKey,
+    version = version,
+    atRestProvenance = if (legacyDirectRecord) {
+        SecureMessagingRecordAtRestProvenance.LEGACY_DIRECT_V1
+    } else {
+        SecureMessagingRecordAtRestProvenance.UNSPECIFIED
+    },
+    error = error,
+)
+
+/**
+ * Adds at-rest provenance to a protocol-codec failure after authenticated decryption succeeded.
+ * The caller must separately prove the exact API-28 codec truncation signature; neither metadata
+ * nor an arbitrary structural failure can mint remote-reset authority. UNSPECIFIED test/fake
+ * stores and every envelope/non-protocol record remain fail closed.
+ */
+internal fun classifySecureMessagingDecodedRecordFailure(
+    record: SecureMessagingRecord,
+    error: Exception,
+    authenticatedAndroid9LegacyTruncationProof:
+        SecureMessagingAuthenticatedAndroid9LegacyTruncationProof? = null,
+): Exception {
+    val isConfirmedLegacyProtocolTruncation =
+        authenticatedAndroid9LegacyTruncationProof != null &&
+            record.namespace == INITIAL_PROTOCOL_NAMESPACE &&
+            record.recordKey == INITIAL_PROTOCOL_RECORD_KEY &&
+            record.version > INITIAL_PROTOCOL_VERSION &&
+            record.atRestProvenance ==
+            SecureMessagingRecordAtRestProvenance.LEGACY_DIRECT_V1
+    return if (isConfirmedLegacyProtocolTruncation) {
+        SecureMessagingStateUnavailableException(
+            "Confirmed legacy secure messaging enrollment state is unreadable",
+            SecureMessagingLegacyConfirmedEnrollmentUnreadableException(error),
+        )
+    } else {
+        error
+    }
+}
 
 /** Keeps transient Android 9/OEM provider failures retryable while corruption stays fail-closed. */
 @VisibleForTesting
@@ -1623,10 +2257,68 @@ internal fun validateSecureMessagingNamespacePageRequest(
     }
 }
 
+/** Bounds both allocation pressure and the Room transaction size before writes are consumed. */
+@VisibleForTesting
+internal fun validateSecureMessagingAtomicWriteBounds(
+    writeCount: Int,
+    totalPlaintextBytes: Long,
+) {
+    require(writeCount in 1..MAX_ATOMIC_WRITES) {
+        "A secure messaging state transaction requires 1 to $MAX_ATOMIC_WRITES records"
+    }
+    require(totalPlaintextBytes in writeCount.toLong()..MAX_ATOMIC_BATCH_PLAINTEXT_BYTES) {
+        "Secure messaging state transaction plaintext is too large"
+    }
+}
+
 private val SECURE_RECORD_ADDRESS = Regex("^[A-Za-z0-9._:@-]{1,160}$")
+
+/** `KIT-MSG` plus format version 1. Its eight-byte length can never be a legacy GCM IV. */
+private val SECURE_MESSAGING_ENVELOPE_MARKER = byteArrayOf(
+    0x4b,
+    0x49,
+    0x54,
+    0x2d,
+    0x4d,
+    0x53,
+    0x47,
+    0x01,
+)
+
+private const val TRANSFORMATION = "AES/GCM/NoPadding"
+private const val ANDROID_KEYSTORE_PROVIDER_PREFIX = "AndroidKeyStore"
+private const val GCM_TAG_BITS = 128
+private const val GCM_TAG_BYTES = GCM_TAG_BITS / 8
+private const val LEGACY_GCM_IV_BYTES = 12
+private const val KEK_WRAP_IV_BYTES = 12
+private const val SOFTWARE_DATA_IV_BYTES = 12
+private const val RECORD_DEK_BYTES = 32
+private const val WRAPPED_DEK_CIPHERTEXT_BYTES = RECORD_DEK_BYTES + GCM_TAG_BYTES
+private const val ENVELOPE_MARKER_BYTES = 8
+private const val ENVELOPE_IV_BYTES =
+    ENVELOPE_MARKER_BYTES + KEK_WRAP_IV_BYTES + SOFTWARE_DATA_IV_BYTES
+private const val ENVELOPE_WRAP_AAD_LAYER: Byte = 1
+private const val ENVELOPE_DATA_AAD_LAYER: Byte = 2
+private const val MAX_SECURE_MESSAGING_RECORD_AAD_BYTES = 512
+// API 28 Room reads each encrypted row through a roughly 2 MiB CursorWindow. The real 100-EC /
+// 100-PQ initial enrollment is 1,163,416 bytes; 1,536 KiB preserves 409,448 bytes of headroom
+// without admitting a row shape that a stock Android 9 CursorWindow cannot restore.
+internal const val MAX_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES = 1_536 * 1024
+internal const val MAX_ATOMIC_BATCH_PLAINTEXT_BYTES = 8L * 1024L * 1024L
+private const val MAX_LEGACY_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES = 65 * 1024 * 1024
+private const val MAX_LEGACY_RECORD_CIPHERTEXT_BYTES =
+    MAX_LEGACY_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES + GCM_TAG_BYTES
+private const val MIN_ENVELOPE_CIPHERTEXT_BYTES =
+    WRAPPED_DEK_CIPHERTEXT_BYTES + GCM_TAG_BYTES + 1
+private const val MAX_ENVELOPE_CIPHERTEXT_BYTES =
+    WRAPPED_DEK_CIPHERTEXT_BYTES +
+        MAX_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES + GCM_TAG_BYTES
 
 private const val PERMANENT_MISSING_KEY_OBSERVATIONS = 4
 private const val MIN_PERMANENT_MISSING_KEY_INTERVAL_MILLIS = 15_000L
 private const val MAX_MISSING_KEY_OBSERVATION_WINDOW_MILLIS = 24L * 60L * 60L * 1_000L
-private const val MAX_ATOMIC_WRITES = 256
+internal const val MAX_ATOMIC_WRITES = 256
 internal const val MAX_SECURE_MESSAGING_NAMESPACE_PAGE_SIZE = 100
+private const val INITIAL_PROTOCOL_NAMESPACE = "libsignal-v2"
+private const val INITIAL_PROTOCOL_RECORD_KEY = "active-protocol-state"
+private const val INITIAL_PROTOCOL_VERSION = 1L

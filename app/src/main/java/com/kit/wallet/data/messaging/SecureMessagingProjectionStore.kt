@@ -319,22 +319,98 @@ internal class SecureMessagingProjectionStore @Inject constructor(
     }
 
     /**
-     * Returns whether the authenticated inbound projection has already been durably recorded.
+     * Starts crash-safe local publication for a newly authenticated inbound message.
      *
-     * The event processor records this metadata only after its idempotent notification sink
-     * returns successfully. A committed companion record without matching metadata is therefore
-     * recoverable notification work after either process death or a failed publication attempt.
+     * The pending marker is committed before projection metadata. The event processor then makes
+     * the projection visible before invoking Android's notification service and finally promotes
+     * this marker to published. A crash in any window can therefore cause only an idempotent
+     * notification replacement, never a shade notification whose conversation has no message.
+     *
+     * Metadata written by an older app version or archive restoration has no marker. Treat that
+     * as already published so an upgrade does not alert again for retained history. A companion
+     * record without either metadata or a marker is incomplete new work and receives a marker.
      */
-    suspend fun isInboundPublicationRecorded(
+    suspend fun prepareInboundNotificationPublication(
         durableRecord: LibSignalCompanionRecord,
         sentAt: Instant,
     ): Boolean {
         val durable = requireInboundProjection(durableRecord)
         val expected = inboundMetadata(durable, sentAt)
-        val existing = readMetadataRecord(durable.recordKey) ?: return false
-        validateMetadataMatches(existing.metadata, durable)
-        validateIdempotentMetadata(existing.metadata, expected)
-        return true
+        val existingMetadata = readMetadataRecord(durable.recordKey)
+        existingMetadata?.let {
+            validateMetadataMatches(it.metadata, durable)
+            validateIdempotentMetadata(it.metadata, expected)
+        }
+        readNotificationPublication(durable.recordKey)?.let { publication ->
+            return publication.state == InboundNotificationPublicationState.PENDING
+        }
+        if (existingMetadata != null) return false
+
+        val encoded = InboundNotificationPublicationCodec.encode(
+            InboundNotificationPublicationState.PENDING,
+        )
+        return try {
+            try {
+                stateStore.write(
+                    NOTIFICATION_PUBLICATION_NAMESPACE,
+                    durable.recordKey,
+                    expectedVersion = null,
+                    bytes = encoded,
+                )
+                true
+            } catch (_: SecureMessagingStateConflictException) {
+                val winner = checkNotNull(readNotificationPublication(durable.recordKey)) {
+                    "Concurrent notification-publication creation omitted its record"
+                }
+                winner.state == InboundNotificationPublicationState.PENDING
+            } catch (error: SecureMessagingStateUnavailableException) {
+                throw SecureMessagingCryptographicFailureException(
+                    SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                    "Secure-message notification publication could not be prepared",
+                    error,
+                )
+            }
+        } finally {
+            encoded.fill(0)
+        }
+    }
+
+    /** Marks one successfully published, already-projected notification as crash-safe complete. */
+    suspend fun completeInboundNotificationPublication(
+        durableRecord: LibSignalCompanionRecord,
+    ) {
+        val durable = requireInboundProjection(durableRecord)
+        repeat(MAX_PROJECTION_WRITE_ATTEMPTS) { attempt ->
+            val existing = checkNotNull(readNotificationPublication(durable.recordKey)) {
+                "Inbound notification publication was not prepared"
+            }
+            if (existing.state == InboundNotificationPublicationState.PUBLISHED) return
+            val encoded = InboundNotificationPublicationCodec.encode(
+                InboundNotificationPublicationState.PUBLISHED,
+            )
+            try {
+                try {
+                    stateStore.write(
+                        NOTIFICATION_PUBLICATION_NAMESPACE,
+                        durable.recordKey,
+                        expectedVersion = existing.version,
+                        bytes = encoded,
+                    )
+                    return
+                } catch (conflict: SecureMessagingStateConflictException) {
+                    if (attempt == MAX_PROJECTION_WRITE_ATTEMPTS - 1) throw conflict
+                } catch (error: SecureMessagingStateUnavailableException) {
+                    throw SecureMessagingCryptographicFailureException(
+                        SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                        "Secure-message notification publication could not be completed",
+                        error,
+                    )
+                }
+            } finally {
+                encoded.fill(0)
+            }
+        }
+        error("Notification-publication write retry bound was exhausted")
     }
 
     suspend fun readPage(
@@ -481,10 +557,14 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         sentAt: Instant,
     ) {
         val durable = requireInboundProjection(durableRecord)
-        if (createOrValidate(
+        createOrValidate(
             inboundMetadata(durable, sentAt),
             durable,
-        )) signalChanged()
+        )
+        // Deliberately re-signal an idempotent replay. A process/storage interruption can happen
+        // after metadata commits but before observers see the StateFlow revision. The retained
+        // event then repairs UI visibility without advancing the Signal ratchet a second time.
+        signalChanged()
     }
 
     /**
@@ -1190,6 +1270,38 @@ internal class SecureMessagingProjectionStore @Inject constructor(
     private suspend fun readMetadata(recordKey: String): ProjectionMetadata? =
         readMetadataRecord(recordKey)?.metadata
 
+    private suspend fun readNotificationPublication(
+        recordKey: String,
+    ): VersionedInboundNotificationPublication? {
+        val record = try {
+            stateStore.read(NOTIFICATION_PUBLICATION_NAMESPACE, recordKey)
+        } catch (error: SecureMessagingStateUnavailableException) {
+            throw SecureMessagingCryptographicFailureException(
+                SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                "Secure-message notification publication is unavailable",
+                error,
+            )
+        } ?: return null
+        return try {
+            try {
+                VersionedInboundNotificationPublication(
+                    state = InboundNotificationPublicationCodec.decode(record.bytes),
+                    version = record.version,
+                )
+            } catch (error: SecureMessagingCryptographicFailureException) {
+                throw error
+            } catch (error: Exception) {
+                throw SecureMessagingCryptographicFailureException(
+                    SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+                    "Secure-message notification publication is corrupt",
+                    error,
+                )
+            }
+        } finally {
+            record.bytes.fill(0)
+        }
+    }
+
     private suspend fun readMetadataRecord(recordKey: String): VersionedProjectionMetadata? {
         val record = try {
             stateStore.read(METADATA_NAMESPACE, recordKey)
@@ -1317,11 +1429,18 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         val version: Long,
     )
 
+    private data class VersionedInboundNotificationPublication(
+        val state: InboundNotificationPublicationState,
+        val version: Long,
+    )
+
     companion object {
         const val COMPANION_NAMESPACE = "message-projection-v1"
         const val HISTORY_COMPANION_NAMESPACE = "history-transfer-v1"
         private const val HISTORY_TASK_NAMESPACE = "history-backfill-task-v1"
         private const val METADATA_NAMESPACE = "message-metadata-v1"
+        private const val NOTIFICATION_PUBLICATION_NAMESPACE =
+            "message-notification-publication-v1"
         private const val HISTORY_TASK_SCAN_PAGE_SIZE = 100
         private const val MAX_HISTORY_TASK_SCAN_PAGES = 100
         private const val MAX_PENDING_HISTORY_TASKS = 16
@@ -1368,6 +1487,40 @@ private data class ProjectionMetadata(
                 (deliveryState in INBOUND_DELIVERY_STATES),
         ) { "Projected message direction and delivery state disagree" }
     }
+}
+
+private enum class InboundNotificationPublicationState {
+    PENDING,
+    PUBLISHED,
+}
+
+/**
+ * Tiny encrypted-state value. Namespace + record-key AAD binds it to the exact inbound message;
+ * the value records only whether Android notification publication is still retryable.
+ */
+private object InboundNotificationPublicationCodec {
+    fun encode(state: InboundNotificationPublicationState): ByteArray =
+        MAGIC + byteArrayOf(SCHEMA_VERSION, state.ordinal.toByte())
+
+    fun decode(bytes: ByteArray): InboundNotificationPublicationState {
+        require(bytes.size == MAGIC.size + 2) {
+            "Invalid secure-message notification-publication size"
+        }
+        require(bytes.copyOfRange(0, MAGIC.size).contentEquals(MAGIC)) {
+            "Invalid secure-message notification-publication header"
+        }
+        require(bytes[MAGIC.size] == SCHEMA_VERSION) {
+            "Unsupported secure-message notification-publication schema"
+        }
+        return enumValues<InboundNotificationPublicationState>()
+            .getOrNull(bytes[MAGIC.size + 1].toInt())
+            ?: throw IllegalArgumentException(
+                "Invalid secure-message notification-publication state",
+            )
+    }
+
+    private val MAGIC = byteArrayOf(0x4b, 0x49, 0x54, 0x4e, 0x4f, 0x54, 0x49)
+    private const val SCHEMA_VERSION: Byte = 1
 }
 
 private object ProjectionMetadataCodec {

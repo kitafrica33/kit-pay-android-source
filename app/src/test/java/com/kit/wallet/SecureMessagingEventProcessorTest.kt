@@ -910,10 +910,12 @@ class SecureMessagingEventProcessorTest {
         val (session, _, _) = openSyncingSession()
         val stateStore = TestSecureMessagingStateStore()
         val crypto = PersistingDecryptionEngine(stateStore)
+        val projections = projectionStore(stateStore)
         val notifications = FailOnceIdempotentNotificationSink(failAfterPublish = false)
         val processor = processor(
             stateStore = stateStore,
             crypto = crypto,
+            projections = projections,
             notifications = notifications,
         )
         val roster = authoritativeRoster()
@@ -930,6 +932,8 @@ class SecureMessagingEventProcessorTest {
         assertNull(SecureMessagingSyncCursorStore(stateStore).load())
         assertEquals(1, notifications.publishAttempts)
         assertTrue(notifications.visibleNotifications.isEmpty())
+        val firstProjectionRevision = projections.changes.value
+        assertTrue(firstProjectionRevision > 0L)
         assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
         assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
         assertTrue(server.takeRequest().path?.contains("/device-roster/v1:sha256:") == true)
@@ -944,6 +948,7 @@ class SecureMessagingEventProcessorTest {
         assertEquals(1, crypto.openedTransactions)
         assertEquals(2, notifications.publishAttempts)
         assertEquals(setOf(INCOMING_MESSAGE_ID), notifications.visibleNotifications.keys)
+        assertTrue(projections.changes.value > firstProjectionRevision)
         val persisted = checkNotNull(SecureMessagingSyncCursorStore(stateStore).load())
         assertEquals(
             "notification_retry_cursor" to 10L,
@@ -987,6 +992,7 @@ class SecureMessagingEventProcessorTest {
                 listOf(incomingEvent(roster, 10)),
                 "ambiguous_notification_cursor",
             )
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
             enqueueDeliveryAcknowledgement()
             processor(
                 stateStore = stateStore,
@@ -995,6 +1001,10 @@ class SecureMessagingEventProcessorTest {
             ).synchronize(restartedSession)
 
             assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/conversations",
+                server.takeRequest().path,
+            )
             assertEquals(
                 "/api/kit-wallet/v1/messaging/messages/delivery-acks",
                 server.takeRequest().path,
@@ -1066,6 +1076,56 @@ class SecureMessagingEventProcessorTest {
             requireSecureMessagingSyncResumePosition(persisted.position),
         )
     }
+
+    @Test
+    fun `legacy projected inbound replay repairs UI signal without duplicate notification`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val roster = authoritativeRoster()
+            val durable = stateStore.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.inboundRecordKey(INCOMING_MESSAGE_ID),
+                direction = LibSignalCompanionDirection.INBOUND,
+                messageId = INCOMING_MESSAGE_ID,
+                clientMessageId = INCOMING_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = PEER,
+                text = "legacy projected plaintext",
+            )
+            // Code 22 and earlier used projection metadata itself as the notification marker.
+            // This creates that upgrade state: accepted projection, no new publication marker.
+            projections.recordInbound(durable, Instant.parse(TIMESTAMP))
+            val revisionBeforeReplay = projections.changes.value
+            val notifications = mutableListOf<SecureMessagingIncomingNotification>()
+            val crypto = PersistingDecryptionEngine(stateStore)
+            val processor = processor(
+                stateStore = stateStore,
+                crypto = crypto,
+                projections = projections,
+                notifications = SecureMessagingIncomingNotificationSink(notifications::add),
+            )
+            enqueueSync(listOf(incomingEvent(roster, 10)), "legacy_projection_cursor")
+            enqueueDeliveryAcknowledgement()
+
+            processor.synchronize(session)
+
+            assertEquals(0, crypto.openedTransactions)
+            assertTrue(notifications.isEmpty())
+            assertTrue(projections.changes.value > revisionBeforeReplay)
+            assertEquals(
+                INCOMING_MESSAGE_ID,
+                projections.readPage(limit = 10).messages().single().serverMessageId,
+            )
+            assertEquals(
+                "legacy_projection_cursor" to 10L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+        }
 
     @Test
     fun `cursor commit conflict reconciles an already persisted exact checkpoint`() = runTest {
@@ -1187,12 +1247,17 @@ class SecureMessagingEventProcessorTest {
     fun `authenticated durable plaintext drives the local notification sink`() = runTest {
         val (session, _, _) = openSyncingSession()
         val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
         val notifications = mutableListOf<SecureMessagingIncomingNotification>()
+        val projectionRevisionsAtPublish = mutableListOf<Long>()
         val processor = SecureMessagingEventProcessor(
             PersistingDecryptionEngine(stateStore),
-            projectionStore(stateStore),
+            projections,
             SecureMessagingSyncCursorStore(stateStore),
-            SecureMessagingIncomingNotificationSink(notifications::add),
+            SecureMessagingIncomingNotificationSink { notification ->
+                projectionRevisionsAtPublish += projections.changes.value
+                notifications += notification
+            },
         )
         val roster = authoritativeRoster()
         enqueueSync(listOf(incomingEvent(roster, 10)), "notification_cursor")
@@ -1206,6 +1271,14 @@ class SecureMessagingEventProcessorTest {
         assertEquals(INCOMING_MESSAGE_ID, notifications.single().messageId)
         assertEquals(CONVERSATION_ID, notifications.single().conversationId)
         assertEquals(BINDING.sessionEpoch, notifications.single().sessionEpoch)
+        assertEquals("Peer", notifications.single().senderName)
+        assertEquals("processor plaintext", notifications.single().authenticatedText)
+        assertEquals(Instant.parse(TIMESTAMP), notifications.single().sentAt)
+        assertTrue(projectionRevisionsAtPublish.single() > 0L)
+        assertEquals(
+            INCOMING_MESSAGE_ID,
+            projections.readPage(limit = 10).messages().single().serverMessageId,
+        )
     }
 
     @Test

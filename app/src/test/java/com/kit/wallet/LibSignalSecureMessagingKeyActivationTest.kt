@@ -6,15 +6,18 @@ import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
 import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
 import com.kit.wallet.data.messaging.LibSignalSecureMessagingCryptoEngine
 import com.kit.wallet.data.messaging.LibSignalSecureMessagingKeyActivation
+import com.kit.wallet.data.messaging.MAX_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES
 import com.kit.wallet.data.messaging.RealSecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.RealSecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.SecureMessagingActivationCoordinator
 import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
+import com.kit.wallet.data.messaging.SecureMessagingAuthenticatedAndroid9LegacyTruncationProof
 import com.kit.wallet.data.messaging.SecureMessagingAuthBindingResolver
 import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
 import com.kit.wallet.data.messaging.SecureMessagingCommittedResult
 import com.kit.wallet.data.messaging.SecureMessagingCryptoAddress
+import com.kit.wallet.data.messaging.SecureMessagingCryptographicFailureException
 import com.kit.wallet.data.messaging.SecureMessagingEventProcessor
 import com.kit.wallet.data.messaging.SecureMessagingFreshAuthenticationRequiredException
 import com.kit.wallet.data.messaging.SecureMessagingKeyReconciliationException
@@ -25,6 +28,7 @@ import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingProvisioningPlan
 import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
 import com.kit.wallet.data.messaging.SecureMessagingRecord
+import com.kit.wallet.data.messaging.SecureMessagingRecordAtRestProvenance
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyHandleCache
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyResolution
@@ -41,6 +45,9 @@ import com.kit.wallet.data.messaging.SecureMessagingStateStore
 import com.kit.wallet.data.messaging.SecureMessagingStateUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingStateWrite
 import com.kit.wallet.data.messaging.SecureMessagingSyncCursorStore
+import com.kit.wallet.data.messaging.classifySecureMessagingDecodedRecordFailure
+import com.kit.wallet.data.messaging.classifySecureMessagingStoredRecordFailure
+import com.kit.wallet.data.messaging.isLegacyConfirmedSecureMessagingEnrollmentUnreadableFailure
 import com.kit.wallet.data.messaging.validateSecureMessagingNamespacePageRequest
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.DeviceRegistrationDto
@@ -58,10 +65,13 @@ import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import java.io.EOFException
 import java.lang.reflect.Proxy
 import java.security.MessageDigest
+import java.security.ProviderException
 import java.time.Instant
 import java.util.Base64
+import javax.crypto.AEADBadTagException
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -153,6 +163,15 @@ class LibSignalSecureMessagingKeyActivationTest {
         activation = LibSignalSecureMessagingKeyActivation(engine)
         activation.reconcile(active.session)
         assertEquals(2, keyServer.publishRequests().size)
+
+        val observedProtocolWriteSizes = stateStore.protocolWriteSizes()
+        assertEquals(4, observedProtocolWriteSizes.size)
+        assertTrue(checkNotNull(observedProtocolWriteSizes.maxOrNull()) > 1024 * 1024)
+        assertTrue(
+            observedProtocolWriteSizes.all {
+                it in 1..MAX_SECURE_MESSAGING_RECORD_PLAINTEXT_BYTES
+            },
+        )
     }
 
     @Test
@@ -208,7 +227,7 @@ class LibSignalSecureMessagingKeyActivationTest {
                         override fun registration() = DeviceRegistrationDto(
                             installationId = BINDING.installationId,
                             name = "Android 9 phone",
-                            appVersion = "0.2.10-r1",
+                            appVersion = "0.2.11",
                             osVersion = "9",
                             model = "MODIO M56",
                         )
@@ -389,7 +408,7 @@ class LibSignalSecureMessagingKeyActivationTest {
         }
 
     @Test
-    fun `unavailable local private enrollment with a server bundle requires reauthentication`() =
+    fun `unknown unavailable local enrollment fails closed without resetting server`() =
         runTest {
             val active = openKeyPreparation()
             LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
@@ -400,8 +419,7 @@ class LibSignalSecureMessagingKeyActivationTest {
                 LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
             }.exceptionOrNull()
 
-            assertTrue(failure is SecureMessagingReauthenticationRequiredException)
-            assertTrue(failure?.cause is SecureMessagingLocalEnrollmentUnavailableException)
+            assertTrue(failure is SecureMessagingLocalEnrollmentUnavailableException)
             assertEquals(SecureMessagingRuntimeStage.PREPARING_KEYS, active.lifecycle.snapshot().stage)
             assertEquals(publicationsBeforeFailure, keyServer.publishRequests().size)
         }
@@ -424,6 +442,289 @@ class LibSignalSecureMessagingKeyActivationTest {
             assertEquals(publicationsBeforeFailure, keyServer.publishRequests().size)
             assertEquals(statusBeforeFailure, keyServer.requireStatus())
             assertEquals(SecureMessagingRuntimeStage.PREPARING_KEYS, active.lifecycle.snapshot().stage)
+        }
+
+    @Test
+    fun `confirmed legacy direct provider failure remains retryable without server reset`() =
+        runTest {
+            val active = openKeyPreparation()
+            LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
+            val statusBeforeFailure = keyServer.requireStatus()
+            val publicationsBeforeFailure = keyServer.publishRequests().size
+            stateStore.markProtocolLegacyDirect()
+            stateStore.unavailableCause = SecureMessagingRecordKeyTemporarilyUnavailableException(
+                ProviderException("Android 9 provider temporarily hid the legacy record key"),
+            )
+            stateStore.readsUnavailable = true
+
+            val failure = runCatching {
+                LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
+            }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingRevalidationRetryException)
+            assertEquals(publicationsBeforeFailure, keyServer.publishRequests().size)
+            assertEquals(statusBeforeFailure, keyServer.requireStatus())
+        }
+
+    @Test
+    fun `Android 9 truncation proof requires real codec prefix and exact record metadata`() =
+        runTest {
+            val active = openKeyPreparation()
+            LibSignalSecureMessagingKeyActivation(engine).reconcile(active.session)
+            val truncated = stateStore.copyProtocolAndroid9Truncation()
+            val structuralFailure = SecureMessagingCryptographicFailureException(
+                SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+                "Authenticated protocol state ended at the Android 9 boundary",
+                EOFException("Android 9 ended plaintext at 65536 bytes"),
+            )
+            val proof = checkNotNull(
+                SecureMessagingAuthenticatedAndroid9LegacyTruncationProof.validate(
+                    truncated,
+                    structuralFailure,
+                ),
+            )
+            val invalidHeader = truncated.copyOf().also { it[0] = 0 }
+            assertNull(
+                SecureMessagingAuthenticatedAndroid9LegacyTruncationProof.validate(
+                    invalidHeader,
+                    structuralFailure,
+                ),
+            )
+            invalidHeader.fill(0)
+            assertNull(
+                SecureMessagingAuthenticatedAndroid9LegacyTruncationProof.validate(
+                    truncated,
+                    SecureMessagingCryptographicFailureException(
+                        SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+                        "Provider failure is not a codec truncation",
+                        ProviderException(
+                            "Provider failures cannot assert codec truncation",
+                            EOFException("nested provider EOF"),
+                        ),
+                    ),
+                ),
+            )
+            val authenticationFailure = AEADBadTagException(
+                "Authentication failures cannot assert codec truncation",
+            ).apply {
+                initCause(EOFException("nested authentication EOF"))
+            }
+            assertNull(
+                SecureMessagingAuthenticatedAndroid9LegacyTruncationProof.validate(
+                    truncated,
+                    SecureMessagingCryptographicFailureException(
+                        SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+                        "Authentication failure is not a codec truncation",
+                        authenticationFailure,
+                    ),
+                ),
+            )
+            fun record(
+                version: Long = checkNotNull(
+                    stateStore.version(PROTOCOL_NAMESPACE, PROTOCOL_RECORD_KEY),
+                ),
+                namespace: String = PROTOCOL_NAMESPACE,
+                provenance: SecureMessagingRecordAtRestProvenance,
+            ) = SecureMessagingRecord(
+                namespace = namespace,
+                recordKey = PROTOCOL_RECORD_KEY,
+                version = version,
+                bytes = truncated,
+                updatedAtEpochMillis = 1L,
+                atRestProvenance = provenance,
+            )
+
+            val confirmedLegacy = classifySecureMessagingDecodedRecordFailure(
+                record(provenance = SecureMessagingRecordAtRestProvenance.LEGACY_DIRECT_V1),
+                structuralFailure,
+                proof,
+            )
+            val envelope = classifySecureMessagingDecodedRecordFailure(
+                record(provenance = SecureMessagingRecordAtRestProvenance.DEK_ENVELOPE_V1),
+                structuralFailure,
+                proof,
+            )
+            val unspecified = classifySecureMessagingDecodedRecordFailure(
+                record(provenance = SecureMessagingRecordAtRestProvenance.UNSPECIFIED),
+                structuralFailure,
+                proof,
+            )
+            val nonProtocol = classifySecureMessagingDecodedRecordFailure(
+                record(
+                    namespace = "projection-metadata-v1",
+                    provenance = SecureMessagingRecordAtRestProvenance.LEGACY_DIRECT_V1,
+                ),
+                structuralFailure,
+                proof,
+            )
+            val unconfirmed = classifySecureMessagingDecodedRecordFailure(
+                record(
+                    version = 1L,
+                    provenance = SecureMessagingRecordAtRestProvenance.LEGACY_DIRECT_V1,
+                ),
+                structuralFailure,
+                proof,
+            )
+
+            assertTrue(
+                isLegacyConfirmedSecureMessagingEnrollmentUnreadableFailure(confirmedLegacy),
+            )
+            assertSame(structuralFailure, envelope)
+            assertSame(structuralFailure, unspecified)
+            assertSame(structuralFailure, nonProtocol)
+            assertSame(structuralFailure, unconfirmed)
+            truncated.fill(0)
+        }
+
+    @Test
+    fun `confirmed legacy direct truncation preserves login and reaches ready successor`() =
+        runTest {
+            val confirmed = openKeyPreparation()
+            LibSignalSecureMessagingKeyActivation(engine).reconcile(confirmed.session)
+            assertTrue(
+                checkNotNull(stateStore.version(PROTOCOL_NAMESPACE, PROTOCOL_RECORD_KEY)) > 1L,
+            )
+            stateStore.replaceProtocolWithLegacyDirectAndroid9Truncation()
+
+            val lifecycle = SecureMessagingLifecycleGuard()
+            val sessionLifecycle = SecureMessagingSessionLifecycle(stateStore, lifecycle)
+            sessionLifecycle.afterSessionSave()
+            val sessionDelegate = ProofSessionStore(resetProof = null)
+            val loginFence = checkNotNull(sessionDelegate.current()).fence()
+            val resetFences = mutableListOf<SecureMessagingSessionFence>()
+            val sessions = object : SessionStore by sessionDelegate {
+                override suspend fun resetSecureMessagingStateIfCurrent(
+                    expected: SessionFence,
+                    activationFence: SecureMessagingSessionFence,
+                    allowPermanentlyUnavailableSnapshot: Boolean,
+                    finalMessagingSnapshot: suspend () -> Unit,
+                ): Boolean {
+                    if (current()?.fence() != expected) return false
+                    sessionLifecycle.resetForRecovery(
+                        fence = activationFence,
+                        allowPermanentlyUnavailableSnapshot =
+                            allowPermanentlyUnavailableSnapshot,
+                        finalSnapshot = finalMessagingSnapshot,
+                    )
+                    if (current()?.fence() != expected) return false
+                    sessionLifecycle.afterSessionSave()
+                    resetFences += activationFence
+                    return true
+                }
+
+                override suspend fun resetSecureMessagingStateAfterProvenRemoteResetIfCurrent(
+                    expected: SessionFence,
+                    activationFence: SecureMessagingSessionFence,
+                    proof: SecureMessagingResetProofFence,
+                    allowPermanentlyUnavailableSnapshot: Boolean,
+                    finalMessagingSnapshot: suspend () -> Unit,
+                ): Boolean {
+                    val current = current() ?: return false
+                    if (!proof.proved ||
+                        current.fence() != expected ||
+                        current.messagingResetProof != proof
+                    ) {
+                        return false
+                    }
+                    return resetSecureMessagingStateIfCurrent(
+                        expected = expected,
+                        activationFence = activationFence,
+                        allowPermanentlyUnavailableSnapshot =
+                            allowPermanentlyUnavailableSnapshot,
+                        finalMessagingSnapshot = finalMessagingSnapshot,
+                    )
+                }
+            }
+            val registry = SecureMessagingActiveSessionRegistry(lifecycle)
+            val processor = SecureMessagingEventProcessor(
+                engine,
+                SecureMessagingProjectionStore(
+                    stateStore,
+                    LibSignalCompanionStateReader(stateStore),
+                ),
+                SecureMessagingSyncCursorStore(stateStore),
+            )
+            val coordinator = SecureMessagingActivationCoordinator(
+                transport = remote,
+                lifecycle = lifecycle,
+                sessions = registry,
+                keyActivation = LibSignalSecureMessagingKeyActivation(engine, sessions),
+                initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+            )
+            var remoteResets = 0
+            var remoteResetFence: SecureMessagingSessionFence? = null
+            val authRepository = Proxy.newProxyInstance(
+                AuthRepository::class.java.classLoader,
+                arrayOf(AuthRepository::class.java),
+            ) { instance, method, arguments ->
+                when (method.name) {
+                    "recoverMissingSecureMessagingEnrollment" -> {
+                        val expected = arguments?.get(0) as SessionFence
+                        val activationFence = arguments[1] as SecureMessagingSessionFence
+                        val target = arguments[2] as SecureMessagingEnrollmentResetTarget
+                        assertEquals(loginFence, expected)
+                        val resultingEpoch = keyServer.resetEnrollment(target)
+                        sessionDelegate.setResetProof(
+                            SecureMessagingResetProofFence(
+                                serverDeviceId = target.serverDeviceId,
+                                previousEnrollmentEpoch = target.enrollmentEpoch,
+                                resultingEnrollmentEpoch = resultingEpoch,
+                                previousRegistrationId = target.registrationId,
+                                previousIdentityKeySha256 = target.identityKeySha256,
+                                previousBundleVersion = target.bundleVersion,
+                            ),
+                        )
+                        remoteResetFence = activationFence
+                        remoteResets++
+                        Unit
+                    }
+                    "requireFreshAuthenticationForSecureMessagingRecovery" ->
+                        error("Confirmed legacy state must use the exact enrollment reset")
+                    "toString" -> "LegacyDirectRecoveryAuthRepository"
+                    "hashCode" -> System.identityHashCode(instance)
+                    "equals" -> instance === arguments?.firstOrNull()
+                    else -> error("Unexpected auth repository call: ${method.name}")
+                }
+            } as AuthRepository
+            val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+            val retrofit = Retrofit.Builder()
+                .baseUrl(server.url("/"))
+                .addConverterFactory(MoshiConverterFactory.create(moshi))
+                .build()
+            val sync = RealSecureMessagingSyncEngine(
+                bindingResolver = SecureMessagingAuthBindingResolver(
+                    sessions = sessions,
+                    api = retrofit.create(KitWalletApi::class.java),
+                    apiCalls = ApiCallExecutor(moshi),
+                    deviceIdentity = object : DeviceIdentityProvider {
+                        override fun registration() = DeviceRegistrationDto(
+                            installationId = BINDING.installationId,
+                            name = "Android 9 phone",
+                            appVersion = "0.2.11",
+                            osVersion = "9",
+                            model = "MODIO M56",
+                        )
+                    },
+                ),
+                activation = coordinator,
+                processor = processor,
+                sessions = sessions,
+                sessionLifecycle = sessionLifecycle,
+                authRepository = authRepository,
+            )
+
+            sync.synchronize()
+
+            assertEquals(loginFence, sessionDelegate.current()?.fence())
+            assertEquals(1, remoteResets)
+            assertEquals(1, resetFences.size)
+            assertTrue(resetFences.single() === remoteResetFence)
+            assertEquals(2, keyServer.publishRequests().size)
+            assertNull(sessionDelegate.current()?.messagingResetProof)
+            assertTrue(keyServer.requireStatus().enrolled == true)
+            assertEquals(2L, keyServer.requireStatus().enrollmentEpoch)
+            assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+            assertTrue(registry.requireCurrent().fence !== remoteResetFence)
         }
 
     @Test
@@ -474,6 +775,29 @@ class LibSignalSecureMessagingKeyActivationTest {
                     sessionLifecycle.afterSessionSave()
                     resetFences += activationFence
                     return true
+                }
+
+                override suspend fun resetSecureMessagingStateAfterProvenRemoteResetIfCurrent(
+                    expected: SessionFence,
+                    activationFence: SecureMessagingSessionFence,
+                    proof: SecureMessagingResetProofFence,
+                    allowPermanentlyUnavailableSnapshot: Boolean,
+                    finalMessagingSnapshot: suspend () -> Unit,
+                ): Boolean {
+                    val current = current() ?: return false
+                    if (!proof.proved ||
+                        current.fence() != expected ||
+                        current.messagingResetProof != proof
+                    ) {
+                        return false
+                    }
+                    return resetSecureMessagingStateIfCurrent(
+                        expected = expected,
+                        activationFence = activationFence,
+                        allowPermanentlyUnavailableSnapshot =
+                            allowPermanentlyUnavailableSnapshot,
+                        finalMessagingSnapshot = finalMessagingSnapshot,
+                    )
                 }
             }
             val registry = SecureMessagingActiveSessionRegistry(lifecycle)
@@ -1078,18 +1402,33 @@ class LibSignalSecureMessagingKeyActivationTest {
             val version: Long,
             val bytes: ByteArray,
             val updatedAt: Long,
+            val atRestProvenance: SecureMessagingRecordAtRestProvenance =
+                SecureMessagingRecordAtRestProvenance.UNSPECIFIED,
         )
 
         private val records = mutableMapOf<Pair<String, String>, Stored>()
+        private val protocolWriteSizes = mutableListOf<Int>()
         private var clock = 1_000L
         var readsUnavailable = false
         var unavailableCause: Throwable = IllegalStateException("injected storage failure")
 
         override suspend fun read(namespace: String, recordKey: String): SecureMessagingRecord? {
             if (readsUnavailable) {
+                val stored = records[namespace to recordKey]
+                val classified = if (stored != null && unavailableCause is Exception) {
+                    classifySecureMessagingStoredRecordFailure(
+                        namespace = namespace,
+                        recordKey = recordKey,
+                        version = stored.version,
+                        atRestProvenance = stored.atRestProvenance,
+                        error = unavailableCause as Exception,
+                    )
+                } else {
+                    unavailableCause
+                }
                 throw SecureMessagingStateUnavailableException(
                     "injected unavailable state",
-                    unavailableCause,
+                    classified,
                 )
             }
             return records[namespace to recordKey]?.let { stored ->
@@ -1099,6 +1438,7 @@ class LibSignalSecureMessagingKeyActivationTest {
                     stored.version,
                     stored.bytes.copyOf(),
                     stored.updatedAt,
+                    stored.atRestProvenance,
                 )
             }
         }
@@ -1122,6 +1462,7 @@ class LibSignalSecureMessagingKeyActivationTest {
                     stored.version,
                     stored.bytes.copyOf(),
                     stored.updatedAt,
+                    stored.atRestProvenance,
                 )
             }
             return SecureMessagingRecordPage(
@@ -1143,6 +1484,9 @@ class LibSignalSecureMessagingKeyActivationTest {
             writes: List<SecureMessagingStateWrite>,
         ): List<SecureMessagingRecordVersion> {
             require(writes.isNotEmpty())
+            writes.filter {
+                it.namespace == PROTOCOL_NAMESPACE && it.recordKey == PROTOCOL_RECORD_KEY
+            }.forEach { protocolWriteSizes += it.byteSize }
             val versions = writes.map { write ->
                 val current = records[write.namespace to write.recordKey]
                 when {
@@ -1174,6 +1518,36 @@ class LibSignalSecureMessagingKeyActivationTest {
 
         fun version(namespace: String, recordKey: String): Long? =
             records[namespace to recordKey]?.version
+
+        fun protocolWriteSizes(): List<Int> = protocolWriteSizes.toList()
+
+        fun markProtocolLegacyDirect() {
+            val address = PROTOCOL_NAMESPACE to PROTOCOL_RECORD_KEY
+            val stored = checkNotNull(records[address])
+            records[address] = stored.copy(
+                atRestProvenance = SecureMessagingRecordAtRestProvenance.LEGACY_DIRECT_V1,
+            )
+        }
+
+        fun copyProtocolAndroid9Truncation(): ByteArray {
+            val address = PROTOCOL_NAMESPACE to PROTOCOL_RECORD_KEY
+            val stored = checkNotNull(records[address])
+            check(stored.bytes.size > ANDROID_9_TRUNCATION_BYTES) {
+                "The realistic protocol state must cross the Android 9 truncation boundary"
+            }
+            return stored.bytes.copyOf(ANDROID_9_TRUNCATION_BYTES)
+        }
+
+        fun replaceProtocolWithLegacyDirectAndroid9Truncation() {
+            val address = PROTOCOL_NAMESPACE to PROTOCOL_RECORD_KEY
+            val stored = checkNotNull(records[address])
+            val truncated = copyProtocolAndroid9Truncation()
+            stored.bytes.fill(0)
+            records[address] = stored.copy(
+                bytes = truncated,
+                atRestProvenance = SecureMessagingRecordAtRestProvenance.LEGACY_DIRECT_V1,
+            )
+        }
     }
 
     private class ProofSessionStore(
@@ -1270,6 +1644,7 @@ class LibSignalSecureMessagingKeyActivationTest {
         const val TIMESTAMP = "2026-07-20T08:00:00Z"
         const val PROTOCOL_NAMESPACE = "libsignal-v2"
         const val PROTOCOL_RECORD_KEY = "active-protocol-state"
+        const val ANDROID_9_TRUNCATION_BYTES = 65_536
         const val RESET_RESULT_EPOCH = 8L
         val RESET_TARGET = com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget(
             serverDeviceId = CURRENT_DEVICE_ID,

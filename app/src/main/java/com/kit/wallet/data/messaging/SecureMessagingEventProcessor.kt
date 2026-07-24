@@ -991,27 +991,60 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         durable: LibSignalCompanionRecord,
         sentAt: Instant,
     ) {
-        // Publication is synchronous and must remain in the same local lease as its durable
-        // idempotency marker. Erasure drains this phase before cancelAll, so an obsolete activation
-        // cannot publish again after notifications were cleared for logout or replacement.
-        state.withProjectionLease {
-            if (!isInboundPublicationRecorded(durable, sentAt)) {
-                try {
-                    notifications.publish(
-                        SecureMessagingIncomingNotification(
-                            messageId = durable.messageId,
-                            conversationId = durable.conversationId,
-                            sessionEpoch = state.session.binding.sessionEpoch,
-                        ),
-                    )
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Exception) {
-                    throw SecureMessagingNotificationPublicationException(error)
-                }
-            }
+        val authoredOnThisAccount = durable.sender.userId == state.session.binding.userId
+        val notificationPending = state.withProjectionLease {
+            val pending = !authoredOnThisAccount &&
+                prepareInboundNotificationPublication(durable, sentAt)
+            // Commit and signal the conversation projection before making a shade notification
+            // externally visible. An interrupted reconnect can now duplicate only the stable-tag
+            // notification, never leave the user with an alert for a locally invisible message.
             recordInbound(durable, sentAt)
+            pending
         }
+        if (!notificationPending) return
+
+        // Resolve the sender only after the message is locally visible. A temporary conversation
+        // lookup failure can delay the alert, but can no longer produce an alert-only state.
+        val notificationPeer = authenticatedNotificationPeer(state, durable)
+        // Re-enter the exact activation lease for the external publication. Erasure drains this
+        // phase before cancelAll, so an obsolete activation cannot notify after logout/replacement.
+        state.withProjectionLease {
+            if (!prepareInboundNotificationPublication(durable, sentAt)) return@withProjectionLease
+            try {
+                notifications.publish(
+                    SecureMessagingIncomingNotification(
+                        messageId = durable.messageId,
+                        conversationId = durable.conversationId,
+                        sessionEpoch = state.session.binding.sessionEpoch,
+                        senderName = notificationPeer.peerName,
+                        authenticatedText = durable.authenticatedText,
+                        sentAt = sentAt,
+                    ),
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                throw SecureMessagingNotificationPublicationException(error)
+            }
+            completeInboundNotificationPublication(durable)
+        }
+    }
+
+    /** Resolves display identity only from the authenticated direct-conversation membership. */
+    private suspend fun authenticatedNotificationPeer(
+        state: SessionState,
+        durable: LibSignalCompanionRecord,
+    ): RemoteSecureMessagingTransport.Session.DirectConversation {
+        val conversations = state.conversations ?: state.session.directConversations()
+            .associateBy(RemoteSecureMessagingTransport.Session.DirectConversation::conversationId)
+            .also { state.conversations = it }
+        val conversation = checkNotNull(conversations[durable.conversationId]) {
+            "Incoming secure message belongs to an unavailable direct conversation"
+        }
+        check(conversation.peerUserId == durable.sender.userId) {
+            "Incoming secure message sender is not the authenticated direct peer"
+        }
+        return conversation
     }
 
     private fun historyDeliveryToken(

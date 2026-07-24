@@ -105,7 +105,52 @@ class AppCapabilitiesTest {
     }
 
     @Test
-    fun `scanner stays closed without a client while receive opens for wallets`() {
+    fun `provider money routes require a wallet and their own rollout capability`() {
+        val allProviderFeatures = mapOf(
+            KitFeature.WALLETS to true,
+            KitFeature.BILLS to true,
+            KitFeature.AIRTIME to true,
+            KitFeature.BANK_TRANSFERS to true,
+            KitFeature.MOBILE_MONEY to true,
+        )
+        val available = AppCapabilities(features = allProviderFeatures, loaded = true)
+
+        assertTrue(available.billPaymentsUsable)
+        assertTrue(available.airtimeUsable)
+        assertTrue(available.bankTransfersUsable)
+        assertTrue(available.mobileMoneyUsable)
+        assertTrue(available.routeUsable(Dest.BILLS))
+        assertTrue(available.routeUsable(Dest.BILL_PAY))
+        assertTrue(available.routeUsable(Dest.AIRTIME))
+        assertTrue(available.routeUsable(Dest.BANK))
+        assertTrue(available.routeUsable(Dest.MOBILE_MONEY))
+
+        val noWallet = available.copy(features = allProviderFeatures - KitFeature.WALLETS)
+        assertFalse(noWallet.billPaymentsUsable)
+        assertFalse(noWallet.airtimeUsable)
+        assertFalse(noWallet.bankTransfersUsable)
+        assertFalse(noWallet.mobileMoneyUsable)
+        assertFalse(noWallet.routeUsable(Dest.BILLS))
+        assertFalse(noWallet.routeUsable(Dest.BILL_PAY))
+        assertFalse(noWallet.routeUsable(Dest.AIRTIME))
+        assertFalse(noWallet.routeUsable(Dest.BANK))
+        assertFalse(noWallet.routeUsable(Dest.MOBILE_MONEY))
+
+        listOf(
+            KitFeature.BILLS to Dest.BILLS,
+            KitFeature.AIRTIME to Dest.AIRTIME,
+            KitFeature.BANK_TRANSFERS to Dest.BANK,
+            KitFeature.MOBILE_MONEY to Dest.MOBILE_MONEY,
+        ).forEach { (feature, route) ->
+            assertFalse(
+                feature,
+                available.copy(features = allProviderFeatures - feature).routeUsable(route),
+            )
+        }
+    }
+
+    @Test
+    fun `scanner stays closed without a client or wallet while receive opens for wallets`() {
         val serverOnly = AppCapabilities(
             features = mapOf(
                 KitFeature.WALLETS to true,
@@ -118,6 +163,12 @@ class AppCapabilitiesTest {
         assertFalse(serverOnly.routeUsable(Dest.SCAN))
         assertTrue(serverOnly.routeUsable(Dest.RECEIVE))
         assertTrue(serverOnly.copy(qrScannerClientReady = true).routeUsable(Dest.SCAN))
+        assertFalse(
+            serverOnly.copy(
+                features = serverOnly.features - KitFeature.WALLETS,
+                qrScannerClientReady = true,
+            ).routeUsable(Dest.SCAN),
+        )
     }
 
     @Test
