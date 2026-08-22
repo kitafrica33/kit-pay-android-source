@@ -55,7 +55,11 @@ internal data class KitMediaMessage(
 
     companion object {
         const val PREFIX = "KITMEDIA1:"
-        private const val MAX_DESCRIPTOR_LENGTH = 4_096
+
+        // Wire bounds shared with iOS: the whole encoded descriptor and the caption are capped in
+        // bytes, so both clients accept and reject exactly the same authenticated content.
+        private const val MAX_DESCRIPTOR_BYTES = 3_584
+        private const val MAX_CAPTION_UTF8_BYTES = 2_048
         private val SHA256_HEX = Regex("^[0-9a-f]{64}$")
         private val CANONICAL_UUID = Regex(
             "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -65,7 +69,8 @@ internal data class KitMediaMessage(
 
         /** Strict parse; returns null for anything that is not a well-formed v1 media descriptor. */
         fun parse(text: String): KitMediaMessage? {
-            if (!text.startsWith(PREFIX) || text.length > MAX_DESCRIPTOR_LENGTH) return null
+            if (!text.startsWith(PREFIX)) return null
+            if (text.toByteArray(StandardCharsets.UTF_8).size > MAX_DESCRIPTOR_BYTES) return null
             val fields = mutableMapOf<String, String>()
             for (pair in text.substring(PREFIX.length).split('&')) {
                 val separator = pair.indexOf('=')
@@ -89,6 +94,11 @@ internal data class KitMediaMessage(
             if (byteSize !in MIN_IMAGE_CIPHERTEXT_BYTES..MAX_IMAGE_CIPHERTEXT_BYTES) return null
             if (!SHA256_HEX.matches(sha256)) return null
             if (plaintextSize !in 1..MAX_IMAGE_PLAINTEXT_BYTES) return null
+            if (caption != null &&
+                caption.toByteArray(StandardCharsets.UTF_8).size > MAX_CAPTION_UTF8_BYTES
+            ) {
+                return null
+            }
             val keyBytes = runCatching { Base64.getDecoder().decode(key) }.getOrNull() ?: return null
             val canonicalKey = try {
                 keyBytes.size == MediaAttachmentCipher.KEY_MATERIAL_BYTES &&

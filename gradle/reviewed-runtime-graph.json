@@ -1,23 +1,23 @@
 {
   "schema_version": 1,
   "configuration": "releaseRuntimeClasspath",
-  "reviewed_runtime_inventory_sha256": "4f63a48022e82f037a9c3e8de80d847f2a54b5948ce6f51be8a8863bd83ca330",
+  "reviewed_runtime_inventory_sha256": "0eaa1deda2e4bc4005613f881a221a898ef0eabad00553cac2979319c88b85a6",
   "gradle_resolution": {
-    "component_count": 188,
-    "direct_component_count": 32,
-    "dependency_edge_count": 910,
-    "graph_sha256": "24b9522cf76d4c129361aca60fbdb2da10e26be46fdbe69e916b8f1e6e24f305"
+    "component_count": 195,
+    "direct_component_count": 33,
+    "dependency_edge_count": 939,
+    "graph_sha256": "818e4c4f609e8aafc0eb256b26770bddeed8a1344a6e185d4ce3191ce5cae91f"
   },
   "aab_dependencies_metadata": {
-    "component_count": 188,
-    "direct_component_count": 32,
-    "dependency_edge_count": 910,
-    "graph_sha256": "24b9522cf76d4c129361aca60fbdb2da10e26be46fdbe69e916b8f1e6e24f305"
+    "component_count": 195,
+    "direct_component_count": 33,
+    "dependency_edge_count": 939,
+    "graph_sha256": "818e4c4f609e8aafc0eb256b26770bddeed8a1344a6e185d4ce3191ce5cae91f"
   },
   "cyclonedx": {
-    "component_count": 188,
-    "direct_component_count": 32,
-    "dependency_edge_count": 602,
-    "graph_sha256": "2c76bb782bcf03ac1d8dbc364e2313385eb69b4ec99fa53f8920e8f0f5e33042"
+    "component_count": 195,
+    "direct_component_count": 33,
+    "dependency_edge_count": 631,
+    "graph_sha256": "a47b999b7d15c7a94130a39f082a1b13c8358ab8846a594d77eedbb62a20fda7"
   }
 }

@@ -53,6 +53,7 @@ data class WalletTransactionEntity(
     val reference: String,
     val amountMinor: Long,
     val currencyCode: String,
+    val currencyScale: Int = 2,
     val type: String,
     val direction: String,
     val status: String,

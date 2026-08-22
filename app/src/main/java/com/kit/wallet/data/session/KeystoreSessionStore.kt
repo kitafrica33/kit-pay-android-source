@@ -211,6 +211,13 @@ class KeystoreSessionStore @Inject constructor(
                     } else {
                         refreshedCredentials.profileSetupState
                     },
+                    cachedAssurance = if (
+                        latest.cachedAssurance != expectedCredentials.cachedAssurance
+                    ) {
+                        latest.cachedAssurance
+                    } else {
+                        refreshedCredentials.cachedAssurance
+                    },
                     messagingResetProof = latest.messagingResetProof,
                 ),
             )
@@ -226,6 +233,18 @@ class KeystoreSessionStore @Inject constructor(
         if (current?.fence() != expected) return@withLock false
         if (current.profileSetupState != state) {
             persistLocked(current.copy(profileSetupState = state))
+        }
+        true
+    }
+
+    override suspend fun updateCachedAssurance(
+        expected: SessionFence,
+        assurance: CachedSessionAssurance,
+    ): Boolean = mutex.withLock {
+        val current = _session.value
+        if (current?.fence() != expected) return@withLock false
+        if (current.cachedAssurance != assurance) {
+            persistLocked(current.copy(cachedAssurance = assurance))
         }
         true
     }
@@ -1141,6 +1160,7 @@ internal data class SessionDiskPayload(
     val accountId: String? = null,
     val cacheScopeId: String? = null,
     val profileSetupState: String? = null,
+    val cachedAssurance: CachedSessionAssurance? = null,
     val messagingResetProof: SecureMessagingResetProofFence? = null,
     val refreshReplayNonce: String? = null,
 )
@@ -1158,6 +1178,7 @@ internal fun SessionTokens.toDiskPayload() = SessionDiskPayload(
         ProfileSetupState.REQUIRED -> "required"
         ProfileSetupState.COMPLETED -> "completed"
     },
+    cachedAssurance = cachedAssurance,
     messagingResetProof = messagingResetProof,
     refreshReplayNonce = refreshReplayNonce,
 )
@@ -1175,6 +1196,7 @@ internal fun SessionDiskPayload.toSessionTokens() = SessionTokens(
         "completed" -> ProfileSetupState.COMPLETED
         else -> ProfileSetupState.UNKNOWN
     },
+    cachedAssurance = cachedAssurance,
     messagingResetProof = messagingResetProof,
     refreshReplayNonce = refreshReplayNonce ?: java.util.UUID.randomUUID().toString(),
 )

@@ -51,10 +51,16 @@ class PushTokenCoordinator @Inject constructor(
         scheduleRegistration { token }
     }
 
-    private fun scheduleRegistration(token: suspend () -> String) {
+    /** Replays registration when a foreground capability refresh changes server policy. */
+    fun capabilityPolicyChanged(): Job? {
+        if (!transport.configured || sessions.current() == null) return null
+        return scheduleRegistration(transport::currentToken)
+    }
+
+    private fun scheduleRegistration(token: suspend () -> String): Job =
         synchronized(registrationLock) {
             registrationJob?.cancel()
-            registrationJob = scope.launch {
+            scope.launch {
                 try {
                     registerWithRetry(token)
                 } catch (cancelled: CancellationException) {
@@ -62,9 +68,8 @@ class PushTokenCoordinator @Inject constructor(
                 } catch (_: Exception) {
                     // Transport and capability discovery retry on the next token/session event.
                 }
-            }
+            }.also { registrationJob = it }
         }
-    }
 
     suspend fun unregisterBeforeLogout() {
         val inFlight = synchronized(registrationLock) {
@@ -108,19 +113,19 @@ class PushTokenCoordinator @Inject constructor(
     internal suspend fun registerIfEnabled(
         tokenProvider: suspend () -> String = transport::currentToken,
     ) {
-        val sessionId = sessions.current()?.sessionId ?: return
+        val sessionFence = sessions.current()?.fence() ?: return
         val capabilities = apiCalls.execute { api.capabilities() }
         if (capabilities.features?.get(KitFeature.NOTIFICATIONS) != true) {
-            if (sessions.current()?.sessionId == sessionId) {
+            if (sessions.current()?.fence() == sessionFence) {
                 apiCalls.execute { api.unregisterPushToken() }
             }
             return
         }
-        if (sessions.current()?.sessionId != sessionId) return
+        if (sessions.current()?.fence() != sessionFence) return
 
         // Do not ask the transport for a token until the server enables notifications.
         val token = tokenProvider()
-        if (token.isBlank() || sessions.current()?.sessionId != sessionId) return
+        if (token.isBlank() || sessions.current()?.fence() != sessionFence) return
         val registered = apiCalls.execute {
             api.registerPushToken(
                 RegisterPushTokenRequest(provider = transport.provider, token = token),

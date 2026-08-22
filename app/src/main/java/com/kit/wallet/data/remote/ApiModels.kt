@@ -204,6 +204,71 @@ data class AuthResultDto(
     val challenge: AuthChallengeDto? = null,
     val session: SessionDto? = null,
     val user: UserDto? = null,
+    @Json(name = "session_assurance") val sessionAssurance: SessionAssuranceDto? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class DeviceIdentityAssuranceDto(
+    val status: String,
+    val required: Boolean,
+    val epoch: Long,
+    @Json(name = "verified_at") val verifiedAt: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class LoginUnlockAssuranceDto(
+    val status: String,
+    val required: Boolean,
+    val methods: List<String>,
+    val method: String? = null,
+    @Json(name = "unlocked_at") val unlockedAt: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class SessionAssuranceDto(
+    @Json(name = "device_identity") val deviceIdentity: DeviceIdentityAssuranceDto,
+    @Json(name = "login_unlock") val loginUnlock: LoginUnlockAssuranceDto,
+    val access: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class SessionAssuranceResultDto(
+    @Json(name = "session_assurance") val sessionAssurance: SessionAssuranceDto,
+    val method: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class LoginUnlockPinRequest(val pin: String)
+
+@JsonClass(generateAdapter = false)
+data class LoginBiometricChallengeDto(
+    @Json(name = "challenge_id") val challengeId: String,
+    val nonce: String,
+    @Json(name = "signing_payload") val signingPayload: String,
+    @Json(name = "expires_at") val expiresAt: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class LoginBiometricAssertionRequest(
+    @Json(name = "challenge_id") val challengeId: String,
+    val nonce: String,
+    val signature: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class EnrollBiometricKeyRequest(
+    @Json(name = "public_key") val publicKey: String,
+    val attestation: Map<String, String>? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class BiometricKeyStatusDto(
+    @Json(name = "device_id") val deviceId: String? = null,
+    val algorithm: String? = null,
+    @Json(name = "enrolled_at") val enrolledAt: String? = null,
+    @Json(name = "attestation_status") val attestationStatus: String? = null,
+    val removed: Boolean? = null,
+    @Json(name = "session_assurance") val sessionAssurance: SessionAssuranceDto? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -393,6 +458,7 @@ data class DeviceDto(
 @JsonClass(generateAdapter = false)
 data class ContactListDto(
     val items: List<ContactDto>? = null,
+    val page: CursorPageDto? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -412,6 +478,50 @@ data class ContactDto(
 @JsonClass(generateAdapter = false)
 data class ContactSyncRequest(
     val contacts: List<DeviceContactDto>,
+)
+
+@JsonClass(generateAdapter = false)
+data class BeginContactSyncRequest(
+    @Json(name = "client_sync_id") val clientSyncId: String,
+    @Json(name = "total_contact_count") val totalContactCount: Int,
+    @Json(name = "snapshot_scope") val snapshotScope: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class ContactSyncSessionResponseDto(
+    val sync: ContactSyncSessionDto,
+)
+
+@JsonClass(generateAdapter = false)
+data class ContactSyncChunkResponseDto(
+    val sync: ContactSyncSessionDto,
+    val chunk: ContactSyncChunkDto,
+)
+
+@JsonClass(generateAdapter = false)
+data class ContactSyncSessionDto(
+    val id: String,
+    @Json(name = "client_sync_id") val clientSyncId: String,
+    val generation: Int,
+    val status: String,
+    @Json(name = "snapshot_scope") val snapshotScope: String,
+    @Json(name = "chunk_size") val chunkSize: Int,
+    @Json(name = "total_contact_count") val totalContactCount: Int,
+    @Json(name = "total_chunk_count") val totalChunkCount: Int,
+    @Json(name = "received_contact_count") val receivedContactCount: Int,
+    @Json(name = "received_chunk_count") val receivedChunkCount: Int,
+    @Json(name = "accepted_contact_count") val acceptedContactCount: Int,
+    @Json(name = "stored_contact_count") val storedContactCount: Int? = null,
+    @Json(name = "missing_chunk_indexes") val missingChunkIndexes: List<Int>,
+    @Json(name = "expires_at") val expiresAt: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class ContactSyncChunkDto(
+    val index: Int,
+    @Json(name = "input_count") val inputCount: Int,
+    @Json(name = "accepted_count") val acceptedCount: Int,
+    val replayed: Boolean,
 )
 
 @JsonClass(generateAdapter = false)
@@ -487,6 +597,13 @@ data class StartCallRequest(
     @Json(name = "recipient_user_ids") val recipientUserIds: List<String>,
     val type: String,
     @Json(name = "conversation_id") val conversationId: String? = null,
+    @Json(name = "client_call_id") val clientCallId: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class CancelCallAttemptDto(
+    @Json(name = "client_call_id") val clientCallId: String,
+    val cancelled: Boolean,
 )
 
 @JsonClass(generateAdapter = false)
@@ -544,6 +661,12 @@ data class VerifyStepUpChallengeRequest(
 )
 
 @JsonClass(generateAdapter = false)
+data class VerifyBiometricStepUpRequest(
+    val nonce: String,
+    val signature: String,
+)
+
+@JsonClass(generateAdapter = false)
 data class StepUpVerificationDto(
     @Json(name = "step_up_token") val stepUpToken: String,
     @Json(name = "expires_at") val expiresAt: String,
@@ -579,6 +702,11 @@ data class PaymentRequestDto(
     @Json(name = "wallet_transaction_id") val walletTransactionId: String? = null,
     @Json(name = "paid_at") val paidAt: String? = null,
     @Json(name = "created_at") val createdAt: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class PaymentRequestListDto(
+    val items: List<PaymentRequestDto>? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -704,6 +832,49 @@ data class CreateBankingOperationRequest(
 )
 
 @JsonClass(generateAdapter = false)
+data class CreateBankingOutboundQuoteRequest(
+    @Json(name = "wallet_id") val walletId: String,
+    @Json(name = "beneficiary_id") val beneficiaryId: String,
+    val amount: String,
+    @Json(name = "fee_mode") val feeMode: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class CreateQuotedBankingOperationRequest(
+    @Json(name = "quote_id") val quoteId: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class BankingQuoteBankDto(val id: String, val code: String, val name: String)
+
+@JsonClass(generateAdapter = false)
+data class BankingQuoteStepUpDto(val purpose: String, val intent: Map<String, String>)
+
+@JsonClass(generateAdapter = false)
+data class BankingOutboundQuoteDto(
+    val id: String,
+    val action: String,
+    @Json(name = "operation_type") val operationType: String,
+    @Json(name = "fee_mode") val feeMode: String,
+    @Json(name = "wallet_id") val walletId: String,
+    @Json(name = "beneficiary_id") val beneficiaryId: String,
+    val bank: BankingQuoteBankDto,
+    @Json(name = "recipient_amount") val recipientAmount: String,
+    @Json(name = "processing_fee") val processingFee: String,
+    @Json(name = "provider_fee") val providerFee: String,
+    @Json(name = "kit_fee") val kitFee: String,
+    @Json(name = "provider_fee_cap") val providerFeeCap: String,
+    @Json(name = "maximum_provider_total") val maximumProviderTotal: String,
+    @Json(name = "customer_debit") val customerDebit: String,
+    @Json(name = "kit_debit") val kitDebit: String,
+    @Json(name = "schedule_version") val scheduleVersion: String,
+    @Json(name = "schedule_verified") val scheduleVerified: Boolean,
+    val currency: CurrencyDto,
+    @Json(name = "expires_at") val expiresAt: String,
+    @Json(name = "step_up") val stepUp: BankingQuoteStepUpDto,
+)
+
+@JsonClass(generateAdapter = false)
 data class BankBeneficiaryListDto(
     val items: List<BankBeneficiaryDto> = emptyList(),
 )
@@ -725,6 +896,22 @@ data class BankingOperationListDto(
 )
 
 @JsonClass(generateAdapter = false)
+data class BankingOutboundPricingDto(
+    @Json(name = "fee_mode") val feeMode: String,
+    @Json(name = "recipient_amount") val recipientAmount: String,
+    @Json(name = "processing_fee") val processingFee: String,
+    @Json(name = "provider_fee") val providerFee: String,
+    @Json(name = "kit_fee") val kitFee: String,
+    @Json(name = "provider_fee_cap") val providerFeeCap: String,
+    @Json(name = "maximum_provider_total") val maximumProviderTotal: String,
+    @Json(name = "customer_debit") val customerDebit: String,
+    @Json(name = "kit_debit") val kitDebit: String,
+    @Json(name = "schedule_version") val scheduleVersion: String,
+    @Json(name = "actual_provider_fee") val actualProviderFee: String? = null,
+    @Json(name = "actual_provider_total") val actualProviderTotal: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
 data class BankingOperationDto(
     val id: String,
     val reference: String,
@@ -736,6 +923,17 @@ data class BankingOperationDto(
     @Json(name = "beneficiary_id") val beneficiaryId: String? = null,
     @Json(name = "wallet_id") val walletId: String,
     val amount: String,
+    @Json(name = "outbound_quote_id") val outboundQuoteId: String? = null,
+    @Json(name = "outbound_pricing") val outboundPricing: BankingOutboundPricingDto? = null,
+    @Json(name = "fee_quote_id") val feeQuoteId: String? = null,
+    @Json(name = "fee_mode") val feeMode: String? = null,
+    @Json(name = "requested_amount") val requestedAmount: String? = null,
+    @Json(name = "provider_fee") val providerFee: String? = null,
+    @Json(name = "provider_fee_estimated") val providerFeeEstimated: Boolean? = null,
+    @Json(name = "platform_fee") val platformFee: String? = null,
+    @Json(name = "rounding_adjustment") val roundingAdjustment: String? = null,
+    @Json(name = "total_fees") val totalFees: String? = null,
+    @Json(name = "net_amount") val netAmount: String? = null,
     val currency: CurrencyDto,
     @Json(name = "provider_reference") val providerReference: String? = null,
     @Json(name = "wallet_transaction_id") val walletTransactionId: String? = null,
@@ -812,6 +1010,54 @@ data class CreateMobileMoneyOperationRequest(
 )
 
 @JsonClass(generateAdapter = false)
+data class CreateMobileMoneyQuoteRequest(
+    @Json(name = "wallet_id") val walletId: String,
+    @Json(name = "account_id") val accountId: String,
+    val amount: String,
+    @Json(name = "fee_mode") val feeMode: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class CreateQuotedMobileMoneyOperationRequest(
+    @Json(name = "quote_id") val quoteId: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class MobileMoneyQuoteStepUpDto(
+    val purpose: String,
+    val intent: Map<String, String>,
+)
+
+@JsonClass(generateAdapter = false)
+data class MobileMoneyQuoteDto(
+    val id: String,
+    val action: String,
+    @Json(name = "fee_mode") val feeMode: String,
+    @Json(name = "wallet_id") val walletId: String,
+    @Json(name = "account_id") val accountId: String,
+    val network: String,
+    val currency: CurrencyDto,
+    @Json(name = "requested_amount") val requestedAmount: String? = null,
+    @Json(name = "provider_amount") val providerAmount: String? = null,
+    @Json(name = "recipient_amount") val recipientAmount: String? = null,
+    @Json(name = "customer_debit") val customerDebit: String? = null,
+    @Json(name = "total_fees") val totalFees: String? = null,
+    @Json(name = "processing_fee") val processingFee: String? = null,
+    @Json(name = "provider_fee") val providerFee: String,
+    @Json(name = "platform_fee") val platformFee: String? = null,
+    @Json(name = "kit_fee") val kitFee: String? = null,
+    @Json(name = "rounding_adjustment") val roundingAdjustment: String? = null,
+    @Json(name = "wallet_credit") val walletCredit: String? = null,
+    @Json(name = "provider_fee_cap") val providerFeeCap: String? = null,
+    @Json(name = "maximum_provider_total") val maximumProviderTotal: String? = null,
+    @Json(name = "kit_debit") val kitDebit: String? = null,
+    @Json(name = "schedule_version") val scheduleVersion: String? = null,
+    @Json(name = "schedule_verified") val scheduleVerified: Boolean? = null,
+    @Json(name = "expires_at") val expiresAt: String,
+    @Json(name = "step_up") val stepUp: MobileMoneyQuoteStepUpDto,
+)
+
+@JsonClass(generateAdapter = false)
 data class MobileMoneyOperationDto(
     val id: String,
     val reference: String,
@@ -823,6 +1069,17 @@ data class MobileMoneyOperationDto(
     @Json(name = "beneficiary_id") val beneficiaryId: String? = null,
     @Json(name = "wallet_id") val walletId: String,
     val amount: String,
+    @Json(name = "outbound_quote_id") val outboundQuoteId: String? = null,
+    @Json(name = "outbound_pricing") val outboundPricing: BankingOutboundPricingDto? = null,
+    @Json(name = "fee_quote_id") val feeQuoteId: String? = null,
+    @Json(name = "fee_mode") val feeMode: String? = null,
+    @Json(name = "requested_amount") val requestedAmount: String? = null,
+    @Json(name = "provider_fee") val providerFee: String? = null,
+    @Json(name = "provider_fee_estimated") val providerFeeEstimated: Boolean? = null,
+    @Json(name = "platform_fee") val platformFee: String? = null,
+    @Json(name = "rounding_adjustment") val roundingAdjustment: String? = null,
+    @Json(name = "total_fees") val totalFees: String? = null,
+    @Json(name = "net_amount") val netAmount: String? = null,
     val currency: CurrencyDto,
     @Json(name = "provider_reference") val providerReference: String? = null,
     @Json(name = "wallet_transaction_id") val walletTransactionId: String? = null,

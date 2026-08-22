@@ -2,6 +2,7 @@ package com.kit.wallet
 
 import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionDiskPayload
+import com.kit.wallet.data.session.CachedSessionAssurance
 import com.kit.wallet.data.session.SessionTokens
 import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.kit.wallet.data.session.decodeSessionPersistingLegacyNonce
@@ -43,15 +44,25 @@ class SessionTokensTest {
 
     @Test
     fun `profile setup state and cache owner survive encrypted payload round trip`() {
+        val assurance = CachedSessionAssurance(
+            access = "restricted",
+            deviceIdentityStatus = "verified",
+            deviceIdentityRequired = true,
+            loginUnlockStatus = "locked",
+            loginUnlockRequired = true,
+            loginUnlockMethods = listOf("pin", "biometric_signature"),
+        )
         val restored = tokens.copy(
             accountId = "account-1",
             cacheScopeId = "account-1:session",
             profileSetupState = ProfileSetupState.REQUIRED,
+            cachedAssurance = assurance,
         ).toDiskPayload().toSessionTokens()
 
         assertEquals("account-1", restored.accountId)
         assertEquals("account-1:session", restored.cacheScopeId)
         assertEquals(ProfileSetupState.REQUIRED, restored.profileSetupState)
+        assertEquals(assurance, restored.cachedAssurance)
         assertEquals(tokens.refreshReplayNonce, restored.refreshReplayNonce)
         assertTrue(restored.profileSetupState.requiresSetup)
     }
@@ -87,6 +98,7 @@ class SessionTokensTest {
             .map(String::trim)
         listOf(
             "-keep class com.kit.wallet.data.session.SessionDiskPayload { *; }",
+            "-keep class com.kit.wallet.data.session.CachedSessionAssurance { *; }",
             "-keep class com.kit.wallet.data.session.SecureMessagingResetProofFence { *; }",
         ).forEach { requiredRule ->
             assertEquals(1, rules.count { it == requiredRule })

@@ -72,6 +72,7 @@ class AppCapabilitiesViewModelTest {
         assertEquals(2, api.calls)
         assertTrue(viewModel.state.value.loaded)
         assertTrue(viewModel.state.value.messagingUsable)
+        assertTrue(viewModel.state.value.biometricTokensAvailable)
 
         // Even a transport that completes after cancellation cannot overwrite the new session.
         api.completeInitialAnonymousRequest()
@@ -86,6 +87,7 @@ class AppCapabilitiesViewModelTest {
         assertFalse(viewModel.state.value.loaded)
         assertFalse(viewModel.state.value.messagingEntryVisible)
         assertFalse(viewModel.state.value.messagingProtocolReady)
+        assertFalse(viewModel.state.value.biometricTokensAvailable)
 
         api.completeLogoutAnonymousRequest()
 
@@ -256,6 +258,7 @@ class AppCapabilitiesViewModelTest {
             data = CapabilitiesDto(
                 currency = CurrencyDto(code = "UGX", scale = "2"),
                 features = mapOf(KitFeature.MESSAGING to enabled),
+                authentication = mapOf("biometric_tokens" to enabled),
                 protocols = ProtocolsDto(
                     messaging = MessagingProtocolDto(
                         ready = protocolReady,

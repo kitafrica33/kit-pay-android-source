@@ -48,6 +48,12 @@ data class Transaction(
     val type: TxType,
     val status: TxStatus = TxStatus.COMPLETED,
     val reference: String,
+    val currencyCode: String = "UGX",
+    val currencyScale: Int = Money.SCALE,
+    val feeMinor: Long? = null,
+    val recipientAmountMinor: Long? = null,
+    val customerDebitMinor: Long? = null,
+    val feeMode: String? = null,
 )
 
 enum class DeliveryState { SENDING, SENT, DELIVERED, READ, RETRY_REQUIRED, FAILED }
@@ -69,6 +75,9 @@ data class Message(
     val paymentRequestId: String? = null,
     /** For payment messages: an optional sender note carried inside the encrypted descriptor. */
     val paymentNote: String? = null,
+    /** For payment messages: the descriptor's authoritative currency and minor-unit scale. */
+    val paymentCurrencyCode: String = "UGX",
+    val paymentCurrencyScale: Int = Money.SCALE,
     /** Epoch millis used to interleave messages with call-log entries in a conversation. */
     val sortEpochMillis: Long = 0,
     /** For CALL entries: direction, whether it was a video call and the connected duration. */

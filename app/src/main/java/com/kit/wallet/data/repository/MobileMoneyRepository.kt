@@ -26,5 +26,13 @@ interface MobileMoneyRepository {
         accountId: String,
         amountMinor: Long,
         paymentPin: String,
+        feeMode: String = if (action == "collection") "inclusive" else "sender_absorbs",
     )
+    suspend fun previewOperation(
+        action: String,
+        accountId: String,
+        amountMinor: Long,
+        feeMode: String = if (action == "collection") "inclusive" else "sender_absorbs",
+    ): FinancialOperationQuote
+    suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String)
 }

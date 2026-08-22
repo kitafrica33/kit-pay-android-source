@@ -55,6 +55,7 @@ import com.kit.wallet.ui.model.MobileMoneyNetwork
 import com.kit.wallet.ui.model.MobileMoneyOperation
 import com.kit.wallet.ui.model.MobileMoneyVerificationState
 import com.kit.wallet.ui.model.Money
+import com.kit.wallet.data.repository.FinancialOperationQuote
 import com.kit.wallet.ui.theme.KitTheme
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -69,6 +70,7 @@ fun MobileMoneyScreen(
     val verification by viewModel.verification.collectAsStateWithLifecycle()
     val busy by viewModel.busy.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
+    val quote by viewModel.quote.collectAsStateWithLifecycle()
     var addingAccount by remember { mutableStateOf(false) }
     var operationAction by remember { mutableStateOf<String?>(null) }
 
@@ -128,12 +130,13 @@ fun MobileMoneyScreen(
             accounts = accounts.filter { action != "collection" || it.isOwnAccount },
             busy = busy,
             error = error,
-            onDismiss = { if (!busy) operationAction = null },
-            onSubmit = { accountId, amountMinor, pin ->
-                viewModel.operate(action, accountId, amountMinor, pin) {
-                    operationAction = null
-                }
+            quote = quote,
+            onDismiss = { if (!busy) { viewModel.clearQuote(); operationAction = null } },
+            onQuoteInvalidated = viewModel::clearQuote,
+            onReview = { accountId, amountMinor, feeMode ->
+                viewModel.preview(action, accountId, amountMinor, feeMode)
             },
+            onSubmit = { pin -> viewModel.submit(pin) { operationAction = null } },
         )
     }
 }
@@ -202,7 +205,7 @@ private fun MobileMoneyContent(
         if (operations.isEmpty()) {
             item {
                 Text(
-                    "Your RukaPay collection and payout status will appear here.",
+                    "Your cash-in and cash-out status will appear here.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
@@ -317,6 +320,14 @@ private fun MobileMoneyOperationRow(operation: MobileMoneyOperation) {
                 else MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
             )
+            operation.feeMinor?.let { fee ->
+                Text(
+                    "Fee ${operation.currencyCode} ${decimalAmount(fee, operation.currencyScale)}" +
+                        if (operation.providerFeeEstimated == true) " estimated" else "",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
         Column(horizontalAlignment = Alignment.End) {
             Text(
@@ -363,7 +374,7 @@ private fun AddMobileMoneyAccountSheet(
         Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 32.dp)) {
             Text("Add mobile money account", style = MaterialTheme.typography.titleLarge)
             Text(
-                "RukaPay verifies the number before Kit Pay saves it.",
+                "We verify the number before Kit Pay saves it.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -411,7 +422,7 @@ private fun AddMobileMoneyAccountSheet(
                     when (verification.status.lowercase()) {
                         "verified" -> "Verified as ${verification.accountName.orEmpty()}"
                         "failed", "rejected" -> verification.failureMessage ?: "Verification failed"
-                        else -> "Checking ${verification.phoneNumberMasked} with RukaPay…"
+                        else -> "Checking ${verification.phoneNumberMasked}…"
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary,
@@ -437,13 +448,26 @@ private fun MobileMoneyOperationSheet(
     accounts: List<MobileMoneyAccount>,
     busy: Boolean,
     error: String?,
+    quote: FinancialOperationQuote?,
     onDismiss: () -> Unit,
-    onSubmit: (String, Long, String) -> Unit,
+    onQuoteInvalidated: () -> Unit,
+    onReview: (String, Long, String) -> Unit,
+    onSubmit: (String) -> Unit,
 ) {
     var accountId by remember(accounts) { mutableStateOf(accounts.firstOrNull()?.id.orEmpty()) }
     var amount by remember { mutableStateOf("") }
     var pin by remember { mutableStateOf("") }
-    val amountMinor = Money.parseMinor(amount) ?: 0L
+    var feeMode by remember(action) {
+        mutableStateOf(if (action == "collection") "inclusive" else "sender_absorbs")
+    }
+    val selectedCurrencyScale = accounts.firstOrNull { it.id == accountId }?.currencyScale
+        ?: Money.SCALE
+    val amountMinor = Money.parseMinor(amount, selectedCurrencyScale) ?: 0L
+    val reviewedQuote = quote?.takeIf {
+        it.operationType == action && it.destinationId == accountId &&
+            it.amountMinor == amountMinor && it.feeMode == feeMode
+    }
+    androidx.compose.runtime.LaunchedEffect(accountId, amountMinor, feeMode) { onQuoteInvalidated() }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 32.dp)) {
             Text(
@@ -472,31 +496,75 @@ private fun MobileMoneyOperationSheet(
                 value = amount,
                 onValueChange = { amount = it.filter(Char::isDigit) },
                 label = { Text("Amount (UGX)") },
-                supportingText = { Text("RukaPay supports whole-shilling amounts") },
+                supportingText = { Text("Enter a whole-shilling amount") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
-            Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
-                value = pin,
-                onValueChange = { pin = it.filter(Char::isDigit).take(4) },
-                label = { Text("Wallet PIN") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                visualTransformation = PasswordVisualTransformation(),
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
+            Row {
+                val primaryMode = if (action == "collection") "inclusive" else "sender_absorbs"
+                val alternateMode = if (action == "collection") "gross_up" else "recipient_absorbs"
+                FilterChip(
+                    selected = feeMode == primaryMode,
+                    onClick = { feeMode = primaryMode },
+                    label = { Text(if (action == "collection") "Fees included" else "I pay fees") },
+                    modifier = Modifier.padding(end = 8.dp),
+                )
+                FilterChip(
+                    selected = feeMode == alternateMode,
+                    onClick = { feeMode = alternateMode },
+                    label = { Text(if (action == "collection") "Add fees" else "Deduct fees") },
+                )
+            }
+            if (reviewedQuote != null) {
+                Spacer(Modifier.height(12.dp))
+                MobileMoneyQuoteSummary(reviewedQuote, action)
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { pin = it.filter(Char::isDigit).take(4) },
+                    label = { Text("Wallet PIN (optional with biometrics)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
             ErrorText(error)
             KitGreenButton(
-                text = if (action == "collection") "Request cash in" else "Confirm cash out",
+                text = if (reviewedQuote == null) "Review amount and fees" else "Confirm payment",
                 loading = busy,
-                enabled = accountId.isNotBlank() && amountMinor > 0 && pin.length == 4,
-                onClick = { onSubmit(accountId, amountMinor, pin) },
+                enabled = accountId.isNotBlank() && amountMinor > 0 &&
+                    (reviewedQuote == null || pin.isEmpty() || pin.length == 4),
+                onClick = {
+                    if (reviewedQuote == null) onReview(accountId, amountMinor, feeMode)
+                    else onSubmit(pin)
+                },
             )
         }
     }
 }
+
+@Composable
+private fun MobileMoneyQuoteSummary(quote: FinancialOperationQuote, action: String) {
+    Surface(Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.medium) {
+        Column(Modifier.padding(16.dp)) {
+            Text("Review", style = MaterialTheme.typography.titleMedium)
+            Text(
+                if (action == "collection") "Wallet receives ${quote.formatAmount(quote.recipientAmountMinor)}"
+                else "Recipient receives ${quote.formatAmount(quote.recipientAmountMinor)}",
+            )
+            if (quote.feesKnown) {
+                Text("Fees ${quote.formatAmount(quote.feesMinor)}")
+                Text("Total ${quote.formatAmount(quote.customerDebitMinor)}")
+            } else {
+                Text("Final fees will be confirmed by your provider.", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+private fun FinancialOperationQuote.formatAmount(amountMinor: Long): String =
+    Money.format(amountMinor, currencyCode, currencyScale)
 
 @Composable
 private fun EmptyPanel(

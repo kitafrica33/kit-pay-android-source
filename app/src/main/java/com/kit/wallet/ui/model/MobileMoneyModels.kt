@@ -40,6 +40,11 @@ data class MobileMoneyOperation(
     val submissionStage: String?,
     val createdAt: String?,
     val failureMessage: String?,
+    val feeMinor: Long? = null,
+    val netAmountMinor: Long? = null,
+    val customerDebitMinor: Long? = null,
+    val feeMode: String? = null,
+    val providerFeeEstimated: Boolean? = null,
 )
 
 data class MobileMoneyVerificationState(

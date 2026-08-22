@@ -90,4 +90,20 @@ class KitMediaMessageTest {
             ),
         )
     }
+
+    @Test
+    fun `caption and descriptor bounds are byte-based and shared with iOS`() {
+        // 2,048 UTF-8 bytes is the last accepted caption size.
+        val captionAtLimit = descriptor.copy(caption = "a".repeat(2_048))
+        assertEquals(captionAtLimit, KitMediaMessage.parse(captionAtLimit.encode()))
+        assertNull(KitMediaMessage.parse(descriptor.copy(caption = "a".repeat(2_049)).encode()))
+
+        // Multi-byte captions count bytes, not characters: 512 two-byte characters fit.
+        val multiByte = descriptor.copy(caption = "é".repeat(512))
+        assertEquals(multiByte, KitMediaMessage.parse(multiByte.encode()))
+
+        // The whole encoded descriptor is capped at 3,584 bytes even when the caption itself is
+        // within its own bound (URL escaping expands each two-byte character to six bytes).
+        assertNull(KitMediaMessage.parse(descriptor.copy(caption = "é".repeat(600)).encode()))
+    }
 }

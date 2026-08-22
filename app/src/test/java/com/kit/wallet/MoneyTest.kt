@@ -40,7 +40,18 @@ class MoneyTest {
     }
 
     @Test
+    fun `parses zero-scale currencies as whole units`() {
+        assertEquals(1_000L, Money.parseMinor("1000", scale = 0))
+        assertNull(Money.parseMinor("1000.50", scale = 0))
+    }
+
+    @Test
     fun `formats the minimum long value safely`() {
         assertEquals("−UGX 92,233,720,368,547,758.08", Money.format(Long.MIN_VALUE))
+    }
+
+    @Test fun `formats currency using its authoritative scale`() {
+        assertEquals("UGX 1000", Money.format(1_000, "UGX", 0))
+        assertEquals("+USD 10.5", Money.format(1_050, "usd", 2, signed = true))
     }
 }

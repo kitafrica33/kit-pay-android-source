@@ -3,6 +3,7 @@ package com.kit.wallet.data.session
 import com.kit.wallet.data.messaging.SecureMessagingSessionFence
 import com.kit.wallet.data.messaging.isRecoverableSecureMessagingStateLoss
 import java.util.UUID
+import com.squareup.moshi.JsonClass
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.StateFlow
 
@@ -17,6 +18,17 @@ enum class ProfileSetupState {
         get() = this != COMPLETED
 }
 
+/** Server-issued access posture cached only inside the encrypted, exact-session credential. */
+@JsonClass(generateAdapter = false)
+data class CachedSessionAssurance(
+    val access: String,
+    val deviceIdentityStatus: String,
+    val deviceIdentityRequired: Boolean,
+    val loginUnlockStatus: String,
+    val loginUnlockRequired: Boolean,
+    val loginUnlockMethods: List<String>,
+)
+
 data class SessionTokens(
     val accessToken: String,
     val refreshToken: String,
@@ -29,6 +41,7 @@ data class SessionTokens(
      */
     val cacheScopeId: String = sessionId,
     val profileSetupState: ProfileSetupState = ProfileSetupState.UNKNOWN,
+    val cachedAssurance: CachedSessionAssurance? = null,
     val messagingResetProof: SecureMessagingResetProofFence? = null,
     /** Device-local replay proof for recovering one committed refresh whose response was lost. */
     val refreshReplayNonce: String = UUID.randomUUID().toString(),
@@ -177,6 +190,13 @@ interface SessionStore {
                 } else {
                     refreshedCredentials.profileSetupState
                 },
+                cachedAssurance = if (
+                    latest.cachedAssurance != expectedCredentials.cachedAssurance
+                ) {
+                    latest.cachedAssurance
+                } else {
+                    refreshedCredentials.cachedAssurance
+                },
                 messagingResetProof = latest.messagingResetProof,
             ),
         )
@@ -187,6 +207,16 @@ interface SessionStore {
         expected: SessionFence,
         state: ProfileSetupState,
     ): Boolean
+
+    suspend fun updateCachedAssurance(
+        expected: SessionFence,
+        assurance: CachedSessionAssurance,
+    ): Boolean {
+        val snapshot = snapshot()
+        val current = current() ?: return false
+        if (snapshot.fence != expected || current.fence() != expected) return false
+        return saveIfUnchanged(snapshot, current.copy(cachedAssurance = assurance))
+    }
 
     /**
      * Serializes a cache mutation with session replacement/clear and rejects an obsolete owner.

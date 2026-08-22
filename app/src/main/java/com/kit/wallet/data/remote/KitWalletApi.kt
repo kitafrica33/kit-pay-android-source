@@ -140,10 +140,30 @@ interface KitWalletApi {
     suspend fun revokeDevice(@Path("deviceId") deviceId: String): ApiEnvelope<Map<String, Any?>>
 
     @GET("api/kit-wallet/v1/contacts")
-    suspend fun contacts(): ApiEnvelope<ContactListDto>
+    suspend fun contacts(
+        @Query("cursor") cursor: String? = null,
+        @Query("limit") limit: Int = 500,
+    ): ApiEnvelope<ContactListDto>
 
     @POST("api/kit-wallet/v1/contacts/sync")
     suspend fun syncContacts(@Body request: ContactSyncRequest): ApiEnvelope<ContactListDto>
+
+    @POST("api/kit-wallet/v1/contacts/sync/sessions")
+    suspend fun startContactSync(
+        @Body request: BeginContactSyncRequest,
+    ): ApiEnvelope<ContactSyncSessionResponseDto>
+
+    @PUT("api/kit-wallet/v1/contacts/sync/sessions/{sessionId}/chunks/{chunkIndex}")
+    suspend fun uploadContactSyncChunk(
+        @Path("sessionId") sessionId: String,
+        @Path("chunkIndex") chunkIndex: Int,
+        @Body request: ContactSyncRequest,
+    ): ApiEnvelope<ContactSyncChunkResponseDto>
+
+    @POST("api/kit-wallet/v1/contacts/sync/sessions/{sessionId}/finalize")
+    suspend fun finalizeContactSync(
+        @Path("sessionId") sessionId: String,
+    ): ApiEnvelope<ContactSyncSessionResponseDto>
 
     @GET("api/kit-wallet/v1/providers/catalog")
     suspend fun providerCatalog(
@@ -159,6 +179,11 @@ interface KitWalletApi {
 
     @POST("api/kit-wallet/v1/calls")
     suspend fun startCall(@Body request: StartCallRequest): ApiEnvelope<CallSessionDto>
+
+    @POST("api/kit-wallet/v1/calls/client-attempts/{clientCallId}/cancel")
+    suspend fun cancelCallAttempt(
+        @Path("clientCallId") clientCallId: String,
+    ): ApiEnvelope<CancelCallAttemptDto>
 
     @GET("api/kit-wallet/v1/calls/{callId}")
     suspend fun call(@Path("callId") callId: String): ApiEnvelope<CallDto>
@@ -195,6 +220,36 @@ interface KitWalletApi {
         @Body request: VerifyStepUpChallengeRequest,
     ): ApiEnvelope<StepUpVerificationDto>
 
+    @POST("api/kit-wallet/v1/auth/step-up/challenges/{challengeId}/verify")
+    suspend fun verifyBiometricStepUpChallenge(
+        @Path("challengeId") challengeId: String,
+        @Body request: VerifyBiometricStepUpRequest,
+    ): ApiEnvelope<StepUpVerificationDto>
+
+    @GET("api/kit-wallet/v1/auth/session-assurance")
+    suspend fun sessionAssurance(): ApiEnvelope<SessionAssuranceResultDto>
+
+    @POST("api/kit-wallet/v1/auth/session-unlock/pin")
+    suspend fun unlockSessionWithPin(
+        @Body request: LoginUnlockPinRequest,
+    ): ApiEnvelope<SessionAssuranceResultDto>
+
+    @POST("api/kit-wallet/v1/auth/session-unlock/biometric/challenge")
+    suspend fun createLoginBiometricChallenge(): ApiEnvelope<LoginBiometricChallengeDto>
+
+    @POST("api/kit-wallet/v1/auth/session-unlock/biometric/assert")
+    suspend fun assertLoginBiometricChallenge(
+        @Body request: LoginBiometricAssertionRequest,
+    ): ApiEnvelope<SessionAssuranceResultDto>
+
+    @retrofit2.http.PUT("api/kit-wallet/v1/devices/current/biometric-key")
+    suspend fun enrollBiometricKey(
+        @Body request: EnrollBiometricKeyRequest,
+    ): ApiEnvelope<BiometricKeyStatusDto>
+
+    @DELETE("api/kit-wallet/v1/devices/current/biometric-key")
+    suspend fun removeBiometricKey(): ApiEnvelope<BiometricKeyStatusDto>
+
     @POST("api/kit-wallet/v1/wallets/{walletId}/transfers")
     suspend fun transfer(
         @Path("walletId") walletId: String,
@@ -208,6 +263,9 @@ interface KitWalletApi {
         @Header("Idempotency-Key") idempotencyKey: String,
         @Body request: CreatePaymentRequestDto,
     ): ApiEnvelope<PaymentRequestDto>
+
+    @GET("api/kit-wallet/v1/payments/requests")
+    suspend fun paymentRequests(): ApiEnvelope<PaymentRequestListDto>
 
     @POST("api/kit-wallet/v1/payments/requests/{requestId}/pay")
     suspend fun payPaymentRequest(
@@ -289,6 +347,30 @@ interface KitWalletApi {
         @Body request: CreateBankingOperationRequest,
     ): ApiEnvelope<BankingOperationDto>
 
+    @POST("api/kit-wallet/v1/banking/withdrawal-quotes")
+    suspend fun createBankWithdrawalQuote(
+        @Body request: CreateBankingOutboundQuoteRequest,
+    ): ApiEnvelope<BankingOutboundQuoteDto>
+
+    @POST("api/kit-wallet/v1/banking/transfer-quotes")
+    suspend fun createBankTransferQuote(
+        @Body request: CreateBankingOutboundQuoteRequest,
+    ): ApiEnvelope<BankingOutboundQuoteDto>
+
+    @POST("api/kit-wallet/v1/banking/withdrawals")
+    suspend fun createQuotedBankWithdrawal(
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: CreateQuotedBankingOperationRequest,
+    ): ApiEnvelope<BankingOperationDto>
+
+    @POST("api/kit-wallet/v1/banking/transfers")
+    suspend fun createQuotedBankTransfer(
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: CreateQuotedBankingOperationRequest,
+    ): ApiEnvelope<BankingOperationDto>
+
     @POST("api/kit-wallet/v1/banking/transfers")
     suspend fun createBankTransfer(
         @Header("Idempotency-Key") idempotencyKey: String,
@@ -332,6 +414,30 @@ interface KitWalletApi {
         @Header("Idempotency-Key") idempotencyKey: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: CreateMobileMoneyOperationRequest,
+    ): ApiEnvelope<MobileMoneyOperationDto>
+
+    @POST("api/kit-wallet/v1/mobile-money/collection-quotes")
+    suspend fun createMobileMoneyCollectionQuote(
+        @Body request: CreateMobileMoneyQuoteRequest,
+    ): ApiEnvelope<MobileMoneyQuoteDto>
+
+    @POST("api/kit-wallet/v1/mobile-money/payout-quotes")
+    suspend fun createMobileMoneyPayoutQuote(
+        @Body request: CreateMobileMoneyQuoteRequest,
+    ): ApiEnvelope<MobileMoneyQuoteDto>
+
+    @POST("api/kit-wallet/v1/mobile-money/collections")
+    suspend fun createQuotedMobileMoneyCollection(
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: CreateQuotedMobileMoneyOperationRequest,
+    ): ApiEnvelope<MobileMoneyOperationDto>
+
+    @POST("api/kit-wallet/v1/mobile-money/payouts")
+    suspend fun createQuotedMobileMoneyPayout(
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: CreateQuotedMobileMoneyOperationRequest,
     ): ApiEnvelope<MobileMoneyOperationDto>
 
     @POST("api/kit-wallet/v1/mobile-money/payouts")

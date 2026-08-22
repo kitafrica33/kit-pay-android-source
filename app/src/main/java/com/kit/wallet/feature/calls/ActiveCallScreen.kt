@@ -2,11 +2,14 @@ package com.kit.wallet.feature.calls
 
 import android.Manifest
 import android.app.Activity
+import android.app.PictureInPictureParams
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.util.Rational
 import androidx.activity.compose.BackHandler
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -37,6 +40,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Chat
+import androidx.compose.material.icons.automirrored.rounded.ScreenShare
+import androidx.compose.material.icons.automirrored.rounded.StopScreenShare
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CallEnd
@@ -46,8 +52,6 @@ import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.MicOff
 import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.Refresh
-import androidx.compose.material.icons.rounded.ScreenShare
-import androidx.compose.material.icons.rounded.StopScreenShare
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material.icons.rounded.VideocamOff
 import androidx.compose.material3.AlertDialog
@@ -74,6 +78,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -98,11 +103,20 @@ fun ActiveCallScreen(
     name: String,
     video: Boolean,
     onEnd: () -> Unit,
+    onOpenChat: (String) -> Unit = {},
     autoAccept: Boolean = false,
     viewModel: ActiveCallViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val canOpenChat by viewModel.canOpenChat.collectAsStateWithLifecycle()
+    val openingChat by viewModel.openingChat.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    // Reading the configuration causes Compose to re-evaluate this after the activity enters or
+    // leaves PiP, including when MainActivity handles the change without being recreated.
+    @Suppress("UNUSED_VARIABLE")
+    val configuration = LocalConfiguration.current
+    val activity = context as? ComponentActivity
+    val inPictureInPicture = activity?.isInPictureInPictureMode == true
     val requestedVideo = if (state.incoming) state.video else video
     val requiredPermissions = remember(requestedVideo) {
         buildList {
@@ -241,11 +255,44 @@ fun ActiveCallScreen(
     DisposableEffect(Unit) {
         onDispose { tones.release() }
     }
+    val pictureInPictureEligible = shouldEnterCallPictureInPicture(state.video, state.phase)
+    DisposableEffect(activity, pictureInPictureEligible) {
+        if (activity == null) return@DisposableEffect onDispose { }
+        val params = PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(9, 16))
+            .apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    setAutoEnterEnabled(pictureInPictureEligible)
+                    setSeamlessResizeEnabled(true)
+                }
+            }
+            .build()
+        activity.setPictureInPictureParams(params)
+        val leaveHint = Runnable {
+            if (
+                Build.VERSION.SDK_INT < Build.VERSION_CODES.S &&
+                pictureInPictureEligible &&
+                !activity.isInPictureInPictureMode
+            ) {
+                activity.enterPictureInPictureMode(params)
+            }
+        }
+        activity.addOnUserLeaveHintListener(leaveHint)
+        onDispose {
+            activity.removeOnUserLeaveHintListener(leaveHint)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                activity.setPictureInPictureParams(
+                    PictureInPictureParams.Builder().setAutoEnterEnabled(false).build(),
+                )
+            }
+        }
+    }
     BackHandler { viewModel.end("cancelled") }
 
     ActiveCallContent(
         state = state.copy(name = state.name.ifBlank { name }),
         room = viewModel.room,
+        compact = inPictureInPicture,
         onMute = viewModel::toggleMute,
         onSpeaker = viewModel::toggleSpeaker,
         onCamera = viewModel::toggleCamera,
@@ -264,6 +311,9 @@ fun ActiveCallScreen(
         onDeclineWaiting = viewModel::declineWaitingCall,
         onMergeWaiting = viewModel::mergeWaitingCall,
         onAddParticipant = { showAddPeople = true },
+        onOpenChat = { viewModel.openChat(onOpenChat) },
+        canOpenChat = canOpenChat,
+        openingChat = openingChat,
         onToggleScreenShare = {
             if (state.screenSharing) {
                 viewModel.stopScreenShare()
@@ -290,10 +340,14 @@ fun ActiveCallScreen(
     )
 }
 
+internal fun shouldEnterCallPictureInPicture(video: Boolean, phase: CallPhase): Boolean =
+    video && phase in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)
+
 @Composable
 private fun ActiveCallContent(
     state: ActiveCallUiState,
     room: io.livekit.android.room.Room,
+    compact: Boolean,
     onMute: () -> Unit,
     onSpeaker: () -> Unit,
     onCamera: () -> Unit,
@@ -303,6 +357,9 @@ private fun ActiveCallContent(
     onDeclineWaiting: () -> Unit,
     onMergeWaiting: () -> Unit,
     onAddParticipant: () -> Unit,
+    onOpenChat: () -> Unit,
+    canOpenChat: Boolean,
+    openingChat: Boolean,
     onToggleScreenShare: () -> Unit,
     onAccept: () -> Unit,
     onDecline: () -> Unit,
@@ -340,8 +397,8 @@ private fun ActiveCallContent(
                 .navigationBarsPadding(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Spacer(Modifier.height(14.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            if (!compact) Spacer(Modifier.height(14.dp))
+            if (!compact) Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     Icons.Rounded.Lock,
                     contentDescription = null,
@@ -362,7 +419,7 @@ private fun ActiveCallContent(
                 VoiceCallBody(state)
             }
 
-            state.error?.let { error ->
+            if (!compact) state.error?.let { error ->
                 Surface(
                     color = MaterialTheme.colorScheme.errorContainer,
                     shape = MaterialTheme.shapes.large,
@@ -385,7 +442,7 @@ private fun ActiveCallContent(
                 }
             }
 
-            if (state.phase in setOf(
+            if (!compact && state.phase in setOf(
                     CallPhase.INCOMING,
                     CallPhase.CONNECTING,
                     CallPhase.RINGING,
@@ -401,8 +458,19 @@ private fun ActiveCallContent(
                         horizontalArrangement = Arrangement.spacedBy(20.dp),
                     ) {
                         CallControl(Icons.Rounded.PersonAdd, "Add", onClick = onAddParticipant)
+                        if (canOpenChat) {
+                            CallControl(
+                                Icons.AutoMirrored.Rounded.Chat,
+                                if (openingChat) "Opening…" else "Chat",
+                                onClick = { if (!openingChat) onOpenChat() },
+                            )
+                        }
                         CallControl(
-                            if (state.screenSharing) Icons.Rounded.StopScreenShare else Icons.Rounded.ScreenShare,
+                            if (state.screenSharing) {
+                                Icons.AutoMirrored.Rounded.StopScreenShare
+                            } else {
+                                Icons.AutoMirrored.Rounded.ScreenShare
+                            },
                             "Share",
                             active = state.screenSharing,
                             onClick = onToggleScreenShare,
@@ -468,7 +536,7 @@ private fun ActiveCallContent(
             }
         }
 
-        state.waitingCall?.let { waiting ->
+        if (!compact) state.waitingCall?.let { waiting ->
             CallWaitingBanner(
                 waiting = waiting,
                 merging = state.mergingWaitingCall,

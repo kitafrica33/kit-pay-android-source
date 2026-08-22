@@ -31,6 +31,7 @@ data class AppCapabilities(
     val messagingProtocolSuite: String? = null,
     val messagingProtocolPostQuantum: Boolean? = null,
     val pushMessagingConfigured: Boolean = false,
+    val biometricTokensAvailable: Boolean = false,
     // The current scanner is presentation-only: it has no CameraX/QR decoder integration.
     val qrScannerClientReady: Boolean = false,
 ) {
@@ -201,6 +202,7 @@ class AppCapabilitiesViewModel @Inject constructor(
                     messagingProtocolVersion = null,
                     messagingProtocolSuite = null,
                     messagingProtocolPostQuantum = null,
+                    biometricTokensAvailable = false,
                 )
             }
         }
@@ -212,6 +214,7 @@ class AppCapabilitiesViewModel @Inject constructor(
                     .orEmpty()
                     .mapValues { (_, enabled) -> enabled == true }
                 val messagingProtocol = response.protocols?.messaging
+                val biometricTokens = response.authentication?.get("biometric_tokens") == true
                 mutableState.update {
                     it.copy(
                         features = features,
@@ -221,6 +224,7 @@ class AppCapabilitiesViewModel @Inject constructor(
                         messagingProtocolVersion = messagingProtocol?.version,
                         messagingProtocolSuite = messagingProtocol?.suite,
                         messagingProtocolPostQuantum = messagingProtocol?.postQuantum,
+                        biometricTokensAvailable = biometricTokens,
                     )
                 }
             } catch (cancelled: CancellationException) {
@@ -239,6 +243,7 @@ class AppCapabilitiesViewModel @Inject constructor(
                         messagingProtocolVersion = null,
                         messagingProtocolSuite = null,
                         messagingProtocolPostQuantum = null,
+                        biometricTokensAvailable = false,
                     )
                 }
             }

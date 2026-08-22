@@ -1,6 +1,8 @@
 package com.kit.wallet.feature.calls
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -12,6 +14,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.CallMissed
 import androidx.compose.material.icons.automirrored.rounded.CallMade
@@ -25,6 +28,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -33,6 +37,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -115,6 +120,14 @@ private fun CallsContent(
                 }
             }
             item { SectionHeader("Recent") }
+            if (calls.isEmpty()) {
+                item {
+                    EmptyCallsState(
+                        missedOnly = filter == "Missed",
+                        onNewCall = onNewCall,
+                    )
+                }
+            }
             items(calls.size) { i ->
                 val target = calls[i].participantUserIds.firstOrNull()
                 CallRow(
@@ -128,6 +141,64 @@ private fun CallsContent(
             }
             item { Spacer(Modifier.height(90.dp)) }
         }
+    }
+}
+
+/** Friendly first-run/empty content so the tab never renders as a bare header. */
+@Composable
+private fun EmptyCallsState(missedOnly: Boolean, onNewCall: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 40.dp, vertical = 48.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            Modifier
+                .size(72.dp)
+                .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Rounded.Call,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.size(32.dp),
+            )
+        }
+        Spacer(Modifier.height(16.dp))
+        Text(
+            if (missedOnly) "No missed calls" else "No calls yet",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            if (missedOnly) {
+                "Calls you don't answer will appear here."
+            } else {
+                "Secure voice and video calls with your Kit Pay contacts appear here."
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        if (!missedOnly) {
+            Spacer(Modifier.height(12.dp))
+            TextButton(onClick = onNewCall) { Text("Start a call") }
+        }
+    }
+}
+
+/** Compact mm:ss (or h:mm:ss) connected time shown next to answered calls. */
+internal fun formatCallDuration(seconds: Long): String {
+    val hours = seconds / 3_600
+    val minutes = (seconds % 3_600) / 60
+    val remaining = seconds % 60
+    return if (hours > 0) {
+        "%d:%02d:%02d".format(hours, minutes, remaining)
+    } else {
+        "%d:%02d".format(minutes, remaining)
     }
 }
 
@@ -157,8 +228,13 @@ private fun CallRow(call: CallEntry, onCall: (() -> Unit)?) {
                 }
                 Icon(icon, contentDescription = null, modifier = Modifier.size(14.dp), tint = tint)
                 Spacer(Modifier.width(4.dp))
+                val detail = if (call.answered && call.durationSeconds > 0) {
+                    "${call.time} • ${formatCallDuration(call.durationSeconds)}"
+                } else {
+                    call.time
+                }
                 Text(
-                    call.time,
+                    detail,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

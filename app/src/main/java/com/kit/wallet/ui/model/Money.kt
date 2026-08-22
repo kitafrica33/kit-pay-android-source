@@ -18,10 +18,11 @@ object Money {
      * Values with more fractional digits than the currency supports are rejected,
      * as are values that cannot fit in the app's signed minor-unit representation.
      */
-    fun parseMinor(value: String): Long? = runCatching {
+    fun parseMinor(value: String, scale: Int = SCALE): Long? = runCatching {
+        require(scale in 0..18)
         BigDecimal(value.trim())
-            .setScale(SCALE, RoundingMode.UNNECESSARY)
-            .movePointRight(SCALE)
+            .setScale(scale, RoundingMode.UNNECESSARY)
+            .movePointRight(scale)
             .longValueExact()
     }.getOrNull()
 
@@ -37,5 +38,22 @@ object Money {
         val grouped = units.toString().reversed().chunked(3).joinToString(",").reversed()
         val body = if (cents == 0) grouped else "$grouped.%02d".format(cents)
         return if (withSymbol) "$sign$SYMBOL $body" else "$sign$body"
+    }
+
+    fun format(
+        amountMinor: Long,
+        currencyCode: String,
+        scale: Int,
+        signed: Boolean = false,
+    ): String {
+        require(scale in 0..18)
+        val sign = when {
+            signed && amountMinor > 0 -> "+"
+            amountMinor < 0 -> "−"
+            else -> ""
+        }
+        val amount = BigDecimal(BigInteger.valueOf(amountMinor).abs(), scale)
+            .stripTrailingZeros().toPlainString()
+        return "$sign${currencyCode.uppercase()} $amount"
     }
 }

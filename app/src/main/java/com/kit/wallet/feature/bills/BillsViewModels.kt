@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.repository.BillsRepository
+import com.kit.wallet.data.repository.FinancialOperationQuote
 import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.ui.model.BillProvider
@@ -65,6 +66,9 @@ class BillPayViewModel @Inject constructor(
     private val _paying = MutableStateFlow(false)
     val paying = _paying.asStateFlow()
 
+    private val _quote = MutableStateFlow<FinancialOperationQuote?>(null)
+    val quote = _quote.asStateFlow()
+
     private val _error = MutableStateFlow<String?>(
         if (providerId.isBlank()) {
             "This bill-payment link is invalid. Go back and choose a provider."
@@ -88,7 +92,8 @@ class BillPayViewModel @Inject constructor(
         }
     }
 
-    fun pay(account: String, amountMinor: Long, paymentPin: String, onDone: () -> Unit) {
+    /** Fetches the authoritative amount/fee/total for review; nothing is debited yet. */
+    fun review(account: String, amountMinor: Long) {
         if (_paying.value) return
         viewModelScope.launch {
             _paying.value = true
@@ -97,10 +102,34 @@ class BillPayViewModel @Inject constructor(
                 val selectedProvider = requireNotNull(provider.value) {
                     "The selected bill provider is no longer available"
                 }
-                wallet.payBill(selectedProvider, account, amountMinor, paymentPin)
+                wallet.previewBill(selectedProvider, account, amountMinor)
             }
-                .onSuccess { onDone() }
-                .onFailure { _error.value = it.message ?: "The bill payment could not be completed" }
+                .onSuccess { _quote.value = it }
+                .onFailure { _error.value = it.message ?: "The bill quote could not be prepared" }
+            _paying.value = false
+        }
+    }
+
+    /** Editing any detail invalidates the reviewed quote so a stale fee is never approved. */
+    fun invalidateQuote() {
+        _quote.value = null
+    }
+
+    fun pay(paymentPin: String, onDone: () -> Unit) {
+        if (_paying.value) return
+        val reviewed = _quote.value ?: return
+        viewModelScope.launch {
+            _paying.value = true
+            _error.value = null
+            runCatching { wallet.submitProviderOperation(reviewed, paymentPin) }
+                .onSuccess {
+                    _quote.value = null
+                    onDone()
+                }
+                .onFailure {
+                    _quote.value = null
+                    _error.value = it.message ?: "The bill payment could not be completed"
+                }
             _paying.value = false
         }
     }
@@ -131,20 +160,42 @@ class AirtimeViewModel @Inject constructor(
         }
     }
 
-    fun buy(
-        productId: String,
-        phone: String,
-        amountMinor: Long,
-        paymentPin: String,
-        onDone: () -> Unit,
-    ) {
+    private val _quote = MutableStateFlow<FinancialOperationQuote?>(null)
+    val quote = _quote.asStateFlow()
+
+    /** Fetches the authoritative amount/fee/total for review; nothing is debited yet. */
+    fun review(productId: String, phone: String, amountMinor: Long) {
         if (_buying.value) return
         viewModelScope.launch {
             _buying.value = true
             _error.value = null
-            runCatching { wallet.buyAirtime(productId, phone, amountMinor, paymentPin) }
-                .onSuccess { onDone() }
-                .onFailure { _error.value = it.message ?: "The airtime purchase could not be completed" }
+            runCatching { wallet.previewAirtime(productId, phone, amountMinor) }
+                .onSuccess { _quote.value = it }
+                .onFailure { _error.value = it.message ?: "The airtime quote could not be prepared" }
+            _buying.value = false
+        }
+    }
+
+    /** Editing any detail invalidates the reviewed quote so a stale fee is never approved. */
+    fun invalidateQuote() {
+        _quote.value = null
+    }
+
+    fun buy(paymentPin: String, onDone: () -> Unit) {
+        if (_buying.value) return
+        val reviewed = _quote.value ?: return
+        viewModelScope.launch {
+            _buying.value = true
+            _error.value = null
+            runCatching { wallet.submitProviderOperation(reviewed, paymentPin) }
+                .onSuccess {
+                    _quote.value = null
+                    onDone()
+                }
+                .onFailure {
+                    _quote.value = null
+                    _error.value = it.message ?: "The airtime purchase could not be completed"
+                }
             _buying.value = false
         }
     }

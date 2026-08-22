@@ -7,10 +7,14 @@ import com.kit.wallet.data.remote.CallPageDto
 import com.kit.wallet.data.remote.CallSessionDto
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.RtcCredentialsDto
+import com.kit.wallet.data.remote.StartCallRequest
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.RemoteCallRepository
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
+import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionSnapshot
+import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.ui.model.Contact
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
@@ -51,6 +55,27 @@ class RemoteCallRepositoryTest {
         assertEquals(RECIPIENT_PHONE, second.phone)
         assertEquals("2026-07-23T00:00:45Z", first.ringExpiresAt)
         assertEquals("2026-07-23T00:00:45Z", second.ringExpiresAt)
+        assertEquals(2, api.clientCallIds.distinct().size)
+    }
+
+    @Test
+    fun `replayed call attempt keeps the caller supplied idempotency identity`() = runTest {
+        val api = RecordingCallApi()
+        val repository = RemoteCallRepository(
+            api = api.proxy,
+            apiCalls = ApiCallExecutor(Moshi.Builder().add(KotlinJsonAdapterFactory()).build()),
+            contacts = RecordingContactRepository(),
+            sessions = sessionStore(),
+            scope = backgroundScope,
+        )
+
+        val clientCallId = "8d17fded-b512-4c2c-88cd-700657ca39f4"
+        repository.start(RECIPIENT_ID, video = false, clientCallId = clientCallId)
+        repository.start(RECIPIENT_ID, video = false, clientCallId = clientCallId)
+        repository.cancelAttempt(clientCallId)
+
+        assertEquals(listOf(clientCallId, clientCallId), api.clientCallIds)
+        assertEquals(listOf(clientCallId), api.cancelledClientCallIds)
     }
 
     private class RecordingContactRepository : ContactRepository {
@@ -82,13 +107,26 @@ class RemoteCallRepositoryTest {
             private set
         var callListRequests = 0
             private set
+        val clientCallIds = mutableListOf<String>()
+        val cancelledClientCallIds = mutableListOf<String>()
 
         val proxy: KitWalletApi = Proxy.newProxyInstance(
             KitWalletApi::class.java.classLoader,
             arrayOf(KitWalletApi::class.java),
         ) { instance, method, arguments ->
             when (method.name) {
-                "startCall" -> ApiEnvelope(ok = true, data = callSession(++startedCalls))
+                "startCall" -> {
+                    clientCallIds += (arguments?.first() as StartCallRequest).clientCallId.orEmpty()
+                    ApiEnvelope(ok = true, data = callSession(++startedCalls))
+                }
+                "cancelCallAttempt" -> {
+                    val id = arguments?.first() as String
+                    cancelledClientCallIds += id
+                    ApiEnvelope(
+                        ok = true,
+                        data = com.kit.wallet.data.remote.CancelCallAttemptDto(id, true),
+                    )
+                }
                 "endCall" -> ApiEnvelope(
                     ok = true,
                     data = callSession(++endedCalls).call.copy(state = "ended"),
@@ -106,19 +144,30 @@ class RemoteCallRepositoryTest {
     }
 
     private fun sessionStore(): SessionStore {
-        val session = MutableStateFlow<SessionTokens?>(null)
-        return Proxy.newProxyInstance(
-            SessionStore::class.java.classLoader,
-            arrayOf(SessionStore::class.java),
-        ) { instance, method, arguments ->
-            when (method.name) {
-                "getSession" -> session
-                "toString" -> "EmptySessionStore"
-                "hashCode" -> System.identityHashCode(instance)
-                "equals" -> instance === arguments?.firstOrNull()
-                else -> error("Unexpected session call: ${method.name}")
+        val tokens = SessionTokens("access", "refresh", "session")
+        return object : SessionStore {
+            override val session: StateFlow<SessionTokens?> = MutableStateFlow(null)
+            override fun current(): SessionTokens = tokens
+            override fun snapshot() = SessionSnapshot(0, tokens.fence())
+            override suspend fun save(tokens: SessionTokens) = Unit
+            override suspend fun saveIfUnchanged(
+                expected: SessionSnapshot,
+                tokens: SessionTokens,
+            ) = true
+            override suspend fun updateProfileSetupState(
+                expected: SessionFence,
+                state: ProfileSetupState,
+            ) = true
+            override suspend fun <T> withCurrentSession(
+                expected: SessionFence,
+                block: suspend (SessionTokens) -> T,
+            ): T {
+                check(expected == tokens.fence())
+                return block(tokens)
             }
-        } as SessionStore
+            override suspend fun clearIfCurrent(expected: SessionFence) = false
+            override suspend fun clear() = Unit
+        }
     }
 
     private companion object {

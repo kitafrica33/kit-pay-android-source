@@ -87,6 +87,7 @@ fun TransactionDto.toEntity(defaultWalletUuid: String): WalletTransactionEntity 
         reference = reference,
         amountMinor = signedMinor,
         currencyCode = currency.code,
+        currencyScale = scale,
         type = type,
         direction = direction,
         status = status,
@@ -121,6 +122,8 @@ fun WalletTransactionEntity.toUiModel(
         type = type.toUiType(direction),
         status = status.toUiStatus(),
         reference = reference,
+        currencyCode = currencyCode,
+        currencyScale = currencyScale,
     )
 }
 

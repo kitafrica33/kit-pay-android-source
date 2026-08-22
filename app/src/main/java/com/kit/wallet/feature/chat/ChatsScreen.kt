@@ -34,6 +34,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -42,6 +43,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -171,10 +173,80 @@ private fun ChatsContent(
                     }
                 }
             }
+            if (messagingAvailable && chats.isEmpty()) {
+                item {
+                    EmptyChatsState(
+                        noChatsAtAll = allChats.isEmpty(),
+                        filter = filter,
+                        searching = query.isNotBlank(),
+                        onNewChat = onNewChat,
+                    )
+                }
+            }
             items(chats.size) { i ->
                 ChatRow(chat = chats[i], onClick = { onChat(chats[i].id) })
             }
             item { Spacer(Modifier.height(90.dp)) }
+        }
+    }
+}
+
+/** Friendly first-run/empty content so the tab never renders as a bare search box. */
+@Composable
+private fun EmptyChatsState(
+    noChatsAtAll: Boolean,
+    filter: String,
+    searching: Boolean,
+    onNewChat: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 40.dp, vertical = 48.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            Modifier
+                .size(72.dp)
+                .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Rounded.AddComment,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.size(32.dp),
+            )
+        }
+        Spacer(Modifier.height(16.dp))
+        Text(
+            when {
+                noChatsAtAll -> "No chats yet"
+                searching -> "No chats found"
+                filter == "Unread" -> "You're all caught up"
+                filter == "Groups" -> "No group chats yet"
+                else -> "No chats found"
+            },
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            when {
+                noChatsAtAll ->
+                    "Start an end-to-end encrypted chat with your Kit Pay contacts."
+                searching -> "Try a different name or message."
+                filter == "Unread" -> "New messages will appear here."
+                filter == "Groups" -> "Group conversations will appear here."
+                else -> "Try a different name or message."
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        if (noChatsAtAll) {
+            Spacer(Modifier.height(12.dp))
+            TextButton(onClick = onNewChat) { Text("Start a chat") }
         }
     }
 }

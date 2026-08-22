@@ -11,6 +11,7 @@ import com.kit.wallet.ui.model.Transaction
 import com.kit.wallet.ui.model.UserProfile
 import java.time.Instant
 import kotlinx.coroutines.flow.StateFlow
+import com.kit.wallet.data.session.SessionFence
 
 /**
  * Presentation-facing contracts backed by the independent Kit Wallet API.
@@ -91,6 +92,26 @@ interface WalletRepository {
         amountMinor: Long,
         paymentPin: String,
     ): Transaction
+
+    /** Fetches the authoritative bill quote (amount, fee, total) for review before approval. */
+    suspend fun previewBill(
+        provider: BillProvider,
+        account: String,
+        amountMinor: Long,
+    ): FinancialOperationQuote = error("Bill payments are unavailable")
+
+    /** Fetches the authoritative airtime quote (amount, fee, total) for review before approval. */
+    suspend fun previewAirtime(
+        productId: String,
+        phone: String,
+        amountMinor: Long,
+    ): FinancialOperationQuote = error("Airtime purchases are unavailable")
+
+    /** Submits the exact reviewed provider quote after PIN or biometric approval. */
+    suspend fun submitProviderOperation(
+        quote: FinancialOperationQuote,
+        paymentPin: String,
+    ): Transaction = error("Provider operations are unavailable")
 }
 
 interface ContactRepository {
@@ -146,6 +167,14 @@ interface ChatRepository {
     suspend fun openImageMessage(chatId: String, mediaDescriptor: String): ByteArray {
         error("This chat repository does not support secure media messages")
     }
+
+    /** Best-effort encrypted composer draft for [chatId]; null when none is stored. */
+    suspend fun composerDraft(chatId: String): String? = null
+
+    /** Persists (or clears, when blank) the encrypted composer draft for [chatId]. */
+    suspend fun saveComposerDraft(chatId: String, text: String) = Unit
+
+    suspend fun clearComposerDraft(chatId: String) = Unit
 }
 
 interface CallRepository {
@@ -161,6 +190,20 @@ interface CallRepository {
         video: Boolean,
         conversationId: String? = null,
     ): CallConnection = error("Calling is unavailable")
+
+    /**
+     * Starts or safely replays one process-owned call attempt. [clientCallId] must remain stable
+     * across transport retries and must never be restored after process death.
+     */
+    suspend fun start(
+        recipientUserId: String,
+        video: Boolean,
+        conversationId: String? = null,
+        clientCallId: String,
+    ): CallConnection = start(recipientUserId, video, conversationId)
+
+    /** Prevents a still-in-flight process-owned call attempt from ringing after local dismissal. */
+    suspend fun cancelAttempt(clientCallId: String) = Unit
 
     /** Adds more Kit Pay users to an active or ringing call, turning it into a group call. */
     suspend fun invite(callId: String, recipientUserIds: List<String>) = Unit
@@ -235,5 +278,36 @@ interface BankingRepository {
         beneficiaryId: String,
         amountMinor: Long,
         paymentPin: String,
+        feeMode: String = "sender_absorbs",
     )
+    suspend fun previewOperation(
+        type: String,
+        beneficiaryId: String,
+        amountMinor: Long,
+        feeMode: String = "sender_absorbs",
+    ): FinancialOperationQuote
+    suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String)
 }
+
+class FinancialOperationQuote internal constructor(
+    val quoteId: String?,
+    val operationType: String,
+    val destinationId: String,
+    val amountMinor: Long,
+    val recipientAmountMinor: Long,
+    val feesMinor: Long,
+    val customerDebitMinor: Long,
+    val currencyCode: String,
+    val currencyScale: Int,
+    val feeMode: String,
+    val expiresAt: String?,
+    val feesKnown: Boolean,
+    internal val authorizationPurpose: String,
+    internal val authorizationIntent: Map<String, Any?>,
+    internal val sessionFence: SessionFence,
+    /** Customer-facing destination label (e.g. the provider or product name), when known. */
+    val destinationName: String? = null,
+    /** Provider-verified account presentation (e.g. the meter or subscriber name), when known. */
+    val accountDisplay: String? = null,
+    internal val productId: String? = null,
+)

@@ -28,6 +28,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -168,6 +169,29 @@ private fun TransactionsContent(
                 }
             }
             item { MonthSummary(transactions) }
+
+            if (visible.isEmpty()) {
+                item {
+                    Text(
+                        when {
+                            transactions.isEmpty() ->
+                                "No transactions yet. Your payments and transfers will appear here."
+                            query.isNotBlank() -> "No transactions match your search."
+                            filter == "In" -> "No incoming transactions yet."
+                            filter == "Out" -> "No outgoing transactions yet."
+                            filter == "Bills" -> "No bill or airtime payments yet."
+                            filter == "Bank" -> "No bank transfers yet."
+                            else -> "No transactions yet."
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 24.dp),
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
 
             grouped.forEach { (group, txs) ->
                 item { SectionHeader(group) }

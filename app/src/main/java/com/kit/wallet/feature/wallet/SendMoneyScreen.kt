@@ -408,8 +408,8 @@ private fun ConfirmPayment(
         OutlinedTextField(
             value = paymentPin,
             onValueChange = onPaymentPin,
-            label = { Text("Wallet PIN") },
-            supportingText = { Text("Required once to authorize this exact payment") },
+            label = { Text("Wallet PIN (optional with biometrics)") },
+            supportingText = { Text("Authorizes this exact payment; leave blank to use biometrics") },
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
             singleLine = true,
@@ -431,7 +431,7 @@ private fun ConfirmPayment(
             icon = Icons.Rounded.Lock,
             loading = sending,
             onClick = onConfirm,
-            enabled = paymentPin.length == 4,
+            enabled = paymentPin.isEmpty() || paymentPin.length == 4,
         )
     }
 }

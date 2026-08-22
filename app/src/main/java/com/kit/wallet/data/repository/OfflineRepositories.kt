@@ -17,6 +17,7 @@ import com.kit.wallet.data.remote.CreatePaymentRequestDto
 import com.kit.wallet.data.remote.CreateProviderOperationRequest
 import com.kit.wallet.data.remote.CreateProviderQuoteRequest
 import com.kit.wallet.data.remote.KitWalletApi
+import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.EmailAddressRequest
 import com.kit.wallet.data.remote.EmailAttachmentVerificationRequest
 import com.kit.wallet.data.remote.UpdateProfileRequest
@@ -248,7 +249,11 @@ class OfflineWalletRepository @Inject constructor(
         paymentPin: String,
     ): Transaction {
         require(amountMinor > 0) { "Amount must be positive" }
-        require(paymentPin.matches(Regex("^[0-9]{4}$"))) { "Enter the four-digit wallet PIN" }
+        // An empty PIN defers to PaymentAuthorizer, which uses biometric approval when the server
+        // advertises it and otherwise requires the four-digit wallet PIN itself.
+        require(paymentPin.isEmpty() || paymentPin.matches(Regex("^[0-9]{4}$"))) {
+            "Enter the four-digit wallet PIN"
+        }
         val source = requireSelectedWallet()
         val destinationWalletId = requireNotNull(recipient.receivingWalletId) {
             "This contact cannot receive Kit Pay transfers yet"
@@ -281,17 +286,26 @@ class OfflineWalletRepository @Inject constructor(
         require(amountMinor > 0) { "Amount must be positive" }
         require(from.isKitUser) { "Payment requests can only be sent to Kit Pay users" }
         val destination = requireSelectedWallet()
-        apiCalls.execute {
+        val amount = DecimalMoney.fromMinor(amountMinor, destination.currencyScale)
+        val created = apiCalls.execute {
             api.createPaymentRequest(
                 idempotencyKey = "android-request-${java.util.UUID.randomUUID()}",
                 request = CreatePaymentRequestDto(
                     destinationWalletId = destination.uuid,
                     requestedFromUserId = from.id,
-                    amount = DecimalMoney.fromMinor(amountMinor, destination.currencyScale),
+                    amount = amount,
                     note = note,
                 ),
             )
         }
+        validateCreatedPaymentRequest(
+            created = created,
+            destinationWalletId = destination.uuid,
+            requestedFromUserId = from.id,
+            amount = amount,
+            currencyCode = destination.currencyCode,
+            currencyScale = destination.currencyScale,
+        )
     }
 
     override suspend fun createChatPaymentRequest(
@@ -302,17 +316,26 @@ class OfflineWalletRepository @Inject constructor(
         require(amountMinor > 0) { "Amount must be positive" }
         require(peerUserId.isNotBlank()) { "This conversation has no Kit Pay peer" }
         val destination = requireSelectedWallet()
+        val amount = DecimalMoney.fromMinor(amountMinor, destination.currencyScale)
         val created = apiCalls.execute {
             api.createPaymentRequest(
                 idempotencyKey = "android-chat-request-${java.util.UUID.randomUUID()}",
                 request = CreatePaymentRequestDto(
                     destinationWalletId = destination.uuid,
                     requestedFromUserId = peerUserId,
-                    amount = DecimalMoney.fromMinor(amountMinor, destination.currencyScale),
+                    amount = amount,
                     note = note?.trim()?.takeIf(String::isNotBlank),
                 ),
             )
         }
+        validateCreatedPaymentRequest(
+            created = created,
+            destinationWalletId = destination.uuid,
+            requestedFromUserId = peerUserId,
+            amount = amount,
+            currencyCode = destination.currencyCode,
+            currencyScale = destination.currencyScale,
+        )
         return ChatPaymentRequest(
             id = created.id,
             amountMinor = amountMinor,
@@ -328,8 +351,29 @@ class OfflineWalletRepository @Inject constructor(
         paymentPin: String,
     ) {
         require(amountMinor > 0) { "The payment request amount is invalid" }
-        require(paymentPin.matches(Regex("^[0-9]{4}$"))) { "Enter the four-digit wallet PIN" }
+        // An empty PIN defers to PaymentAuthorizer's biometric-or-PIN selection.
+        require(paymentPin.isEmpty() || paymentPin.matches(Regex("^[0-9]{4}$"))) {
+            "Enter the four-digit wallet PIN"
+        }
         val source = requireSelectedWallet()
+        // Reconcile the card with the authoritative request list before any step-up, so paid,
+        // cancelled, expired, mutated or unknown requests are refused with clear reasons instead
+        // of asking for approval first. Older services without the read endpoint skip this check.
+        val listed = try {
+            apiCalls.execute { api.paymentRequests() }.items
+        } catch (error: KitWalletApiException) {
+            if (error.statusCode != 404) throw error
+            null
+        }
+        if (listed != null) {
+            requirePayablePaymentRequest(
+                records = listed,
+                requestId = requestId,
+                amountMinor = amountMinor,
+                currencyCode = source.currencyCode,
+                currencyScale = source.currencyScale,
+            )
+        }
         val amount = DecimalMoney.fromMinor(amountMinor, source.currencyScale)
         // The intent fields and their values must exactly match the backend's pay-time
         // step-up intent hash: action, payment_request_id, source_wallet_id, amount, currency.
@@ -341,7 +385,7 @@ class OfflineWalletRepository @Inject constructor(
             "currency" to source.currencyCode,
         )
         val stepUpToken = paymentAuthorizer.authorize("payment_request", intent, paymentPin)
-        apiCalls.execute {
+        val paid = apiCalls.execute {
             api.payPaymentRequest(
                 requestId = requestId,
                 idempotencyKey = "android-chat-pay-${java.util.UUID.randomUUID()}",
@@ -351,6 +395,7 @@ class OfflineWalletRepository @Inject constructor(
                 ),
             )
         }
+        validatePaidPaymentRequest(paid, requestId)
         walletSync.refresh()
     }
 
@@ -359,84 +404,156 @@ class OfflineWalletRepository @Inject constructor(
         account: String,
         amountMinor: Long,
         paymentPin: String,
-    ): Transaction = createProviderOperation(
-        productId = provider.id,
-        account = account,
-        amountMinor = amountMinor,
-        paymentPin = paymentPin,
-        type = "bill_payment",
-        counterparty = provider.name,
-        transactionType = TxType.BILL,
-    )
+    ): Transaction = submitProviderOperation(previewBill(provider, account, amountMinor), paymentPin)
 
     override suspend fun buyAirtime(
         productId: String,
         phone: String,
         amountMinor: Long,
         paymentPin: String,
-    ): Transaction {
-        if (providerCatalog.product(productId) == null) providerCatalog.refresh()
-        val product = requireNotNull(providerCatalog.product(productId)) {
-            "Choose an available airtime network"
-        }
-        check(product.serviceType == "airtime") { "The selected product is not airtime" }
-        return createProviderOperation(
-            productId = product.id,
-            account = phone,
-            amountMinor = amountMinor,
-            paymentPin = paymentPin,
-            type = "airtime_purchase",
-            counterparty = product.name,
-            transactionType = TxType.AIRTIME,
-        )
-    }
+    ): Transaction = submitProviderOperation(previewAirtime(productId, phone, amountMinor), paymentPin)
 
-    private suspend fun createProviderOperation(
+    override suspend fun previewBill(
+        provider: BillProvider,
+        account: String,
+        amountMinor: Long,
+    ): FinancialOperationQuote = previewProviderOperation(
+        productId = provider.id,
+        account = account,
+        amountMinor = amountMinor,
+        type = "bill_payment",
+        serviceType = "bill",
+        unavailableMessage = "The selected bill provider is no longer available",
+    )
+
+    override suspend fun previewAirtime(
+        productId: String,
+        phone: String,
+        amountMinor: Long,
+    ): FinancialOperationQuote = previewProviderOperation(
+        productId = productId,
+        account = phone,
+        amountMinor = amountMinor,
+        type = "airtime_purchase",
+        serviceType = "airtime",
+        unavailableMessage = "Choose an available airtime network",
+    )
+
+    private suspend fun previewProviderOperation(
         productId: String,
         account: String,
         amountMinor: Long,
-        paymentPin: String,
         type: String,
-        counterparty: String,
-        transactionType: TxType,
-    ): Transaction {
+        serviceType: String,
+        unavailableMessage: String,
+    ): FinancialOperationQuote {
         require(amountMinor > 0) { "Amount must be positive" }
+        require(account.isNotBlank()) { "Enter the destination account" }
+        val active = requireNotNull(sessions.current()) { "Sign in again to access this wallet" }
         val wallet = requireSelectedWallet()
-        val product = requireNotNull(providerCatalog.product(productId)) { "Provider product is unavailable" }
-        val amount = DecimalMoney.fromMinor(amountMinor, product.currency.scale.toInt())
+        if (providerCatalog.product(productId) == null) runCatching { providerCatalog.refresh() }
+        val product = requireNotNull(providerCatalog.product(productId)) { unavailableMessage }
+        check(product.serviceType == serviceType) { unavailableMessage }
+        val scale = product.currency.scale.toInt()
+        val amount = DecimalMoney.fromMinor(amountMinor, scale)
         val quote = apiCalls.execute {
             api.createProviderQuote(productId, CreateProviderQuoteRequest(account, amount))
         }
-        val clientReference = "android-provider-${java.util.UUID.randomUUID()}"
-        val intent = linkedMapOf<String, Any?>(
-            "quote_id" to quote.id,
-            "wallet_id" to wallet.uuid,
-            "client_reference" to clientReference,
+        validateProviderQuote(
+            quote = quote,
+            productId = product.id,
+            serviceType = serviceType,
+            amount = amount,
+            currencyCode = product.currency.code,
+            currencyScale = scale,
         )
-        val stepUpToken = paymentAuthorizer.authorize(type, intent, paymentPin)
-        val request = CreateProviderOperationRequest(quote.id, wallet.uuid, clientReference)
+        // The client reference is fixed at review time so approval, submission and the backend
+        // step-up intent hash all describe one immutable operation.
+        val clientReference = "android-provider-${java.util.UUID.randomUUID()}"
+        return FinancialOperationQuote(
+            quoteId = quote.id,
+            operationType = type,
+            destinationId = account,
+            amountMinor = amountMinor,
+            recipientAmountMinor = amountMinor,
+            feesMinor = DecimalMoney.toMinor(quote.fee, scale),
+            customerDebitMinor = DecimalMoney.toMinor(quote.total, scale),
+            currencyCode = product.currency.code.uppercase(),
+            currencyScale = scale,
+            feeMode = "sender_absorbs",
+            expiresAt = quote.expiresAt,
+            feesKnown = true,
+            authorizationPurpose = type,
+            authorizationIntent = linkedMapOf(
+                "quote_id" to quote.id,
+                "wallet_id" to wallet.uuid,
+                "client_reference" to clientReference,
+            ),
+            sessionFence = active.fence(),
+            destinationName = product.name,
+            accountDisplay = quote.accountDisplay,
+            productId = product.id,
+        )
+    }
+
+    override suspend fun submitProviderOperation(
+        quote: FinancialOperationQuote,
+        paymentPin: String,
+    ): Transaction {
+        require(quote.operationType in setOf("bill_payment", "airtime_purchase")) {
+            "The provider quote is invalid"
+        }
+        require(paymentPin.isEmpty() || paymentPin.matches(Regex("^[0-9]{4}$"))) {
+            "Enter the four-digit wallet PIN"
+        }
+        check(sessions.current()?.fence() == quote.sessionFence) {
+            "The signed-in account changed after this quote was created"
+        }
+        quote.expiresAt?.let { expiresAt ->
+            check(
+                runCatching {
+                    java.time.Instant.parse(expiresAt).isAfter(java.time.Instant.now())
+                }.getOrDefault(false),
+            ) { "This quote has expired. Review a new quote." }
+        }
+        val quoteId = quote.quoteId ?: error("The provider quote is invalid")
+        val walletId = quote.authorizationIntent["wallet_id"] as? String
+            ?: error("The provider quote omitted its wallet")
+        val clientReference = quote.authorizationIntent["client_reference"] as? String
+            ?: error("The provider quote omitted its reference")
+        val stepUpToken = paymentAuthorizer.authorize(
+            quote.authorizationPurpose,
+            quote.authorizationIntent,
+            paymentPin,
+        )
+        val request = CreateProviderOperationRequest(quoteId, walletId, clientReference)
         val operation = apiCalls.execute {
-            if (type == "bill_payment") {
+            if (quote.operationType == "bill_payment") {
                 api.createBillPayment(clientReference, stepUpToken, request)
             } else {
                 api.createAirtimePurchase(clientReference, stepUpToken, request)
             }
         }
+        validateProviderOperationResponse(operation, quote, walletId, clientReference)
         runCatching { walletSync.refresh() }
         return Transaction(
             id = operation.id,
-            counterparty = counterparty,
+            counterparty = quote.destinationName ?: operation.productName,
             note = providerDestinationPresentation(operation.accountDisplay),
-            amountMinor = -amountMinor,
+            amountMinor = -quote.amountMinor,
             time = "Just now",
             dateGroup = "Today",
-            type = transactionType,
+            type = if (quote.operationType == "bill_payment") TxType.BILL else TxType.AIRTIME,
             status = when (operation.status) {
                 "succeeded" -> TxStatus.COMPLETED
                 "failed" -> TxStatus.FAILED
                 else -> TxStatus.PENDING
             },
             reference = operation.providerReference ?: clientReference,
+            currencyCode = quote.currencyCode,
+            currencyScale = quote.currencyScale,
+            feeMinor = quote.feesMinor,
+            customerDebitMinor = quote.customerDebitMinor,
         )
     }
 
@@ -543,4 +660,139 @@ class OfflineWalletSyncRepository @Inject constructor(
     private companion object {
         const val PAGE_SIZE = 50
     }
+}
+
+/**
+ * The authoritative create response must describe exactly the request that was submitted: a fresh
+ * pending payment_request into this wallet, addressed to this user, for this amount and currency.
+ * Anything else is treated as a failed creation instead of being shown as a sendable card.
+ */
+internal fun validateCreatedPaymentRequest(
+    created: com.kit.wallet.data.remote.PaymentRequestDto,
+    destinationWalletId: String,
+    requestedFromUserId: String,
+    amount: String,
+    currencyCode: String,
+    currencyScale: Int,
+) {
+    check(
+        runCatching { java.util.UUID.fromString(created.id) }.isSuccess &&
+            created.type == "payment_request" &&
+            created.status.equals("pending", ignoreCase = true) &&
+            created.destinationWalletId == destinationWalletId &&
+            created.requestedFromUserId.equals(requestedFromUserId, ignoreCase = true) &&
+            created.amount == amount &&
+            created.currency.code.equals(currencyCode, ignoreCase = true) &&
+            created.currency.scale.toIntOrNull() == currencyScale,
+    ) { "The server did not confirm this exact payment request" }
+}
+
+/**
+ * A decoded 2xx alone must not surface a paid card: the server has to confirm this exact request
+ * settled as `paid` and reference the wallet transaction that actually moved the money.
+ */
+internal fun validatePaidPaymentRequest(
+    paid: com.kit.wallet.data.remote.PaymentRequestDto,
+    requestId: String,
+) {
+    check(
+        paid.id.equals(requestId, ignoreCase = true) &&
+            paid.type == "payment_request" &&
+            paid.status.equals("paid", ignoreCase = true) &&
+            !paid.walletTransactionId.isNullOrBlank(),
+    ) { "The server did not confirm this payment request was paid" }
+}
+
+/**
+ * A payment-request card may only be paid while the authoritative backend record is a pending,
+ * unexpired `payment_request` whose amount and currency still match the card. Everything else —
+ * paid, cancelled, expired, mutated, or absent from the actor's request list — is refused with a
+ * clear customer-facing reason before any PIN or biometric approval is requested.
+ */
+internal fun requirePayablePaymentRequest(
+    records: List<com.kit.wallet.data.remote.PaymentRequestDto>,
+    requestId: String,
+    amountMinor: Long,
+    currencyCode: String,
+    currencyScale: Int,
+    now: java.time.Instant = java.time.Instant.now(),
+) {
+    val record = records.firstOrNull {
+        it.type == "payment_request" && it.id.equals(requestId, ignoreCase = true)
+    }
+    checkNotNull(record) { "This payment request is no longer available" }
+    when (record.status.lowercase()) {
+        "pending" -> Unit
+        "paid" -> error("This request was already paid")
+        "cancelled" -> error("This request was cancelled by the requester")
+        "expired" -> error("This request has expired. Ask for a new one.")
+        else -> error("This payment request is no longer available")
+    }
+    record.expiresAt?.let { expiresAt ->
+        check(
+            runCatching { java.time.Instant.parse(expiresAt).isAfter(now) }.getOrDefault(true),
+        ) { "This request has expired. Ask for a new one." }
+    }
+    check(
+        record.currency.code.equals(currencyCode, ignoreCase = true) &&
+            record.currency.scale.toIntOrNull() == currencyScale &&
+            runCatching { DecimalMoney.toMinor(record.amount, currencyScale) }
+                .getOrNull() == amountMinor,
+    ) { "This request no longer matches the shown amount. Ask for a new one." }
+}
+
+/**
+ * The reviewed provider quote must be exactly what was requested: this product and service, the
+ * entered amount, an internally consistent `amount + fee == total`, and an unexpired review window.
+ */
+internal fun validateProviderQuote(
+    quote: com.kit.wallet.data.remote.ProviderQuoteDto,
+    productId: String,
+    serviceType: String,
+    amount: String,
+    currencyCode: String,
+    currencyScale: Int,
+    now: java.time.Instant = java.time.Instant.now(),
+) {
+    fun decimal(value: String) = runCatching { java.math.BigDecimal(value) }.getOrNull()
+    val quotedAmount = decimal(quote.amount)
+    val fee = decimal(quote.fee)
+    val total = decimal(quote.total)
+    check(
+        quote.id.isNotBlank() && quote.productId == productId && quote.serviceType == serviceType &&
+            quote.currency.code.equals(currencyCode, ignoreCase = true) &&
+            quote.currency.scale.toIntOrNull() == currencyScale &&
+            quotedAmount != null && fee != null && total != null &&
+            quotedAmount.signum() > 0 && fee.signum() >= 0 &&
+            decimal(amount)?.compareTo(quotedAmount) == 0 &&
+            total.compareTo(quotedAmount + fee) == 0 &&
+            runCatching { java.time.Instant.parse(quote.expiresAt).isAfter(now) }
+                .getOrDefault(false),
+    ) { "The quote does not match this request. Try again." }
+}
+
+/**
+ * The created operation must be exactly the reviewed and approved quote — same wallet, product,
+ * reference, currency and money amounts — before it is presented as a submitted payment.
+ */
+internal fun validateProviderOperationResponse(
+    operation: com.kit.wallet.data.remote.ProviderOperationDto,
+    quote: FinancialOperationQuote,
+    walletId: String,
+    clientReference: String,
+) {
+    fun minor(value: String) = runCatching {
+        DecimalMoney.toMinor(value, quote.currencyScale)
+    }.getOrNull()
+    check(
+        operation.id.isNotBlank() && operation.type == quote.operationType &&
+            operation.walletId == walletId &&
+            (quote.productId == null || operation.productId == quote.productId) &&
+            (operation.clientReference == null || operation.clientReference == clientReference) &&
+            operation.currency.code.equals(quote.currencyCode, ignoreCase = true) &&
+            operation.currency.scale.toIntOrNull() == quote.currencyScale &&
+            minor(operation.amount) == quote.amountMinor &&
+            minor(operation.fee) == quote.feesMinor &&
+            minor(operation.total) == quote.customerDebitMinor,
+    ) { "The submitted operation does not match the approved quote" }
 }

@@ -173,6 +173,32 @@ class SecureMessagingDatabaseMigrationTest {
         database.close()
     }
 
+    @Test
+    fun migration6To7PreservesTransactionsAndAddsCurrencyScale() {
+        helper.createDatabase(MIGRATION_6_7_DATABASE, 6).apply {
+            execSQL(
+                "INSERT INTO wallet_transactions " +
+                    "(id, walletUuid, reference, amountMinor, currencyCode, type, direction, " +
+                    "status, counterpartyName, note, occurredAtEpochMillis) " +
+                    "VALUES ('tx', 'wallet', 'ref', 1000, 'UGX', 'transfer', 'debit', " +
+                    "'completed', 'Amina', NULL, 1)",
+            )
+            close()
+        }
+
+        val database = helper.runMigrationsAndValidate(
+            MIGRATION_6_7_DATABASE,
+            7,
+            true,
+            KitWalletDatabase.MIGRATION_6_7,
+        )
+        database.query("SELECT currencyScale FROM wallet_transactions WHERE id = 'tx'").use {
+            assertTrue(it.moveToFirst())
+            assertEquals(2, it.getInt(0))
+        }
+        database.close()
+    }
+
     private fun assertMetadataSchema(database: SupportSQLiteDatabase) {
         val columns = database.query("PRAGMA table_info(secure_messaging_metadata)").use { cursor ->
             buildMap {
@@ -215,5 +241,6 @@ class SecureMessagingDatabaseMigrationTest {
             "secure-messaging-metadata-migration-5-6-with-state"
         const val MIGRATION_5_6_EMPTY_DATABASE =
             "secure-messaging-metadata-migration-5-6-empty"
+        const val MIGRATION_6_7_DATABASE = "wallet-currency-scale-migration-6-7"
     }
 }

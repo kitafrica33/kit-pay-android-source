@@ -9,7 +9,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Contacts
@@ -25,6 +27,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.demo.DemoData
+import com.kit.wallet.data.repository.FinancialOperationQuote
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.KitOutlinedButton
 import com.kit.wallet.ui.model.BillProvider
@@ -61,16 +65,18 @@ fun AirtimeScreen(
     val products by viewModel.products.collectAsStateWithLifecycle()
     val buying by viewModel.buying.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
+    val quote by viewModel.quote.collectAsStateWithLifecycle()
     AirtimeContent(
         products = products,
         ownPhone = viewModel.ownPhone,
         buying = buying,
         error = error,
+        quote = quote,
         snackbarHostState = remember { SnackbarHostState() },
         onBack = onBack,
-        onBuy = { productId, phone, amountMinor, pin ->
-            viewModel.buy(productId, phone, amountMinor, pin, onDone)
-        },
+        onQuoteInvalidated = viewModel::invalidateQuote,
+        onReview = viewModel::review,
+        onBuy = { pin -> viewModel.buy(pin, onDone) },
     )
 }
 
@@ -81,9 +87,12 @@ internal fun AirtimeContent(
     ownPhone: String,
     buying: Boolean,
     error: String?,
+    quote: FinancialOperationQuote?,
     snackbarHostState: SnackbarHostState,
     onBack: () -> Unit,
-    onBuy: (String, String, Long, String) -> Unit,
+    onQuoteInvalidated: () -> Unit,
+    onReview: (String, String, Long) -> Unit,
+    onBuy: (String) -> Unit,
 ) {
     var productId by rememberSaveable(products) {
         mutableStateOf(products.firstOrNull()?.id.orEmpty())
@@ -92,6 +101,12 @@ internal fun AirtimeContent(
     var amount by rememberSaveable { mutableStateOf("") }
     var paymentPin by rememberSaveable { mutableStateOf("") }
     val amountMinor = Money.parseMinor(amount) ?: 0L
+    // Only a quote for exactly these details may be approved; edits require a fresh review.
+    val reviewedQuote = quote?.takeIf {
+        it.operationType == "airtime_purchase" && it.productId == productId &&
+            it.destinationId == phone && it.amountMinor == amountMinor
+    }
+    LaunchedEffect(productId, phone, amountMinor) { onQuoteInvalidated() }
     val scope = rememberCoroutineScope()
     val showComingSoon: (String) -> Unit = { message ->
         scope.launch {
@@ -118,13 +133,14 @@ internal fun AirtimeContent(
                 .fillMaxSize()
                 .padding(padding)
                 .padding(horizontal = 24.dp)
+                .verticalScroll(rememberScrollState())
                 .navigationBarsPadding(),
         ) {
             Text("Network", style = MaterialTheme.typography.labelLarge)
             Spacer(Modifier.height(6.dp))
             if (products.isEmpty()) {
                 Text(
-                    "No RukaPay airtime network is currently available.",
+                    "No airtime network is currently available.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
@@ -184,18 +200,22 @@ internal fun AirtimeContent(
                 singleLine = true,
                 shape = MaterialTheme.shapes.medium,
             )
-            Spacer(Modifier.height(12.dp))
-            OutlinedTextField(
-                value = paymentPin,
-                onValueChange = { paymentPin = it.filter(Char::isDigit).take(4) },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Wallet PIN") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                visualTransformation = PasswordVisualTransformation(),
-                singleLine = true,
-                isError = error != null,
-                shape = MaterialTheme.shapes.medium,
-            )
+            if (reviewedQuote != null) {
+                Spacer(Modifier.height(16.dp))
+                ProviderQuoteSummary(reviewedQuote)
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = paymentPin,
+                    onValueChange = { paymentPin = it.filter(Char::isDigit).take(4) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Wallet PIN (optional with biometrics)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    isError = error != null,
+                    shape = MaterialTheme.shapes.medium,
+                )
+            }
             if (error != null) {
                 Text(
                     error,
@@ -204,13 +224,24 @@ internal fun AirtimeContent(
                     modifier = Modifier.padding(top = 8.dp),
                 )
             }
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.height(24.dp))
             KitGreenButton(
-                text = if (amountMinor > 0) "Buy airtime • ${Money.format(amountMinor)}" else "Buy airtime",
+                text = if (reviewedQuote == null) {
+                    "Review amount and fees"
+                } else {
+                    "Buy airtime • ${Money.format(
+                        reviewedQuote.customerDebitMinor,
+                        reviewedQuote.currencyCode,
+                        reviewedQuote.currencyScale,
+                    )}"
+                },
                 loading = buying,
-                onClick = { onBuy(productId, phone, amountMinor, paymentPin) },
-                enabled = productId.isNotBlank() && phone.length >= 9 &&
-                    amountMinor > 0 && paymentPin.length == 4,
+                onClick = {
+                    if (reviewedQuote == null) onReview(productId, phone, amountMinor)
+                    else onBuy(paymentPin)
+                },
+                enabled = productId.isNotBlank() && phone.length >= 9 && amountMinor > 0 &&
+                    (reviewedQuote == null || paymentPin.isEmpty() || paymentPin.length == 4),
             )
             Spacer(Modifier.height(24.dp))
         }
@@ -226,9 +257,12 @@ private fun AirtimePreview() {
             ownPhone = DemoData.USER_PHONE,
             buying = false,
             error = null,
+            quote = null,
             snackbarHostState = remember { SnackbarHostState() },
             onBack = {},
-            onBuy = { _, _, _, _ -> },
+            onQuoteInvalidated = {},
+            onReview = { _, _, _ -> },
+            onBuy = {},
         )
     }
 }

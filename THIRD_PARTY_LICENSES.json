@@ -1,8 +1,8 @@
 {
   "schema_version": 3,
   "application_id": "com.kit.wallet",
-  "version_name": "0.2.13",
-  "version_code": 25,
+  "version_name": "0.2.14",
+  "version_code": 26,
   "audit_date": "2026-07-22",
   "distribution_clearance": true,
   "unresolved_issue_ids": [],
@@ -61,9 +61,9 @@
     ],
     "rationale": "Namisi Arnold Paul, Chief Executive Officer of Kit POS Uganda Limited, approved all future Kit Pay releases under the app-specific standing policy. The clearance is not bound to a candidate, version name, version code, tag, commit, APK, or AAB. Version and artifact metadata changes do not require a new approval by themselves; material dependency, licence, signing-identity, or distribution-architecture changes require re-review before the affected release may rely on the app-wide clearance.",
     "decision_document": "docs/google-fcm-agpl-clearance-decision-app-wide.md",
-    "decision_document_sha256": "b51646bd19079d0dc5fec8122292ef2895f84b1bc4a072cb0b786ef70ba50da1",
-    "reviewed_runtime_inventory_sha256": "4f63a48022e82f037a9c3e8de80d847f2a54b5948ce6f51be8a8863bd83ca330",
-    "reviewed_runtime_graph_manifest_sha256": "1602aeac63688c2dd85062b6b951aa58e7df1715b7da125b1f487efcf385a5a9",
+    "decision_document_sha256": "61b2ffae9aa341fbfc86f5d6279ff4c3d6c52cc285fb34532c97a22b34478728",
+    "reviewed_runtime_inventory_sha256": "0eaa1deda2e4bc4005613f881a221a898ef0eabad00553cac2979319c88b85a6",
+    "reviewed_runtime_graph_manifest_sha256": "e1c4b26d0358e85c38464fcdd78fe2e47d41ae1b130d7023a3ff36bf861eb9fd",
     "reviewed_artifacts": [
       {
         "coordinate": "com.google.android.gms:play-services-base:18.1.0",
@@ -98,14 +98,14 @@
     ]
   },
   "inventory": {
-    "release_runtime_components": 188,
-    "direct_components": 32,
-    "transitive_components": 156,
-    "artifact_archives": 151,
+    "release_runtime_components": 195,
+    "direct_components": 33,
+    "transitive_components": 162,
+    "artifact_archives": 158,
     "separate_core_library_desugaring_inputs": 1
   },
   "normalized_license_counts": {
-    "Apache-2.0": 175,
+    "Apache-2.0": 182,
     "LicenseRef-Android-SDK-License": 6,
     "BSD-3-Clause": 3,
     "AGPL-3.0-only": 2,
@@ -1245,6 +1245,48 @@
       "coordinate": "com.android.tools:desugar_jdk_libs:2.1.5",
       "relationship": "coreLibraryDesugaring",
       "declared_evidence": "GPL-2.0-with-Classpath-Exception",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.appcompat:appcompat-resources:1.2.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.appcompat:appcompat:1.2.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.biometric:biometric:1.1.0",
+      "relationship": "direct",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.cursoradapter:cursoradapter:1.0.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.drawerlayout:drawerlayout:1.0.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.vectordrawable:vectordrawable-animated:1.1.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.vectordrawable:vectordrawable:1.1.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
       "issue_ids": []
     }
   ]

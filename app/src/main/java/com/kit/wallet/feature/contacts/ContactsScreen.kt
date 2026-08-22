@@ -61,6 +61,12 @@ import com.kit.wallet.ui.theme.KitWalletTheme
 
 enum class ContactPickerPurpose { CHAT, CALL }
 
+internal fun orderContactsForDisplay(contacts: List<Contact>): List<Contact> =
+    contacts.sortedWith(
+        compareByDescending<Contact> { it.isKitUser }
+            .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name },
+    )
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ContactsScreen(
@@ -280,7 +286,7 @@ private fun ContactsContent(
         allContacts
             .filter { purpose != ContactPickerPurpose.CALL || it.isKitUser }
             .filter { it.name.contains(query, true) || it.phone.contains(query) }
-            .sortedBy { it.name }
+            .let(::orderContactsForDisplay)
     }
 
     Scaffold(

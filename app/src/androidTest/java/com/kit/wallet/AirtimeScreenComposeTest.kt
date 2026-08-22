@@ -31,9 +31,12 @@ class AirtimeScreenComposeTest {
                     ownPhone = "+256700000000",
                     buying = false,
                     error = null,
+                    quote = null,
                     snackbarHostState = snackbar,
                     onBack = {},
-                    onBuy = { _, _, _, _ -> },
+                    onQuoteInvalidated = {},
+                    onReview = { _, _, _ -> },
+                    onBuy = {},
                 )
             }
         }

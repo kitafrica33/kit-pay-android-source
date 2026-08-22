@@ -7,6 +7,7 @@ import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
 import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
+import com.kit.wallet.data.session.CachedSessionAssurance
 import java.time.Instant
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -117,6 +118,16 @@ class AuthTokenRefresher @Inject constructor(
                 accountId = current.accountId ?: user?.id,
                 cacheScopeId = current.cacheScopeId,
                 profileSetupState = setupState,
+                cachedAssurance = result.sessionAssurance?.let {
+                    CachedSessionAssurance(
+                        access = it.access,
+                        deviceIdentityStatus = it.deviceIdentity.status,
+                        deviceIdentityRequired = it.deviceIdentity.required,
+                        loginUnlockStatus = it.loginUnlock.status,
+                        loginUnlockRequired = it.loginUnlock.required,
+                        loginUnlockMethods = it.loginUnlock.methods,
+                    )
+                } ?: current.cachedAssurance,
                 messagingResetProof = current.messagingResetProof,
                 refreshReplayNonce = java.util.UUID.randomUUID().toString(),
             ),

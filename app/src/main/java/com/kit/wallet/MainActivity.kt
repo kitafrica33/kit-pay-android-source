@@ -3,7 +3,6 @@ package com.kit.wallet
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.annotation.VisibleForTesting
@@ -19,6 +18,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.kit.wallet.data.messaging.ACTION_OPEN_AUTHORIZED_SECURE_MESSAGE
@@ -31,6 +31,7 @@ import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
 import com.kit.wallet.data.notifications.IncomingCallPayload
+import com.kit.wallet.data.notifications.PushTokenCoordinator
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
@@ -59,11 +60,12 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 @AndroidEntryPoint
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     @Inject lateinit var sessions: SessionStore
     @Inject lateinit var messagingSyncScheduler: SecureMessagingSyncScheduler
     @Inject lateinit var messagingSyncEngine: SecureMessagingSyncEngine
     @Inject lateinit var secureMessageAuthorizer: SecureMessageNavigationAuthorizer
+    @Inject lateinit var pushTokens: PushTokenCoordinator
     private val foregroundStartMutex = Mutex()
     private var foregroundStartJob: Job? = null
     private var pendingDeepLink by mutableStateOf<String?>(null)
@@ -134,6 +136,7 @@ class MainActivity : ComponentActivity() {
                                 pendingTextShareSending = sending
                             }
                         },
+                        onNotificationCapabilityChanged = { pushTokens.capabilityPolicyChanged() },
                     )
                 }
             }

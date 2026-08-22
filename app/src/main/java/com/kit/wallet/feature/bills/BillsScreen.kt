@@ -122,7 +122,7 @@ private fun BillsContent(
             if (loading && providers.isEmpty() && !airtimeAvailable) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Text(
-                        "Loading available RukaPay services…",
+                        "Loading available services…",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }

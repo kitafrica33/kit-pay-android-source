@@ -66,6 +66,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -105,7 +106,10 @@ import kotlin.math.abs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -147,6 +151,7 @@ fun ConversationScreen(
     val mediaBytes by viewModel.mediaBytes.collectAsStateWithLifecycle()
     val mediaLoading by viewModel.mediaLoading.collectAsStateWithLifecycle()
     val mediaErrors by viewModel.mediaErrors.collectAsStateWithLifecycle()
+    val restoredDraft by viewModel.restoredDraft.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val pickImage = rememberLauncherForActivityResult(
@@ -217,6 +222,9 @@ fun ConversationScreen(
         mediaErrors = mediaErrors,
         onOpenMedia = viewModel::openMedia,
         onRetryMedia = viewModel::retryMedia,
+        restoredDraft = restoredDraft,
+        onRestoredDraftConsumed = viewModel::consumeRestoredDraft,
+        onPersistDraft = viewModel::persistDraft,
     )
 }
 
@@ -291,6 +299,8 @@ private fun SecureMessagingUnavailable(onBack: () -> Unit) {
     }
 }
 
+private const val COMPOSER_DRAFT_PERSIST_DELAY_MILLIS = 600L
+
 /** In-memory plaintext plus a monotonic edit fence for delayed durable-send callbacks. */
 internal data class ConversationComposerState(
     val text: String = "",
@@ -328,14 +338,43 @@ private fun ConversationContent(
     mediaErrors: Map<String, String> = emptyMap(),
     onOpenMedia: (Message) -> Unit = {},
     onRetryMedia: (Message) -> Unit = {},
+    restoredDraft: String? = null,
+    onRestoredDraftConsumed: () -> Unit = {},
+    onPersistDraft: (String) -> Unit = {},
 ) {
-    // Message plaintext must not enter the Activity saved-instance-state bundle. A rotation or
-    // process death deliberately discards this in-memory draft until an encrypted draft store exists.
+    // Message plaintext must not enter the Activity saved-instance-state bundle. Instead, the
+    // composer is continuously mirrored into the hardware-encrypted messaging draft store, which
+    // restores it across rotation and process death and is erased with the messaging state.
     var composerState by remember { mutableStateOf(ConversationComposerState()) }
+    LaunchedEffect(restoredDraft) {
+        val restored = restoredDraft ?: return@LaunchedEffect
+        if (restored.isNotBlank() && composerState.text.isEmpty()) {
+            composerState = composerState.edited(restored)
+        }
+        onRestoredDraftConsumed()
+    }
+    LaunchedEffect(Unit) {
+        snapshotFlow { composerState.text }
+            .drop(1)
+            .collectLatest { text ->
+                // collectLatest gives debounce semantics: rapid keystrokes cancel the pending
+                // write and only the settled composer text reaches the encrypted store.
+                delay(COMPOSER_DRAFT_PERSIST_DELAY_MILLIS)
+                onPersistDraft(text)
+            }
+    }
     var showRequestDialog by remember { mutableStateOf(false) }
     var payTarget by remember { mutableStateOf<Message?>(null) }
     val retryableMessageIds = remember(messages) {
         retryableOutgoingMessageIds(messages)
+    }
+    // Request cards stop offering Pay once this thread carries a paid confirmation for them.
+    val settledRequestIds = remember(messages) {
+        messages.mapNotNullTo(mutableSetOf()) { message ->
+            message.paymentRequestId
+                ?.lowercase()
+                ?.takeIf { message.kind == MessageKind.PAYMENT }
+        }
     }
 
     // Keep the newest message visible, just like WhatsApp: jump to the bottom the first time the
@@ -369,7 +408,11 @@ private fun ConversationContent(
     }
     payTarget?.let { target ->
         PaymentPinDialog(
-            amountMinor = target.amountMinor,
+            amountText = Money.format(
+                abs(target.amountMinor),
+                target.paymentCurrencyCode,
+                target.paymentCurrencyScale,
+            ),
             sending = sending,
             onDismiss = { payTarget = null },
             onConfirm = { pin ->
@@ -532,6 +575,7 @@ private fun ConversationContent(
                         mediaError = mediaErrors[message.id],
                         onOpenMedia = { onOpenMedia(message) },
                         onRetryMedia = { onRetryMedia(message) },
+                        requestSettled = message.paymentRequestId?.lowercase() in settledRequestIds,
                         onPayRequest = { payTarget = message },
                     )
                 }
@@ -553,6 +597,7 @@ internal fun MessageBubble(
     mediaError: String? = null,
     onOpenMedia: () -> Unit = {},
     onRetryMedia: () -> Unit = {},
+    requestSettled: Boolean = false,
     onPayRequest: () -> Unit = {},
 ) {
     val colors = KitTheme.colors
@@ -592,7 +637,8 @@ internal fun MessageBubble(
                         MessageKind.PAYMENT -> PaymentChatCard(msg)
                         MessageKind.PAYMENT_REQUEST -> PaymentRequestChatCard(
                             msg = msg,
-                            payEnabled = !operationInFlight,
+                            settled = requestSettled,
+                            payEnabled = !operationInFlight && !requestSettled,
                             onPay = onPayRequest,
                         )
                         MessageKind.VOICE_NOTE -> VoiceNoteRow(msg)
@@ -778,7 +824,7 @@ private fun PaymentChatCard(msg: Message) {
                     color = Color.White.copy(alpha = 0.75f),
                 )
                 Text(
-                    Money.format(abs(msg.amountMinor)),
+                    Money.format(abs(msg.amountMinor), msg.paymentCurrencyCode, msg.paymentCurrencyScale),
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
@@ -800,6 +846,7 @@ private fun PaymentChatCard(msg: Message) {
 @Composable
 private fun PaymentRequestChatCard(
     msg: Message,
+    settled: Boolean,
     payEnabled: Boolean,
     onPay: () -> Unit,
 ) {
@@ -829,12 +876,16 @@ private fun PaymentRequestChatCard(
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
                 Text(
-                    if (msg.fromMe) "Payment request sent" else "Payment request",
+                    when {
+                        settled -> "Payment request • Paid"
+                        msg.fromMe -> "Payment request sent"
+                        else -> "Payment request"
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = Color.White.copy(alpha = 0.75f),
                 )
                 Text(
-                    Money.format(abs(msg.amountMinor)),
+                    Money.format(abs(msg.amountMinor), msg.paymentCurrencyCode, msg.paymentCurrencyScale),
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
@@ -849,7 +900,7 @@ private fun PaymentRequestChatCard(
                 color = Color.White.copy(alpha = 0.85f),
             )
         }
-        if (!msg.fromMe) {
+        if (!msg.fromMe && !settled) {
             Spacer(Modifier.height(10.dp))
             Box(
                 Modifier
@@ -860,7 +911,7 @@ private fun PaymentRequestChatCard(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    "Pay ${Money.format(abs(msg.amountMinor))}",
+                    "Pay ${Money.format(abs(msg.amountMinor), msg.paymentCurrencyCode, msg.paymentCurrencyScale)}",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.SemiBold,
                     color = Color(0xFF0B2B1A),
@@ -921,10 +972,10 @@ private fun PaymentRequestDialog(
     )
 }
 
-/** Confirms an in-chat payment with the four-digit wallet PIN before the debit is authorized. */
+/** Approves an in-chat payment with biometrics (when advertised) or the four-digit wallet PIN. */
 @Composable
 private fun PaymentPinDialog(
-    amountMinor: Long,
+    amountText: String,
     sending: Boolean,
     onDismiss: () -> Unit,
     onConfirm: (String) -> Unit,
@@ -932,11 +983,11 @@ private fun PaymentPinDialog(
     var pin by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = { if (!sending) onDismiss() },
-        title = { Text("Pay ${Money.format(abs(amountMinor))}") },
+        title = { Text("Pay $amountText") },
         text = {
             Column {
                 Text(
-                    "Enter your wallet PIN to approve this payment.",
+                    "Approve this payment with your wallet PIN, or leave it blank to use biometrics.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -945,7 +996,7 @@ private fun PaymentPinDialog(
                     value = pin,
                     onValueChange = { value -> pin = value.filter(Char::isDigit).take(4) },
                     enabled = !sending,
-                    label = { Text("Wallet PIN") },
+                    label = { Text("Wallet PIN (optional with biometrics)") },
                     singleLine = true,
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
@@ -954,7 +1005,7 @@ private fun PaymentPinDialog(
         },
         confirmButton = {
             TextButton(
-                enabled = !sending && pin.length == 4,
+                enabled = !sending && (pin.isEmpty() || pin.length == 4),
                 onClick = { onConfirm(pin) },
             ) { Text(if (sending) "Paying…" else "Pay") }
         },

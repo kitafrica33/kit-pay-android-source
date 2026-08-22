@@ -147,6 +147,20 @@ class PushTokenCoordinatorTest {
         assertEquals("/api/kit-wallet/v1/devices/current/push-token", server.takeRequest().path)
     }
 
+    @Test
+    fun `foreground capability change replays push registration`() = runTest {
+        server.enqueue(jsonResponse(capabilitiesJson(notifications = true)))
+        server.enqueue(jsonResponse(PUSH_REGISTERED_JSON))
+        val transport = FakePushMessagingTransport(token = "replayed-token")
+        val coordinator = coordinator(FakeSessionStore.signedIn(), backgroundScope, transport)
+
+        coordinator.capabilityPolicyChanged()?.join()
+
+        assertEquals("/api/kit-wallet/v1/capabilities", server.takeRequest().path)
+        assertEquals("/api/kit-wallet/v1/devices/current/push-token", server.takeRequest().path)
+        assertEquals(1, transport.tokenReads)
+    }
+
     private fun coordinator(
         sessions: SessionStore,
         scope: kotlinx.coroutines.CoroutineScope,

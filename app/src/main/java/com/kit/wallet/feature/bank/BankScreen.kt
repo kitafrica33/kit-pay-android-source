@@ -57,6 +57,7 @@ import com.kit.wallet.ui.model.BankOperationKind
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.model.Transaction
 import com.kit.wallet.ui.model.TxType
+import com.kit.wallet.data.repository.FinancialOperationQuote
 import com.kit.wallet.ui.model.eligibleBankBeneficiaries
 import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
@@ -72,6 +73,7 @@ fun BankScreen(
     val banks by viewModel.banks.collectAsStateWithLifecycle()
     val busy by viewModel.busy.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
+    val quote by viewModel.quote.collectAsStateWithLifecycle()
     var operation by remember { mutableStateOf<BankOperationKind?>(null) }
     var addingAccount by remember { mutableStateOf(false) }
     val linkableBanks = banks.filter { it.supports(BankCapability.ACCOUNT_VERIFICATION) }
@@ -108,9 +110,9 @@ fun BankScreen(
         withdrawalAvailable = withdrawalBeneficiaries.isNotEmpty(),
         transferAvailable = transferBeneficiaries.isNotEmpty(),
         accountLinkingAvailable = linkableBanks.isNotEmpty(),
-        onDeposit = { viewModel.clearError(); operation = BankOperationKind.DEPOSIT },
-        onWithdraw = { viewModel.clearError(); operation = BankOperationKind.WITHDRAWAL },
-        onTransfer = { viewModel.clearError(); operation = BankOperationKind.TRANSFER },
+        onDeposit = { viewModel.clearError(); viewModel.clearQuote(); operation = BankOperationKind.DEPOSIT },
+        onWithdraw = { viewModel.clearError(); viewModel.clearQuote(); operation = BankOperationKind.WITHDRAWAL },
+        onTransfer = { viewModel.clearError(); viewModel.clearQuote(); operation = BankOperationKind.TRANSFER },
         onAdd = { viewModel.clearError(); addingAccount = true },
     )
 
@@ -132,10 +134,13 @@ fun BankScreen(
             beneficiaries = selectedBeneficiaries,
             busy = busy,
             error = error,
-            onDismiss = { if (!busy) operation = null },
-            onSubmit = { beneficiaryId, amountMinor, pin ->
-                viewModel.operate(selected, beneficiaryId, amountMinor, pin) { operation = null }
+            quote = quote,
+            onDismiss = { if (!busy) { viewModel.clearQuote(); operation = null } },
+            onQuoteInvalidated = viewModel::clearQuote,
+            onReview = { beneficiaryId, amountMinor, feeMode ->
+                viewModel.preview(selected, beneficiaryId, amountMinor, feeMode)
             },
+            onSubmit = { pin -> viewModel.submit(pin) { operation = null } },
         )
     }
 }
@@ -394,15 +399,24 @@ private fun BankOperationSheet(
     beneficiaries: List<Beneficiary>,
     busy: Boolean,
     error: String?,
+    quote: FinancialOperationQuote?,
     onDismiss: () -> Unit,
-    onSubmit: (String, Long, String) -> Unit,
+    onQuoteInvalidated: () -> Unit,
+    onReview: (String, Long, String) -> Unit,
+    onSubmit: (String) -> Unit,
 ) {
     var beneficiaryId by remember(beneficiaries) {
         mutableStateOf(beneficiaries.firstOrNull()?.id.orEmpty())
     }
     var amount by remember { mutableStateOf("") }
     var pin by remember { mutableStateOf("") }
+    var feeMode by remember(operation) { mutableStateOf("sender_absorbs") }
     val amountMinor = Money.parseMinor(amount) ?: 0L
+    val reviewedQuote = quote?.takeIf {
+        it.operationType == operation.apiType && it.destinationId == beneficiaryId &&
+            it.amountMinor == amountMinor && it.feeMode == feeMode
+    }
+    LaunchedEffect(beneficiaryId, amountMinor, feeMode) { onQuoteInvalidated() }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 32.dp)) {
             Text(
@@ -439,30 +453,67 @@ private fun BankOperationSheet(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
-            Spacer(Modifier.height(10.dp))
-            OutlinedTextField(
-                value = pin,
-                onValueChange = { pin = it.filter(Char::isDigit).take(4) },
-                label = { Text("Wallet PIN") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                visualTransformation = PasswordVisualTransformation(),
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
+            if (operation != BankOperationKind.DEPOSIT) {
+                Row {
+                    FilterChip(
+                        selected = feeMode == "sender_absorbs",
+                        onClick = { feeMode = "sender_absorbs" },
+                        label = { Text("I pay fees") },
+                        modifier = Modifier.padding(end = 8.dp),
+                    )
+                    FilterChip(
+                        selected = feeMode == "recipient_absorbs",
+                        onClick = { feeMode = "recipient_absorbs" },
+                        label = { Text("Deduct fees") },
+                    )
+                }
+            }
+            if (reviewedQuote != null) {
+                Spacer(Modifier.height(12.dp))
+                QuoteSummary(reviewedQuote)
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { pin = it.filter(Char::isDigit).take(4) },
+                    label = { Text("Wallet PIN (optional with biometrics)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
             ErrorText(error)
             com.kit.wallet.ui.components.KitGreenButton(
-                text = when (operation) {
-                    BankOperationKind.DEPOSIT -> "Request deposit"
-                    BankOperationKind.WITHDRAWAL -> "Request withdrawal"
-                    BankOperationKind.TRANSFER -> "Send bank transfer"
-                },
+                text = if (reviewedQuote == null) "Review amount and fees" else "Confirm payment",
                 loading = busy,
-                enabled = beneficiaryId.isNotBlank() && amountMinor > 0 && pin.length == 4,
-                onClick = { onSubmit(beneficiaryId, amountMinor, pin) },
+                enabled = beneficiaryId.isNotBlank() && amountMinor > 0 &&
+                    (reviewedQuote == null || pin.isEmpty() || pin.length == 4),
+                onClick = {
+                    if (reviewedQuote == null) onReview(beneficiaryId, amountMinor, feeMode)
+                    else onSubmit(pin)
+                },
             )
         }
     }
 }
+
+@Composable
+private fun QuoteSummary(quote: FinancialOperationQuote) {
+    Surface(Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.medium) {
+        Column(Modifier.padding(16.dp)) {
+            Text("Review", style = MaterialTheme.typography.titleMedium)
+            Text("Recipient receives ${quote.format(quote.recipientAmountMinor)}")
+            if (quote.feesKnown) {
+                Text("Fees ${quote.format(quote.feesMinor)}")
+                Text("Total debit ${quote.format(quote.customerDebitMinor)}")
+            } else {
+                Text("Final fees will be confirmed by your provider.", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+private fun FinancialOperationQuote.format(amountMinor: Long): String =
+    Money.format(amountMinor, currencyCode, currencyScale)
 
 @Composable
 private fun ErrorText(error: String?) {

@@ -73,7 +73,7 @@ class DeviceContactSyncSanitizerTest {
             sequenceOf(candidate(" 0700 123 456 ", " \t ")),
         ).single()
 
-        assertEquals(DeviceContactDto("0700123456", "0700123456"), contact)
+        assertEquals(DeviceContactDto("+256700123456", "+256700123456"), contact)
     }
 
     @Test
@@ -90,11 +90,54 @@ class DeviceContactSyncSanitizerTest {
 
         assertEquals(
             listOf(
-                DeviceContactDto("0700123456", "First"),
-                DeviceContactDto("0700123457", "Second"),
+                DeviceContactDto("+256700123456", "First"),
+                DeviceContactDto("+256700123457", "Second"),
             ),
             contacts,
         )
+    }
+
+    @Test
+    fun `local and international Uganda formats normalize to one identity`() {
+        val contacts = sanitizeDeviceContactsForSync(
+            sequenceOf(
+                candidate("0772 123 456", "Local"),
+                candidate("+256 772 123 456", "International duplicate"),
+                candidate("00256 701 234 567", "International prefix"),
+            ),
+        )
+
+        assertEquals(
+            listOf(
+                DeviceContactDto("+256772123456", "Local"),
+                DeviceContactDto("+256701234567", "International prefix"),
+            ),
+            contacts,
+        )
+    }
+
+    @Test
+    fun `foreign international numbers retain their country identity`() {
+        val contacts = sanitizeDeviceContactsForSync(
+            sequenceOf(
+                candidate("+44 7700 900123", "London"),
+                candidate("+256 700 900123", "Kampala"),
+            ),
+        )
+
+        assertEquals(listOf("+447700900123", "+256700900123"), contacts.map { it.phone })
+    }
+
+    @Test
+    fun `complete address books larger than ten thousand are retained`() {
+        val contacts = sanitizeDeviceContactsForSync(
+            (0..10_000).asSequence().map { index ->
+                candidate("+2567${index.toString().padStart(8, '0')}", "Contact $index")
+            },
+        )
+
+        assertEquals(10_001, contacts.size)
+        assertEquals("Contact 10000", contacts.last().name)
     }
 
     private fun candidate(

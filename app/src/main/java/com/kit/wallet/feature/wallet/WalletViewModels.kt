@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 
@@ -46,13 +47,16 @@ class SendMoneyViewModel @Inject constructor(
         viewModelScope.launch {
             _sending.value = true
             _error.value = null
-            runCatching { wallet.send(recipient, amountMinor, note, paymentPin) }
-                .onSuccess {
-                    _lastSent.value = it
-                    onSent()
-                }
-                .onFailure { _error.value = it.message ?: "The transfer could not be completed" }
-            _sending.value = false
+            try {
+                _lastSent.value = wallet.send(recipient, amountMinor, note, paymentPin)
+                onSent()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                _error.value = error.message ?: "The transfer could not be completed"
+            } finally {
+                _sending.value = false
+            }
         }
     }
 }

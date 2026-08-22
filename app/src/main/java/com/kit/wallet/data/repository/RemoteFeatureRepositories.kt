@@ -12,10 +12,16 @@ import com.kit.wallet.data.local.WalletCache
 import com.kit.wallet.data.remote.CreateBankBeneficiaryRequest
 import com.kit.wallet.data.remote.CreateBankVerificationRequest
 import com.kit.wallet.data.remote.CreateBankingOperationRequest
+import com.kit.wallet.data.remote.CreateBankingOutboundQuoteRequest
+import com.kit.wallet.data.remote.CreateQuotedBankingOperationRequest
+import com.kit.wallet.data.remote.BankingOutboundQuoteDto
 import com.kit.wallet.data.remote.ContactDto
 import com.kit.wallet.data.remote.ContactSyncRequest
+import com.kit.wallet.data.remote.BeginContactSyncRequest
+import com.kit.wallet.data.remote.ContactSyncSessionDto
 import com.kit.wallet.data.remote.DeviceContactDto
 import com.kit.wallet.data.remote.KitWalletApi
+import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.CallSessionDto
 import com.kit.wallet.data.remote.StartCallRequest
 import com.kit.wallet.data.remote.EndCallRequest
@@ -38,6 +44,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
+import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
@@ -50,7 +57,10 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 
-private const val MAX_CONTACTS = 1_000
+private const val MAX_CONTACTS = 50_000
+private const val LEGACY_CONTACT_SYNC_LIMIT = 1_000
+private const val CONTACT_PAGE_LIMIT = 500
+private const val MAX_CONTACT_PAGES = MAX_CONTACTS / CONTACT_PAGE_LIMIT
 private const val MAX_CONTACT_PHONE_BYTES = 32
 private const val MIN_CONTACT_PHONE_DIGITS = 7
 private const val MAX_CONTACT_PHONE_DIGITS = 15
@@ -95,23 +105,75 @@ internal fun sanitizeDeviceContactsForSync(
     return sanitizedContacts
 }
 
+internal fun validateContactSync(
+    sync: ContactSyncSessionDto,
+    clientSyncId: String,
+    contactCount: Int,
+    expectedStatus: String,
+) {
+    check(runCatching { UUID.fromString(sync.id) }.isSuccess) {
+        "The contact sync server returned an invalid session identifier"
+    }
+    check(sync.clientSyncId.equals(clientSyncId, ignoreCase = true)) {
+        "The contact sync server returned a different client identifier"
+    }
+    check(sync.snapshotScope == "full" && sync.generation > 0 && sync.status == expectedStatus) {
+        "The contact sync server returned an invalid session state"
+    }
+    check(sync.chunkSize in 1..CONTACT_PAGE_LIMIT && sync.totalContactCount == contactCount) {
+        "The contact sync server returned invalid snapshot bounds"
+    }
+    val expectedChunks = (contactCount + sync.chunkSize - 1) / sync.chunkSize
+    check(sync.totalChunkCount == expectedChunks) {
+        "The contact sync server returned an invalid chunk count"
+    }
+    check(sync.receivedContactCount in 0..contactCount) {
+        "The contact sync server returned an invalid received count"
+    }
+    check(sync.receivedChunkCount in 0..sync.totalChunkCount) {
+        "The contact sync server returned an invalid received chunk count"
+    }
+    check(sync.acceptedContactCount in 0..sync.receivedContactCount) {
+        "The contact sync server returned an invalid accepted contact count"
+    }
+    check(sync.missingChunkIndexes.all { it in 0 until sync.totalChunkCount }) {
+        "The contact sync server returned invalid missing chunks"
+    }
+}
+
+/** Canonical Uganda-local/E.164 identity that never merges foreign numbers by suffix. */
+internal fun normalizedContactPhone(rawPhone: String?): String? {
+    val raw = rawPhone?.trim().orEmpty()
+    if (raw.isEmpty() || raw.toByteArray(Charsets.UTF_8).size > 64) return null
+    val compact = StringBuilder(raw.length)
+    for ((index, character) in raw.withIndex()) {
+        when {
+            character in '0'..'9' -> compact.append(character)
+            character == '+' && index == 0 -> Unit
+            character.isSupportedPhoneSeparator() -> Unit
+            else -> return null
+        }
+    }
+    val digits = compact.toString()
+    val international = when {
+        raw.startsWith('+') -> digits
+        digits.startsWith("00") -> digits.drop(2)
+        digits.startsWith("256") -> digits
+        digits.startsWith('0') -> "256${digits.drop(1)}"
+        digits.length == 9 -> "256$digits"
+        else -> return null
+    }
+    if (international.length !in 8..15 || international.startsWith('0')) return null
+    return "+$international"
+}
+
 private fun sanitizeDeviceContactPhone(rawPhone: String?): String? {
     val raw = rawPhone?.trim().orEmpty()
     if (raw.isEmpty() || raw.toByteArray(Charsets.UTF_8).size > MAX_CONTACT_PHONE_BYTES) {
         return null
     }
 
-    val compact = StringBuilder(raw.length)
-    for (character in raw) {
-        when {
-            character in '0'..'9' -> compact.append(character)
-            character == '+' && compact.isEmpty() -> compact.append(character)
-            character.isSupportedPhoneSeparator() -> Unit
-            else -> return null
-        }
-    }
-
-    val sanitized = compact.toString()
+    val sanitized = normalizedContactPhone(raw) ?: return null
     val digits = sanitized.removePrefix("+")
     if (digits.length !in MIN_CONTACT_PHONE_DIGITS..MAX_CONTACT_PHONE_DIGITS) return null
     if (digits.all { it == '0' }) return null
@@ -164,7 +226,7 @@ class RemoteContactRepository @Inject constructor(
             return
         }
         val deviceNames = deviceContactNames()
-        val registered = apiCalls.execute { api.contacts() }.items.orEmpty()
+        val registered = loadAllContacts()
             .map { it.toUiModel(deviceNames) }
         mutableContacts.value = withLocalOnlyDeviceContacts(registered, deviceNames)
     }
@@ -293,10 +355,68 @@ class RemoteContactRepository @Inject constructor(
             sanitizeDeviceContactsForSync(candidates)
         }.orEmpty()
         val deviceNames = localContacts.associate { contactNumberKey(it.phone) to it.name }
-        val registered = apiCalls.execute {
-            api.syncContacts(ContactSyncRequest(localContacts))
-        }.items.orEmpty().map { it.toUiModel(deviceNames) }
+        val registered = synchronizeContacts(localContacts)
+            .map { it.toUiModel(deviceNames) }
         mutableContacts.value = withLocalOnlyDeviceContacts(registered, deviceNames)
+    }
+
+    private suspend fun synchronizeContacts(localContacts: List<DeviceContactDto>): List<ContactDto> {
+        val clientSyncId = UUID.randomUUID().toString().lowercase()
+        val opened = try {
+            apiCalls.execute {
+                api.startContactSync(
+                    BeginContactSyncRequest(clientSyncId, localContacts.size, "full"),
+                )
+            }.sync
+        } catch (error: KitWalletApiException) {
+            if (error.statusCode != 404) throw error
+            check(localContacts.size <= LEGACY_CONTACT_SYNC_LIMIT) {
+                "This Kit Pay service cannot safely sync more than $LEGACY_CONTACT_SYNC_LIMIT contacts yet"
+            }
+            return apiCalls.execute { api.syncContacts(ContactSyncRequest(localContacts)) }.items.orEmpty()
+        }
+        validateContactSync(opened, clientSyncId, localContacts.size, expectedStatus = "open")
+        localContacts.chunked(opened.chunkSize).forEachIndexed { index, chunk ->
+            val uploaded = apiCalls.execute {
+                api.uploadContactSyncChunk(opened.id, index, ContactSyncRequest(chunk))
+            }
+            validateContactSync(uploaded.sync, clientSyncId, localContacts.size, "open")
+            check(uploaded.chunk.index == index && uploaded.chunk.inputCount == chunk.size) {
+                "The contact sync server returned an invalid chunk receipt"
+            }
+            check(uploaded.chunk.acceptedCount in 0..uploaded.chunk.inputCount) {
+                "The contact sync server returned an invalid accepted count"
+            }
+        }
+        val finalized = apiCalls.execute { api.finalizeContactSync(opened.id) }.sync
+        validateContactSync(finalized, clientSyncId, localContacts.size, "finalized")
+        check(finalized.storedContactCount != null && finalized.missingChunkIndexes.isEmpty()) {
+            "The contact sync server did not finalize the complete address book"
+        }
+        return loadAllContacts()
+    }
+
+    private suspend fun loadAllContacts(): List<ContactDto> {
+        val contacts = ArrayList<ContactDto>()
+        val seenCursors = mutableSetOf<String>()
+        var cursor: String? = null
+        repeat(MAX_CONTACT_PAGES) {
+            val response = apiCalls.execute { api.contacts(cursor, CONTACT_PAGE_LIMIT) }
+            val items = response.items.orEmpty()
+            check(items.size <= CONTACT_PAGE_LIMIT && contacts.size + items.size <= MAX_CONTACTS) {
+                "The contact service returned too many contacts"
+            }
+            contacts += items
+            val page = response.page ?: return contacts
+            val hasMore = page.hasMore == true
+            if (!hasMore) return contacts
+            val next = page.nextCursor?.trim().orEmpty()
+            check(next.isNotEmpty() && next.length <= 2_048 && seenCursors.add(next)) {
+                "The contact service returned an invalid continuation"
+            }
+            cursor = next
+        }
+        error("The contact service exceeded the supported pagination bound")
     }
 
     /**
@@ -348,8 +468,9 @@ class RemoteContactRepository @Inject constructor(
         )
     }
 
-    /** Matches address-book and server numbers by their trailing national digits (e.g. +256/0 forms). */
-    private fun contactNumberKey(raw: String): String = raw.filter(Char::isDigit).takeLast(9)
+    /** Matches Uganda local/international forms without conflating foreign numbers by suffix. */
+    private fun contactNumberKey(raw: String): String =
+        normalizedContactPhone(raw) ?: "raw:${raw.filter(Char::isDigit)}"
 
     private fun hasContactPermission(): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) ==
@@ -425,7 +546,7 @@ class RemoteCallRepository @Inject constructor(
     private val api: KitWalletApi,
     private val apiCalls: ApiCallExecutor,
     private val contacts: ContactRepository,
-    sessions: SessionStore,
+    private val sessions: SessionStore,
     @ApplicationScope scope: CoroutineScope,
 ) : CallRepository {
     private val mutableCalls = MutableStateFlow<List<CallEntry>>(emptyList())
@@ -446,7 +567,20 @@ class RemoteCallRepository @Inject constructor(
     }
 
     private suspend fun refreshCallList() {
-        mutableCalls.value = apiCalls.execute { api.calls() }.items.orEmpty().map { call ->
+        val active = sessions.current() ?: return
+        val fence = active.fence()
+        val pages = CallHistoryPageAccumulator()
+        var complete = false
+        while (!complete) {
+            val page = apiCalls.execute {
+                api.calls(
+                    cursor = pages.nextCursor,
+                    limit = CallHistoryPageAccumulator.PAGE_LIMIT,
+                )
+            }
+            complete = pages.append(page)
+        }
+        val mapped = pages.calls.map { call ->
             val startedAt = runCatching { Instant.parse(call.startedAt) }.getOrNull()
             val answeredAt = call.answeredAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
             val endedAt = call.endedAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
@@ -477,6 +611,7 @@ class RemoteCallRepository @Inject constructor(
                 answered = answeredAt != null,
             )
         }
+        sessions.withCurrentSession(fence) { mutableCalls.value = mapped }
     }
 
     override suspend fun incoming(callId: String): IncomingCallDetails {
@@ -500,14 +635,30 @@ class RemoteCallRepository @Inject constructor(
         recipientUserId: String,
         video: Boolean,
         conversationId: String?,
+    ): CallConnection = start(
+        recipientUserId = recipientUserId,
+        video = video,
+        conversationId = conversationId,
+        clientCallId = UUID.randomUUID().toString(),
+    )
+
+    override suspend fun start(
+        recipientUserId: String,
+        video: Boolean,
+        conversationId: String?,
+        clientCallId: String,
     ): CallConnection {
         require(recipientUserId.isNotBlank()) { "Choose a Kit Pay contact to call" }
+        require(runCatching { UUID.fromString(clientCallId) }.isSuccess) {
+            "The call attempt identifier is invalid"
+        }
         val session = apiCalls.execute {
             api.startCall(
                 StartCallRequest(
                     recipientUserIds = listOf(recipientUserId),
                     type = if (video) "video" else "voice",
                     conversationId = conversationId,
+                    clientCallId = clientCallId.lowercase(),
                 ),
             )
         }
@@ -529,6 +680,15 @@ class RemoteCallRepository @Inject constructor(
             )
         }
         refreshCallList()
+    }
+
+    override suspend fun cancelAttempt(clientCallId: String) {
+        val canonical = runCatching { UUID.fromString(clientCallId).toString() }.getOrNull()
+            ?: error("The call attempt identifier is invalid")
+        val result = apiCalls.execute { api.cancelCallAttempt(canonical) }
+        check(result.cancelled && result.clientCallId.equals(canonical, ignoreCase = true)) {
+            "The call attempt was not cancelled"
+        }
     }
 
     override suspend fun accept(callId: String): CallConnection {
@@ -635,6 +795,12 @@ class RemoteBankingRepository @Inject constructor(
             .map { operation ->
                 val scale = operation.currency.scale.toInt()
                 val amountMinor = DecimalMoney.toMinor(operation.amount, scale)
+                val pricing = operation.outboundPricing
+                val feeMinor = pricing?.processingFee?.let { DecimalMoney.toMinor(it, scale) }
+                    ?: operation.totalFees?.let { DecimalMoney.toMinor(it, scale) }
+                val recipientMinor = pricing?.recipientAmount?.let { DecimalMoney.toMinor(it, scale) }
+                    ?: operation.netAmount?.let { DecimalMoney.toMinor(it, scale) }
+                val debitMinor = pricing?.customerDebit?.let { DecimalMoney.toMinor(it, scale) }
                 val incoming = operation.direction.lowercase() in
                     setOf("credit", "incoming", "in") || operation.type == "deposit"
                 Transaction(
@@ -653,6 +819,12 @@ class RemoteBankingRepository @Inject constructor(
                         else -> TxStatus.PENDING
                     },
                     reference = operation.reference,
+                    currencyCode = operation.currency.code.uppercase(),
+                    currencyScale = scale,
+                    feeMinor = feeMinor,
+                    recipientAmountMinor = recipientMinor,
+                    customerDebitMinor = debitMinor,
+                    feeMode = pricing?.feeMode ?: operation.feeMode,
                 )
             }
         sessions.withCurrentSession(fence) {
@@ -700,7 +872,17 @@ class RemoteBankingRepository @Inject constructor(
         beneficiaryId: String,
         amountMinor: Long,
         paymentPin: String,
+        feeMode: String,
     ) {
+        submitOperation(previewOperation(type, beneficiaryId, amountMinor, feeMode), paymentPin)
+    }
+
+    override suspend fun previewOperation(
+        type: String,
+        beneficiaryId: String,
+        amountMinor: Long,
+        feeMode: String,
+    ): FinancialOperationQuote {
         val operation = requireNotNull(BankOperationKind.fromApiType(type)) {
             "Unsupported bank operation"
         }
@@ -716,6 +898,10 @@ class RemoteBankingRepository @Inject constructor(
             "This bank does not support the selected operation"
         }
         require(amountMinor > 0) { "Enter a positive amount" }
+        require(
+            operation == BankOperationKind.DEPOSIT ||
+                feeMode in setOf("sender_absorbs", "recipient_absorbs"),
+        ) { "Choose how bank transfer fees are paid" }
         val active = requireNotNull(sessions.current()) { "Sign in again to access this wallet" }
         val wallet = sessions.withCurrentSession(active.fence()) { current ->
             requireNotNull(walletCache.selectedWallet(current.cacheScopeId)) {
@@ -723,20 +909,132 @@ class RemoteBankingRepository @Inject constructor(
             }
         }
         val amount = DecimalMoney.fromMinor(amountMinor, wallet.currencyScale)
-        val intent = linkedMapOf<String, Any?>(
+        val legacyIntent = linkedMapOf<String, Any?>(
             "operation_type" to operation.apiType,
             "wallet_id" to wallet.uuid,
             "beneficiary_id" to beneficiaryId,
             "amount" to amount,
         )
-        val token = paymentAuthorizer.authorize("bank_transfer", intent, paymentPin)
-        val request = CreateBankingOperationRequest(wallet.uuid, beneficiaryId, amount)
+        if (operation == BankOperationKind.DEPOSIT) {
+            return FinancialOperationQuote(
+                quoteId = null,
+                operationType = operation.apiType,
+                destinationId = beneficiaryId,
+                amountMinor = amountMinor,
+                recipientAmountMinor = amountMinor,
+                feesMinor = 0,
+                customerDebitMinor = amountMinor,
+                currencyCode = wallet.currencyCode,
+                currencyScale = wallet.currencyScale,
+                feeMode = feeMode,
+                expiresAt = null,
+                feesKnown = false,
+                authorizationPurpose = "bank_transfer",
+                authorizationIntent = legacyIntent,
+                sessionFence = active.fence(),
+            )
+        } else {
+            val quote = try {
+                apiCalls.execute {
+                    val request = CreateBankingOutboundQuoteRequest(
+                        wallet.uuid,
+                        beneficiaryId,
+                        amount,
+                        feeMode,
+                    )
+                    if (operation == BankOperationKind.WITHDRAWAL) {
+                        api.createBankWithdrawalQuote(request)
+                    } else {
+                        api.createBankTransferQuote(request)
+                    }
+                }
+            } catch (error: KitWalletApiException) {
+                if (error.statusCode != 404) throw error
+                null
+            }
+            return if (quote == null) {
+                FinancialOperationQuote(
+                    quoteId = null,
+                    operationType = operation.apiType,
+                    destinationId = beneficiaryId,
+                    amountMinor = amountMinor,
+                    recipientAmountMinor = amountMinor,
+                    feesMinor = 0,
+                    customerDebitMinor = amountMinor,
+                    currencyCode = wallet.currencyCode,
+                    currencyScale = wallet.currencyScale,
+                    feeMode = feeMode,
+                    expiresAt = null,
+                    feesKnown = false,
+                    authorizationPurpose = "bank_transfer",
+                    authorizationIntent = legacyIntent,
+                    sessionFence = active.fence(),
+                )
+            } else {
+                validateBankingOutboundQuote(
+                    quote, operation, wallet.uuid, beneficiaryId, requireNotNull(beneficiary.bankId),
+                    amount, feeMode, wallet.currencyCode, wallet.currencyScale,
+                )
+                FinancialOperationQuote(
+                    quoteId = quote.id,
+                    operationType = operation.apiType,
+                    destinationId = beneficiaryId,
+                    amountMinor = amountMinor,
+                    recipientAmountMinor = DecimalMoney.toMinor(quote.recipientAmount, wallet.currencyScale),
+                    feesMinor = DecimalMoney.toMinor(quote.processingFee, wallet.currencyScale),
+                    customerDebitMinor = DecimalMoney.toMinor(quote.customerDebit, wallet.currencyScale),
+                    currencyCode = wallet.currencyCode,
+                    currencyScale = wallet.currencyScale,
+                    feeMode = feeMode,
+                    expiresAt = quote.expiresAt,
+                    feesKnown = true,
+                    authorizationPurpose = quote.stepUp.purpose,
+                    authorizationIntent = quote.stepUp.intent.mapValues { it.value as Any? },
+                    sessionFence = active.fence(),
+                )
+            }
+        }
+    }
+
+    override suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String) {
+        val operation = requireNotNull(BankOperationKind.fromApiType(quote.operationType)) {
+            "The bank quote is invalid"
+        }
+        check(sessions.current()?.fence() == quote.sessionFence) {
+            "The signed-in account changed after this quote was created"
+        }
+        quote.expiresAt?.let { expiresAt ->
+            check(runCatching { Instant.parse(expiresAt).isAfter(Instant.now()) }.getOrDefault(false)) {
+                "This bank quote has expired. Review a new quote."
+            }
+        }
+        val token = paymentAuthorizer.authorize(
+            quote.authorizationPurpose,
+            quote.authorizationIntent,
+            paymentPin,
+        )
         val key = "android-bank-operation-${java.util.UUID.randomUUID()}"
-        apiCalls.execute {
-            when (operation) {
-                BankOperationKind.DEPOSIT -> api.createBankDeposit(key, token, request)
-                BankOperationKind.WITHDRAWAL -> api.createBankWithdrawal(key, token, request)
-                BankOperationKind.TRANSFER -> api.createBankTransfer(key, token, request)
+        if (quote.quoteId != null) {
+            val request = CreateQuotedBankingOperationRequest(quote.quoteId)
+            apiCalls.execute {
+                if (operation == BankOperationKind.WITHDRAWAL) {
+                    api.createQuotedBankWithdrawal(key, token, request)
+                } else {
+                    api.createQuotedBankTransfer(key, token, request)
+                }
+            }
+        } else {
+            val walletId = quote.authorizationIntent["wallet_id"] as? String
+                ?: error("The bank quote omitted its wallet")
+            val amount = quote.authorizationIntent["amount"] as? String
+                ?: error("The bank quote omitted its amount")
+            val request = CreateBankingOperationRequest(walletId, quote.destinationId, amount)
+            apiCalls.execute {
+                when (operation) {
+                    BankOperationKind.DEPOSIT -> api.createBankDeposit(key, token, request)
+                    BankOperationKind.WITHDRAWAL -> api.createBankWithdrawal(key, token, request)
+                    BankOperationKind.TRANSFER -> api.createBankTransfer(key, token, request)
+                }
             }
         }
         refresh()
@@ -751,4 +1049,65 @@ class RemoteBankingRepository @Inject constructor(
         const val VERIFICATION_POLLS = 10
         const val VERIFICATION_POLL_MILLIS = 750L
     }
+}
+
+internal fun validateBankingOutboundQuote(
+    quote: BankingOutboundQuoteDto,
+    operation: BankOperationKind,
+    walletId: String,
+    beneficiaryId: String,
+    bankId: String,
+    amount: String,
+    feeMode: String,
+    currency: String,
+    currencyScale: Int,
+    now: Instant = Instant.now(),
+) {
+    val expectedAction = if (operation == BankOperationKind.TRANSFER) "transfer" else "withdrawal"
+    val enteredAmount = if (feeMode == "recipient_absorbs") quote.customerDebit else quote.recipientAmount
+    fun decimal(value: String) = runCatching { java.math.BigDecimal(value) }.getOrNull()
+    val recipient = decimal(quote.recipientAmount)
+    val processing = decimal(quote.processingFee)
+    val provider = decimal(quote.providerFee)
+    val kitFee = decimal(quote.kitFee)
+    val providerCap = decimal(quote.providerFeeCap)
+    val maximumProviderTotal = decimal(quote.maximumProviderTotal)
+    val customer = decimal(quote.customerDebit)
+    val kitDebit = decimal(quote.kitDebit)
+    val expectedIntent = mapOf(
+        "action" to expectedAction,
+        "operation_type" to operation.apiType,
+        "quote_id" to quote.id,
+        "wallet_id" to walletId,
+        "beneficiary_id" to beneficiaryId,
+        "bank_id" to bankId,
+        "bank_code" to quote.bank.code,
+        "fee_mode" to feeMode,
+        "recipient_amount" to quote.recipientAmount,
+        "processing_fee" to quote.processingFee,
+        "provider_fee" to quote.providerFee,
+        "kit_fee" to quote.kitFee,
+        "provider_fee_cap" to quote.providerFeeCap,
+        "maximum_provider_total" to quote.maximumProviderTotal,
+        "customer_debit" to quote.customerDebit,
+        "kit_debit" to quote.kitDebit,
+        "schedule_version" to quote.scheduleVersion,
+        "currency" to quote.currency.code,
+    )
+    check(
+        quote.action == expectedAction && quote.operationType == operation.apiType &&
+            quote.walletId == walletId && quote.beneficiaryId == beneficiaryId &&
+            quote.bank.id == bankId && quote.feeMode == feeMode && quote.scheduleVerified &&
+            quote.currency.code.equals(currency, ignoreCase = true) &&
+            quote.currency.scale.toIntOrNull() == currencyScale &&
+            recipient != null && decimal(enteredAmount)?.compareTo(java.math.BigDecimal(amount)) == 0 &&
+            processing != null && provider != null && kitFee != null && providerCap != null &&
+            maximumProviderTotal != null && customer != null && kitDebit != null &&
+            recipient.signum() > 0 && provider.signum() >= 0 && kitFee.signum() >= 0 &&
+            processing.compareTo(provider + kitFee) == 0 && providerCap.compareTo(provider) == 0 &&
+            maximumProviderTotal.compareTo(recipient + providerCap) == 0 &&
+            customer.compareTo(recipient + processing) == 0 && kitDebit.signum() == 0 &&
+            runCatching { Instant.parse(quote.expiresAt).isAfter(now) }.getOrDefault(false) &&
+            quote.stepUp.purpose == "bank_transfer" && quote.stepUp.intent == expectedIntent
+    ) { "The bank transfer quote does not match this request" }
 }

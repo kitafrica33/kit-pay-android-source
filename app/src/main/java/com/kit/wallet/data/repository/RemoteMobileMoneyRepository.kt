@@ -5,6 +5,9 @@ import com.kit.wallet.data.mapper.DecimalMoney
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.CreateMobileMoneyAccountRequest
 import com.kit.wallet.data.remote.CreateMobileMoneyOperationRequest
+import com.kit.wallet.data.remote.CreateMobileMoneyQuoteRequest
+import com.kit.wallet.data.remote.CreateQuotedMobileMoneyOperationRequest
+import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.CreateMobileMoneyVerificationRequest
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.MobileMoneyAccountDto
@@ -18,6 +21,7 @@ import com.kit.wallet.ui.model.MobileMoneyNetwork
 import com.kit.wallet.ui.model.MobileMoneyOperation
 import com.kit.wallet.ui.model.MobileMoneyVerificationState
 import java.math.BigDecimal
+import java.time.Instant
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -143,7 +147,17 @@ class RemoteMobileMoneyRepository @Inject constructor(
         accountId: String,
         amountMinor: Long,
         paymentPin: String,
+        feeMode: String,
     ) {
+        submitOperation(previewOperation(action, accountId, amountMinor, feeMode), paymentPin)
+    }
+
+    override suspend fun previewOperation(
+        action: String,
+        accountId: String,
+        amountMinor: Long,
+        feeMode: String,
+    ): FinancialOperationQuote {
         require(action in OPERATION_ACTIONS) { "Choose cash in or cash out" }
         require(amountMinor > 0) { "Enter a positive amount" }
         val account = findAccount(accountId)
@@ -165,10 +179,10 @@ class RemoteMobileMoneyRepository @Inject constructor(
         }
         val amount = DecimalMoney.fromMinor(amountMinor, account.currencyScale)
         check(BigDecimal(amount).stripTrailingZeros().scale() <= 0) {
-            "RukaPay mobile money amounts must be whole ${account.currencyCode} values"
+            "Mobile money amounts must be whole ${account.currencyCode} values"
         }
 
-        val intent = linkedMapOf<String, Any?>(
+        val legacyIntent = linkedMapOf<String, Any?>(
             "action" to action,
             "wallet_id" to wallet.uuid,
             "mobile_money_account_id" to account.id,
@@ -176,18 +190,107 @@ class RemoteMobileMoneyRepository @Inject constructor(
             "amount" to amount,
             "currency" to account.currencyCode,
         )
-        val purpose = if (action == "collection") {
-            "mobile_money_collection"
-        } else {
-            "mobile_money_payout"
+        require(feeMode in if (action == "collection") COLLECTION_FEE_MODES else PAYOUT_FEE_MODES) {
+            "Choose how mobile money fees are paid"
         }
-        val stepUpToken = paymentAuthorizer.authorize(purpose, intent, paymentPin)
-        val request = CreateMobileMoneyOperationRequest(wallet.uuid, account.id, amount)
-        val operation = apiCalls.execute {
-            if (action == "collection") {
-                api.createMobileMoneyCollection(idempotencyKey("collection"), stepUpToken, request)
-            } else {
-                api.createMobileMoneyPayout(idempotencyKey("payout"), stepUpToken, request)
+        val quote = try {
+            apiCalls.execute {
+                val request = CreateMobileMoneyQuoteRequest(wallet.uuid, account.id, amount, feeMode)
+                if (action == "collection") api.createMobileMoneyCollectionQuote(request)
+                else api.createMobileMoneyPayoutQuote(request)
+            }
+        } catch (error: KitWalletApiException) {
+            if (error.statusCode != 404) throw error
+            null
+        }
+        return if (quote != null) {
+            validateMobileMoneyQuote(
+                quote = quote,
+                action = action,
+                walletId = wallet.uuid,
+                accountId = account.id,
+                amount = amount,
+                feeMode = feeMode,
+                currency = account.currencyCode,
+                currencyScale = account.currencyScale,
+            )
+            val recipient = if (action == "collection") quote.walletCredit else quote.recipientAmount
+            val fees = if (action == "collection") quote.totalFees else quote.processingFee
+            val debit = if (action == "collection") quote.providerAmount else quote.customerDebit
+            FinancialOperationQuote(
+                quoteId = quote.id,
+                operationType = action,
+                destinationId = account.id,
+                amountMinor = amountMinor,
+                recipientAmountMinor = DecimalMoney.toMinor(requireNotNull(recipient), account.currencyScale),
+                feesMinor = DecimalMoney.toMinor(requireNotNull(fees), account.currencyScale),
+                customerDebitMinor = DecimalMoney.toMinor(requireNotNull(debit), account.currencyScale),
+                currencyCode = account.currencyCode,
+                currencyScale = account.currencyScale,
+                feeMode = feeMode,
+                expiresAt = quote.expiresAt,
+                feesKnown = true,
+                authorizationPurpose = quote.stepUp.purpose,
+                authorizationIntent = quote.stepUp.intent.mapValues { it.value as Any? },
+                sessionFence = active.fence(),
+            )
+        } else {
+            FinancialOperationQuote(
+                quoteId = null,
+                operationType = action,
+                destinationId = account.id,
+                amountMinor = amountMinor,
+                recipientAmountMinor = amountMinor,
+                feesMinor = 0,
+                customerDebitMinor = amountMinor,
+                currencyCode = account.currencyCode,
+                currencyScale = account.currencyScale,
+                feeMode = feeMode,
+                expiresAt = null,
+                feesKnown = false,
+                authorizationPurpose = "mobile_money_$action",
+                authorizationIntent = legacyIntent,
+                sessionFence = active.fence(),
+            )
+        }
+    }
+
+    override suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String) {
+        require(quote.operationType in OPERATION_ACTIONS) { "The mobile money quote is invalid" }
+        check(sessions.current()?.fence() == quote.sessionFence) {
+            "The signed-in account changed after this quote was created"
+        }
+        quote.expiresAt?.let { expiresAt ->
+            check(runCatching { Instant.parse(expiresAt).isAfter(Instant.now()) }.getOrDefault(false)) {
+                "This mobile money quote has expired. Review a new quote."
+            }
+        }
+        val stepUpToken = paymentAuthorizer.authorize(
+            quote.authorizationPurpose,
+            quote.authorizationIntent,
+            paymentPin,
+        )
+        val operation = if (quote.quoteId != null) {
+            val request = CreateQuotedMobileMoneyOperationRequest(quote.quoteId)
+            apiCalls.execute {
+                if (quote.operationType == "collection") {
+                    api.createQuotedMobileMoneyCollection(idempotencyKey("collection"), stepUpToken, request)
+                } else {
+                    api.createQuotedMobileMoneyPayout(idempotencyKey("payout"), stepUpToken, request)
+                }
+            }
+        } else {
+            val walletId = quote.authorizationIntent["wallet_id"] as? String
+                ?: error("The mobile money quote omitted its wallet")
+            val amount = quote.authorizationIntent["amount"] as? String
+                ?: error("The mobile money quote omitted its amount")
+            val request = CreateMobileMoneyOperationRequest(walletId, quote.destinationId, amount)
+            apiCalls.execute {
+                if (quote.operationType == "collection") {
+                    api.createMobileMoneyCollection(idempotencyKey("collection"), stepUpToken, request)
+                } else {
+                    api.createMobileMoneyPayout(idempotencyKey("payout"), stepUpToken, request)
+                }
             }
         }
         mergeOperation(operation.toUiModel())
@@ -298,12 +401,21 @@ class RemoteMobileMoneyRepository @Inject constructor(
             submissionStage = submissionStage,
             createdAt = createdAt,
             failureMessage = failure?.message,
+            feeMinor = outboundPricing?.processingFee?.let { DecimalMoney.toMinor(it, scale) }
+                ?: totalFees?.let { DecimalMoney.toMinor(it, scale) },
+            netAmountMinor = outboundPricing?.recipientAmount?.let { DecimalMoney.toMinor(it, scale) }
+                ?: netAmount?.let { DecimalMoney.toMinor(it, scale) },
+            customerDebitMinor = outboundPricing?.customerDebit?.let { DecimalMoney.toMinor(it, scale) },
+            feeMode = outboundPricing?.feeMode ?: feeMode,
+            providerFeeEstimated = providerFeeEstimated,
         )
     }
 
     private companion object {
         val ACCOUNT_KINDS = setOf("own", "third_party")
         val OPERATION_ACTIONS = setOf("collection", "payout")
+        val COLLECTION_FEE_MODES = setOf("inclusive", "gross_up")
+        val PAYOUT_FEE_MODES = setOf("sender_absorbs", "recipient_absorbs")
         val VERIFICATION_PENDING_STATUSES = setOf("pending", "queued", "processing", "submitted")
         val OPERATION_TERMINAL_STATUSES = setOf(
             "completed",
@@ -318,4 +430,76 @@ class RemoteMobileMoneyRepository @Inject constructor(
         const val OPERATION_POLL_LIMIT = 40
         const val OPERATION_POLL_INTERVAL_MILLIS = 1_500L
     }
+}
+
+internal fun validateMobileMoneyQuote(
+    quote: com.kit.wallet.data.remote.MobileMoneyQuoteDto,
+    action: String,
+    walletId: String,
+    accountId: String,
+    amount: String,
+    feeMode: String,
+    currency: String,
+    currencyScale: Int,
+    now: Instant = Instant.now(),
+) {
+    val quotedInput = when {
+        action == "collection" -> quote.requestedAmount
+        feeMode == "recipient_absorbs" -> quote.customerDebit
+        else -> quote.recipientAmount
+    }
+    fun decimal(value: String?) = value?.let { runCatching { BigDecimal(it) }.getOrNull() }
+    val expectedIntent = if (action == "collection") {
+        mapOf(
+            "action" to action, "quote_id" to quote.id, "wallet_id" to walletId,
+            "mobile_money_account_id" to accountId, "network" to quote.network,
+            "fee_mode" to feeMode, "requested_amount" to quote.requestedAmount,
+            "provider_amount" to quote.providerAmount, "provider_fee" to quote.providerFee,
+            "platform_fee" to quote.platformFee, "rounding_adjustment" to quote.roundingAdjustment,
+            "total_fees" to quote.totalFees, "wallet_credit" to quote.walletCredit,
+            "currency" to quote.currency.code,
+        ).mapValues { requireNotNull(it.value) }
+    } else {
+        mapOf(
+            "action" to action, "quote_id" to quote.id, "wallet_id" to walletId,
+            "mobile_money_account_id" to accountId, "network" to quote.network,
+            "fee_mode" to feeMode, "recipient_amount" to quote.recipientAmount,
+            "processing_fee" to quote.processingFee, "provider_fee" to quote.providerFee,
+            "kit_fee" to quote.kitFee, "provider_fee_cap" to quote.providerFeeCap,
+            "maximum_provider_total" to quote.maximumProviderTotal,
+            "customer_debit" to quote.customerDebit, "kit_debit" to quote.kitDebit,
+            "schedule_version" to quote.scheduleVersion, "currency" to quote.currency.code,
+        ).mapValues { requireNotNull(it.value) }
+    }
+    val amountsReconcile = if (action == "collection") {
+        val providerAmount = decimal(quote.providerAmount)
+        val totalFees = decimal(quote.totalFees)
+        val walletCredit = decimal(quote.walletCredit)
+        providerAmount != null && totalFees != null && walletCredit != null &&
+            providerAmount.compareTo(walletCredit + totalFees) == 0
+    } else {
+        val recipient = decimal(quote.recipientAmount)
+        val processing = decimal(quote.processingFee)
+        val provider = decimal(quote.providerFee)
+        val kitFee = decimal(quote.kitFee)
+        val providerCap = decimal(quote.providerFeeCap)
+        val maximumTotal = decimal(quote.maximumProviderTotal)
+        val customer = decimal(quote.customerDebit)
+        val kitDebit = decimal(quote.kitDebit)
+        recipient != null && processing != null && provider != null && kitFee != null &&
+            providerCap != null && maximumTotal != null && customer != null && kitDebit != null &&
+            processing.compareTo(provider + kitFee) == 0 && providerCap.compareTo(provider) == 0 &&
+            maximumTotal.compareTo(recipient + providerCap) == 0 &&
+            customer.compareTo(recipient + processing) == 0 && kitDebit.signum() == 0 &&
+            quote.scheduleVerified == true
+    }
+    check(quote.action == action && quote.walletId == walletId && quote.accountId == accountId &&
+        quote.feeMode == feeMode && quote.currency.code.equals(currency, ignoreCase = true) &&
+        quote.currency.scale.toIntOrNull() == currencyScale &&
+        quotedInput?.let(::BigDecimal)?.compareTo(BigDecimal(amount)) == 0 &&
+        amountsReconcile &&
+        runCatching { Instant.parse(quote.expiresAt).isAfter(now) }.getOrDefault(false) &&
+        quote.stepUp.purpose == "mobile_money_$action" &&
+        quote.stepUp.intent == expectedIntent
+    ) { "The mobile money quote does not match this request" }
 }

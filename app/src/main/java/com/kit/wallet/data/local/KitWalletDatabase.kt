@@ -15,7 +15,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         SecureMessagingMetadataEntity::class,
         AccountMessageArchiveEntity::class,
     ],
-    version = 6,
+    version = 7,
     exportSchema = true,
 )
 abstract class KitWalletDatabase : RoomDatabase() {
@@ -107,6 +107,15 @@ abstract class KitWalletDatabase : RoomDatabase() {
                         "SELECT '$SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_KEY', " +
                         "'$SECURE_MESSAGING_LEGACY_KEY_CONTINUITY_VALUE' " +
                         "WHERE EXISTS (SELECT 1 FROM secure_messaging_records LIMIT 1)",
+                )
+            }
+        }
+
+        val MIGRATION_6_7: Migration = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE wallet_transactions ADD COLUMN " +
+                        "currencyScale INTEGER NOT NULL DEFAULT 2",
                 )
             }
         }

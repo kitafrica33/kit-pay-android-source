@@ -1,6 +1,7 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.auth.AuthOutcome
+import com.kit.wallet.data.auth.BiometricKeyLifecycle
 import com.kit.wallet.data.auth.AuthChallengeKind
 import com.kit.wallet.data.auth.DeviceIdentityProvider
 import com.kit.wallet.data.auth.PendingAuthChallenge
@@ -100,6 +101,8 @@ class RemoteAuthRepositoryTest {
         assertEquals("session-uuid", sessions.current()?.sessionId)
         assertEquals("7", sessions.current()?.accountId)
         assertEquals(ProfileSetupState.REQUIRED, sessions.current()?.profileSetupState)
+        assertEquals("restricted", sessions.current()?.cachedAssurance?.access)
+        assertEquals(listOf("pin"), sessions.current()?.cachedAssurance?.loginUnlockMethods)
         assertEquals(1, refresh.calls)
         val request = server.takeRequest()
         assertEquals("/api/kit-wallet/v1/auth/email/login", request.path)
@@ -682,6 +685,20 @@ class RemoteAuthRepositoryTest {
     }
 
     @Test
+    fun `logout removes the retired accounts local biometric key`() = runTest {
+        server.enqueue(jsonResponse(PUSH_UNREGISTER_JSON))
+        server.enqueue(jsonResponse(LOGOUT_JSON))
+        val accountId = "11111111-1111-4111-8111-111111111111"
+        val sessions = FakeSessionStore().apply { save(TEST_SESSION.copy(accountId = accountId)) }
+        val keys = RecordingBiometricKeys()
+        val repository = repository(sessions, FakeRefreshTrigger(), biometricKeys = keys)
+
+        repository.logout(allDevices = false)
+
+        assertEquals(listOf(accountId), keys.removed)
+    }
+
+    @Test
     fun `messaging recovery resets exact enrollment and retains authenticated session`() = runTest {
         server.enqueue(jsonResponse(RESET_APPLIED_JSON))
         val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
@@ -1124,6 +1141,7 @@ class RemoteAuthRepositoryTest {
         refresh: FakeRefreshTrigger,
         walletSync: WalletSyncRepository = FakeWalletSync(),
         messageHistory: AccountMessageHistoryRetention = NoOpAccountMessageHistoryRetention,
+        biometricKeys: BiometricKeyLifecycle? = null,
     ) = RemoteAuthRepository(
         api = api,
         apiCalls = apiCalls,
@@ -1143,7 +1161,13 @@ class RemoteAuthRepositoryTest {
         paymentAuthorizer = PaymentAuthorizer(api, apiCalls),
         messageHistory = messageHistory,
         applicationScope = backgroundScope,
+        biometricSigningKey = biometricKeys,
     )
+
+    private class RecordingBiometricKeys : BiometricKeyLifecycle {
+        val removed = mutableListOf<String>()
+        override fun remove(accountId: String) { removed += accountId }
+    }
 
     private fun jsonResponse(body: String) = MockResponse()
         .setResponseCode(200)
@@ -1389,7 +1413,7 @@ class RemoteAuthRepositoryTest {
         """.trimIndent()
 
         val AUTHENTICATED_JSON = """
-            {"ok":true,"data":{"state":"authenticated","challenge":null,"session":{"access_token":"access-token","refresh_token":"refresh-token","token_type":"Bearer","access_expires_at":"2026-07-16T13:00:00Z","refresh_expires_at":"2026-08-15T12:00:00Z","session_id":"session-uuid"},"user":{"id":"7","name":"Amina Yusuf","email":"amina@example.test","phone":"+256772345678","tag":"KIT-1001","kyc_status":"verified"}},"meta":{"request_id":"request-auth","api_version":"v1","server_time":"2026-07-16T12:00:00Z"}}
+            {"ok":true,"data":{"state":"authenticated","challenge":null,"session":{"access_token":"access-token","refresh_token":"refresh-token","token_type":"Bearer","access_expires_at":"2026-07-16T13:00:00Z","refresh_expires_at":"2026-08-15T12:00:00Z","session_id":"session-uuid"},"user":{"id":"7","name":"Amina Yusuf","email":"amina@example.test","phone":"+256772345678","tag":"KIT-1001","kyc_status":"verified"},"session_assurance":{"device_identity":{"status":"verified","required":true,"epoch":1},"login_unlock":{"status":"locked","required":true,"methods":["pin"]},"access":"restricted"}},"meta":{"request_id":"request-auth","api_version":"v1","server_time":"2026-07-16T12:00:00Z"}}
         """.trimIndent()
 
         val PLACEHOLDER_PROFILE_JSON = """

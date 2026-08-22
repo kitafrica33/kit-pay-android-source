@@ -26,6 +26,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -137,6 +138,25 @@ fun SecurityScreen(
                     },
                     onClick = onMfa,
                 )
+                if (state.biometricAvailable) {
+                    SettingsRow(
+                        Icons.Rounded.PhonelinkLock,
+                        "Biometric unlock",
+                        "Use your device biometrics instead of your wallet PIN when signing in",
+                        trailing = {
+                            Switch(
+                                checked = state.biometricEnabled,
+                                onCheckedChange = viewModel::setBiometricEnabled,
+                                enabled = !state.configuringBiometrics,
+                            )
+                        },
+                        onClick = {
+                            if (!state.configuringBiometrics) {
+                                viewModel.setBiometricEnabled(!state.biometricEnabled)
+                            }
+                        },
+                    )
+                }
             }
             item { SectionHeader("Devices") }
             items(state.devices.size) { index ->

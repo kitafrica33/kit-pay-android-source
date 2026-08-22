@@ -37,6 +37,7 @@ import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionSnapshot
+import com.kit.wallet.data.session.CachedSessionAssurance
 import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.kit.wallet.di.ApplicationScope
 import java.time.Duration
@@ -72,6 +73,7 @@ class RemoteAuthRepository @Inject constructor(
     private val messageHistory: AccountMessageHistoryRetention =
         NoOpAccountMessageHistoryRetention,
     @ApplicationScope applicationScope: CoroutineScope,
+    private val biometricSigningKey: BiometricKeyLifecycle? = null,
 ) : AuthRepository {
 
     override val signedIn: StateFlow<Boolean> = sessions.session
@@ -629,7 +631,13 @@ class RemoteAuthRepository @Inject constructor(
                 walletSync.clearCachedUserData(target.cacheScopeId)
             } catch (cacheFailure: Exception) {
                 sessionFailure?.addSuppressed(cacheFailure)
-                if (sessionFailure == null) throw cacheFailure
+                if (sessionFailure == null) sessionFailure = cacheFailure
+            }
+            try {
+                removeRetiredBiometricKey(target.accountId)
+            } catch (keyFailure: Exception) {
+                sessionFailure?.addSuppressed(keyFailure)
+                if (sessionFailure == null) sessionFailure = keyFailure
             }
         }
 
@@ -668,11 +676,28 @@ class RemoteAuthRepository @Inject constructor(
             walletSync.clearCachedUserData(expected.cacheScopeId)
         } catch (cacheFailure: Exception) {
             sessionFailure?.addSuppressed(cacheFailure)
-            if (sessionFailure == null) throw cacheFailure
+            if (sessionFailure == null) sessionFailure = cacheFailure
+        }
+        try {
+            removeRetiredBiometricKey(expected.accountId)
+        } catch (keyFailure: Exception) {
+            sessionFailure?.addSuppressed(keyFailure)
+            if (sessionFailure == null) sessionFailure = keyFailure
         }
 
         sessionFailure?.let { throw it }
         return true
+    }
+
+    /**
+     * A biometric private key belongs to an account, not merely to an Activity. Remove it after
+     * that account's session is irreversibly retired. A concurrent replacement session for the
+     * same account keeps the enrollment, while a different account can never inherit it.
+     */
+    private fun removeRetiredBiometricKey(accountId: String?) {
+        val retiredAccountId = accountId?.takeIf(String::isNotBlank) ?: return
+        if (sessions.current()?.accountId == retiredAccountId) return
+        biometricSigningKey?.remove(retiredAccountId)
     }
 
     private suspend fun AuthResultDto.toOutcome(
@@ -718,6 +743,7 @@ class RemoteAuthRepository @Inject constructor(
                     "${authenticatedUser.id}:${sessionDto.sessionId}"
                 },
                 profileSetupState = setupState,
+                cachedAssurance = sessionAssurance?.toCachedSessionAssurance(),
                 messagingResetProof = if (sessionDto.sessionId == previousFence?.sessionId) {
                     sessions.current()?.messagingResetProof
                 } else {
@@ -805,6 +831,16 @@ class RemoteAuthRepository @Inject constructor(
     private fun String?.orFallback(fallback: String): String =
         this?.trim()?.takeIf(String::isNotBlank) ?: fallback
 }
+
+internal fun com.kit.wallet.data.remote.SessionAssuranceDto.toCachedSessionAssurance() =
+    CachedSessionAssurance(
+        access = access,
+        deviceIdentityStatus = deviceIdentity.status,
+        deviceIdentityRequired = deviceIdentity.required,
+        loginUnlockStatus = loginUnlock.status,
+        loginUnlockRequired = loginUnlock.required,
+        loginUnlockMethods = loginUnlock.methods,
+    )
 
 internal fun challengeLifetimeMillis(expiresAt: Instant?, serverTime: Instant?): Long? {
     if (expiresAt == null || serverTime == null) return null

@@ -3,8 +3,10 @@ package com.kit.wallet.feature.mobilemoney
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.repository.MobileMoneyRepository
+import com.kit.wallet.data.repository.FinancialOperationQuote
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
@@ -23,6 +25,8 @@ class MobileMoneyViewModel @Inject constructor(
 
     private val mutableError = MutableStateFlow<String?>(null)
     val error = mutableError.asStateFlow()
+    private val mutableQuote = MutableStateFlow<FinancialOperationQuote?>(null)
+    val quote = mutableQuote.asStateFlow()
 
     init {
         refresh()
@@ -44,17 +48,26 @@ class MobileMoneyViewModel @Inject constructor(
         }
     }
 
-    fun operate(
+    fun preview(
         action: String,
         accountId: String,
         amountMinor: Long,
-        paymentPin: String,
-        onDone: () -> Unit,
+        feeMode: String,
     ) {
-        runCommand(onDone) {
-            mobileMoney.createOperation(action, accountId, amountMinor, paymentPin)
+        runCommand {
+            mutableQuote.value = mobileMoney.previewOperation(action, accountId, amountMinor, feeMode)
         }
     }
+
+    fun submit(paymentPin: String, onDone: () -> Unit) {
+        val quote = mutableQuote.value ?: return
+        runCommand(onDone) {
+            mobileMoney.submitOperation(quote, paymentPin)
+            mutableQuote.value = null
+        }
+    }
+
+    fun clearQuote() { mutableQuote.value = null }
 
     fun clearError() {
         mutableError.value = null
@@ -65,14 +78,18 @@ class MobileMoneyViewModel @Inject constructor(
         viewModelScope.launch {
             mutableBusy.value = true
             mutableError.value = null
-            runCatching { command() }
-                .onSuccess { onDone() }
-                .onFailure {
-                    mutableError.value = it.message
-                        ?.takeIf(String::isNotBlank)
-                        ?: "The mobile money request could not be completed"
-                }
-            mutableBusy.value = false
+            try {
+                command()
+                onDone()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message
+                    ?.takeIf(String::isNotBlank)
+                    ?: "The mobile money request could not be completed"
+            } finally {
+                mutableBusy.value = false
+            }
         }
     }
 }

@@ -94,7 +94,7 @@ fun TransactionRow(
         Spacer(Modifier.width(12.dp))
         Column(horizontalAlignment = Alignment.End) {
             Text(
-                Money.format(tx.amountMinor, signed = true),
+                Money.format(tx.amountMinor, tx.currencyCode, tx.currencyScale, signed = true),
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.SemiBold,
                 color = amountColor,

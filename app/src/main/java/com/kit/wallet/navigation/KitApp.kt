@@ -66,6 +66,10 @@ import com.kit.wallet.feature.auth.PhoneLoginScreen
 import com.kit.wallet.feature.auth.PinSetupScreen
 import com.kit.wallet.feature.auth.RegisterScreen
 import com.kit.wallet.feature.auth.ResetPasswordScreen
+import com.kit.wallet.feature.auth.SessionAssuranceViewModel
+import com.kit.wallet.feature.auth.SessionUnlockGate
+import com.kit.wallet.feature.auth.BiometricApprovalPrompt
+import com.kit.wallet.feature.auth.BiometricApprovalViewModel
 import com.kit.wallet.feature.auth.VerifyEmailScreen
 import com.kit.wallet.feature.bank.BankScreen
 import com.kit.wallet.feature.bills.AirtimeScreen
@@ -113,9 +117,12 @@ fun KitApp(
     incomingTextShare: IncomingTextShareRequest? = null,
     onTextShareConsumed: (String) -> Unit = {},
     onTextShareSendingChanged: (String, Boolean) -> Unit = { _, _ -> },
+    onNotificationCapabilityChanged: () -> Unit = {},
     authViewModel: AuthViewModel = hiltViewModel(),
     accountAccessViewModel: AccountAccessViewModel = hiltViewModel(),
     capabilitiesViewModel: AppCapabilitiesViewModel = hiltViewModel(),
+    sessionAssuranceViewModel: SessionAssuranceViewModel = hiltViewModel(),
+    biometricApprovalViewModel: BiometricApprovalViewModel = hiltViewModel(),
 ) {
     val navController = rememberNavController()
     val signedIn by authViewModel.signedIn.collectAsStateWithLifecycle()
@@ -127,6 +134,8 @@ fun KitApp(
     ) { notificationPermissionRequested.value = true }
     val authState by authViewModel.uiState.collectAsStateWithLifecycle()
     val capabilities by capabilitiesViewModel.state.collectAsStateWithLifecycle()
+    val sessionAssurance by sessionAssuranceViewModel.state.collectAsStateWithLifecycle()
+    val biometricApproval by biometricApprovalViewModel.request.collectAsStateWithLifecycle()
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(lifecycleOwner, capabilitiesViewModel) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -252,6 +261,16 @@ fun KitApp(
     }
 
     val notificationsEnabled = capabilities.enabled(KitFeature.NOTIFICATIONS)
+    LaunchedEffect(
+        signedIn,
+        capabilities.loaded,
+        capabilities.loadFailed,
+        notificationsEnabled,
+    ) {
+        if (signedIn && capabilities.loaded && !capabilities.loadFailed) {
+            onNotificationCapabilityChanged()
+        }
+    }
     LaunchedEffect(signedIn, notificationsEnabled) {
         if (signedIn && notificationsEnabled &&
             capabilities.pushMessagingConfigured &&
@@ -267,6 +286,13 @@ fun KitApp(
 
     LaunchedEffect(signedIn) {
         capabilitiesViewModel.onSessionChanged()
+    }
+
+    LaunchedEffect(signedIn, capabilities.loaded, capabilities.biometricTokensAvailable) {
+        sessionAssuranceViewModel.reconcile(
+            signedIn = signedIn,
+            supported = capabilities.loaded && capabilities.biometricTokensAvailable,
+        )
     }
 
     Scaffold(
@@ -341,6 +367,25 @@ fun KitApp(
             onSendingChanged = { sending ->
                 onTextShareSendingChanged(request.token, sending)
             },
+        )
+    }
+
+    if (signedIn && capabilities.biometricTokensAvailable && sessionAssurance.required) {
+        SessionUnlockGate(
+            state = sessionAssurance,
+            onUnlock = sessionAssuranceViewModel::unlockWithPin,
+            onRetry = sessionAssuranceViewModel::refresh,
+            onRequestBiometric = sessionAssuranceViewModel::requestBiometricUnlock,
+            onBiometricSuccess = sessionAssuranceViewModel::completeBiometricUnlock,
+            onBiometricCancelled = sessionAssuranceViewModel::cancelBiometricUnlock,
+            onSignOut = authViewModel::logoutCurrentDevice,
+        )
+    }
+    biometricApproval?.let { request ->
+        BiometricApprovalPrompt(
+            request = request,
+            onSuccess = biometricApprovalViewModel::approve,
+            onCancel = biometricApprovalViewModel::cancel,
         )
     }
 }
@@ -751,6 +796,7 @@ private fun KitNavHost(
                     name = entry.arguments?.getString("name").orEmpty(),
                     video = false,
                     onEnd = { navController.popBackStack() },
+                    onOpenChat = { navController.navigate(Dest.conversation(it)) },
                 )
             }
         }
@@ -760,6 +806,7 @@ private fun KitNavHost(
                     name = entry.arguments?.getString("name").orEmpty(),
                     video = true,
                     onEnd = { navController.popBackStack() },
+                    onOpenChat = { navController.navigate(Dest.conversation(it)) },
                 )
             }
         }
@@ -778,6 +825,7 @@ private fun KitNavHost(
                     name = "Incoming Kit Pay call",
                     video = false,
                     onEnd = { navController.popBackStack() },
+                    onOpenChat = { navController.navigate(Dest.conversation(it)) },
                     autoAccept = entry.arguments?.getString("accept") == "1",
                 )
             }

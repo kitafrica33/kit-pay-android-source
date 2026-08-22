@@ -24,6 +24,7 @@ import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingSyncCompletionSignal
+import com.kit.wallet.data.messaging.SecureMessagingComposerDraftStore
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.isRecoverableSecureMessagingStateLoss
 import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
@@ -597,15 +598,26 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         // This operation now owns a durable encrypted outbox record. Notify its exact caller before
         // the transport can suspend or fail; no text/projection matching is needed at the UI edge.
         onDurablyCommitted(durable.clientMessageId)
-        // Server-visible attachment metadata is derived from the descriptor text on every send
-        // and retry, so the end-to-end content and the metadata rows can never disagree.
-        val receipt = active.transport.send(
-            conversation,
-            encrypted,
-            KitMediaMessage.attachmentsFor(text),
-        )
-        projections.withActivationLease(active.activation, readyRequired = true) {
-            markOutboundSent(durable, receipt)
+        try {
+            // Server-visible attachment metadata is derived from the descriptor text on every send
+            // and retry, so the end-to-end content and the metadata rows can never disagree.
+            val receipt = active.transport.send(
+                conversation,
+                encrypted,
+                KitMediaMessage.attachmentsFor(text),
+            )
+            projections.withActivationLease(active.activation, readyRequired = true) {
+                markOutboundSent(durable, receipt)
+            }
+        } catch (error: Throwable) {
+            // The exact ciphertext is already committed. Enqueue the network-constrained sync
+            // worker so returning connectivity replays this outbox record on its own, without
+            // waiting for a later login, push, foreground, or visible-conversation event.
+            runCatching { syncScheduler?.schedule() }
+                .exceptionOrNull()
+                ?.takeIf { it !== error }
+                ?.let(error::addSuppressed)
+            throw error
         }
     }
 
@@ -1064,7 +1076,21 @@ class EncryptedChatRepository @Inject internal constructor(
     private val contacts: ContactRepository,
     @ApplicationScope scope: CoroutineScope,
     clock: Clock,
+    private val composerDrafts: SecureMessagingComposerDraftStore? = null,
 ) : ChatRepository {
+    // Drafts are a best-effort convenience riding the encrypted messaging state store; they are
+    // erased with that state on logout and must never fail or gate any messaging operation.
+    override suspend fun composerDraft(chatId: String): String? =
+        runCatching { composerDrafts?.read(chatId) }.getOrNull()
+
+    override suspend fun saveComposerDraft(chatId: String, text: String) {
+        runCatching { composerDrafts?.save(chatId, text) }
+    }
+
+    override suspend fun clearComposerDraft(chatId: String) {
+        runCatching { composerDrafts?.clear(chatId) }
+    }
+
     // A message-ready transport is necessary but not sufficient for UI readiness. Keep this gate
     // closed until the new epoch's restored/current projection baseline has been published, so an
     // open conversation cannot mistake restored history for newly arrived messages or payments.
@@ -1508,6 +1534,8 @@ class EncryptedChatRepository @Inject internal constructor(
             },
             paymentRequestId = payment?.paymentRequestId,
             paymentNote = payment?.note,
+            paymentCurrencyCode = payment?.currencyCode ?: "UGX",
+            paymentCurrencyScale = payment?.currencyScale ?: com.kit.wallet.ui.model.Money.SCALE,
             sortEpochMillis = projected.sentAt.toEpochMilli(),
         )
     }

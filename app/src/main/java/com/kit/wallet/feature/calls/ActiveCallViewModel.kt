@@ -16,6 +16,7 @@ import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.CallConnection
 import com.kit.wallet.data.repository.CallRepository
+import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.IncomingCallDetails
 import com.kit.wallet.data.repository.initialCallPresentation
@@ -38,6 +39,7 @@ import io.livekit.android.room.track.Track
 import io.livekit.android.room.track.VideoTrack
 import io.livekit.android.room.track.screencapture.ScreenCaptureParams
 import java.io.IOException
+import java.util.UUID
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -47,6 +49,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -109,6 +112,9 @@ data class ActiveCallUiState(
     val isGroup: Boolean get() = remoteParticipants.size > 1
 }
 
+internal fun offlineCallRetryDelayMillis(attempt: Int): Long =
+    (2_000L shl attempt.coerceIn(0, 4)).coerceAtMost(30_000L)
+
 internal data class ActiveCallContactPresentationSource(
     val callId: String?,
     val serverName: String?,
@@ -128,6 +134,21 @@ internal data class ActiveCallContactPresentationRefresh(
     val activeTelecom: TelecomPresentationUpdate?,
     val waitingTelecom: TelecomPresentationUpdate?,
 )
+
+internal fun directCallChatContact(
+    source: ActiveCallContactPresentationSource?,
+    contacts: List<Contact>,
+): Contact? {
+    val participantIds = source?.participantUserIds
+        ?.map(String::trim)
+        ?.filter(String::isNotEmpty)
+        ?.distinctBy(String::lowercase)
+        .orEmpty()
+    val matches = contacts.filter { contact ->
+        contact.isKitUser && participantIds.any { it.equals(contact.id, ignoreCase = true) }
+    }.distinctBy { it.id.lowercase() }
+    return matches.singleOrNull()
+}
 
 /**
  * Re-resolves viewer-specific call labels from an already-loaded contact snapshot. This function
@@ -206,6 +227,7 @@ class ActiveCallViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val calls: CallRepository,
     private val contacts: ContactRepository,
+    private val chats: ChatRepository,
     private val callEvents: CallLifecycleEventBus,
     private val activeCallState: ActiveCallStateHolder,
     private val incomingCalls: IncomingCallRelay,
@@ -222,6 +244,9 @@ class ActiveCallViewModel @Inject constructor(
     } else {
         null
     }
+    // Process-only by design: configuration changes retain this ViewModel, while process death
+    // creates a new attempt that the stale-route gate refuses to submit or ring.
+    private val outgoingClientCallId = if (incomingCallId == null) UUID.randomUUID().toString() else null
 
     private val initialPresentation = initialCallPresentation(target, contacts.contacts.value)
     private val mutableState = MutableStateFlow(
@@ -236,6 +261,16 @@ class ActiveCallViewModel @Inject constructor(
         ),
     )
     val state = mutableState.asStateFlow()
+    private val mutableOpeningChat = MutableStateFlow(false)
+    val openingChat = mutableOpeningChat.asStateFlow()
+    val canOpenChat: StateFlow<Boolean> = combine(
+        state,
+        contacts.contacts,
+        chats.readiness,
+    ) { callState, availableContacts, messagingReady ->
+        messagingReady && callState.phase in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING) &&
+            directCallChatContact(activeContactPresentationSource(), availableContacts) != null
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     internal fun consumeOutgoingCallLaunch(): OutgoingCallLaunchAction =
         outgoingCallLaunchGate?.consume() ?: OutgoingCallLaunchAction.KEEP_CURRENT_ROUTE
@@ -249,6 +284,10 @@ class ActiveCallViewModel @Inject constructor(
     private var verifiedIncomingCall: IncomingCallDetails? = null
     private var validationJob: Job? = null
     private var startJob: Job? = null
+    private var offlineStartRetryJob: Job? = null
+    private var offlineStartRetryAttempt = 0
+    private var outgoingAttemptSubmitted = false
+    private var outgoingAttemptResolved = false
     private var cleanupJob: Job? = null
     private var terminationJob: Job? = null
     private var timerJob: Job? = null
@@ -377,6 +416,28 @@ class ActiveCallViewModel @Inject constructor(
         }
     }
 
+    fun openChat(onOpened: (String) -> Unit) {
+        if (mutableOpeningChat.value || !canOpenChat.value) return
+        val contact = directCallChatContact(
+            activeContactPresentationSource(),
+            contacts.contacts.value,
+        ) ?: return
+        viewModelScope.launch {
+            mutableOpeningChat.value = true
+            try {
+                onOpened(chats.openDirectConversation(contact))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                if (!terminated) {
+                    mutableState.value = mutableState.value.copy(error = error.userMessage())
+                }
+            } finally {
+                mutableOpeningChat.value = false
+            }
+        }
+    }
+
     private fun clearWaitingCall() {
         if (mutableState.value.waitingCall != null || mutableState.value.mergingWaitingCall) {
             mutableState.value = mutableState.value.copy(
@@ -421,9 +482,18 @@ class ActiveCallViewModel @Inject constructor(
                 error = null,
             )
             try {
-                val session = incomingCallId?.let { calls.accept(it) }
-                    ?: calls.start(resolveRecipient(), requestedVideo)
+                val session = incomingCallId?.let { calls.accept(it) } ?: run {
+                    outgoingAttemptSubmitted = true
+                    calls.start(
+                        recipientUserId = resolveRecipient(),
+                        video = requestedVideo,
+                        clientCallId = requireNotNull(outgoingClientCallId),
+                    ).also { outgoingAttemptResolved = true }
+                }
                 connection = session
+                offlineStartRetryJob?.cancel()
+                offlineStartRetryJob = null
+                offlineStartRetryAttempt = 0
                 if (incomingCallId == null) {
                     telecom.trackOutgoing(session.callId, session.name, session.phone, session.video)
                 } else {
@@ -473,7 +543,31 @@ class ActiveCallViewModel @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
-                if (!terminated) fail(error)
+                if (!terminated && incomingCallId == null && connection == null &&
+                    error.isKitConnectivityError()
+                ) {
+                    scheduleOfflineStartRetry(requestedVideo, error)
+                } else if (!terminated) {
+                    fail(error)
+                }
+            }
+        }
+    }
+
+    private fun scheduleOfflineStartRetry(requestedVideo: Boolean, error: Throwable) {
+        mutableState.value = mutableState.value.copy(
+            phase = CallPhase.ERROR,
+            error = error.userMessage(),
+        )
+        if (offlineStartRetryJob?.isActive == true) return
+        val retryDelayMillis = offlineCallRetryDelayMillis(offlineStartRetryAttempt)
+        offlineStartRetryAttempt++
+        offlineStartRetryJob = viewModelScope.launch {
+            delay(retryDelayMillis)
+            offlineStartRetryJob = null
+            startJob = null
+            if (!terminated && connection == null && mutableState.value.phase == CallPhase.ERROR) {
+                connect(requestedVideo)
             }
         }
     }
@@ -488,6 +582,9 @@ class ActiveCallViewModel @Inject constructor(
             validateIncomingCall()
             return
         }
+        offlineStartRetryJob?.cancel()
+        offlineStartRetryJob = null
+        offlineStartRetryAttempt = 0
         startJob = null
         if (incomingCallId != null) accept(mutableState.value.video)
         else start(mutableState.value.video)
@@ -826,8 +923,14 @@ class ActiveCallViewModel @Inject constructor(
                     KitTelecomDisconnect.LOCAL
                 },
             )
+            outgoingClientCallId?.takeIf { outgoingAttemptSubmitted && !outgoingAttemptResolved }
+                ?.let { attemptId ->
+                applicationScope.launch { runCatching { calls.cancelAttempt(attemptId) } }
+            }
         }
         terminated = true
+        offlineStartRetryJob?.cancel()
+        offlineStartRetryJob = null
         validationJob?.cancel()
         timerJob?.cancel()
         timerJob = null
@@ -1044,6 +1147,7 @@ class ActiveCallViewModel @Inject constructor(
 
     override fun onCleared() {
         validationJob?.cancel()
+        offlineStartRetryJob?.cancel()
         timerJob?.cancel()
         timerJob = null
         terminated = true
@@ -1065,6 +1169,13 @@ class ActiveCallViewModel @Inject constructor(
             pendingTerminations.enqueue(
                 PendingCallTermination(incomingCallId, BackendCallTerminationKind.DECLINE),
             )
+        }
+        if (connection == null && incomingCallId == null &&
+            outgoingAttemptSubmitted && !outgoingAttemptResolved
+        ) {
+            outgoingClientCallId?.let { attemptId ->
+                applicationScope.launch { runCatching { calls.cancelAttempt(attemptId) } }
+            }
         }
         val pending = pendingTerminations.snapshot()
         if (pending.isNotEmpty()) {

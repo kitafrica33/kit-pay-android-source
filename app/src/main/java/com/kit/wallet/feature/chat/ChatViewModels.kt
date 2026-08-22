@@ -7,6 +7,7 @@ import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
 import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.CallRepository
+import com.kit.wallet.data.repository.ChatPaymentRequest
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.ui.model.CallDirection
@@ -205,8 +206,16 @@ class ConversationViewModel @Inject constructor(
     private val mutableConversationVisible = MutableStateFlow(false)
     private var foregroundSyncJob: Job? = null
 
+    // Encrypted composer draft restored once per conversation entry; consumed by the screen.
+    private val mutableRestoredDraft = MutableStateFlow<String?>(null)
+    val restoredDraft = mutableRestoredDraft.asStateFlow()
+
     init {
         if (chatId.isNotBlank()) {
+            viewModelScope.launch {
+                mutableRestoredDraft.value =
+                    runCatching { chatRepo.composerDraft(chatId) }.getOrNull()
+            }
             viewModelScope.launch {
                 combine(
                     mutableConversationVisible,
@@ -284,6 +293,17 @@ class ConversationViewModel @Inject constructor(
         mutableError.value = message
     }
 
+    /** The screen seeded its composer from the restored draft (or chose not to). */
+    fun consumeRestoredDraft() {
+        mutableRestoredDraft.value = null
+    }
+
+    /** Best-effort encrypted draft persistence; blank text clears the stored draft. */
+    fun persistDraft(text: String) {
+        if (chatId.isBlank()) return
+        viewModelScope.launch { chatRepo.saveComposerDraft(chatId, text) }
+    }
+
     private suspend fun attemptMarkConversationRead() {
         if (
             !mutableConversationVisible.value ||
@@ -307,7 +327,11 @@ class ConversationViewModel @Inject constructor(
         viewModelScope.launch {
             val composerReleased = AtomicBoolean(false)
             fun releaseComposer() {
-                if (composerReleased.compareAndSet(false, true)) onSent()
+                if (composerReleased.compareAndSet(false, true)) {
+                    onSent()
+                    // The message is durably owned by the outbox; its draft copy is obsolete.
+                    viewModelScope.launch { chatRepo.clearComposerDraft(selectedChat.id) }
+                }
             }
             val failure = try {
                 chatRepo.sendMessage(selectedChat.id, normalized) {
@@ -357,6 +381,17 @@ class ConversationViewModel @Inject constructor(
         )
     }
 
+    /** A server-confirmed request whose encrypted card has not been durably shared yet. */
+    private data class UnsharedPaymentRequest(
+        val chatId: String,
+        val peerUserId: String,
+        val amountMinor: Long,
+        val note: String?,
+        val request: ChatPaymentRequest,
+    )
+
+    private var unsharedPaymentRequest: UnsharedPaymentRequest? = null
+
     /**
      * Creates an idempotent, non-debit backend payment request addressed to the chat peer, then
      * shares it into the conversation as an end-to-end encrypted payment-request descriptor.
@@ -373,11 +408,30 @@ class ConversationViewModel @Inject constructor(
             mutableError.value = "This conversation is not linked to a Kit Pay account"
             return
         }
+        val normalizedNote = note?.trim()?.takeIf(String::isNotBlank)
         viewModelScope.launch {
             mutableSending.value = true
             mutableError.value = null
+            var durablyShared = false
             try {
-                val created = walletRepo.createChatPaymentRequest(peerUserId, amountMinor, note)
+                // A request the server already confirmed for these exact details is reused, so a
+                // create-success/share-failure retry never mints a second financial request. The
+                // request UUID stays the stable identity of the eventual card, matching iOS.
+                val retained = unsharedPaymentRequest?.takeIf {
+                    it.chatId == selectedChat.id && it.peerUserId == peerUserId &&
+                        it.amountMinor == amountMinor && it.note == normalizedNote
+                }?.request
+                val created = retained
+                    ?: walletRepo.createChatPaymentRequest(peerUserId, amountMinor, normalizedNote)
+                        .also { confirmed ->
+                            unsharedPaymentRequest = UnsharedPaymentRequest(
+                                chatId = selectedChat.id,
+                                peerUserId = peerUserId,
+                                amountMinor = amountMinor,
+                                note = normalizedNote,
+                                request = confirmed,
+                            )
+                        }
                 val descriptor = KitPaymentMessage(
                     action = KitPaymentMessage.ACTION_REQUEST,
                     paymentRequestId = created.id,
@@ -386,13 +440,22 @@ class ConversationViewModel @Inject constructor(
                     currencyScale = created.currencyScale,
                     note = created.note?.takeIf(String::isNotBlank),
                 ).encode()
-                chatRepo.sendMessage(selectedChat.id, descriptor)
+                chatRepo.sendMessage(selectedChat.id, descriptor) { durablyShared = true }
+                unsharedPaymentRequest = null
                 onSent()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                mutableError.value = error.message
-                    ?: "The payment request could not be sent"
+                if (durablyShared) {
+                    // The encrypted card is committed to the outbox, appears in the conversation
+                    // as a pending bubble, and owns replay from here. Close the composer like a
+                    // WhatsApp offline send; surfacing an error here would invite a duplicate.
+                    unsharedPaymentRequest = null
+                    onSent()
+                } else {
+                    mutableError.value = error.message
+                        ?: "The payment request could not be sent"
+                }
             } finally {
                 mutableSending.value = false
             }
