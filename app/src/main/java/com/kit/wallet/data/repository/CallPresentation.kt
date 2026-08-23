@@ -6,6 +6,7 @@ import com.kit.wallet.ui.model.Contact
 internal data class CallPresentation(
     val name: String,
     val phone: String? = null,
+    val avatarUrl: String? = null,
 )
 
 /**
@@ -36,6 +37,7 @@ internal fun resolveCallPresentation(
         name = localNames.takeIf(List<String>::isNotEmpty)?.joinToString(", ")
             ?: serverName.toCallDisplayName(),
         phone = matched.singleOrNull()?.phone?.trim()?.takeIf(String::isNotEmpty),
+        avatarUrl = matched.singleOrNull()?.avatarUrl?.trim()?.takeIf(String::isNotEmpty),
     )
 }
 

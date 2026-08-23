@@ -70,6 +70,17 @@ data class SyncStateEntity(
 )
 
 /**
+ * Viewer-local conversation presentation preferences (pin/mute), matching iOS where these live
+ * on-device only and never reach the messaging wire. Cleared with the rest of cached user data.
+ */
+@Entity(tableName = "conversation_prefs")
+data class ConversationPrefEntity(
+    @PrimaryKey val conversationId: String,
+    val pinned: Boolean = false,
+    val muted: Boolean = false,
+)
+
+/**
  * Opaque E2EE state only. Identity/prekey/session bytes and decrypted message projections must be
  * encrypted before they reach Room; namespace/key/version are authenticated as AES-GCM AAD.
  */

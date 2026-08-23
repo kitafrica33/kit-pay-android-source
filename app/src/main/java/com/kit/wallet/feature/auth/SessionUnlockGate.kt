@@ -36,12 +36,18 @@ fun SessionUnlockGate(
     onBiometricSuccess: (BiometricUnlockRequest, java.security.Signature) -> Unit,
     onBiometricCancelled: (String?) -> Unit,
     onSignOut: () -> Unit,
+    onVerifyIdentity: () -> Unit = {},
 ) {
     var pin by remember { mutableStateOf("") }
     var confirmPin by remember { mutableStateOf("") }
     // A brand-new account has no wallet PIN and no biometric key yet: creating the first PIN is
     // the unlock method the server accepts for it, so the gate offers it inline.
-    val needsFirstPin = !state.checking && state.methods.isEmpty()
+    val needsFirstPin = !state.checking && state.methods.isEmpty() && !state.deviceIdentityRequired
+    // No PIN or biometric can unlock this login until the device identity check finishes, so the
+    // gate never shows a PIN form it knows the server will refuse.
+    val needsIdentity = !state.checking && state.deviceIdentityRequired
+    val identityPending = state.deviceIdentityStatus.equals("pending", ignoreCase = true) ||
+        state.deviceIdentityStatus.equals("review", ignoreCase = true)
     val activity = LocalContext.current as? FragmentActivity
     LaunchedEffect(state.biometricRequest) {
         val request = state.biometricRequest ?: return@LaunchedEffect
@@ -75,7 +81,7 @@ fun SessionUnlockGate(
     }
     AlertDialog(
         onDismissRequest = {},
-        title = { Text("Unlock Kit Pay") },
+        title = { Text(if (needsIdentity) "Verify your identity" else "Unlock Kit Pay") },
         text = {
             Column {
                 if (state.checking) {
@@ -85,13 +91,23 @@ fun SessionUnlockGate(
                 } else {
                     Text(
                         state.error ?: when {
+                            needsIdentity && identityPending ->
+                                "Your identity check is being reviewed. This usually finishes " +
+                                    "in a few minutes — tap Check again once you're done."
+                            needsIdentity &&
+                                state.deviceIdentityStatus.equals("failed", ignoreCase = true) ->
+                                "Your last identity check did not go through. Verify your " +
+                                    "identity again to continue."
+                            needsIdentity ->
+                                "To keep your money safe, verify your identity once on this " +
+                                    "phone. It only takes a minute."
                             needsFirstPin ->
                                 "Create a four-digit wallet PIN to secure this account and " +
                                     "unlock this login."
                             else -> "Enter your wallet PIN to continue on this device."
                         },
                     )
-                    if ("pin" in state.methods) {
+                    if (!needsIdentity && "pin" in state.methods) {
                         Spacer(Modifier.height(12.dp))
                         OutlinedTextField(
                             value = pin,
@@ -131,6 +147,10 @@ fun SessionUnlockGate(
         confirmButton = {
             when {
                 state.checking -> Unit
+                needsIdentity && identityPending ->
+                    Button(onClick = onRetry) { Text("Check again") }
+                needsIdentity ->
+                    Button(onClick = onVerifyIdentity) { Text("Verify identity") }
                 "pin" in state.methods -> Button(
                     onClick = { onUnlock(pin) },
                     enabled = pin.length == 4 && !state.unlocking,
@@ -144,8 +164,11 @@ fun SessionUnlockGate(
         },
         dismissButton = {
             Column {
-                if (state.biometricReady && "biometric_signature" in state.methods &&
-                    state.biometricRequest == null
+                if (needsIdentity && !identityPending) {
+                    OutlinedButton(onClick = onRetry) { Text("I've already verified") }
+                }
+                if (!needsIdentity && state.biometricReady &&
+                    "biometric_signature" in state.methods && state.biometricRequest == null
                 ) {
                     OutlinedButton(onClick = onRequestBiometric) { Text("Use biometrics") }
                 }

@@ -30,6 +30,7 @@ import androidx.compose.material.icons.rounded.SimCard
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.VerifiedUser
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -37,7 +38,9 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,7 +93,13 @@ fun HomeScreen(
     val balanceMinor by viewModel.balanceMinor.collectAsStateWithLifecycle()
     val recent by viewModel.recentTransactions.collectAsStateWithLifecycle()
     val favorites by viewModel.favorites.collectAsStateWithLifecycle()
+    val refreshing by viewModel.refreshing.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
+
+    DisposableEffect(Unit) {
+        viewModel.setHomeVisible(true)
+        onDispose { viewModel.setHomeVisible(false) }
+    }
 
     HomeDashboard(
         profile = profile,
@@ -98,6 +107,8 @@ fun HomeScreen(
         capabilities = capabilities,
         favorites = favorites,
         recent = recent,
+        refreshing = refreshing,
+        onRefresh = viewModel::refresh,
         snackbarHostState = snackbarHostState,
         onSend = onSend,
         onReceive = onReceive,
@@ -114,6 +125,7 @@ fun HomeScreen(
     )
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun HomeDashboard(
     profile: UserProfile,
@@ -122,6 +134,8 @@ internal fun HomeDashboard(
     favorites: List<Contact>,
     recent: List<Transaction>,
     snackbarHostState: SnackbarHostState,
+    refreshing: Boolean = false,
+    onRefresh: () -> Unit = {},
     onSend: () -> Unit,
     onReceive: () -> Unit,
     onScan: () -> Unit,
@@ -148,7 +162,11 @@ internal fun HomeDashboard(
         }
     }
 
-    Box(Modifier.fillMaxSize()) {
+    PullToRefreshBox(
+        isRefreshing = refreshing,
+        onRefresh = onRefresh,
+        modifier = Modifier.fillMaxSize(),
+    ) {
         HomeContent(
             profile = profile,
             balanceMinor = balanceMinor,
@@ -221,7 +239,7 @@ private fun HomeContent(
                         .padding(horizontal = 20.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    KitAvatar(profile.name, size = 40.dp)
+                    KitAvatar(profile.name, size = 40.dp, avatarUrl = profile.avatarUrl)
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(

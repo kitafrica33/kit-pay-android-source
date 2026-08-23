@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.MessagingRichMediaCapability
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
 import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.CallRepository
@@ -97,7 +98,7 @@ internal class ConversationSoundBaseline {
 }
 
 @HiltViewModel
-class ChatsViewModel @Inject constructor(chatRepo: ChatRepository) : ViewModel() {
+class ChatsViewModel @Inject constructor(private val chatRepo: ChatRepository) : ViewModel() {
     val messagingAvailable = chatRepo.readiness
     val chats = chatRepo.chats
 
@@ -109,6 +110,28 @@ class ChatsViewModel @Inject constructor(chatRepo: ChatRepository) : ViewModel()
             SharingStarted.Eagerly,
             chatRepo.chats.value.sumOf { preview -> preview.unread },
         )
+
+    /** Viewer-local pin; applies to every selected conversation. */
+    fun setPinned(chatIds: Collection<String>, pinned: Boolean) {
+        viewModelScope.launch {
+            chatIds.forEach { chatRepo.setChatPinned(it, pinned) }
+        }
+    }
+
+    fun setMuted(chatIds: Collection<String>, muted: Boolean) {
+        viewModelScope.launch {
+            chatIds.forEach { chatRepo.setChatMuted(it, muted) }
+        }
+    }
+
+    /** Publishes read receipts for every selected conversation with unread messages. */
+    fun markRead(chatIds: Collection<String>) {
+        viewModelScope.launch {
+            chatIds.forEach { chatId ->
+                runCatching { chatRepo.markConversationRead(chatId) }
+            }
+        }
+    }
 }
 
 @HiltViewModel
@@ -118,6 +141,7 @@ class ConversationViewModel @Inject constructor(
     private val callRepo: CallRepository,
     private val messageSounds: MessageSoundPlayer,
     savedStateHandle: SavedStateHandle,
+    internal val richMediaCapability: MessagingRichMediaCapability? = null,
 ) : ViewModel() {
 
     private val chatId: String = savedStateHandle.get<String>("chatId")
@@ -498,7 +522,16 @@ class ConversationViewModel @Inject constructor(
         }
     }
 
-    fun sendImage(bytes: ByteArray, mediaType: String, onSent: () -> Unit = {}) {
+    fun sendImage(bytes: ByteArray, mediaType: String, onSent: () -> Unit = {}) =
+        sendMedia(bytes, mediaType, caption = null, onSent = onSent)
+
+    /** Sends any kit-media-v1 attachment (photo, voice note, video or document) end-to-end. */
+    fun sendMedia(
+        bytes: ByteArray,
+        mediaType: String,
+        caption: String? = null,
+        onSent: () -> Unit = {},
+    ) {
         val selectedChat = chat.value
         if (
             selectedChat == null ||
@@ -513,13 +546,14 @@ class ConversationViewModel @Inject constructor(
             mutableSending.value = true
             mutableError.value = null
             try {
-                chatRepo.sendImageMessage(selectedChat.id, bytes, mediaType)
+                richMediaCapability?.requireAvailable(mediaType.trim().lowercase())
+                chatRepo.sendImageMessage(selectedChat.id, bytes, mediaType, caption)
                 onSent()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
                 mutableError.value = error.message
-                    ?: "The secure photo could not be sent"
+                    ?: "The secure attachment could not be sent"
             } finally {
                 bytes.fill(0)
                 mutableSending.value = false

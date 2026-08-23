@@ -33,18 +33,28 @@ import androidx.compose.material.icons.automirrored.rounded.CallMade
 import androidx.compose.material.icons.automirrored.rounded.CallMissed
 import androidx.compose.material.icons.automirrored.rounded.CallReceived
 import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Done
 import androidx.compose.material.icons.rounded.DoneAll
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Payments
 import androidx.compose.material.icons.rounded.Photo
+import androidx.compose.material.icons.rounded.PhotoCamera
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -62,6 +72,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -74,8 +85,10 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -89,6 +102,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.R
 import com.kit.wallet.data.demo.DemoData
+import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
 import com.kit.wallet.data.messaging.readBoundedMedia
 import com.kit.wallet.ui.components.KitAvatar
@@ -154,33 +168,133 @@ fun ConversationScreen(
     val restoredDraft by viewModel.restoredDraft.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    val pickImage = rememberLauncherForActivityResult(
+    // Every picker/capture result funnels through one bounded reader that hands plaintext
+    // ownership to the ViewModel send job (which erases it on completion or failure).
+    fun sendPickedMedia(read: suspend () -> Triple<ByteArray, String, String?>) {
+        coroutineScope.launch {
+            var selectedBytes: ByteArray? = null
+            try {
+                var mediaType = "application/octet-stream"
+                var caption: String? = null
+                withContext(Dispatchers.IO + NonCancellable) {
+                    val (bytes, type, name) = read()
+                    selectedBytes = bytes
+                    mediaType = type
+                    caption = name
+                }
+                coroutineContext.ensureActive()
+                val owned = checkNotNull(selectedBytes)
+                viewModel.sendMedia(owned, mediaType, caption)
+                selectedBytes = null // Ownership moved to the ViewModel send job.
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                viewModel.reportMediaSelectionError(
+                    error.message ?: "The selected file could not be opened",
+                )
+            } finally {
+                selectedBytes?.fill(0)
+            }
+        }
+    }
+
+    val pickLibraryMedia = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
     ) { uri ->
         if (uri != null) {
-            coroutineScope.launch {
-                var selectedBytes: ByteArray? = null
-                try {
-                    var mediaType = "image/jpeg"
-                    withContext(Dispatchers.IO + NonCancellable) {
-                        selectedBytes = context.contentResolver.openInputStream(uri)?.use {
-                            it.readBoundedMedia(MAX_IMAGE_PLAINTEXT_BYTES)
-                        } ?: error("The selected photo could not be opened")
-                        mediaType = context.contentResolver.getType(uri) ?: mediaType
-                    }
-                    coroutineContext.ensureActive()
-                    val owned = checkNotNull(selectedBytes)
-                    viewModel.sendImage(owned, mediaType)
-                    selectedBytes = null // Ownership moved to the ViewModel send job.
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Exception) {
-                    viewModel.reportMediaSelectionError(
-                        error.message ?: "The selected photo could not be opened",
-                    )
-                } finally {
-                    selectedBytes?.fill(0)
+            sendPickedMedia {
+                val resolvedType = context.contentResolver.getType(uri).orEmpty().lowercase()
+                if (resolvedType.startsWith("video/")) {
+                    val bytes = context.contentResolver.openInputStream(uri)?.use {
+                        it.readBoundedMedia(MAX_IMAGE_PLAINTEXT_BYTES)
+                    } ?: error("The selected video could not be opened")
+                    val mediaType = KitMediaMessage.normalizeMediaType(resolvedType) ?: "video/mp4"
+                    Triple(bytes, mediaType, null)
+                } else {
+                    val bytes = transcodeChatImage(context.contentResolver, uri)
+                        ?: error("The selected photo could not be prepared")
+                    Triple(bytes, "image/jpeg", null)
                 }
+            }
+        }
+    }
+    var captureTarget by remember { mutableStateOf<android.net.Uri?>(null) }
+    var captureFile by remember { mutableStateOf<java.io.File?>(null) }
+    fun newCaptureTarget(extension: String): android.net.Uri {
+        val directory = java.io.File(context.cacheDir, "chat-capture").apply { mkdirs() }
+        val file = java.io.File(directory, "capture-${java.util.UUID.randomUUID()}.$extension")
+        captureFile = file
+        return androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.chatmedia",
+            file,
+        ).also { captureTarget = it }
+    }
+    val takePhoto = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicture(),
+    ) { saved ->
+        val target = captureTarget
+        val file = captureFile
+        captureTarget = null
+        captureFile = null
+        if (saved && target != null) {
+            sendPickedMedia {
+                try {
+                    val bytes = transcodeChatImage(context.contentResolver, target)
+                        ?: error("The captured photo could not be prepared")
+                    Triple(bytes, "image/jpeg", null)
+                } finally {
+                    file?.delete()
+                }
+            }
+        } else {
+            file?.delete()
+        }
+    }
+    val captureVideoNote = rememberLauncherForActivityResult(
+        ActivityResultContracts.CaptureVideo(),
+    ) { saved ->
+        val target = captureTarget
+        val file = captureFile
+        captureTarget = null
+        captureFile = null
+        if (saved && target != null) {
+            sendPickedMedia {
+                try {
+                    val bytes = context.contentResolver.openInputStream(target)?.use {
+                        it.readBoundedMedia(MAX_IMAGE_PLAINTEXT_BYTES)
+                    } ?: error("The recorded video could not be opened")
+                    Triple(bytes, "video/mp4", null)
+                } finally {
+                    file?.delete()
+                }
+            }
+        } else {
+            file?.delete()
+        }
+    }
+    val pickDocument = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            sendPickedMedia {
+                val bytes = context.contentResolver.openInputStream(uri)?.use {
+                    it.readBoundedMedia(MAX_IMAGE_PLAINTEXT_BYTES)
+                } ?: error("The selected document could not be opened")
+                val mediaType = KitMediaMessage.normalizeMediaType(
+                    context.contentResolver.getType(uri).orEmpty(),
+                ) ?: "application/octet-stream"
+                // The wire descriptor has no filename field; the caption carries it (iOS parity).
+                val displayName = context.contentResolver.query(
+                    uri,
+                    arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                    null,
+                    null,
+                    null,
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) cursor.getString(0) else null
+                }
+                Triple(bytes, mediaType, displayName?.take(120))
             }
         }
     }
@@ -207,13 +321,35 @@ fun ConversationScreen(
         onRetry = viewModel::retry,
         onSendPaymentRequest = viewModel::sendPaymentRequest,
         onPayRequest = viewModel::payPaymentRequest,
-        onAttach = {
-            // Dormant-feature guard: the composer hides the affordance, and this keeps even a
-            // stale composition from opening the picker while the release profile is text-only.
+        // Dormant-feature guard: the composer hides the affordances, and these keep even a
+        // stale composition from opening a picker while the release profile is text-only.
+        onAttachLibrary = {
             if (BuildConfig.MEDIA_MESSAGING_ENABLED) {
-                pickImage.launch(
-                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                pickLibraryMedia.launch(
+                    PickVisualMediaRequest(
+                        ActivityResultContracts.PickVisualMedia.ImageAndVideo,
+                    ),
                 )
+            }
+        },
+        onAttachCamera = {
+            if (BuildConfig.MEDIA_MESSAGING_ENABLED) takePhoto.launch(newCaptureTarget("jpg"))
+        },
+        onAttachVideoNote = {
+            if (BuildConfig.MEDIA_MESSAGING_ENABLED) {
+                captureVideoNote.launch(newCaptureTarget("mp4"))
+            }
+        },
+        onAttachDocument = {
+            if (BuildConfig.MEDIA_MESSAGING_ENABLED) {
+                pickDocument.launch(CHAT_DOCUMENT_MIME_TYPES)
+            }
+        },
+        onSendVoiceNote = { bytes ->
+            if (BuildConfig.MEDIA_MESSAGING_ENABLED) {
+                viewModel.sendMedia(bytes, VoiceNoteRecorder.Recording.MEDIA_TYPE)
+            } else {
+                bytes.fill(0)
             }
         },
         mediaEnabled = BuildConfig.MEDIA_MESSAGING_ENABLED,
@@ -331,7 +467,11 @@ private fun ConversationContent(
     onRetry: (Message, () -> Unit) -> Unit,
     onSendPaymentRequest: (Long, String?, () -> Unit) -> Unit = { _, _, done -> done() },
     onPayRequest: (Message, String, () -> Unit) -> Unit = { _, _, done -> done() },
-    onAttach: () -> Unit = {},
+    onAttachLibrary: () -> Unit = {},
+    onAttachCamera: () -> Unit = {},
+    onAttachVideoNote: () -> Unit = {},
+    onAttachDocument: () -> Unit = {},
+    onSendVoiceNote: (ByteArray) -> Unit = {},
     mediaEnabled: Boolean = false,
     mediaBytes: Map<String, ByteArray> = emptyMap(),
     mediaLoading: Set<String> = emptySet(),
@@ -427,7 +567,7 @@ private fun ConversationContent(
             TopAppBar(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        KitAvatar(chat.name, size = 40.dp, online = chat.online)
+                        KitAvatar(chat.name, size = 40.dp, online = chat.online, avatarUrl = chat.avatarUrl)
                         Spacer(Modifier.width(10.dp))
                         Column {
                             Text(chat.name, style = MaterialTheme.typography.titleMedium)
@@ -484,7 +624,11 @@ private fun ConversationContent(
                             composerState = composerState.clearIfUnchanged(submitted)
                         }
                     },
-                    onAttach = onAttach,
+                    onAttachLibrary = onAttachLibrary,
+                    onAttachCamera = onAttachCamera,
+                    onAttachVideoNote = onAttachVideoNote,
+                    onAttachDocument = onAttachDocument,
+                    onSendVoiceNote = onSendVoiceNote,
                     mediaEnabled = mediaEnabled,
                     onRequestPayment = {
                         if (error != null) onClearError()
@@ -585,6 +729,7 @@ private fun ConversationContent(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun MessageBubble(
     msg: Message,
@@ -610,6 +755,19 @@ internal fun MessageBubble(
         bottomEnd = if (msg.fromMe) 6.dp else 18.dp,
     )
 
+    // Copyable plaintext exists only for ordinary text and media captions; payment cards,
+    // call logs and raw descriptors are deliberately not exposed to the clipboard.
+    val copyableText = when (msg.kind) {
+        MessageKind.TEXT -> msg.text
+        MessageKind.IMAGE, MessageKind.VIDEO, MessageKind.VOICE_NOTE, MessageKind.DOCUMENT ->
+            msg.text.takeIf {
+                it.isNotBlank() && it !in setOf("Photo", "Voice note", "Video", "Document")
+            }
+        else -> null
+    }
+    var copyMenuOpen by remember(msg.id) { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+
     Box(Modifier.fillMaxWidth()) {
         Column(
             Modifier
@@ -617,7 +775,29 @@ internal fun MessageBubble(
                 .padding(bottom = if (msg.reactions.isEmpty()) 8.dp else 18.dp)
                 .widthIn(max = 300.dp),
         ) {
-            Surface(color = bubbleColor, contentColor = contentColor, shape = shape, shadowElevation = 1.dp) {
+            DropdownMenu(expanded = copyMenuOpen, onDismissRequest = { copyMenuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Copy") },
+                    onClick = {
+                        copyMenuOpen = false
+                        copyableText?.let { clipboard.setText(AnnotatedString(it)) }
+                    },
+                )
+            }
+            Surface(
+                color = bubbleColor,
+                contentColor = contentColor,
+                shape = shape,
+                shadowElevation = 1.dp,
+                modifier = if (copyableText != null) {
+                    Modifier.combinedClickable(
+                        onClick = {},
+                        onLongClick = { copyMenuOpen = true },
+                    )
+                } else {
+                    Modifier
+                },
+            ) {
                 Column(Modifier.padding(horizontal = 13.dp, vertical = 9.dp)) {
                     msg.replyToText?.let { reply ->
                         Surface(
@@ -641,7 +821,30 @@ internal fun MessageBubble(
                             payEnabled = !operationInFlight && !requestSettled,
                             onPay = onPayRequest,
                         )
-                        MessageKind.VOICE_NOTE -> VoiceNoteRow(msg)
+                        MessageKind.VOICE_NOTE -> SecureVoiceNoteContent(
+                            msg = msg,
+                            mediaBytes = mediaBytes,
+                            mediaLoading = mediaLoading,
+                            mediaError = mediaError,
+                            onOpenMedia = onOpenMedia,
+                            onRetryMedia = onRetryMedia,
+                        )
+                        MessageKind.VIDEO -> SecureVideoContent(
+                            msg = msg,
+                            mediaBytes = mediaBytes,
+                            mediaLoading = mediaLoading,
+                            mediaError = mediaError,
+                            onOpenMedia = onOpenMedia,
+                            onRetryMedia = onRetryMedia,
+                        )
+                        MessageKind.DOCUMENT -> SecureDocumentContent(
+                            msg = msg,
+                            mediaBytes = mediaBytes,
+                            mediaLoading = mediaLoading,
+                            mediaError = mediaError,
+                            onOpenMedia = onOpenMedia,
+                            onRetryMedia = onRetryMedia,
+                        )
                         MessageKind.IMAGE -> SecureImageContent(
                             msg = msg,
                             mediaBytes = mediaBytes,
@@ -1015,23 +1218,6 @@ private fun PaymentPinDialog(
     )
 }
 
-@Composable
-private fun VoiceNoteRow(msg: Message) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            "Voice note playback unavailable",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.width(8.dp))
-        Text(
-            "0:%02d".format(msg.durationSec % 60),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-}
-
 /**
  * A call-log entry shown inline in the conversation, like a WhatsApp call bubble: a directional
  * icon, the call type (and "Missed" when it went unanswered), the time and connected duration, and
@@ -1203,7 +1389,7 @@ private fun SecureImageContent(
                 color = MaterialTheme.colorScheme.error,
             )
         }
-        if (msg.text.isNotBlank() && msg.text != "📷 Photo") {
+        if (msg.text.isNotBlank() && msg.text != "Photo" && msg.text != "📷 Photo") {
             Text(
                 msg.text,
                 style = MaterialTheme.typography.bodyLarge,
@@ -1257,6 +1443,21 @@ internal fun decodeBoundedSecureImage(bytes: ByteArray): androidx.compose.ui.gra
         null
     }
 
+/** SAF document mime filter mirroring the kit-media-v1 document set (plus the octet fallback). */
+private val CHAT_DOCUMENT_MIME_TYPES = arrayOf(
+    "application/pdf",
+    "application/zip",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "text/plain",
+    "text/csv",
+    "application/octet-stream",
+)
+
 private const val MAX_SOURCE_IMAGE_DIMENSION = 32_768
 private const val MAX_RENDERED_IMAGE_DIMENSION = 4_096
 private const val MAX_RENDERED_IMAGE_PIXELS = 4_000_000L
@@ -1268,10 +1469,47 @@ private fun Composer(
     draft: String,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
-    onAttach: () -> Unit = {},
+    onAttachLibrary: () -> Unit = {},
+    onAttachCamera: () -> Unit = {},
+    onAttachVideoNote: () -> Unit = {},
+    onAttachDocument: () -> Unit = {},
+    onSendVoiceNote: (ByteArray) -> Unit = {},
+    onVoiceNoteTooShort: () -> Unit = {},
     mediaEnabled: Boolean = false,
     onRequestPayment: () -> Unit = {},
 ) {
+    val context = LocalContext.current
+    val recorder = remember { VoiceNoteRecorder(context) }
+    var recording by remember { mutableStateOf(false) }
+    var attachMenuOpen by remember { mutableStateOf(false) }
+    var recordingElapsedMillis by remember { mutableStateOf(0L) }
+    var recordingLevel by remember { mutableStateOf(0f) }
+    val recordPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            runCatching { recorder.start() }
+                .onSuccess { recording = true }
+        }
+    }
+    LaunchedEffect(recording) {
+        while (recording) {
+            recordingElapsedMillis = recorder.elapsedMillis()
+            recordingLevel = recorder.level()
+            if (recordingElapsedMillis >=
+                com.kit.wallet.data.messaging.KitChatMediaLimits.VOICE_NOTE_MAX_DURATION_MILLIS
+            ) {
+                recorder.finish()?.let { onSendVoiceNote(it.bytes) }
+                recording = false
+            }
+            delay(80)
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            recorder.cancel()
+        }
+    }
     Row(
         Modifier
             .fillMaxWidth()
@@ -1286,54 +1524,189 @@ private fun Composer(
             shadowElevation = 1.dp,
             modifier = Modifier.weight(1f),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                // The composer is never disabled while a send is in flight: text goes into the
-                // thread instantly and the user can keep typing and firing messages without waiting.
-                TextField(
-                    value = draft,
-                    onValueChange = onDraft,
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Message") },
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = Color.Transparent,
-                        unfocusedContainerColor = Color.Transparent,
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent,
-                    ),
-                    maxLines = 4,
-                )
-                if (mediaEnabled) {
-                    IconButton(onClick = onAttach) {
+            if (recording) {
+                Row(
+                    Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(onClick = {
+                        recorder.cancel()
+                        recording = false
+                    }) {
                         Icon(
-                            Icons.Rounded.Photo,
-                            contentDescription = "Send an encrypted photo",
+                            Icons.Rounded.Delete,
+                            contentDescription = "Discard recording",
+                            tint = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    Box(
+                        Modifier
+                            .size(10.dp)
+                            .background(MaterialTheme.colorScheme.error, CircleShape),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        formatVoiceNoteTime(recordingElapsedMillis),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    RecorderLevelWave(
+                        level = recordingLevel,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            } else {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // The composer is never disabled while a send is in flight: text goes into
+                    // the thread instantly and the user keeps typing without waiting.
+                    TextField(
+                        value = draft,
+                        onValueChange = onDraft,
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("Message") },
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = Color.Transparent,
+                            unfocusedContainerColor = Color.Transparent,
+                            focusedIndicatorColor = Color.Transparent,
+                            unfocusedIndicatorColor = Color.Transparent,
+                        ),
+                        maxLines = 4,
+                    )
+                    if (mediaEnabled) {
+                        Box {
+                            IconButton(onClick = { attachMenuOpen = true }) {
+                                Icon(
+                                    Icons.Rounded.AttachFile,
+                                    contentDescription = "Attachments",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = attachMenuOpen,
+                                onDismissRequest = { attachMenuOpen = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Photo & video library") },
+                                    leadingIcon = { Icon(Icons.Rounded.Photo, null) },
+                                    onClick = {
+                                        attachMenuOpen = false
+                                        onAttachLibrary()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Camera") },
+                                    leadingIcon = { Icon(Icons.Rounded.PhotoCamera, null) },
+                                    onClick = {
+                                        attachMenuOpen = false
+                                        onAttachCamera()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Video note") },
+                                    leadingIcon = { Icon(Icons.Rounded.Videocam, null) },
+                                    onClick = {
+                                        attachMenuOpen = false
+                                        onAttachVideoNote()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Document") },
+                                    leadingIcon = { Icon(Icons.Rounded.Description, null) },
+                                    onClick = {
+                                        attachMenuOpen = false
+                                        onAttachDocument()
+                                    },
+                                )
+                            }
+                        }
+                    }
+                    IconButton(onClick = onRequestPayment) {
+                        Icon(
+                            Icons.Rounded.Payments,
+                            contentDescription = "Request a payment",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
-                IconButton(onClick = onRequestPayment) {
-                    Icon(
-                        Icons.Rounded.Payments,
-                        contentDescription = "Request a payment",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
             }
         }
         Spacer(Modifier.width(8.dp))
-        Box(
-            Modifier
-                .size(50.dp)
-                .background(MaterialTheme.colorScheme.secondary, CircleShape)
-                .clickable(enabled = draft.isNotBlank(), onClick = onSend),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                Icons.AutoMirrored.Rounded.Send,
-                contentDescription = "Send",
-                tint = MaterialTheme.colorScheme.onSecondary.copy(
-                    alpha = if (draft.isNotBlank()) 1f else 0.45f,
+        if (recording) {
+            Box(
+                Modifier
+                    .size(50.dp)
+                    .background(MaterialTheme.colorScheme.secondary, CircleShape)
+                    .clickable {
+                        val finished = recorder.finish()
+                        recording = false
+                        if (finished != null) onSendVoiceNote(finished.bytes) else onVoiceNoteTooShort()
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Rounded.Send,
+                    contentDescription = "Send voice note",
+                    tint = MaterialTheme.colorScheme.onSecondary,
+                )
+            }
+        } else if (draft.isBlank() && mediaEnabled) {
+            Box(
+                Modifier
+                    .size(50.dp)
+                    .background(MaterialTheme.colorScheme.secondary, CircleShape)
+                    .clickable {
+                        recordPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Rounded.Mic,
+                    contentDescription = "Record a voice note",
+                    tint = MaterialTheme.colorScheme.onSecondary,
+                )
+            }
+        } else {
+            Box(
+                Modifier
+                    .size(50.dp)
+                    .background(MaterialTheme.colorScheme.secondary, CircleShape)
+                    .clickable(enabled = draft.isNotBlank(), onClick = onSend),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Rounded.Send,
+                    contentDescription = "Send",
+                    tint = MaterialTheme.colorScheme.onSecondary.copy(
+                        alpha = if (draft.isNotBlank()) 1f else 0.45f,
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/** Scrolling live-input wave for the recording bar, sized like the iOS `RecorderLevelWave`. */
+@Composable
+private fun RecorderLevelWave(level: Float, modifier: Modifier = Modifier) {
+    val history = remember { mutableStateListOf<Float>() }
+    LaunchedEffect(level) {
+        history.add(level)
+        if (history.size > 28) history.removeAt(0)
+    }
+    val accent = MaterialTheme.colorScheme.secondary.copy(alpha = 0.75f)
+    Canvas(modifier.height(24.dp)) {
+        val barWidth = 2.6.dp.toPx()
+        val spacing = 2.4.dp.toPx()
+        history.takeLast(28).forEachIndexed { index, value ->
+            val barHeight = 4.dp.toPx() + value * 18.dp.toPx()
+            drawRoundRect(
+                color = accent,
+                topLeft = androidx.compose.ui.geometry.Offset(
+                    x = index * (barWidth + spacing),
+                    y = (size.height - barHeight) / 2f,
                 ),
+                size = androidx.compose.ui.geometry.Size(barWidth, barHeight),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(barWidth / 2f),
             )
         }
     }

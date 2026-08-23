@@ -163,6 +163,65 @@ class SessionAssuranceViewModelTest {
         assertTrue(relocked.required)
     }
 
+    @Test
+    fun `device identity requirement surfaces instead of a PIN form the server would refuse`() =
+        runTest {
+            server.enqueue(
+                jsonResponse(
+                    assuranceJson(
+                        access = "restricted",
+                        methods = "[]",
+                        identityStatus = "required",
+                        identityRequired = true,
+                    ),
+                ),
+            )
+            val viewModel = viewModel(FakeSessionStore())
+
+            viewModel.reconcile(signedIn = true, supported = true)
+
+            val settled = awaitSettled(viewModel)
+            assertTrue(settled.required)
+            assertTrue(settled.deviceIdentityRequired)
+            assertEquals("required", settled.deviceIdentityStatus)
+        }
+
+    @Test
+    fun `first PIN saves but the gate pivots to identity when the server stays locked`() = runTest {
+        server.enqueue(
+            jsonResponse(
+                assuranceJson(
+                    access = "restricted",
+                    methods = "[]",
+                    identityStatus = "required",
+                    identityRequired = true,
+                ),
+            ),
+        )
+        server.enqueue(
+            jsonResponse(
+                """{"payment_pin_set":true,"payment_pin_set_at":"2026-08-23T08:00:00Z",""" +
+                    """"session_assurance":${assuranceBody(
+                        access = "restricted",
+                        unlockStatus = "locked",
+                        methods = """["pin"]""",
+                        identityStatus = "required",
+                        identityRequired = true,
+                    )}}""",
+            ),
+        )
+        val viewModel = viewModel(FakeSessionStore())
+        viewModel.reconcile(signedIn = true, supported = true)
+        awaitSettled(viewModel)
+
+        viewModel.createPinAndUnlock("2947", "2947")
+
+        val settled = awaitState(viewModel) { !it.unlocking && it.methods.isNotEmpty() }
+        assertTrue(settled.required)
+        assertTrue(settled.deviceIdentityRequired)
+        assertEquals(setOf("pin"), settled.methods)
+    }
+
     private suspend fun awaitSettled(
         viewModel: SessionAssuranceViewModel,
     ): SessionAssuranceUiState = awaitState(viewModel) { !it.checking && !it.unlocking }
@@ -194,14 +253,21 @@ class SessionAssuranceViewModelTest {
         access: String,
         unlockStatus: String = "locked",
         methods: String = """["pin"]""",
-    ) = """{"session_assurance":${assuranceBody(access, unlockStatus, methods)}}"""
+        identityStatus: String = "not_required",
+        identityRequired: Boolean = false,
+    ) = """{"session_assurance":${
+        assuranceBody(access, unlockStatus, methods, identityStatus, identityRequired)
+    }}"""
 
     private fun assuranceBody(
         access: String,
         unlockStatus: String = "locked",
         methods: String = """["pin"]""",
+        identityStatus: String = "not_required",
+        identityRequired: Boolean = false,
     ) = """
-        {"device_identity":{"status":"not_required","required":false,"epoch":1,"verified_at":null},
+        {"device_identity":{"status":"$identityStatus","required":$identityRequired,
+        "epoch":1,"verified_at":null},
         "login_unlock":{"status":"$unlockStatus","required":${unlockStatus != "unlocked"},
         "methods":$methods,"method":null,"unlocked_at":null},
         "access":"$access"}

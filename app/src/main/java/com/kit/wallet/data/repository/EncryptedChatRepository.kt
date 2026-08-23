@@ -2,6 +2,9 @@ package com.kit.wallet.data.repository
 
 import android.util.Log
 import com.kit.wallet.BuildConfig
+import com.kit.wallet.data.local.ConversationPrefEntity
+import com.kit.wallet.data.local.ConversationPrefsDao
+import com.kit.wallet.data.messaging.KitChatMediaKind
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
@@ -628,12 +631,12 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         mediaType: String,
         caption: String?,
     ) {
-        require(bytes.isNotEmpty()) { "Choose an image to send securely" }
+        require(bytes.isNotEmpty()) { "Choose a file to send securely" }
         require(bytes.size <= MAX_IMAGE_PLAINTEXT_BYTES) {
-            "Images up to ${MAX_IMAGE_PLAINTEXT_BYTES / (1024 * 1024)} MB are supported"
+            "Files up to ${MAX_IMAGE_PLAINTEXT_BYTES / (1024 * 1024)} MB are supported"
         }
-        val normalizedMediaType = requireNotNull(KitMediaMessage.normalizeImageMediaType(mediaType)) {
-            "Choose a JPEG, PNG, WebP or GIF image"
+        val normalizedMediaType = requireNotNull(KitMediaMessage.normalizeMediaType(mediaType)) {
+            "Choose a supported photo, voice note, video or document"
         }
         val active = requireCurrent(session)
         val conversation = requireConversation(active, conversationId)
@@ -1077,6 +1080,7 @@ class EncryptedChatRepository @Inject internal constructor(
     @ApplicationScope scope: CoroutineScope,
     clock: Clock,
     private val composerDrafts: SecureMessagingComposerDraftStore? = null,
+    private val conversationPrefs: ConversationPrefsDao? = null,
 ) : ChatRepository {
     // Drafts are a best-effort convenience riding the encrypted messaging state store; they are
     // erased with that state on logout and must never fail or gate any messaging operation.
@@ -1097,8 +1101,32 @@ class EncryptedChatRepository @Inject internal constructor(
     private val mutableReadiness = MutableStateFlow(false)
     override val readiness: StateFlow<Boolean> = mutableReadiness.asStateFlow()
 
+    // Viewer-local pin/mute decoration happens synchronously at the publication edge so the
+    // authenticated projection flow stays byte-derived from the encrypted store while readers
+    // (including openDirectConversation's post-publication check) never observe a stale list.
+    private val rawChats = MutableStateFlow<List<ChatPreview>>(emptyList())
+    private val prefsSnapshot = MutableStateFlow<List<ConversationPrefEntity>>(emptyList())
     private val mutableChats = MutableStateFlow<List<ChatPreview>>(emptyList())
     override val chats: StateFlow<List<ChatPreview>> = mutableChats.asStateFlow()
+
+    private fun publishChats(previews: List<ChatPreview>) {
+        rawChats.value = previews
+        mutableChats.value = applyConversationPrefs(previews, prefsSnapshot.value)
+    }
+
+    override suspend fun setChatPinned(chatId: String, pinned: Boolean) {
+        val dao = conversationPrefs ?: return
+        runCatching {
+            dao.put((dao.get(chatId) ?: ConversationPrefEntity(chatId)).copy(pinned = pinned))
+        }
+    }
+
+    override suspend fun setChatMuted(chatId: String, muted: Boolean) {
+        val dao = conversationPrefs ?: return
+        runCatching {
+            dao.put((dao.get(chatId) ?: ConversationPrefEntity(chatId)).copy(muted = muted))
+        }
+    }
     private val publicationLock = Any()
     private val conversationLock = Any()
     private val conversationFlows = mutableMapOf<String, MutableStateFlow<List<Message>>>()
@@ -1118,6 +1146,14 @@ class EncryptedChatRepository @Inject internal constructor(
     )
 
     init {
+        conversationPrefs?.let { dao ->
+            scope.launch {
+                dao.observeAll().collect { prefs ->
+                    prefsSnapshot.value = prefs
+                    mutableChats.value = applyConversationPrefs(rawChats.value, prefs)
+                }
+            }
+        }
         scope.launch {
             val stateRequests = combine(
                 runtime.activeSession,
@@ -1453,6 +1489,14 @@ class EncryptedChatRepository @Inject internal constructor(
         val savedNames = localContacts.asSequence()
             .filter { it.isKitUser && it.savedInDevice }
             .associate { it.id.lowercase() to it.name.safeChatContactName() }
+        val avatarsByUser = localContacts.asSequence()
+            .filter { it.isKitUser && it.id.isNotBlank() }
+            .mapNotNull { contact ->
+                contact.avatarUrl?.trim()?.takeIf(String::isNotEmpty)?.let {
+                    contact.id.lowercase() to it
+                }
+            }
+            .toMap()
         val chats = conversations.sortedWith(
             compareByDescending<AuthenticatedDirectConversation> { conversation ->
                 latestByConversation[conversation.id]?.sentAt?.toEpochMilli() ?: Long.MIN_VALUE
@@ -1465,7 +1509,10 @@ class EncryptedChatRepository @Inject internal constructor(
                     ?: conversation.peerName.safeChatContactName()
                     ?: "Kit Pay contact",
                 lastMessage = last?.text?.let { text ->
-                    KitMediaMessage.parse(text)?.let { media -> media.caption ?: "📷 Photo" }
+                    KitMediaMessage.parse(text)?.let { media ->
+                        val label = KitChatMediaKind.fromMediaType(media.mediaType).previewLabel
+                        media.caption?.let { caption -> "$label · $caption" } ?: label
+                    }
                         ?: KitPaymentMessage.parse(text)?.let { payment ->
                             if (payment.isRequest) "💰 Payment request" else "💸 Payment"
                         }
@@ -1480,6 +1527,7 @@ class EncryptedChatRepository @Inject internal constructor(
                 isGroup = false,
                 lastFromMe = last?.fromCurrentUser == true,
                 lastState = last?.deliveryState.toUiDeliveryState(),
+                avatarUrl = avatarsByUser[conversation.peerUserId.lowercase()],
             )
         }
         return ProjectionPublication(chats, messageLists)
@@ -1498,7 +1546,7 @@ class EncryptedChatRepository @Inject internal constructor(
                     .value = messages
             }
         }
-        mutableChats.value = publication.chats
+        publishChats(publication.chats)
         publishedSession = session
         // Publish readiness last: observing true implies this activation's chats/messages were
         // already committed under the same repository publication lock.
@@ -1507,11 +1555,12 @@ class EncryptedChatRepository @Inject internal constructor(
 
     private fun toUiMessage(projected: AuthenticatedProjectedText): Message {
         val media = KitMediaMessage.parse(projected.text)
+        val mediaKind = media?.let { KitChatMediaKind.fromMediaType(it.mediaType) }
         val payment = if (media == null) KitPaymentMessage.parse(projected.text) else null
         return Message(
             id = projected.messageId,
             text = when {
-                media != null -> media.caption ?: "📷 Photo"
+                media != null -> media.caption ?: mediaKind!!.previewLabel
                 payment != null -> payment.note.orEmpty()
                 else -> projected.text
             },
@@ -1519,13 +1568,18 @@ class EncryptedChatRepository @Inject internal constructor(
             fromMe = projected.fromCurrentUser,
             state = projected.deliveryState.toUiDeliveryState(),
             kind = when {
-                media != null -> MessageKind.IMAGE
+                mediaKind == KitChatMediaKind.VOICE -> MessageKind.VOICE_NOTE
+                mediaKind == KitChatMediaKind.VIDEO -> MessageKind.VIDEO
+                mediaKind == KitChatMediaKind.DOCUMENT -> MessageKind.DOCUMENT
+                mediaKind == KitChatMediaKind.IMAGE -> MessageKind.IMAGE
                 payment == null -> MessageKind.TEXT
                 payment.isRequest -> MessageKind.PAYMENT_REQUEST
                 else -> MessageKind.PAYMENT
             },
             // The opaque authenticated descriptor; the UI passes it back for follow-up actions.
             mediaDescriptor = if (media != null || payment != null) projected.text else null,
+            mediaType = media?.mediaType,
+            mediaPlaintextBytes = media?.plaintextByteSize ?: 0,
             amountMinor = when {
                 payment == null -> 0
                 // A completed payment reads "sent" for the payer and "received" for the requester.
@@ -1571,7 +1625,7 @@ class EncryptedChatRepository @Inject internal constructor(
     private fun clearPublishedStateLocked(owner: SecureMessagingChatSession?) {
         mutableReadiness.value = false
         publishedSession = owner
-        mutableChats.value = emptyList()
+        publishChats(emptyList())
         synchronized(conversationLock) {
             conversationFlows.values.forEach { it.value = emptyList() }
         }
@@ -1600,3 +1654,24 @@ private fun debugProjectionBaselineFailure(error: Throwable) {
 
 private const val PROJECTION_DIAGNOSTIC_TAG = "KitMessagingBaseline"
 private const val MAX_PROJECTION_DIAGNOSTIC_CAUSES = 8
+
+/**
+ * Decorates published previews with viewer-local pin/mute flags and floats pinned chats to the
+ * top, preserving the recency order the publication already established within each group.
+ */
+internal fun applyConversationPrefs(
+    previews: List<ChatPreview>,
+    prefs: List<ConversationPrefEntity>,
+): List<ChatPreview> {
+    if (prefs.isEmpty()) return previews
+    val byId = prefs.associateBy(ConversationPrefEntity::conversationId)
+    val decorated = previews.map { preview ->
+        val pref = byId[preview.id] ?: return@map preview
+        if (pref.pinned == preview.pinned && pref.muted == preview.muted) {
+            preview
+        } else {
+            preview.copy(pinned = pref.pinned, muted = pref.muted)
+        }
+    }
+    return decorated.sortedByDescending(ChatPreview::pinned)
+}

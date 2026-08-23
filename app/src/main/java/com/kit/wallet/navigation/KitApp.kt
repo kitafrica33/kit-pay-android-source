@@ -309,6 +309,19 @@ fun KitApp(
         }
         wasAssuranceRequired = sessionAssurance.required
     }
+    // Returning from the KYC flow (or finishing onboarding) is the moment identity verification
+    // may have completed server-side; re-check so the gate reflects it without an app restart.
+    var previousRoute by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(currentRoute) {
+        val leftIdentityFlow = previousRoute == Dest.KYC ||
+            previousRoute in ACCOUNT_SETUP_ROUTES
+        previousRoute = currentRoute
+        if (signedIn && sessionAssurance.required && leftIdentityFlow &&
+            currentRoute != Dest.KYC && currentRoute !in ACCOUNT_SETUP_ROUTES
+        ) {
+            sessionAssuranceViewModel.refresh()
+        }
+    }
 
     Scaffold(
         bottomBar = {
@@ -385,7 +398,12 @@ fun KitApp(
         )
     }
 
-    if (signedIn && sessionAssurance.required) {
+    // Profile/PIN onboarding and the KYC flow run on server routes that stay open while the
+    // login is locked, and they are exactly how a new account satisfies the gate. Overlaying
+    // the gate on those screens previously trapped brand-new users: the server saved their
+    // first PIN but refused to unlock until identity verification, which the gate never offered.
+    val accountSetupActive = profileSetupRequired || currentRoute in ACCOUNT_SETUP_ROUTES
+    if (signedIn && sessionAssurance.required && !accountSetupActive && currentRoute != Dest.KYC) {
         SessionUnlockGate(
             state = sessionAssurance,
             onUnlock = sessionAssuranceViewModel::unlockWithPin,
@@ -395,6 +413,9 @@ fun KitApp(
             onBiometricSuccess = sessionAssuranceViewModel::completeBiometricUnlock,
             onBiometricCancelled = sessionAssuranceViewModel::cancelBiometricUnlock,
             onSignOut = authViewModel::logoutCurrentDevice,
+            onVerifyIdentity = {
+                navController.navigate(Dest.KYC) { launchSingleTop = true }
+            },
         )
     }
     biometricApproval?.let { request ->

@@ -142,3 +142,7 @@ internal object NoOpSecureMessagingIncomingNotificationSink :
     SecureMessagingIncomingNotificationSink {
     override fun publish(notification: SecureMessagingIncomingNotification) = Unit
 }
+
+internal object NoOpWalletRefreshTrigger : com.kit.wallet.data.repository.WalletRefreshTrigger {
+    override fun refreshNow() = Unit
+}

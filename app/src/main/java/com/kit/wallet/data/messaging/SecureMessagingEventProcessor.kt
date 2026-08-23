@@ -2,6 +2,7 @@ package com.kit.wallet.data.messaging
 
 import androidx.annotation.VisibleForTesting
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
+import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
 import com.kit.wallet.data.remote.KitWalletApiException
 import java.io.IOException
@@ -101,6 +102,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         NoOpSecureMessagingCurrentActivationRevocation,
     private val historyContinuationScheduler: SecureMessagingHistoryContinuationScheduler =
         NoOpSecureMessagingHistoryContinuationScheduler,
+    private val walletRefresh: WalletRefreshTrigger = NoOpWalletRefreshTrigger,
 ) {
     private class SessionState(
         val session: RemoteSecureMessagingTransport.Session,
@@ -1027,6 +1029,15 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             // notification, never leave the user with an alert for a locally invisible message.
             recordInbound(durable, sentAt)
             pending
+        }
+        // A committed incoming settlement means money just landed in this account. The backend
+        // sends no wallet push, so this authenticated message is the receiver's earliest signal.
+        if (
+            !authoredOnThisAccount &&
+            KitPaymentMessage.parse(durable.authenticatedText)?.action ==
+            KitPaymentMessage.ACTION_PAID
+        ) {
+            walletRefresh.refreshNow()
         }
         if (!notificationPending) return
 

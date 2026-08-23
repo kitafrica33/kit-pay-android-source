@@ -1,7 +1,9 @@
 package com.kit.wallet.feature.chat
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,6 +13,7 @@ import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -19,25 +22,31 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AddComment
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Done
 import androidx.compose.material.icons.rounded.DoneAll
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.NotificationsOff
 import androidx.compose.material.icons.rounded.PushPin
+import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -64,7 +73,15 @@ fun ChatsScreen(
 ) {
     val chats by viewModel.chats.collectAsStateWithLifecycle()
     val messagingAvailable by viewModel.messagingAvailable.collectAsStateWithLifecycle()
-    ChatsContent(chats, messagingAvailable, onChat, onNewChat)
+    ChatsContent(
+        allChats = chats,
+        messagingAvailable = messagingAvailable,
+        onChat = onChat,
+        onNewChat = onNewChat,
+        onSetPinned = viewModel::setPinned,
+        onSetMuted = viewModel::setMuted,
+        onMarkRead = viewModel::markRead,
+    )
 }
 
 @Composable
@@ -73,23 +90,30 @@ private fun ChatsContent(
     messagingAvailable: Boolean,
     onChat: (String) -> Unit,
     onNewChat: () -> Unit,
+    onSetPinned: (Collection<String>, Boolean) -> Unit = { _, _ -> },
+    onSetMuted: (Collection<String>, Boolean) -> Unit = { _, _ -> },
+    onMarkRead: (Collection<String>) -> Unit = {},
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf("All") }
+    // Multi-select is a transient gesture mode; it deliberately resets on process death.
+    var selected by remember { mutableStateOf(setOf<String>()) }
+    val selecting = selected.isNotEmpty()
 
     val chats = allChats.filter { c ->
         val q = query.isBlank() || c.name.contains(query, true) || c.lastMessage.contains(query, true)
         val f = when (filter) {
             "Unread" -> c.unread > 0
-            "Groups" -> c.isGroup
+            "Pinned" -> c.pinned
             else -> true
         }
         q && f
     }
+    val selectedChats = allChats.filter { it.id in selected }
 
     Scaffold(
         floatingActionButton = {
-            if (messagingAvailable) {
+            if (messagingAvailable && !selecting) {
                 FloatingActionButton(
                     onClick = onNewChat,
                     containerColor = MaterialTheme.colorScheme.secondary,
@@ -97,6 +121,29 @@ private fun ChatsContent(
                 ) {
                     Icon(Icons.Rounded.AddComment, contentDescription = "New chat")
                 }
+            }
+        },
+        bottomBar = {
+            if (selecting) {
+                ChatSelectionBar(
+                    count = selected.size,
+                    anyUnread = selectedChats.any { it.unread > 0 },
+                    allPinned = selectedChats.isNotEmpty() && selectedChats.all { it.pinned },
+                    allMuted = selectedChats.isNotEmpty() && selectedChats.all { it.muted },
+                    onMarkRead = {
+                        onMarkRead(selected)
+                        selected = emptySet()
+                    },
+                    onPin = { pinned ->
+                        onSetPinned(selected, pinned)
+                        selected = emptySet()
+                    },
+                    onMute = { muted ->
+                        onSetMuted(selected, muted)
+                        selected = emptySet()
+                    },
+                    onCancel = { selected = emptySet() },
+                )
             }
         },
     ) { padding ->
@@ -114,11 +161,14 @@ private fun ChatsContent(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        "Chats",
+                        if (selecting) "${selected.size} selected" else "Chats",
                         style = MaterialTheme.typography.headlineMedium,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.weight(1f),
                     )
+                    if (selecting) {
+                        TextButton(onClick = { selected = emptySet() }) { Text("Cancel") }
+                    }
                 }
             }
             item {
@@ -136,7 +186,7 @@ private fun ChatsContent(
             }
             item {
                 Row(Modifier.padding(horizontal = 20.dp)) {
-                    listOf("All", "Unread", "Groups").forEach { f ->
+                    listOf("All", "Unread", "Pinned").forEach { f ->
                         FilterChip(
                             selected = filter == f,
                             onClick = { filter = f },
@@ -184,7 +234,23 @@ private fun ChatsContent(
                 }
             }
             items(chats.size) { i ->
-                ChatRow(chat = chats[i], onClick = { onChat(chats[i].id) })
+                val chat = chats[i]
+                ChatRow(
+                    chat = chat,
+                    selecting = selecting,
+                    selected = chat.id in selected,
+                    onClick = {
+                        if (selecting) {
+                            selected = if (chat.id in selected) selected - chat.id else selected + chat.id
+                        } else {
+                            onChat(chat.id)
+                        }
+                    },
+                    onSelect = { if (!selecting) selected = setOf(chat.id) },
+                    onPin = { onSetPinned(listOf(chat.id), !chat.pinned) },
+                    onMute = { onSetMuted(listOf(chat.id), !chat.muted) },
+                    onMarkRead = { onMarkRead(listOf(chat.id)) },
+                )
             }
             item { Spacer(Modifier.height(90.dp)) }
         }
@@ -251,16 +317,79 @@ private fun EmptyChatsState(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ChatRow(chat: ChatPreview, onClick: () -> Unit) {
+private fun ChatRow(
+    chat: ChatPreview,
+    onClick: () -> Unit,
+    selecting: Boolean = false,
+    selected: Boolean = false,
+    onSelect: () -> Unit = {},
+    onPin: () -> Unit = {},
+    onMute: () -> Unit = {},
+    onMarkRead: () -> Unit = {},
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Box {
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            DropdownMenuItem(
+                text = { Text(if (chat.pinned) "Unpin" else "Pin") },
+                leadingIcon = { Icon(Icons.Rounded.PushPin, null) },
+                onClick = {
+                    menuOpen = false
+                    onPin()
+                },
+            )
+            if (chat.unread > 0) {
+                DropdownMenuItem(
+                    text = { Text("Mark as read") },
+                    leadingIcon = { Icon(Icons.Rounded.DoneAll, null) },
+                    onClick = {
+                        menuOpen = false
+                        onMarkRead()
+                    },
+                )
+            }
+            DropdownMenuItem(
+                text = { Text(if (chat.muted) "Unmute" else "Mute") },
+                leadingIcon = { Icon(Icons.Rounded.NotificationsOff, null) },
+                onClick = {
+                    menuOpen = false
+                    onMute()
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Select") },
+                leadingIcon = { Icon(Icons.Rounded.CheckCircle, null) },
+                onClick = {
+                    menuOpen = false
+                    onSelect()
+                },
+            )
+        }
     Row(
         Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = { if (!selecting) menuOpen = true },
+            )
             .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        KitAvatar(chat.name, size = 52.dp, online = chat.online)
+        if (selecting) {
+            Icon(
+                if (selected) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+                contentDescription = if (selected) "Selected" else "Not selected",
+                tint = if (selected) {
+                    MaterialTheme.colorScheme.secondary
+                } else {
+                    MaterialTheme.colorScheme.outline
+                },
+                modifier = Modifier.padding(end = 12.dp),
+            )
+        }
+        KitAvatar(chat.name, size = 52.dp, online = chat.online, avatarUrl = chat.avatarUrl)
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
             Text(
@@ -360,6 +489,43 @@ private fun ChatRow(chat: ChatPreview, onClick: () -> Unit) {
                     }
                 }
             }
+        }
+    }
+    }
+}
+
+/** Bulk actions for the selected conversations, floating above the navigation bar. */
+@Composable
+private fun ChatSelectionBar(
+    count: Int,
+    anyUnread: Boolean,
+    allPinned: Boolean,
+    allMuted: Boolean,
+    onMarkRead: () -> Unit,
+    onPin: (Boolean) -> Unit,
+    onMute: (Boolean) -> Unit,
+    onCancel: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        shadowElevation = 6.dp,
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceEvenly,
+        ) {
+            TextButton(onClick = onMarkRead, enabled = anyUnread && count > 0) { Text("Read") }
+            TextButton(onClick = { onPin(!allPinned) }, enabled = count > 0) {
+                Text(if (allPinned) "Unpin" else "Pin")
+            }
+            TextButton(onClick = { onMute(!allMuted) }, enabled = count > 0) {
+                Text(if (allMuted) "Unmute" else "Mute")
+            }
+            TextButton(onClick = onCancel) { Text("Done") }
         }
     }
 }

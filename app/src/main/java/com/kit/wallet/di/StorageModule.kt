@@ -2,6 +2,7 @@ package com.kit.wallet.di
 
 import android.content.Context
 import androidx.room.Room
+import com.kit.wallet.data.local.ConversationPrefsDao
 import com.kit.wallet.data.local.KitWalletDatabase
 import com.kit.wallet.data.local.ProfileDao
 import com.kit.wallet.data.local.SecureMessagingMetadataDao
@@ -128,6 +129,7 @@ object StorageModule {
                 KitWalletDatabase.MIGRATION_5_6,
                 KitWalletDatabase.MIGRATION_6_7,
                 KitWalletDatabase.MIGRATION_7_8,
+                KitWalletDatabase.MIGRATION_8_9,
             )
             .fallbackToDestructiveMigrationOnDowngrade()
             .build()
@@ -144,6 +146,10 @@ object StorageModule {
 
     @Provides
     fun provideSyncStateDao(database: KitWalletDatabase): SyncStateDao = database.syncStateDao()
+
+    @Provides
+    fun provideConversationPrefsDao(database: KitWalletDatabase): ConversationPrefsDao =
+        database.conversationPrefsDao()
 
     @Provides
     fun provideSecureMessagingMetadataDao(

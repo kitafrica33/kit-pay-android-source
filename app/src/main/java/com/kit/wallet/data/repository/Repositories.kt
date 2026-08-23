@@ -147,6 +147,10 @@ interface ChatRepository {
     fun conversation(chatId: String): StateFlow<List<Message>>
     suspend fun markConversationRead(chatId: String) = Unit
     suspend fun synchronizeConversation(chatId: String) = Unit
+
+    /** Viewer-local pin/mute preferences; never sent to the server (iOS parity). */
+    suspend fun setChatPinned(chatId: String, pinned: Boolean) = Unit
+    suspend fun setChatMuted(chatId: String, muted: Boolean) = Unit
     suspend fun openDirectConversation(contact: Contact): String
     suspend fun sendMessage(
         chatId: String,

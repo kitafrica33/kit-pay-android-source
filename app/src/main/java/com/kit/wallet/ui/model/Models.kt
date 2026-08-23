@@ -61,7 +61,7 @@ data class Transaction(
 )
 
 enum class DeliveryState { SENDING, SENT, DELIVERED, READ, RETRY_REQUIRED, FAILED }
-enum class MessageKind { TEXT, PAYMENT, PAYMENT_REQUEST, VOICE_NOTE, IMAGE, CALL }
+enum class MessageKind { TEXT, PAYMENT, PAYMENT_REQUEST, VOICE_NOTE, IMAGE, VIDEO, DOCUMENT, CALL }
 
 data class Message(
     val id: String,
@@ -73,6 +73,10 @@ data class Message(
     val kind: MessageKind = MessageKind.TEXT,
     /** For IMAGE and payment messages: the opaque end-to-end descriptor for follow-up actions. */
     val mediaDescriptor: String? = null,
+    /** For media messages: the authenticated MIME type (`mt`), the single kind source of truth. */
+    val mediaType: String? = null,
+    /** For media messages: the decrypted payload size, for placeholder byte labels. */
+    val mediaPlaintextBytes: Int = 0,
     /** For PAYMENT messages: signed minor units. */
     val amountMinor: Long = 0,
     /** For payment messages: the backend payment-request identifier this bubble refers to. */
@@ -108,6 +112,8 @@ data class ChatPreview(
     val muted: Boolean = false,
     val lastFromMe: Boolean = false,
     val lastState: DeliveryState = DeliveryState.READ,
+    /** The peer's profile photo URL, resolved from the local address book. */
+    val avatarUrl: String? = null,
 )
 
 enum class CallDirection { INCOMING, OUTGOING, MISSED }
@@ -127,6 +133,8 @@ data class CallEntry(
     val durationSeconds: Long = 0,
     /** True when the call actually connected (used to distinguish "no answer" from a real call). */
     val answered: Boolean = false,
+    /** The single matched participant's profile photo URL, resolved from the local address book. */
+    val avatarUrl: String? = null,
 )
 
 data class BillProvider(

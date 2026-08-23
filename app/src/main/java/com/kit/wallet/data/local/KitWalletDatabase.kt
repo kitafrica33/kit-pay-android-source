@@ -14,8 +14,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         SecureMessagingRecordEntity::class,
         SecureMessagingMetadataEntity::class,
         AccountMessageArchiveEntity::class,
+        ConversationPrefEntity::class,
     ],
-    version = 8,
+    version = 9,
     exportSchema = true,
 )
 abstract class KitWalletDatabase : RoomDatabase() {
@@ -26,6 +27,7 @@ abstract class KitWalletDatabase : RoomDatabase() {
     abstract fun secureMessagingRecordDao(): SecureMessagingRecordDao
     abstract fun secureMessagingMetadataDao(): SecureMessagingMetadataDao
     abstract fun accountMessageArchiveDao(): AccountMessageArchiveDao
+    abstract fun conversationPrefsDao(): ConversationPrefsDao
 
     companion object {
         val MIGRATION_1_2: Migration = object : Migration(1, 2) {
@@ -123,6 +125,18 @@ abstract class KitWalletDatabase : RoomDatabase() {
         val MIGRATION_7_8: Migration = object : Migration(7, 8) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE profile ADD COLUMN avatarUrl TEXT")
+            }
+        }
+
+        val MIGRATION_8_9: Migration = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS conversation_prefs (" +
+                        "conversationId TEXT NOT NULL, " +
+                        "pinned INTEGER NOT NULL DEFAULT 0, " +
+                        "muted INTEGER NOT NULL DEFAULT 0, " +
+                        "PRIMARY KEY(conversationId))",
+                )
             }
         }
     }

@@ -81,6 +81,38 @@ class CallPresentationTest {
     }
 
     @Test
+    fun `single matched participant carries the contact profile photo`() {
+        val presentation = resolveCallPresentation(
+            serverName = "Flora Registered",
+            participantUserIds = listOf(floraId),
+            contacts = listOf(flora.copy(avatarUrl = " https://pay.kit.africa/media/a1 ")),
+        )
+
+        assertEquals("https://pay.kit.africa/media/a1", presentation.avatarUrl)
+    }
+
+    @Test
+    fun `group calls and blank photo URLs resolve without an avatar`() {
+        val secondId = "86d5c9b8-4c19-4f14-91a7-28c2500049d1"
+        val second = Contact(secondId, "Amina", "+256700000002", avatarUrl = "https://pay.kit.africa/media/a2")
+
+        assertNull(
+            resolveCallPresentation(
+                serverName = null,
+                participantUserIds = listOf(floraId, secondId),
+                contacts = listOf(flora.copy(avatarUrl = "https://pay.kit.africa/media/a1"), second),
+            ).avatarUrl,
+        )
+        assertNull(
+            resolveCallPresentation(
+                serverName = null,
+                participantUserIds = listOf(floraId),
+                contacts = listOf(flora.copy(avatarUrl = "   ")),
+            ).avatarUrl,
+        )
+    }
+
+    @Test
     fun `LiveKit participant identity uses the locally saved contact name`() {
         assertEquals(
             "Flora from my contacts",

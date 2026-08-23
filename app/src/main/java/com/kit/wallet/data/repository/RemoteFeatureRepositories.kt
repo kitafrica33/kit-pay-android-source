@@ -610,6 +610,7 @@ class RemoteCallRepository @Inject constructor(
                 startedAtEpochMillis = startedAt?.toEpochMilli() ?: 0,
                 durationSeconds = durationSeconds,
                 answered = answeredAt != null,
+                avatarUrl = presentation.avatarUrl,
             )
         }
         sessions.withCurrentSession(fence) { mutableCalls.value = mapped }

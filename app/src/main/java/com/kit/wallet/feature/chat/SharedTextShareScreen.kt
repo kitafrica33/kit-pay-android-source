@@ -368,7 +368,7 @@ private fun RecipientRow(chat: ChatPreview, selected: Boolean, onClick: () -> Un
             .padding(horizontal = 20.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        KitAvatar(chat.name, size = 44.dp, online = chat.online)
+        KitAvatar(chat.name, size = 44.dp, online = chat.online, avatarUrl = chat.avatarUrl)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(
@@ -397,7 +397,7 @@ private fun SharePreview(recipient: ChatPreview, text: String, modifier: Modifie
     ) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                KitAvatar(recipient.name, size = 36.dp)
+                KitAvatar(recipient.name, size = 36.dp, avatarUrl = recipient.avatarUrl)
                 Spacer(Modifier.width(10.dp))
                 Column {
                     Text("To", style = MaterialTheme.typography.labelSmall)

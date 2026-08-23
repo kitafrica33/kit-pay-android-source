@@ -90,7 +90,7 @@ internal data class KitMediaMessage(
             val caption = fields["cap"]
             if (!CANONICAL_UUID.matches(attachmentId)) return null
             if (!CANONICAL_UUID.matches(storageKey)) return null
-            if (mediaType !in SUPPORTED_IMAGE_MEDIA_TYPES) return null
+            if (mediaType !in SUPPORTED_MEDIA_TYPES) return null
             if (byteSize !in MIN_IMAGE_CIPHERTEXT_BYTES..MAX_IMAGE_CIPHERTEXT_BYTES) return null
             if (!SHA256_HEX.matches(sha256)) return null
             if (plaintextSize !in 1..MAX_IMAGE_PLAINTEXT_BYTES) return null
@@ -131,7 +131,11 @@ internal data class KitMediaMessage(
             parse(text)?.let { listOf(it.toAttachmentRequest()) } ?: emptyList()
 
         fun normalizeImageMediaType(value: String): String? = value.trim().lowercase()
-            .takeIf { it in SUPPORTED_IMAGE_MEDIA_TYPES }
+            .takeIf { it in SUPPORTED_MEDIA_TYPES && it.startsWith("image/") }
+
+        /** Normalizes any rich media type the shared kit-media-v1 profile allows. */
+        fun normalizeMediaType(value: String): String? = value.trim().lowercase()
+            .takeIf { it in SUPPORTED_MEDIA_TYPES }
 
         private fun String.urlEncode(): String =
             URLEncoder.encode(this, StandardCharsets.UTF_8.name()).replace("+", "%20")
@@ -139,11 +143,34 @@ internal data class KitMediaMessage(
         private fun String.urlDecode(): String? =
             runCatching { URLDecoder.decode(this, StandardCharsets.UTF_8.name()) }.getOrNull()
 
-        private val SUPPORTED_IMAGE_MEDIA_TYPES = setOf(
+        /**
+         * The kit-media-v1 profile shared with iOS and enforced by the server. The v1 descriptor
+         * deliberately has no kind field: the `mt` MIME type is the single source of truth, and
+         * both clients derive the rendered kind from its prefix.
+         */
+        val SUPPORTED_MEDIA_TYPES = setOf(
             "image/jpeg",
             "image/png",
             "image/webp",
             "image/gif",
+            "audio/mp4",
+            "audio/aac",
+            "audio/mpeg",
+            "audio/ogg",
+            "video/mp4",
+            "video/quicktime",
+            "video/webm",
+            "application/pdf",
+            "application/zip",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-powerpoint",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "text/plain",
+            "text/csv",
+            "application/octet-stream",
         )
         private const val MIN_IMAGE_CIPHERTEXT_BYTES = 64L
     }

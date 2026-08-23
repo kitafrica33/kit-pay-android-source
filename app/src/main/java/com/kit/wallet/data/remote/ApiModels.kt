@@ -15,6 +15,18 @@ data class MessagingProtocolDto(
     val version: String? = null,
     val suite: String? = null,
     @Json(name = "post_quantum") val postQuantum: Boolean? = null,
+    @Json(name = "rich_media") val richMedia: RichMediaProtocolDto? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class RichMediaProtocolDto(
+    val ready: Boolean? = null,
+    val profile: String? = null,
+    @Json(name = "supported_platforms") val supportedPlatforms: List<String>? = null,
+    @Json(name = "minimum_ciphertext_bytes") val minimumCiphertextBytes: Long? = null,
+    @Json(name = "maximum_plaintext_bytes") val maximumPlaintextBytes: Long? = null,
+    @Json(name = "maximum_ciphertext_bytes") val maximumCiphertextBytes: Long? = null,
+    @Json(name = "media_types") val mediaTypes: List<String>? = null,
 )
 
 @JsonClass(generateAdapter = false)

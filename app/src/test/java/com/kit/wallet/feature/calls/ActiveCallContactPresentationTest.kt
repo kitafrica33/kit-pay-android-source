@@ -121,6 +121,34 @@ class ActiveCallContactPresentationTest {
         assertNull(removed.waitingTelecom?.phone)
     }
 
+    @Test
+    fun `contact refresh carries the single peer profile photo and clears it for groups`() {
+        val source = ActiveCallContactPresentationSource(
+            callId = ACTIVE_CALL_ID,
+            serverName = "Flora Registered",
+            participantUserIds = listOf(ACTIVE_USER_ID),
+        )
+        val flora = contact(ACTIVE_USER_ID, "Flora saved", "+256700000001")
+            .copy(avatarUrl = "https://pay.kit.africa/media/a1")
+
+        val withPhoto = refreshActiveCallContactPresentation(
+            state = ActiveCallUiState(name = "Flora Registered"),
+            activeSource = source,
+            contacts = listOf(flora),
+        )
+        assertEquals("https://pay.kit.africa/media/a1", withPhoto.state.avatarUrl)
+
+        val groupSource = source.copy(
+            participantUserIds = listOf(ACTIVE_USER_ID, WAITING_USER_ID),
+        )
+        val grouped = refreshActiveCallContactPresentation(
+            state = withPhoto.state,
+            activeSource = groupSource,
+            contacts = listOf(flora, contact(WAITING_USER_ID, "Amina saved", "+256700000002")),
+        )
+        assertNull(grouped.state.avatarUrl)
+    }
+
     private fun contact(id: String, name: String, phone: String) = Contact(
         id = id,
         name = name,

@@ -90,6 +90,8 @@ data class WaitingCall(
 
 data class ActiveCallUiState(
     val name: String = "Kit Pay contact",
+    /** The single matched peer's profile photo URL; null for groups or unsaved callers. */
+    val avatarUrl: String? = null,
     val video: Boolean = false,
     val incoming: Boolean = false,
     val incomingVerified: Boolean = false,
@@ -193,6 +195,7 @@ internal fun refreshActiveCallContactPresentation(
     }
     val refreshedState = state.copy(
         name = activePresentation?.name ?: state.name,
+        avatarUrl = if (activePresentation != null) activePresentation.avatarUrl else state.avatarUrl,
         waitingCall = refreshedWaiting,
         remoteParticipants = refreshedParticipants,
     )
@@ -256,6 +259,7 @@ class ActiveCallViewModel @Inject constructor(
             } else {
                 initialPresentation.name
             },
+            avatarUrl = if (incomingCallId != null) null else initialPresentation.avatarUrl,
             incoming = incomingCallId != null,
             phase = if (incomingCallId != null) CallPhase.VALIDATING else CallPhase.IDLE,
         ),

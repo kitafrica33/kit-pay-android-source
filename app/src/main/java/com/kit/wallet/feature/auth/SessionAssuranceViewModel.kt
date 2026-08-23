@@ -39,6 +39,10 @@ data class SessionAssuranceUiState(
     val biometricReady: Boolean = false,
     val biometricRequest: BiometricUnlockRequest? = null,
     val error: String? = null,
+    /** The server requires identity verification on this device before any unlock can succeed. */
+    val deviceIdentityRequired: Boolean = false,
+    /** Raw device-identity status (required/pending/review/failed/verified) for gate copy. */
+    val deviceIdentityStatus: String? = null,
 )
 
 @HiltViewModel
@@ -279,7 +283,8 @@ class SessionAssuranceViewModel @Inject constructor(
             biometricReady = sessions.current()?.accountId?.let {
                 runCatching { biometricKey?.hasKey(it) == true }.getOrDefault(false)
             } == true,
-            error = if (!identityReady) "Identity verification is required for this session." else null,
+            deviceIdentityRequired = !identityReady,
+            deviceIdentityStatus = assurance.deviceIdentity.status,
         )
     }
 
@@ -298,7 +303,8 @@ class SessionAssuranceViewModel @Inject constructor(
             biometricReady = session.accountId?.let {
                 runCatching { biometricKey?.hasKey(it) == true }.getOrDefault(false)
             } == true,
-            error = if (!identityReady) "Identity verification is required for this session." else null,
+            deviceIdentityRequired = !identityReady,
+            deviceIdentityStatus = cached.deviceIdentityStatus,
         )
     }
 }

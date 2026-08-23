@@ -18,7 +18,9 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -39,6 +41,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Chat
 import androidx.compose.material.icons.automirrored.rounded.ScreenShare
@@ -76,10 +79,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -87,6 +92,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.compose.AsyncImage
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.initialsOf
 import com.kit.wallet.ui.model.Contact
@@ -451,86 +457,121 @@ private fun ActiveCallContent(
                 )
             ) {
                 val connected = state.phase in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)
-                // Add people to the call and share the screen — available once connected.
-                if (connected) {
+                if (state.phase == CallPhase.INCOMING) {
+                    // A ringing call gets a dedicated wide answer layout: two large,
+                    // well-separated targets that cannot be confused or mis-tapped.
                     Row(
-                        Modifier.padding(bottom = 14.dp),
-                        horizontalArrangement = Arrangement.spacedBy(20.dp),
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(start = 44.dp, end = 44.dp, bottom = 40.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        CallControl(Icons.Rounded.PersonAdd, "Add", onClick = onAddParticipant)
-                        if (canOpenChat) {
-                            CallControl(
-                                Icons.AutoMirrored.Rounded.Chat,
-                                if (openingChat) "Opening…" else "Chat",
-                                onClick = { if (!openingChat) onOpenChat() },
-                            )
-                        }
                         CallControl(
-                            if (state.screenSharing) {
-                                Icons.AutoMirrored.Rounded.StopScreenShare
-                            } else {
-                                Icons.AutoMirrored.Rounded.ScreenShare
-                            },
-                            "Share",
-                            active = state.screenSharing,
-                            onClick = onToggleScreenShare,
+                            Icons.Rounded.CallEnd,
+                            "Decline",
+                            danger = true,
+                            size = 68.dp,
+                            onClick = onDecline,
+                        )
+                        CallControl(
+                            Icons.Rounded.Call,
+                            "Accept",
+                            success = true,
+                            size = 68.dp,
+                            onClick = onAccept,
                         )
                     }
-                }
-                Surface(
-                    color = if (state.video) Color(0xFF081524).copy(alpha = 0.62f) else Color.Transparent,
-                    shape = MaterialTheme.shapes.extraLarge,
-                    modifier = Modifier.padding(bottom = 26.dp),
-                ) {
-                    Row(
-                        Modifier.padding(horizontal = 16.dp, vertical = if (state.video) 16.dp else 0.dp),
-                        horizontalArrangement = Arrangement.spacedBy(if (state.video) 14.dp else 20.dp),
-                    ) {
-                        if (state.phase == CallPhase.INCOMING) {
+                } else {
+                    // Add people to the call and share the screen — available once connected.
+                    if (connected) {
+                        Row(
+                            Modifier.padding(bottom = 14.dp),
+                            horizontalArrangement = Arrangement.spacedBy(18.dp),
+                        ) {
                             CallControl(
-                                Icons.Rounded.Call,
-                                "Accept",
-                                success = true,
-                                onClick = onAccept,
+                                Icons.Rounded.PersonAdd,
+                                "Add",
+                                size = 44.dp,
+                                onClick = onAddParticipant,
                             )
-                            CallControl(
-                                Icons.Rounded.CallEnd,
-                                "Decline",
-                                danger = true,
-                                onClick = onDecline,
-                            )
-                        } else if (state.video) {
-                            CallControl(
-                                if (state.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
-                                "Mute",
-                                active = state.muted,
-                                onClick = onMute,
-                            )
-                            CallControl(
-                                if (state.cameraEnabled) Icons.Rounded.Videocam else Icons.Rounded.VideocamOff,
-                                "Camera",
-                                active = !state.cameraEnabled,
-                                onClick = onCamera,
-                            )
-                            CallControl(Icons.Rounded.Call, "Audio", onClick = onSwitchToAudio)
-                        } else {
-                            CallControl(
-                                Icons.AutoMirrored.Rounded.VolumeUp,
-                                "Speaker",
-                                active = state.speakerEnabled,
-                                onClick = onSpeaker,
-                            )
-                            if (connected) {
-                                CallControl(Icons.Rounded.Videocam, "Video", onClick = onSwitchToVideo)
+                            if (canOpenChat) {
+                                CallControl(
+                                    Icons.AutoMirrored.Rounded.Chat,
+                                    if (openingChat) "Opening…" else "Chat",
+                                    size = 44.dp,
+                                    onClick = { if (!openingChat) onOpenChat() },
+                                )
                             }
                             CallControl(
-                                if (state.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
-                                "Mute",
-                                active = state.muted,
-                                onClick = onMute,
+                                if (state.screenSharing) {
+                                    Icons.AutoMirrored.Rounded.StopScreenShare
+                                } else {
+                                    Icons.AutoMirrored.Rounded.ScreenShare
+                                },
+                                "Share",
+                                active = state.screenSharing,
+                                size = 44.dp,
+                                onClick = onToggleScreenShare,
                             )
                         }
-                        CallControl(Icons.Rounded.CallEnd, "End", danger = true, onClick = onEnd)
+                    }
+                    // One consistent glass capsule for voice and video, mirroring the iOS panel.
+                    Surface(
+                        color = Color(0xFF081524).copy(alpha = if (state.video) 0.55f else 0.35f),
+                        shape = RoundedCornerShape(38.dp),
+                        border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.12f)),
+                        modifier = Modifier.padding(bottom = 26.dp),
+                    ) {
+                        Row(
+                            Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            if (state.video) {
+                                CallControl(
+                                    if (state.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
+                                    if (state.muted) "Unmute" else "Mute",
+                                    active = state.muted,
+                                    onClick = onMute,
+                                )
+                                CallControl(
+                                    if (state.cameraEnabled) {
+                                        Icons.Rounded.Videocam
+                                    } else {
+                                        Icons.Rounded.VideocamOff
+                                    },
+                                    "Camera",
+                                    active = !state.cameraEnabled,
+                                    onClick = onCamera,
+                                )
+                                CallControl(Icons.Rounded.Call, "Audio", onClick = onSwitchToAudio)
+                            } else {
+                                CallControl(
+                                    Icons.AutoMirrored.Rounded.VolumeUp,
+                                    "Speaker",
+                                    active = state.speakerEnabled,
+                                    onClick = onSpeaker,
+                                )
+                                if (connected) {
+                                    CallControl(
+                                        Icons.Rounded.Videocam,
+                                        "Video",
+                                        onClick = onSwitchToVideo,
+                                    )
+                                }
+                                CallControl(
+                                    if (state.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
+                                    if (state.muted) "Unmute" else "Mute",
+                                    active = state.muted,
+                                    onClick = onMute,
+                                )
+                            }
+                            CallControl(
+                                Icons.Rounded.CallEnd,
+                                "End",
+                                danger = true,
+                                onClick = onEnd,
+                            )
+                        }
                     }
                 }
             }
@@ -741,6 +782,14 @@ private fun ColumnScope.VoiceCallBody(state: ActiveCallUiState) {
                         fontWeight = FontWeight.SemiBold,
                         color = KitGreen700,
                     )
+                    if (!state.avatarUrl.isNullOrBlank()) {
+                        AsyncImage(
+                            model = state.avatarUrl,
+                            contentDescription = null,
+                            modifier = Modifier.size(132.dp).clip(CircleShape),
+                            contentScale = ContentScale.Crop,
+                        )
+                    }
                 }
             }
         }
@@ -779,27 +828,46 @@ private fun CallControl(
     active: Boolean = false,
     danger: Boolean = false,
     success: Boolean = false,
+    size: Dp = 52.dp,
     onClick: () -> Unit,
 ) {
+    // The end-call red matches the iOS call panel exactly; the rest stays on the Kit palette.
     val background = when {
-        danger -> Color(0xFFE5484D)
+        danger -> Color(0xFFFA0640)
         success -> KitGreen500
         active -> Color.White.copy(alpha = 0.95f)
-        else -> Color.White.copy(alpha = 0.14f)
+        else -> Color.White.copy(alpha = 0.16f)
     }
     val foreground = if (active && !danger) KitNavy700 else Color.White
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Box(
             Modifier
-                .size(58.dp)
+                .size(size)
                 .background(background, CircleShape)
+                .then(
+                    if (danger || success || active) {
+                        Modifier
+                    } else {
+                        Modifier.border(0.8.dp, Color.White.copy(alpha = 0.22f), CircleShape)
+                    },
+                )
+                .clip(CircleShape)
                 .clickable(onClick = onClick),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(icon, contentDescription = label, tint = foreground, modifier = Modifier.size(24.dp))
+            Icon(
+                icon,
+                contentDescription = label,
+                tint = foreground,
+                modifier = Modifier.size(size * 22 / 52),
+            )
         }
         Spacer(Modifier.height(7.dp))
-        Text(label, style = MaterialTheme.typography.labelSmall, color = Color.White.copy(alpha = 0.82f))
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = Color.White.copy(alpha = 0.82f),
+        )
     }
 }
 
@@ -881,7 +949,7 @@ private fun AddPeopleDialog(
                                 .padding(vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            KitAvatar(contact.name, size = 40.dp)
+                            KitAvatar(contact.name, size = 40.dp, avatarUrl = contact.avatarUrl)
                             Spacer(Modifier.width(12.dp))
                             Text(contact.name, style = MaterialTheme.typography.titleSmall)
                         }

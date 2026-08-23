@@ -211,7 +211,7 @@ private fun CallRow(call: CallEntry, onCall: (() -> Unit)?) {
             .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        KitAvatar(call.name, size = 48.dp)
+        KitAvatar(call.name, size = 48.dp, avatarUrl = call.avatarUrl)
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
             Text(

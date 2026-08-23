@@ -37,6 +37,16 @@
         android:theme="@style/Theme.KitWallet.Splash">
 
         <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.chatmedia"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/chat_media_paths" />
+        </provider>
+
+        <provider
             android:name="androidx.startup.InitializationProvider"
             android:authorities="${applicationId}.androidx-startup"
             android:exported="false"

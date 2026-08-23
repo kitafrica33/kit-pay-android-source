@@ -249,3 +249,18 @@ interface AccountMessageArchiveDao {
     @Query("DELETE FROM account_message_archive WHERE ownerAccountId = :ownerAccountId")
     suspend fun deleteAccount(ownerAccountId: String): Int
 }
+
+@Dao
+interface ConversationPrefsDao {
+    @Query("SELECT * FROM conversation_prefs")
+    fun observeAll(): Flow<List<ConversationPrefEntity>>
+
+    @Upsert
+    suspend fun put(pref: ConversationPrefEntity)
+
+    @Query("SELECT * FROM conversation_prefs WHERE conversationId = :conversationId")
+    suspend fun get(conversationId: String): ConversationPrefEntity?
+
+    @Query("DELETE FROM conversation_prefs")
+    suspend fun clear()
+}

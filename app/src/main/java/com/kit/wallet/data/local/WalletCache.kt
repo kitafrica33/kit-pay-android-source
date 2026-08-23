@@ -35,6 +35,7 @@ class RoomWalletCache @Inject constructor(
     private val walletDao: WalletDao,
     private val transactionDao: WalletTransactionDao,
     private val syncStateDao: SyncStateDao,
+    private val conversationPrefsDao: ConversationPrefsDao? = null,
 ) : WalletCache {
     override val ownerScope: Flow<String?> = syncStateDao.observe(AUTHENTICATED_CACHE_OWNER_KEY)
 
@@ -116,6 +117,7 @@ class RoomWalletCache @Inject constructor(
         syncStateDao.clear()
         walletDao.clear()
         profileDao.clear()
+        conversationPrefsDao?.clear()
     }
 
     private suspend fun requireOwner(ownerScopeId: String) {

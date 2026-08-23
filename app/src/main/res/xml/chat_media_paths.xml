@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Short-lived decrypted chat media for external viewers and camera capture handoff. -->
+    <cache-path name="chat-media" path="chat-media/" />
+    <cache-path name="chat-capture" path="chat-capture/" />
+</paths>

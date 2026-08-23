@@ -5,6 +5,7 @@ import com.kit.wallet.data.messaging.AccountMessageHistoryAccess
 import com.kit.wallet.data.messaging.CapturedAccountMessageHistory
 import com.kit.wallet.data.messaging.FailClosedSecureMessagingCryptoTransaction
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
@@ -1693,6 +1694,46 @@ class SecureMessagingEventProcessorTest {
     }
 
     @Test
+    fun `incoming paid settlement triggers a wallet refresh and requests do not`() = runTest {
+        val paidText = KitPaymentMessage(
+            action = KitPaymentMessage.ACTION_PAID,
+            paymentRequestId = "0198a5b4-6f2d-7e3a-8c1b-2d4e6f8a0b1c",
+            amountMinor = 250_000,
+            currencyCode = "UGX",
+            currencyScale = 0,
+            note = null,
+        ).encode()
+        val requestText = KitPaymentMessage(
+            action = KitPaymentMessage.ACTION_REQUEST,
+            paymentRequestId = "0198a5b4-6f2d-7e3a-8c1b-2d4e6f8a0b1d",
+            amountMinor = 250_000,
+            currencyCode = "UGX",
+            currencyScale = 0,
+            note = null,
+        ).encode()
+        for ((text, expectedRefreshes) in listOf(paidText to 1, requestText to 0)) {
+            val (session, lifecycle, fence) = openSyncingSession()
+            lifecycle.finishActivation(fence)
+            val stateStore = TestSecureMessagingStateStore()
+            var refreshes = 0
+            val processor = processor(
+                stateStore,
+                PersistingDecryptionEngine(stateStore, authenticatedText = text),
+                walletRefresh = { refreshes++ },
+            )
+            val roster = authoritativeRoster()
+            enqueueSync(listOf(incomingEvent(roster, 10)), "settlement_refresh_cursor")
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            enqueueRoster(roster)
+            enqueueDeliveryAcknowledgement()
+
+            processor.synchronize(session)
+
+            assertEquals(expectedRefreshes, refreshes)
+        }
+    }
+
+    @Test
     fun `malformed sync page quarantines ready session and cannot be retried in place`() = runTest {
         val (session, lifecycle, fence) = openSyncingSession()
         lifecycle.finishActivation(fence)
@@ -2589,6 +2630,8 @@ class SecureMessagingEventProcessorTest {
             com.kit.wallet.data.messaging.NoOpSecureMessagingCurrentActivationRevocation,
         historyContinuationScheduler: SecureMessagingHistoryContinuationScheduler =
             SecureMessagingHistoryContinuationScheduler { },
+        walletRefresh: com.kit.wallet.data.repository.WalletRefreshTrigger =
+            com.kit.wallet.data.messaging.NoOpWalletRefreshTrigger,
     ) = SecureMessagingEventProcessor(
         crypto,
         projections,
@@ -2596,6 +2639,7 @@ class SecureMessagingEventProcessorTest {
         notifications,
         currentActivationRevocation,
         historyContinuationScheduler,
+        walletRefresh,
     )
 
     private fun projectionStore(stateStore: SecureMessagingStateStore) =
