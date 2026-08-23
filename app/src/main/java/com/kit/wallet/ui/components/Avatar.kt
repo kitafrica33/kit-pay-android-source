@@ -10,7 +10,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import coil.compose.AsyncImage
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -42,6 +45,7 @@ fun KitAvatar(
     modifier: Modifier = Modifier,
     size: Dp = 48.dp,
     online: Boolean = false,
+    avatarUrl: String? = null,
 ) {
     val (fg, bg) = AvatarPalette[abs(name.hashCode()) % AvatarPalette.size]
     Box(modifier = modifier.size(size)) {
@@ -51,12 +55,24 @@ fun KitAvatar(
                 .background(bg, CircleShape),
             contentAlignment = Alignment.Center,
         ) {
+            // Initials render first and stay visible until the moderated photo loads, so lists
+            // never flash empty circles offline or while the image is fetched.
             Text(
                 text = initialsOf(name),
                 color = fg,
                 fontSize = (size.value * 0.36f).sp,
                 fontWeight = FontWeight.SemiBold,
             )
+            if (!avatarUrl.isNullOrBlank()) {
+                AsyncImage(
+                    model = avatarUrl,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(size)
+                        .clip(CircleShape),
+                )
+            }
         }
         if (online) {
             Box(

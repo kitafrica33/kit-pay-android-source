@@ -42,6 +42,10 @@ interface UserRepository {
 
     suspend fun updateProfile(name: String, tag: String)
 
+    /** Uploads a JPEG profile photo through the moderated media pipeline and attaches it. */
+    suspend fun attachAvatar(jpegBytes: ByteArray): Unit =
+        error("Profile photos are unavailable")
+
     suspend fun requestEmailAttachment(email: String): ProfileEmailChallenge
 
     suspend fun verifyEmailAttachment(challengeId: String, code: String)

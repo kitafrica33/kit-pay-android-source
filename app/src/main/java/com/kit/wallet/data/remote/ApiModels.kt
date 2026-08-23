@@ -299,6 +299,48 @@ data class UserDto(
     @Json(name = "email_verified") val emailVerified: Boolean? = null,
     @Json(name = "phone_verified") val phoneVerified: Boolean? = null,
     @Json(name = "profile_setup_required") val profileSetupRequired: Boolean? = null,
+    @Json(name = "avatar_url") val avatarUrl: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class CreateMediaUploadIntentRequest(
+    val kind: String = "image",
+    val purpose: String = "avatar",
+    val filename: String = "profile-avatar.jpg",
+    @Json(name = "mime_type") val mimeType: String = "image/jpeg",
+    @Json(name = "byte_size") val byteSize: Int,
+    val sha256: String,
+    @Json(name = "client_encrypted") val clientEncrypted: Boolean = false,
+)
+
+@JsonClass(generateAdapter = false)
+data class MediaUploadIntentDto(
+    val asset: MediaAssetDto,
+    val upload: MediaUploadInstructionsDto,
+)
+
+@JsonClass(generateAdapter = false)
+data class MediaUploadInstructionsDto(
+    val method: String,
+    val url: String,
+    val headers: Map<String, String>? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class MediaAssetDto(
+    val id: String,
+    val status: String,
+    val scan: MediaScanDto? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class MediaScanDto(
+    val status: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class AttachProfileAvatarRequest(
+    @Json(name = "asset_id") val assetId: String,
 )
 
 @JsonClass(generateAdapter = false)
@@ -785,6 +827,8 @@ data class SetPaymentPinRequest(
 data class PaymentPinStatusDto(
     @Json(name = "payment_pin_set") val paymentPinSet: Boolean? = null,
     @Json(name = "payment_pin_set_at") val paymentPinSetAt: String? = null,
+    /** Newer services return the session state so a first PIN can unlock without a re-fetch. */
+    @Json(name = "session_assurance") val sessionAssurance: SessionAssuranceDto? = null,
 )
 
 @JsonClass(generateAdapter = false)

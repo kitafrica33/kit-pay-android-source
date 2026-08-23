@@ -399,7 +399,7 @@ private fun SettingsContent(
                     .padding(horizontal = 20.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                KitAvatar(profile.name, size = 76.dp)
+                KitAvatar(profile.name, size = 76.dp, avatarUrl = profile.avatarUrl)
                 Spacer(Modifier.width(16.dp))
                 Column(Modifier.weight(1f)) {
                     Text(profile.name.ifBlank { "Kit Pay user" }, style = MaterialTheme.typography.titleLarge)

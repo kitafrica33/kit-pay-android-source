@@ -20,6 +20,7 @@ import kotlinx.coroutines.launch
 data class ProfileEditorUiState(
     val saving: Boolean = false,
     val error: String? = null,
+    val uploadingAvatar: Boolean = false,
 )
 
 data class ProfileEmailUiState(
@@ -89,6 +90,33 @@ class SettingsViewModel @Inject constructor(
 
     fun clearProfileError() {
         mutableEditorState.value = mutableEditorState.value.copy(error = null)
+    }
+
+    /** Uploads an already-transcoded JPEG profile photo through the moderated media pipeline. */
+    fun attachAvatar(jpegBytes: ByteArray) {
+        if (mutableEditorState.value.uploadingAvatar) return
+        viewModelScope.launch {
+            mutableEditorState.value = mutableEditorState.value.copy(
+                uploadingAvatar = true,
+                error = null,
+            )
+            runCatching { userRepo.attachAvatar(jpegBytes) }
+                .onSuccess {
+                    mutableEditorState.value = mutableEditorState.value.copy(
+                        uploadingAvatar = false,
+                    )
+                }
+                .onFailure { error ->
+                    mutableEditorState.value = mutableEditorState.value.copy(
+                        uploadingAvatar = false,
+                        error = error.message ?: "The profile photo could not be updated",
+                    )
+                }
+        }
+    }
+
+    fun reportAvatarSelectionError(message: String) {
+        mutableEditorState.value = mutableEditorState.value.copy(error = message)
     }
 
     fun beginEmailFlow(currentEmail: String?) {

@@ -18,6 +18,7 @@ import com.kit.wallet.data.remote.CreateProviderOperationRequest
 import com.kit.wallet.data.remote.CreateProviderQuoteRequest
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.remote.ProfileAvatarUploader
 import com.kit.wallet.data.remote.EmailAddressRequest
 import com.kit.wallet.data.remote.EmailAttachmentVerificationRequest
 import com.kit.wallet.data.remote.UpdateProfileRequest
@@ -57,6 +58,7 @@ class OfflineUserRepository @Inject constructor(
     private val apiCalls: ApiCallExecutor,
     private val clock: Clock,
     @ApplicationScope scope: CoroutineScope,
+    private val avatarUploader: ProfileAvatarUploader? = null,
 ) : UserRepository {
     override val profile: StateFlow<UserProfile> = sessions.session.flatMapLatest { session ->
         if (session == null) {
@@ -113,6 +115,17 @@ class OfflineUserRepository @Inject constructor(
                 cached.name == updated.name &&
                 cached.tag == updated.tag
         }
+    }
+
+    override suspend fun attachAvatar(jpegBytes: ByteArray) {
+        val uploader = avatarUploader ?: error("Profile photos are unavailable")
+        val session = requireActiveSession()
+        val user = uploader.upload(jpegBytes)
+        requireSameAccount(session, user.id)
+        check(!user.avatarUrl.isNullOrBlank()) {
+            "The profile photo was not attached"
+        }
+        persistProfile(session.fence(), user.toEntity(clock.millis()))
     }
 
     override suspend fun requestEmailAttachment(email: String): ProfileEmailChallenge {

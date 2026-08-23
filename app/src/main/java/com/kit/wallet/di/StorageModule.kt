@@ -127,6 +127,7 @@ object StorageModule {
                 KitWalletDatabase.MIGRATION_4_5,
                 KitWalletDatabase.MIGRATION_5_6,
                 KitWalletDatabase.MIGRATION_6_7,
+                KitWalletDatabase.MIGRATION_7_8,
             )
             .fallbackToDestructiveMigrationOnDowngrade()
             .build()

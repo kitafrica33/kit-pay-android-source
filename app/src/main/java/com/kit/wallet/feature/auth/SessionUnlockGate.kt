@@ -30,6 +30,7 @@ import androidx.fragment.app.FragmentActivity
 fun SessionUnlockGate(
     state: SessionAssuranceUiState,
     onUnlock: (String) -> Unit,
+    onCreatePin: (String, String) -> Unit = { _, _ -> },
     onRetry: () -> Unit,
     onRequestBiometric: () -> Unit,
     onBiometricSuccess: (BiometricUnlockRequest, java.security.Signature) -> Unit,
@@ -37,6 +38,10 @@ fun SessionUnlockGate(
     onSignOut: () -> Unit,
 ) {
     var pin by remember { mutableStateOf("") }
+    var confirmPin by remember { mutableStateOf("") }
+    // A brand-new account has no wallet PIN and no biometric key yet: creating the first PIN is
+    // the unlock method the server accepts for it, so the gate offers it inline.
+    val needsFirstPin = !state.checking && state.methods.isEmpty()
     val activity = LocalContext.current as? FragmentActivity
     LaunchedEffect(state.biometricRequest) {
         val request = state.biometricRequest ?: return@LaunchedEffect
@@ -78,13 +83,42 @@ fun SessionUnlockGate(
                     Spacer(Modifier.height(12.dp))
                     Text("Checking this session…")
                 } else {
-                    Text(state.error ?: "Enter your wallet PIN to continue on this device.")
-                    if ("pin" in state.methods && state.error == null) {
+                    Text(
+                        state.error ?: when {
+                            needsFirstPin ->
+                                "Create a four-digit wallet PIN to secure this account and " +
+                                    "unlock this login."
+                            else -> "Enter your wallet PIN to continue on this device."
+                        },
+                    )
+                    if ("pin" in state.methods) {
                         Spacer(Modifier.height(12.dp))
                         OutlinedTextField(
                             value = pin,
                             onValueChange = { pin = it.filter(Char::isDigit).take(4) },
                             label = { Text("Wallet PIN") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    if (needsFirstPin) {
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = pin,
+                            onValueChange = { pin = it.filter(Char::isDigit).take(4) },
+                            label = { Text("New wallet PIN") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = confirmPin,
+                            onValueChange = { confirmPin = it.filter(Char::isDigit).take(4) },
+                            label = { Text("Confirm wallet PIN") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
                             visualTransformation = PasswordVisualTransformation(),
                             singleLine = true,
@@ -97,11 +131,15 @@ fun SessionUnlockGate(
         confirmButton = {
             when {
                 state.checking -> Unit
-                state.error != null -> Button(onClick = onRetry) { Text("Retry") }
                 "pin" in state.methods -> Button(
                     onClick = { onUnlock(pin) },
                     enabled = pin.length == 4 && !state.unlocking,
                 ) { Text(if (state.unlocking) "Unlocking…" else "Unlock") }
+                needsFirstPin -> Button(
+                    onClick = { onCreatePin(pin, confirmPin) },
+                    enabled = pin.length == 4 && confirmPin.length == 4 && !state.unlocking,
+                ) { Text(if (state.unlocking) "Saving…" else "Create PIN and unlock") }
+                state.error != null -> Button(onClick = onRetry) { Text("Retry") }
             }
         },
         dismissButton = {

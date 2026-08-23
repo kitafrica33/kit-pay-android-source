@@ -18,6 +18,7 @@ data class ProfileEntity(
     val email: String?,
     val emailVerified: Boolean,
     val profileSetupRequired: Boolean,
+    val avatarUrl: String? = null,
     val updatedAtEpochMillis: Long,
 ) {
     companion object {

@@ -398,7 +398,7 @@ private fun ContactsContent(
                         .padding(horizontal = 20.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    KitAvatar(c.name, size = 48.dp)
+                    KitAvatar(c.name, size = 48.dp, avatarUrl = c.avatarUrl)
                     Spacer(Modifier.width(14.dp))
                     Column(Modifier.weight(1f)) {
                         Text(c.name, style = MaterialTheme.typography.titleSmall)

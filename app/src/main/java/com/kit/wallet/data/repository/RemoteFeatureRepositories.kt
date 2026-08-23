@@ -465,6 +465,7 @@ class RemoteContactRepository @Inject constructor(
             status = status ?: if (isKitUser == true) "On Kit Pay" else "",
             registeredName = registeredName,
             savedInDevice = localName != null,
+            avatarUrl = avatarUrl?.takeIf(String::isNotBlank),
         )
     }
 

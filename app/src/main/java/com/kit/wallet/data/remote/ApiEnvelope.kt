@@ -97,7 +97,10 @@ internal data class ApiFailureEnvelope(
 )
 
 @Singleton
-class ApiCallExecutor @Inject constructor(moshi: Moshi) {
+class ApiCallExecutor @Inject constructor(
+    moshi: Moshi,
+    private val assuranceSignal: SessionAssuranceSignal? = null,
+) {
     private val failureAdapter = moshi.adapter(ApiFailureEnvelope::class.java)
 
     suspend fun <T> execute(call: suspend () -> ApiEnvelope<T>): T =
@@ -115,6 +118,9 @@ class ApiCallExecutor @Inject constructor(moshi: Moshi) {
         val failure = runCatching {
             error.response()?.errorBody()?.string()?.let(failureAdapter::fromJson)
         }.getOrNull()
+        // HTTP 428 is the server's session-assurance refusal (login unlock or device identity).
+        // Surface it app-wide so the unlock gate re-verifies instead of screens dead-ending.
+        if (error.code() == 428) assuranceSignal?.notifyLocked()
         throw KitWalletApiException(
             code = failure?.error?.code ?: "HTTP_${error.code()}",
             message = failure?.error?.message ?: error.message(),

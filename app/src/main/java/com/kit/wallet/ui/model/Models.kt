@@ -17,6 +17,8 @@ data class Contact(
     val registeredName: String? = null,
     /** True when the phone number is already saved in this device's address book. */
     val savedInDevice: Boolean = false,
+    /** Absolute URL of this member's moderated profile photo, when one is attached. */
+    val avatarUrl: String? = null,
 )
 
 data class UserProfile(
@@ -27,6 +29,8 @@ data class UserProfile(
     val email: String? = null,
     val emailVerified: Boolean = false,
     val profileSetupRequired: Boolean = false,
+    /** Absolute URL of the moderated profile photo, when one is attached. */
+    val avatarUrl: String? = null,
 )
 
 fun formatKitTag(value: String): String = value.trim().trimStart('@')

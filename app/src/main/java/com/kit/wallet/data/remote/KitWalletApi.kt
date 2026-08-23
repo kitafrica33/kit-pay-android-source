@@ -307,6 +307,23 @@ interface KitWalletApi {
         @Body request: SetPaymentPinRequest,
     ): ApiEnvelope<PaymentPinStatusDto>
 
+    @POST("api/kit-wallet/v1/media/upload-intents")
+    suspend fun createMediaUploadIntent(
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Body request: CreateMediaUploadIntentRequest,
+    ): ApiEnvelope<MediaUploadIntentDto>
+
+    @GET("api/kit-wallet/v1/media/{assetId}")
+    suspend fun mediaAsset(@Path("assetId") assetId: String): ApiEnvelope<MediaAssetDto>
+
+    @POST("api/kit-wallet/v1/media/{assetId}/finalize")
+    suspend fun finalizeMediaAsset(@Path("assetId") assetId: String): ApiEnvelope<MediaAssetDto>
+
+    @POST("api/kit-wallet/v1/profile/avatar")
+    suspend fun attachProfileAvatar(
+        @Body request: AttachProfileAvatarRequest,
+    ): ApiEnvelope<UserDto>
+
     @GET("api/kit-wallet/v1/banking/beneficiaries")
     suspend fun bankBeneficiaries(): ApiEnvelope<BankBeneficiaryListDto>
 

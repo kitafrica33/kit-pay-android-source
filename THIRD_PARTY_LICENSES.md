@@ -2,8 +2,8 @@
 
 Audit snapshot: 2026-07-22  
 Application ID: `com.kit.wallet`  
-Version name: `0.2.16`  
-Version code: `28`  
+Version name: `0.2.17`  
+Version code: `29`  
 Distribution clearance: `true`  
 Distribution review disposition: `CLEARED`  
 Distribution review record type: `APP_WIDE_INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL`  
@@ -30,9 +30,9 @@ Applicable terms retrieval date: `2026-07-20`
 Applicable terms URL: `https://developer.android.com/studio/terms`  
 Applicable terms SHA-256: `8bd88dc1144a7d12818687d680d6a9f9e8a2f1ee62c43a8e21f5c6a75f6977cd`  
 Decision document: `docs/google-fcm-agpl-clearance-decision-app-wide.md`  
-Decision document SHA-256: `61b2ffae9aa341fbfc86f5d6279ff4c3d6c52cc285fb34532c97a22b34478728`  
-Reviewed runtime inventory SHA-256: `0eaa1deda2e4bc4005613f881a221a898ef0eabad00553cac2979319c88b85a6`  
-Reviewed runtime graph manifest SHA-256: `e1c4b26d0358e85c38464fcdd78fe2e47d41ae1b130d7023a3ff36bf861eb9fd`  
+Decision document SHA-256: `de0b1ed0cb5dcd691fd1b36988842878755422c84bdbe7bef5a3bfee678a25db`  
+Reviewed runtime inventory SHA-256: `6539e43d22c0f644e9ae5865280fb2c4e8338103368726c81eb14222fae82b8e`  
+Reviewed runtime graph manifest SHA-256: `da5db3d86fe0bb7dcef97ff5469bbbb742d2ca79013f12df90a17dbf7da3de04`  
 Distribution conditions recorded: `7`  
 Re-review triggers recorded: `9`  
 Unresolved issue IDs: `none`
@@ -41,13 +41,13 @@ This is the release-runtime licence inventory, not legal advice or a publication
 
 ## Scope and method
 
-Gradle's `releaseRuntimeClasspath` identifies 195 Maven components: 33 direct and 162 transitive. Those components resolve to 158 AAR/JAR artifact archives. The release AAB must reproduce this inventory in `BUNDLE-METADATA/com.android.tools.build.libraries/dependencies.pb` before clearance can change. `com.android.tools:desugar_jdk_libs:2.1.5` is reviewed separately because Android's build tools rewrite its code into the application DEX from the `coreLibraryDesugaring` configuration.
+Gradle's `releaseRuntimeClasspath` identifies 203 Maven components: 34 direct and 169 transitive. Those components resolve to 166 AAR/JAR artifact archives. The release AAB must reproduce this inventory in `BUNDLE-METADATA/com.android.tools.build.libraries/dependencies.pb` before clearance can change. `com.android.tools:desugar_jdk_libs:2.1.5` is reviewed separately because Android's build tools rewrite its code into the application DEX from the `coreLibraryDesugaring` configuration.
 
-Licence evidence was checked from exact resolved POMs, artifact contents and, where POM/archive evidence was incomplete, version-pinned upstream sources. The normalized 195-component result is:
+Licence evidence was checked from exact resolved POMs, artifact contents and, where POM/archive evidence was incomplete, version-pinned upstream sources. The normalized 203-component result is:
 
 | Evidence category | Components |
 | --- | ---: |
-| Apache-2.0 | 182 |
+| Apache-2.0 | 190 |
 | Android SDK License | 6 |
 | BSD-3-Clause | 3 |
 | AGPL-3.0-only | 2 |
@@ -89,7 +89,7 @@ The recorded re-review triggers are:
 9. A change to the approved Android application ID or release-signing identity.
 
 The release gates compare the resolved six Google/Firebase AARs and POMs byte-for-byte
-with the reviewed hashes, bind the complete 195-component runtime inventory, preserve
+with the reviewed hashes, bind the complete 203-component runtime inventory, preserve
 the required notices, and verify the attested Gradle, CycloneDX and final-AAB dependency
 graphs before distribution. The graph-manifest digest is derived release evidence, not
 additional reviewer identity or a replacement legal opinion. A material trigger
@@ -182,8 +182,8 @@ The “declared evidence” column reports metadata/evidence, not a compatibilit
 | `androidx.annotation:annotation-experimental:1.4.1` | transitive | `Apache-2.0` |
 | `androidx.annotation:annotation-jvm:1.9.1` | transitive | `Apache-2.0` |
 | `androidx.annotation:annotation:1.9.1` | transitive | `Apache-2.0` |
-| `androidx.appcompat:appcompat-resources:1.2.0` | transitive | `Apache-2.0` |
-| `androidx.appcompat:appcompat:1.2.0` | transitive | `Apache-2.0` |
+| `androidx.appcompat:appcompat-resources:1.6.1` | transitive | `Apache-2.0` |
+| `androidx.appcompat:appcompat:1.6.1` | transitive | `Apache-2.0` |
 | `androidx.arch.core:core-common:2.2.0` | transitive | `Apache-2.0` |
 | `androidx.arch.core:core-runtime:2.2.0` | transitive | `Apache-2.0` |
 | `androidx.autofill:autofill:1.0.0` | transitive | `Apache-2.0` |
@@ -248,7 +248,9 @@ The “declared evidence” column reports metadata/evidence, not a compatibilit
 | `androidx.datastore:datastore:1.1.3` | transitive | `Apache-2.0` |
 | `androidx.documentfile:documentfile:1.0.0` | transitive | `Apache-2.0` |
 | `androidx.drawerlayout:drawerlayout:1.0.0` | transitive | `Apache-2.0` |
+| `androidx.emoji2:emoji2-views-helper:1.3.0` | transitive | `Apache-2.0` |
 | `androidx.emoji2:emoji2:1.3.0` | transitive | `Apache-2.0` |
+| `androidx.exifinterface:exifinterface:1.3.7` | transitive | `Apache-2.0` |
 | `androidx.fragment:fragment:1.5.1` | transitive | `Apache-2.0` |
 | `androidx.graphics:graphics-path:1.0.1` | transitive | `Apache-2.0` |
 | `androidx.hilt:hilt-common:1.2.0` | transitive | `Apache-2.0` |
@@ -286,6 +288,7 @@ The “declared evidence” column reports metadata/evidence, not a compatibilit
 | `androidx.navigation:navigation-runtime:2.8.5` | transitive | `Apache-2.0` |
 | `androidx.print:print:1.0.0` | transitive | `Apache-2.0` |
 | `androidx.profileinstaller:profileinstaller:1.3.1` | transitive | `Apache-2.0` |
+| `androidx.resourceinspection:resourceinspection-annotation:1.0.1` | transitive | `Apache-2.0` |
 | `androidx.room:room-common-jvm:2.7.2` | transitive | `Apache-2.0` |
 | `androidx.room:room-common:2.7.2` | transitive | `Apache-2.0` |
 | `androidx.room:room-ktx:2.7.2` | direct | `Apache-2.0` |
@@ -308,6 +311,7 @@ The “declared evidence” column reports metadata/evidence, not a compatibilit
 | `androidx.work:work-runtime:2.10.0` | transitive | `Apache-2.0` |
 | `com.auth0.android:jwtdecode:2.0.2` | transitive | `MIT` |
 | `com.github.davidliu:audioswitch:039a35aefab7747c557242fa216c9ea11743b604` | transitive | `Apache-2.0` |
+| `com.google.accompanist:accompanist-drawablepainter:0.32.0` | transitive | `Apache-2.0` |
 | `com.google.android.datatransport:transport-api:3.1.0` | transitive | `Apache-2.0` |
 | `com.google.android.datatransport:transport-backend-cct:3.1.9` | transitive | `Apache-2.0` |
 | `com.google.android.datatransport:transport-runtime:3.1.9` | transitive | `Apache-2.0` |
@@ -341,11 +345,15 @@ The “declared evidence” column reports metadata/evidence, not a compatibilit
 | `com.squareup.moshi:moshi:1.15.2` | direct | `Apache-2.0` |
 | `com.squareup.okhttp3:logging-interceptor:4.12.0` | direct | `Apache-2.0` |
 | `com.squareup.okhttp3:okhttp:4.12.0` | direct | `Apache-2.0` |
-| `com.squareup.okio:okio-jvm:3.7.0` | transitive | `Apache-2.0` |
-| `com.squareup.okio:okio:3.7.0` | transitive | `Apache-2.0` |
+| `com.squareup.okio:okio-jvm:3.9.0` | transitive | `Apache-2.0` |
+| `com.squareup.okio:okio:3.9.0` | transitive | `Apache-2.0` |
 | `com.squareup.retrofit2:converter-moshi:2.11.0` | direct | `Apache-2.0` |
 | `com.squareup.retrofit2:retrofit:2.11.0` | direct | `Apache-2.0` |
 | `com.vdurmont:semver4j:3.1.0` | transitive | `MIT` |
+| `io.coil-kt:coil-base:2.7.0` | transitive | `Apache-2.0` |
+| `io.coil-kt:coil-compose-base:2.7.0` | transitive | `Apache-2.0` |
+| `io.coil-kt:coil-compose:2.7.0` | direct | `Apache-2.0` |
+| `io.coil-kt:coil:2.7.0` | transitive | `Apache-2.0` |
 | `io.github.webrtc-sdk:android-prefixed:144.7559.09` | transitive | `Composite: BSD-3-Clause (WebRTC baseline) + Apache-2.0 (fork modifications) + generated third-party terms; MIT packaging wrapper` |
 | `jakarta.inject:jakarta.inject-api:2.0.1` | transitive | `Apache-2.0` |
 | `javax.inject:javax.inject:1` | transitive | `Apache-2.0` |
@@ -354,7 +362,7 @@ The “declared evidence” column reports metadata/evidence, not a compatibilit
 | `org.jetbrains.kotlin:kotlin-reflect:1.8.21` | transitive | `Apache-2.0` |
 | `org.jetbrains.kotlin:kotlin-stdlib-common:2.2.20` | transitive | `Apache-2.0` |
 | `org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.25` | transitive | `Apache-2.0` |
-| `org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.21` | transitive | `Apache-2.0` |
+| `org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.0` | transitive | `Apache-2.0` |
 | `org.jetbrains.kotlin:kotlin-stdlib:2.2.20` | direct | `Apache-2.0` |
 | `org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2` | transitive | `Apache-2.0` |
 | `org.jetbrains.kotlinx:kotlinx-coroutines-bom:1.10.2` | transitive | `Apache-2.0` |

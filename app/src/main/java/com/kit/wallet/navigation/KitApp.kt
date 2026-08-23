@@ -39,6 +39,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -288,11 +289,25 @@ fun KitApp(
         capabilitiesViewModel.onSessionChanged()
     }
 
-    LaunchedEffect(signedIn, capabilities.loaded, capabilities.biometricTokensAvailable) {
+    // Session assurance is independent of biometric availability: a locked login must always be
+    // able to unlock with the wallet PIN (or create its first PIN), so the check only waits for
+    // capability discovery to finish rather than for any specific authentication method.
+    LaunchedEffect(signedIn, capabilities.loaded, capabilities.loadFailed) {
         sessionAssuranceViewModel.reconcile(
             signedIn = signedIn,
-            supported = capabilities.loaded && capabilities.biometricTokensAvailable,
+            supported = capabilities.loaded && !capabilities.loadFailed,
         )
+    }
+    // Unlocking re-opens every server surface at once. Refresh discovery and push registration
+    // immediately so features, contacts, chats, and calls recover without waiting for the next
+    // foreground poll.
+    var wasAssuranceRequired by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(sessionAssurance.required) {
+        if (wasAssuranceRequired && !sessionAssurance.required && signedIn) {
+            capabilitiesViewModel.refresh()
+            onNotificationCapabilityChanged()
+        }
+        wasAssuranceRequired = sessionAssurance.required
     }
 
     Scaffold(
@@ -370,10 +385,11 @@ fun KitApp(
         )
     }
 
-    if (signedIn && capabilities.biometricTokensAvailable && sessionAssurance.required) {
+    if (signedIn && sessionAssurance.required) {
         SessionUnlockGate(
             state = sessionAssurance,
             onUnlock = sessionAssuranceViewModel::unlockWithPin,
+            onCreatePin = sessionAssuranceViewModel::createPinAndUnlock,
             onRetry = sessionAssuranceViewModel::refresh,
             onRequestBiometric = sessionAssuranceViewModel::requestBiometricUnlock,
             onBiometricSuccess = sessionAssuranceViewModel::completeBiometricUnlock,

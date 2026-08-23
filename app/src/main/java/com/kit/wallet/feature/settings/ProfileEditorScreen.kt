@@ -1,12 +1,17 @@
 package com.kit.wallet.feature.settings
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material3.Button
@@ -23,9 +28,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
@@ -33,7 +41,11 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.auth.isPlaceholderProfileName
 import com.kit.wallet.data.auth.isProvisionalProfileTag
+import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.model.UserProfile
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -99,6 +111,51 @@ fun ProfileEditorScreen(
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (!setup) {
+                val context = LocalContext.current
+                val scope = rememberCoroutineScope()
+                val pickAvatar = rememberLauncherForActivityResult(
+                    ActivityResultContracts.PickVisualMedia(),
+                ) { uri ->
+                    if (uri == null) return@rememberLauncherForActivityResult
+                    scope.launch {
+                        val jpeg = withContext(Dispatchers.Default) {
+                            runCatching {
+                                transcodeProfileAvatar(context.contentResolver, uri)
+                            }.getOrNull()
+                        }
+                        if (jpeg == null) {
+                            viewModel.reportAvatarSelectionError(
+                                "That photo could not be prepared. Choose a different photo.",
+                            )
+                        } else {
+                            viewModel.attachAvatar(jpeg)
+                        }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    KitAvatar(profile.name, size = 64.dp, avatarUrl = profile.avatarUrl)
+                    Spacer(Modifier.width(14.dp))
+                    TextButton(
+                        onClick = {
+                            if (!editorState.uploadingAvatar) {
+                                pickAvatar.launch(
+                                    PickVisualMediaRequest(
+                                        ActivityResultContracts.PickVisualMedia.ImageOnly,
+                                    ),
+                                )
+                            }
+                        },
+                        enabled = !editorState.uploadingAvatar,
+                    ) {
+                        Text(
+                            if (editorState.uploadingAvatar) "Uploading photo…"
+                            else if (profile.avatarUrl != null) "Change photo"
+                            else "Add photo",
+                        )
+                    }
+                }
+            }
             OutlinedTextField(
                 value = name,
                 onValueChange = {

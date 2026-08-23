@@ -44,6 +44,7 @@ fun UserDto.toEntity(nowEpochMillis: Long): ProfileEntity = ProfileEntity(
     email = email,
     emailVerified = emailVerified == true,
     profileSetupRequired = profileSetupRequired == true || requiresProfileSetup(name, tag),
+    avatarUrl = avatarUrl?.takeIf(String::isNotBlank),
     updatedAtEpochMillis = nowEpochMillis,
 )
 
@@ -55,6 +56,7 @@ fun ProfileEntity.toUiModel(): UserProfile = UserProfile(
     email = email,
     emailVerified = emailVerified,
     profileSetupRequired = profileSetupRequired || requiresProfileSetup(name, tag),
+    avatarUrl = avatarUrl,
 )
 
 fun WalletDto.toEntity(nowEpochMillis: Long): WalletEntity {

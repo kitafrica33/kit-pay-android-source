@@ -15,7 +15,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         SecureMessagingMetadataEntity::class,
         AccountMessageArchiveEntity::class,
     ],
-    version = 7,
+    version = 8,
     exportSchema = true,
 )
 abstract class KitWalletDatabase : RoomDatabase() {
@@ -117,6 +117,12 @@ abstract class KitWalletDatabase : RoomDatabase() {
                     "ALTER TABLE wallet_transactions ADD COLUMN " +
                         "currencyScale INTEGER NOT NULL DEFAULT 2",
                 )
+            }
+        }
+
+        val MIGRATION_7_8: Migration = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE profile ADD COLUMN avatarUrl TEXT")
             }
         }
     }
