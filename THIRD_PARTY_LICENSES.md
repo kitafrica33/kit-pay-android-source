@@ -2,7 +2,7 @@
 
 Audit snapshot: 2026-07-22  
 Application ID: `com.kit.wallet`  
-Version name: `0.2.19-r1`  
+Version name: `0.2.19-r2`  
 Version code: `31`  
 Distribution clearance: `true`  
 Distribution review disposition: `CLEARED`  
@@ -164,6 +164,7 @@ Each family below is packaged for `arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64`
 
 | Component | Packaged library | Evidence |
 | --- | --- | --- |
+| `androidx.camera:camera-core:1.4.2` | `libimage_processing_util_jni.so`, `libsurface_util_jni.so` | Apache-2.0 |
 | `androidx.datastore:datastore-core-android:1.1.3` | `libdatastore_shared_counter.so` | Apache-2.0 |
 | `androidx.graphics:graphics-path:1.0.1` | `libandroidx.graphics.path.so` | Apache-2.0 |
 | `io.github.webrtc-sdk:android-prefixed:144.7559.09` | `liblkjingle_peerconnection_so.so` | Composite terms verified; exact four-ABI byte match and M144 notices bundled |
