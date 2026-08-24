@@ -30,6 +30,8 @@ class TransferClaimMappingTest {
         assertEquals("UGX", claim.currencyCode)
         assertEquals(2, claim.currencyScale)
         assertEquals("Rent", claim.note)
+        assertEquals("u1", claim.senderUserId)
+        assertEquals("u2", claim.recipientUserId)
         assertEquals("Amara", claim.senderName)
         assertEquals("Bwire", claim.recipientName)
         assertTrue(claim.canAccept)

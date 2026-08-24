@@ -1391,29 +1391,72 @@ class EncryptedChatRepository @Inject internal constructor(
         chatId: String,
         text: String,
         onDurablyCommitted: (clientMessageId: String) -> Unit,
+    ) = sendValidatedText(
+        chatId = chatId,
+        text = text,
+        retryClientMessageId = null,
+        trustedPaymentEvent = false,
+        onDurablyCommitted = onDurablyCommitted,
+    )
+
+    override suspend fun sendPaymentEvent(
+        chatId: String,
+        descriptor: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit,
+    ) = sendValidatedText(
+        chatId = chatId,
+        text = descriptor,
+        retryClientMessageId = null,
+        trustedPaymentEvent = true,
+        onDurablyCommitted = onDurablyCommitted,
+    )
+
+    override suspend fun retryMessage(chatId: String, clientMessageId: String, text: String) =
+        sendValidatedText(
+            chatId = chatId,
+            text = text,
+            retryClientMessageId = clientMessageId,
+            trustedPaymentEvent = false,
+        )
+
+    override suspend fun retryPaymentEvent(
+        chatId: String,
+        clientMessageId: String,
+        descriptor: String,
+    ) = sendValidatedText(
+        chatId = chatId,
+        text = descriptor,
+        retryClientMessageId = clientMessageId,
+        trustedPaymentEvent = true,
+    )
+
+    private suspend fun sendValidatedText(
+        chatId: String,
+        text: String,
+        retryClientMessageId: String?,
+        trustedPaymentEvent: Boolean,
+        onDurablyCommitted: (clientMessageId: String) -> Unit = {},
     ) {
         val session = requireReadySession()
         val normalized = text.trim()
         require(normalized.isNotEmpty()) { "Enter a message to send securely" }
+        if (trustedPaymentEvent) {
+            require(KitPaymentMessage.parse(normalized) != null) {
+                "Kit Pay could not validate this payment event"
+            }
+        } else {
+            require(KitPaymentMessage.allowsUserAuthoredText(normalized)) {
+                "Messages cannot start with Kit Pay's reserved payment prefix"
+            }
+        }
         try {
             runtime.sendText(
                 session = session,
                 conversationId = chatId,
                 text = normalized,
-                retryClientMessageId = null,
+                retryClientMessageId = retryClientMessageId,
                 onDurablyCommitted = onDurablyCommitted,
             )
-        } finally {
-            refresh(session, contacts.contacts.value)
-        }
-    }
-
-    override suspend fun retryMessage(chatId: String, clientMessageId: String, text: String) {
-        val session = requireReadySession()
-        val normalized = text.trim()
-        require(normalized.isNotEmpty()) { "Enter a message to retry securely" }
-        try {
-            runtime.sendText(session, chatId, normalized, retryClientMessageId = clientMessageId)
         } finally {
             refresh(session, contacts.contacts.value)
         }

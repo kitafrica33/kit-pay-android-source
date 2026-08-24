@@ -603,11 +603,11 @@ class ConversationViewModelTest {
 
     @Test
     fun `accepting a held transfer records the acceptance in the conversation`() = runTest {
-        val wallet = FakeWalletRepository(claims = listOf(pendingClaim()))
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim(fromMe = false)))
         val repository = FakeChatRepository()
         val viewModel = viewModel(repository, wallet)
 
-        viewModel.acceptTransfer(transferBubble(fromMe = false))
+        viewModel.acceptTransfer(transferBubble(fromMe = false), claimableTransfersEnabled = true)
 
         assertEquals(listOf(CLAIM_ID to null), wallet.accepted)
         val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
@@ -616,6 +616,8 @@ class ConversationViewModelTest {
         assertEquals(250_000L, posted.amountMinor)
         assertEquals(null, posted.reason)
         assertEquals(null, viewModel.error.value)
+        assertEquals(1, wallet.capabilityRefreshes)
+        assertEquals(1, wallet.authoritativeReads)
         // The card's live state comes straight back from the settled claim, with no extra poll.
         assertEquals(
             TransferClaimStatus.ACCEPTED,
@@ -625,27 +627,153 @@ class ConversationViewModelTest {
 
     @Test
     fun `reversing a transfer documents the reason it was reversed`() = runTest {
-        val wallet = FakeWalletRepository(claims = listOf(pendingClaim()))
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim(fromMe = true)))
         val repository = FakeChatRepository()
         val viewModel = viewModel(repository, wallet)
 
-        viewModel.reverseTransfer(transferBubble(fromMe = true), "  Sent to the wrong person  ")
+        viewModel.reverseTransfer(
+            transferBubble(fromMe = true),
+            "  Sent to the wrong person  ",
+            paymentPin = "2580",
+            claimableTransfersEnabled = true,
+        )
 
-        assertEquals(listOf(CLAIM_ID to "  Sent to the wrong person  "), wallet.reversed)
+        assertEquals(
+            listOf(Triple(CLAIM_ID, "Sent to the wrong person", "2580")),
+            wallet.reversed,
+        )
         val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
         assertEquals(KitPaymentAction.REVERSED, posted.action)
         assertEquals("Sent to the wrong person", posted.reason)
         // The transfer's own note stays on the card above; the line carries only the reason.
         assertEquals(null, posted.note)
+        assertEquals(1, wallet.capabilityRefreshes)
+        assertEquals(1, wallet.authoritativeReads)
+    }
+
+    @Test
+    fun `cached capability off prevents any transfer authority request`() = runTest {
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim(fromMe = true)))
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.reverseTransfer(
+            transferBubble(fromMe = true),
+            reason = null,
+            paymentPin = "2580",
+            claimableTransfersEnabled = false,
+        )
+
+        assertEquals(0, wallet.capabilityRefreshes)
+        assertEquals(0, wallet.authoritativeReads)
+        assertTrue(wallet.reversed.isEmpty())
+        assertTrue(repository.sent.isEmpty())
+    }
+
+    @Test
+    fun `tap-time capability refresh fails closed before reading or settling`() = runTest {
+        val wallet = FakeWalletRepository(
+            claims = listOf(pendingClaim(fromMe = true)),
+            capabilityAvailable = false,
+        )
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.reverseTransfer(
+            transferBubble(fromMe = true),
+            reason = null,
+            paymentPin = "2580",
+            claimableTransfersEnabled = true,
+        )
+
+        assertEquals(1, wallet.capabilityRefreshes)
+        assertEquals(0, wallet.authoritativeReads)
+        assertTrue(wallet.reversed.isEmpty())
+        assertTrue(repository.sent.isEmpty())
+    }
+
+    @Test
+    fun `fresh claim read failure never falls back to the polled claim`() = runTest {
+        val wallet = FakeWalletRepository(
+            claims = listOf(pendingClaim(fromMe = true)),
+            authoritativeFailure = IllegalStateException("fresh claim unavailable"),
+        )
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.reverseTransfer(
+            transferBubble(fromMe = true),
+            reason = null,
+            paymentPin = "2580",
+            claimableTransfersEnabled = true,
+        )
+
+        assertEquals(1, wallet.authoritativeReads)
+        assertTrue(wallet.reversed.isEmpty())
+        assertTrue(repository.sent.isEmpty())
+        assertEquals("fresh claim unavailable", viewModel.error.value)
+    }
+
+    @Test
+    fun `fresh settled claim overrides a stale pending card and prevents settlement`() = runTest {
+        val stale = pendingClaim(fromMe = true)
+        val wallet = FakeWalletRepository(
+            claims = listOf(stale),
+            authoritativeClaim = stale.copy(
+                status = TransferClaimStatus.ACCEPTED,
+                canReverse = false,
+            ),
+        )
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.reverseTransfer(
+            transferBubble(fromMe = true),
+            reason = null,
+            paymentPin = "2580",
+            claimableTransfersEnabled = true,
+        )
+
+        assertEquals(1, wallet.authoritativeReads)
+        assertTrue(wallet.reversed.isEmpty())
+        assertTrue(repository.sent.isEmpty())
+    }
+
+    @Test
+    fun `fresh claim for another conversation cannot be reversed`() = runTest {
+        val foreign = pendingClaim(fromMe = true).copy(
+            recipientUserId = "66666666-6666-4666-8666-666666666666",
+        )
+        val wallet = FakeWalletRepository(
+            claims = listOf(foreign),
+            authoritativeClaim = foreign,
+        )
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.reverseTransfer(
+            transferBubble(fromMe = true),
+            reason = null,
+            paymentPin = "2580",
+            claimableTransfersEnabled = true,
+        )
+
+        assertEquals(1, wallet.authoritativeReads)
+        assertTrue(wallet.reversed.isEmpty())
+        assertTrue(repository.sent.isEmpty())
     }
 
     @Test
     fun `rejecting a transfer documents the reason it was sent back`() = runTest {
-        val wallet = FakeWalletRepository(claims = listOf(pendingClaim()))
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim(fromMe = false)))
         val repository = FakeChatRepository()
         val viewModel = viewModel(repository, wallet)
 
-        viewModel.rejectTransfer(transferBubble(fromMe = false), "I did not expect this")
+        viewModel.rejectTransfer(
+            transferBubble(fromMe = false),
+            "I did not expect this",
+            claimableTransfersEnabled = true,
+        )
 
         assertEquals(listOf(CLAIM_ID to "I did not expect this"), wallet.rejected)
         val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
@@ -655,11 +783,16 @@ class ConversationViewModelTest {
 
     @Test
     fun `an oversized reason is trimmed to what the descriptor can carry, not dropped`() = runTest {
-        val wallet = FakeWalletRepository(claims = listOf(pendingClaim()))
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim(fromMe = true)))
         val repository = FakeChatRepository()
         val viewModel = viewModel(repository, wallet)
 
-        viewModel.reverseTransfer(transferBubble(fromMe = true), "x".repeat(400))
+        viewModel.reverseTransfer(
+            transferBubble(fromMe = true),
+            "x".repeat(400),
+            paymentPin = "",
+            claimableTransfersEnabled = true,
+        )
 
         val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
         assertEquals("x".repeat(KitPaymentMessage.MAX_REASON_LENGTH), posted.reason)
@@ -668,13 +801,25 @@ class ConversationViewModelTest {
     @Test
     fun `a refused settlement surfaces the reason and writes nothing into the chat`() = runTest {
         val wallet = FakeWalletRepository(
-            claims = listOf(pendingClaim().copy(status = TransferClaimStatus.ACCEPTED)),
+            claims = listOf(
+                pendingClaim(fromMe = true).copy(status = TransferClaimStatus.ACCEPTED),
+            ),
+            authoritativeClaim = pendingClaim(fromMe = true),
+            authoritativeClaimAfterSettlementFailure = pendingClaim(fromMe = true).copy(
+                status = TransferClaimStatus.ACCEPTED,
+                canReverse = false,
+            ),
             settleFailure = IllegalStateException("This transfer has already been accepted"),
         )
         val repository = FakeChatRepository()
         val viewModel = viewModel(repository, wallet)
 
-        viewModel.reverseTransfer(transferBubble(fromMe = true), "too late")
+        viewModel.reverseTransfer(
+            transferBubble(fromMe = true),
+            "too late",
+            paymentPin = "2580",
+            claimableTransfersEnabled = true,
+        )
 
         assertTrue(repository.sent.isEmpty())
         assertEquals("This transfer has already been accepted", viewModel.error.value)
@@ -688,11 +833,14 @@ class ConversationViewModelTest {
 
     @Test
     fun `a bubble with no claim reference settles nothing`() = runTest {
-        val wallet = FakeWalletRepository(claims = listOf(pendingClaim()))
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim(fromMe = false)))
         val repository = FakeChatRepository()
         val viewModel = viewModel(repository, wallet)
 
-        viewModel.acceptTransfer(transferBubble(fromMe = false).copy(paymentReferenceId = null))
+        viewModel.acceptTransfer(
+            transferBubble(fromMe = false).copy(paymentReferenceId = null),
+            claimableTransfersEnabled = true,
+        )
 
         assertTrue(wallet.accepted.isEmpty())
         assertTrue(repository.sent.isEmpty())
@@ -701,7 +849,9 @@ class ConversationViewModelTest {
     @Test
     fun `an expired transfer is written into the sender's chat exactly once`() = runTest {
         val wallet = FakeWalletRepository(
-            claims = listOf(pendingClaim().copy(status = TransferClaimStatus.EXPIRED)),
+            claims = listOf(
+                pendingClaim(fromMe = true).copy(status = TransferClaimStatus.EXPIRED),
+            ),
         )
         val repository = FakeChatRepository().apply {
             messages.value = listOf(transferBubble(fromMe = true))
@@ -722,7 +872,9 @@ class ConversationViewModelTest {
     @Test
     fun `an expired transfer is not announced by the side that did not send it`() = runTest {
         val wallet = FakeWalletRepository(
-            claims = listOf(pendingClaim().copy(status = TransferClaimStatus.EXPIRED)),
+            claims = listOf(
+                pendingClaim(fromMe = false).copy(status = TransferClaimStatus.EXPIRED),
+            ),
         )
         val repository = FakeChatRepository().apply {
             messages.value = listOf(transferBubble(fromMe = false))
@@ -804,7 +956,7 @@ class ConversationViewModelTest {
         assertEquals("This request was already paid", viewModel.error.value)
     }
 
-    private fun pendingClaim() = TransferClaim(
+    private fun pendingClaim(fromMe: Boolean) = TransferClaim(
         id = CLAIM_ID,
         transactionId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
         status = TransferClaimStatus.PENDING,
@@ -812,23 +964,36 @@ class ConversationViewModelTest {
         currencyCode = "UGX",
         currencyScale = 2,
         note = "Rent",
-        canAccept = true,
-        canReject = true,
-        canReverse = true,
+        senderUserId = if (fromMe) CURRENT_USER_ID else PEER_USER_ID,
+        recipientUserId = if (fromMe) PEER_USER_ID else CURRENT_USER_ID,
+        canAccept = !fromMe,
+        canReject = !fromMe,
+        canReverse = fromMe,
     )
 
-    private fun transferBubble(fromMe: Boolean) = Message(
-        id = "transfer-bubble",
-        text = "",
-        time = "12:00",
-        fromMe = fromMe,
-        kind = MessageKind.PAYMENT_TRANSFER,
-        amountMinor = 250_000,
-        paymentReferenceId = CLAIM_ID,
-        paymentEvent = PaymentEventKind.TRANSFER,
-        paymentCurrencyCode = "UGX",
-        paymentCurrencyScale = 2,
-    )
+    private fun transferBubble(fromMe: Boolean): Message {
+        val descriptor = KitPaymentMessage(
+            action = KitPaymentAction.TRANSFER,
+            referenceId = CLAIM_ID,
+            amountMinor = 250_000,
+            currencyCode = "UGX",
+            currencyScale = 2,
+            note = "Rent",
+        )
+        return Message(
+            id = "transfer-bubble",
+            text = "",
+            time = "12:00",
+            fromMe = fromMe,
+            kind = MessageKind.PAYMENT_TRANSFER,
+            mediaDescriptor = descriptor.encode(),
+            amountMinor = if (fromMe) -250_000 else 250_000,
+            paymentReferenceId = CLAIM_ID,
+            paymentEvent = PaymentEventKind.TRANSFER,
+            paymentCurrencyCode = "UGX",
+            paymentCurrencyScale = 2,
+        )
+    }
 
     private fun requestBubble(descriptor: KitPaymentMessage, fromMe: Boolean) = Message(
         id = "request-bubble",
@@ -870,14 +1035,22 @@ class ConversationViewModelTest {
     /** Records what a conversation asks of the wallet, and answers with the claims it is given. */
     private class FakeWalletRepository(
         private val claims: List<TransferClaim> = emptyList(),
+        private val authoritativeClaim: TransferClaim? = claims.firstOrNull(),
+        private val authoritativeClaimAfterSettlementFailure: TransferClaim? = null,
+        private val capabilityAvailable: Boolean = true,
+        private val capabilityFailure: Exception? = null,
+        private val authoritativeFailure: Exception? = null,
         private val settleFailure: Exception? = null,
         private val cancelFailure: Exception? = null,
     ) : WalletRepository {
         val accepted = mutableListOf<Pair<String, String?>>()
         val rejected = mutableListOf<Pair<String, String?>>()
-        val reversed = mutableListOf<Pair<String, String?>>()
+        val reversed = mutableListOf<Triple<String, String?, String>>()
         val cancelledRequests = mutableListOf<String>()
+        var capabilityRefreshes = 0
+        var authoritativeReads = 0
 
+        override val currentAccountId: String = CURRENT_USER_ID
         override val balanceMinor: StateFlow<Long> = MutableStateFlow(0L)
         override val transactions: StateFlow<List<Transaction>> = MutableStateFlow(emptyList())
         override val beneficiaries: StateFlow<List<Beneficiary>> = MutableStateFlow(emptyList())
@@ -891,12 +1064,34 @@ class ConversationViewModelTest {
         override suspend fun request(from: Contact, amountMinor: Long, note: String?) =
             error("Unused in conversation tests")
         override suspend fun transferClaims(): List<TransferClaim> = claims
+        override suspend fun refreshClaimableTransfersCapability(): Boolean {
+            capabilityRefreshes++
+            capabilityFailure?.let { throw it }
+            return capabilityAvailable
+        }
+        override suspend fun transferClaim(claimId: String): TransferClaim {
+            authoritativeReads++
+            authoritativeFailure?.let { throw it }
+            return checkNotNull(
+                if (authoritativeReads > 1) {
+                    authoritativeClaimAfterSettlementFailure ?: authoritativeClaim
+                } else {
+                    authoritativeClaim
+                },
+            ) { "No authoritative claim" }
+        }
         override suspend fun acceptTransferClaim(claimId: String): TransferClaim =
             settle(claimId, null, accepted, TransferClaimStatus.ACCEPTED)
         override suspend fun rejectTransferClaim(claimId: String, reason: String?): TransferClaim =
             settle(claimId, reason, rejected, TransferClaimStatus.REJECTED)
-        override suspend fun reverseTransferClaim(claimId: String, reason: String?): TransferClaim =
-            settle(claimId, reason, reversed, TransferClaimStatus.REVERSED)
+        override suspend fun reverseTransferClaim(
+            claimId: String,
+            reason: String?,
+            paymentPin: String,
+        ): TransferClaim {
+            reversed += Triple(claimId, reason, paymentPin)
+            return settle(claimId, reason, null, TransferClaimStatus.REVERSED)
+        }
         override suspend fun cancelChatPaymentRequest(requestId: String) {
             cancelledRequests += requestId
             cancelFailure?.let { throw it }
@@ -905,12 +1100,14 @@ class ConversationViewModelTest {
         private fun settle(
             claimId: String,
             reason: String?,
-            log: MutableList<Pair<String, String?>>,
+            log: MutableList<Pair<String, String?>>?,
             settled: TransferClaimStatus,
         ): TransferClaim {
-            log += claimId to reason
+            log?.add(claimId to reason)
             settleFailure?.let { throw it }
-            val claim = claims.single { it.id == claimId }
+            val claim = checkNotNull(authoritativeClaim).takeIf {
+                it.id.equals(claimId, ignoreCase = true)
+            } ?: error("No matching authoritative claim")
             return claim.copy(
                 status = settled,
                 reason = reason?.trim()?.takeIf(String::isNotBlank),
@@ -951,7 +1148,7 @@ class ConversationViewModelTest {
         private val mediaBlockUntil: CompletableDeferred<Unit>? = null,
         private val media: Map<String, ByteArray> = emptyMap(),
     ) : ChatRepository {
-        private val preview = ChatPreview(CHAT_ID, "Grace", "", "")
+        private val preview = ChatPreview(CHAT_ID, "Grace", "", "", peerUserId = PEER_USER_ID)
         override val readiness: StateFlow<Boolean> = MutableStateFlow(initiallyReady)
         private val mutableChats = MutableStateFlow(if (initiallyLoaded) listOf(preview) else emptyList())
         override val chats: StateFlow<List<ChatPreview>> = mutableChats
@@ -1066,5 +1263,7 @@ class ConversationViewModelTest {
         const val CHAT_ID = "11111111-1111-4111-8111-111111111111"
         const val CLAIM_ID = "22222222-2222-4222-8222-222222222222"
         const val REQUEST_ID = "33333333-3333-4333-8333-333333333333"
+        const val CURRENT_USER_ID = "44444444-4444-4444-8444-444444444444"
+        const val PEER_USER_ID = "55555555-5555-4555-8555-555555555555"
     }
 }

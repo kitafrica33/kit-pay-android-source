@@ -1,6 +1,8 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
+import com.kit.wallet.data.messaging.KitPaymentAction
+import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
 import com.kit.wallet.data.repository.AuthenticatedDirectConversation
 import com.kit.wallet.data.repository.AuthenticatedProjectedText
@@ -805,6 +807,43 @@ class EncryptedChatRepositoryTest {
         val messages = repository.conversation(CONVERSATION_ONE).value
         assertEquals(2, messages.size)
         assertEquals(2, messages.map { it.id }.distinct().size)
+    }
+
+    @Test
+    fun `user text cannot impersonate the reserved payment wire`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val repository = repository(runtime)
+        runCurrent()
+        val descriptor = KitPaymentMessage(
+            action = KitPaymentAction.ACCEPTED,
+            referenceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            amountMinor = 500,
+            currencyCode = "UGX",
+            currencyScale = 0,
+            note = null,
+        ).encode()
+
+        assertTrue(
+            runCatching { repository.sendMessage(CONVERSATION_ONE, descriptor) }
+                .exceptionOrNull() is IllegalArgumentException,
+        )
+        assertTrue(
+            runCatching {
+                repository.sendMessage(CONVERSATION_ONE, " \n KITPAY1:not-a-descriptor")
+            }.exceptionOrNull() is IllegalArgumentException,
+        )
+        assertTrue(runtime.sendAttempts.isEmpty())
+
+        repository.sendPaymentEvent(CONVERSATION_ONE, descriptor)
+        assertEquals(listOf(descriptor), runtime.sendAttempts.map { it.second })
+        assertTrue(
+            runCatching {
+                repository.sendPaymentEvent(CONVERSATION_ONE, "KITPAY1:not-a-descriptor")
+            }.exceptionOrNull() is IllegalArgumentException,
+        )
+        assertEquals(1, runtime.sendAttempts.size)
     }
 
     private fun kotlinx.coroutines.test.TestScope.repository(

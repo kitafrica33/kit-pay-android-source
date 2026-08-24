@@ -19,6 +19,7 @@ import com.kit.wallet.data.remote.CreateProviderOperationRequest
 import com.kit.wallet.data.remote.CreateProviderQuoteRequest
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.remote.claimableTransfersAvailable
 import com.kit.wallet.data.remote.ProfileAvatarUploader
 import com.kit.wallet.data.remote.EmailAddressRequest
 import com.kit.wallet.data.remote.EmailAttachmentVerificationRequest
@@ -222,6 +223,9 @@ class OfflineWalletRepository @Inject constructor(
     private val providerCatalog: ProviderCatalogRepository,
     @ApplicationScope scope: CoroutineScope,
 ) : WalletRepository {
+    override val currentAccountId: String?
+        get() = sessions.current()?.accountId
+
     private val selectedWallet = sessions.session.flatMapLatest { session ->
         if (session == null) {
             flowOf<OwnedSelectedWallet?>(null)
@@ -437,15 +441,33 @@ class OfflineWalletRepository @Inject constructor(
     }
 
     override suspend fun transferClaims(): List<TransferClaim> {
-        val page = try {
-            apiCalls.execute { api.transferClaims() }
+        val claims = try {
+            loadVisibleTransferClaims { status, cursor, limit ->
+                apiCalls.execute {
+                    api.transferClaims(status = status, cursor = cursor, limit = limit)
+                }
+            }
         } catch (error: KitWalletApiException) {
             // A service that predates held transfers simply has none to report. A conversation
             // must still open, and its ordinary messages must still render, without them.
             if (error.statusCode == 404) return emptyList()
             throw error
         }
-        return page.items.mapNotNull { it.toUiModel() }
+        return claims.mapNotNull { it.toUiModel() }
+    }
+
+    override suspend fun refreshClaimableTransfersCapability(): Boolean {
+        return apiCalls.execute { api.capabilities() }.claimableTransfersAvailable()
+    }
+
+    override suspend fun transferClaim(claimId: String): TransferClaim {
+        require(claimId.isNotBlank()) { "This transfer has no claim to verify" }
+        val claim = apiCalls.execute { api.transferClaim(claimId) }.toUiModel()
+            ?: error("The transfer state could not be verified")
+        check(claim.id.equals(claimId, ignoreCase = true)) {
+            "The transfer state did not match this payment"
+        }
+        return claim
     }
 
     override suspend fun acceptTransferClaim(claimId: String): TransferClaim =
@@ -456,18 +478,37 @@ class OfflineWalletRepository @Inject constructor(
             api.rejectTransferClaim(claimId, TransferClaimResolutionRequest(reason.orNullIfBlank()))
         }
 
-    override suspend fun reverseTransferClaim(claimId: String, reason: String?): TransferClaim =
-        settleTransferClaim(claimId) {
-            api.reverseTransferClaim(claimId, TransferClaimResolutionRequest(reason.orNullIfBlank()))
+    override suspend fun reverseTransferClaim(
+        claimId: String,
+        reason: String?,
+        paymentPin: String,
+    ): TransferClaim {
+        require(paymentPin.isEmpty() || paymentPin.matches(Regex("^[0-9]{4}$"))) {
+            "Enter the four-digit wallet PIN"
         }
+        val canonicalReason = canonicalTransferClaimReason(reason)
+        val authorizationIntent = transferClaimReverseIntent(claimId, canonicalReason)
+        val stepUpToken = paymentAuthorizer.authorize(
+            "wallet_transfer_reverse",
+            authorizationIntent,
+            paymentPin,
+            "Approve reversing this payment",
+        )
+        return settleTransferClaim(claimId) {
+            api.reverseTransferClaim(
+                claimId,
+                stepUpToken,
+                TransferClaimResolutionRequest(canonicalReason),
+            )
+        }
+    }
 
     /**
      * Settling a claim is the moment money either becomes final or goes back, so the cached
      * balance is stale the instant the call returns. Refresh before the caller reads it.
      *
-     * No step-up here on purpose: none of accept, reject or reverse debits the actor's own
-     * spendable balance, so there is nothing for a PIN to authorize that the server has not
-     * already decided from who is asking.
+     * Accept and reject require authoritative party checks at the caller and server. Reverse also
+     * carries a claim-bound biometric-or-PIN token because it cancels the sender's payment intent.
      */
     private suspend fun settleTransferClaim(
         claimId: String,

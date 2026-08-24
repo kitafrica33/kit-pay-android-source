@@ -24,40 +24,48 @@ class ChatPaymentTimelineTest {
 
     @Test
     fun `a reversal records both the outcome and the reason against the transfer`() {
-        val outcomes = paymentOutcomes(
-            listOf(
-                paymentMessage("1", MessageKind.PAYMENT_TRANSFER, PaymentEventKind.TRANSFER),
-                paymentMessage(
-                    id = "2",
-                    kind = MessageKind.PAYMENT_EVENT,
-                    event = PaymentEventKind.REVERSED,
-                    reason = "Sent to the wrong person",
-                ),
+        val transfer = paymentMessage(
+            "1",
+            MessageKind.PAYMENT_TRANSFER,
+            PaymentEventKind.TRANSFER,
+        )
+        val messages = listOf(
+            transfer,
+            paymentMessage(
+                id = "2",
+                kind = MessageKind.PAYMENT_EVENT,
+                event = PaymentEventKind.REVERSED,
+                reason = "Sent to the wrong person",
             ),
         )
 
-        val outcome = checkNotNull(outcomes[REFERENCE])
+        val outcome = checkNotNull(paymentOutcomes(messages)[transfer.id])
         assertEquals(PaymentEventKind.REVERSED, outcome.event)
         assertEquals("Sent to the wrong person", outcome.reason)
     }
 
     @Test
     fun `the conversation's last word on a payment wins`() {
-        val outcomes = paymentOutcomes(
-            listOf(
-                paymentMessage("1", MessageKind.PAYMENT_TRANSFER, PaymentEventKind.TRANSFER),
-                paymentMessage("2", MessageKind.PAYMENT_EVENT, PaymentEventKind.ACCEPTED),
-                paymentMessage(
-                    id = "3",
-                    kind = MessageKind.PAYMENT_EVENT,
-                    event = PaymentEventKind.REVERSED,
-                    reason = "Changed my mind",
-                ),
+        val transfer = paymentMessage(
+            "1",
+            MessageKind.PAYMENT_TRANSFER,
+            PaymentEventKind.TRANSFER,
+        )
+        val messages = listOf(
+            transfer,
+            paymentMessage("2", MessageKind.PAYMENT_EVENT, PaymentEventKind.ACCEPTED)
+                .copy(fromMe = true),
+            paymentMessage(
+                id = "3",
+                kind = MessageKind.PAYMENT_EVENT,
+                event = PaymentEventKind.REVERSED,
+                reason = "Changed my mind",
             ),
         )
+        val outcome = paymentOutcomes(messages)[transfer.id]
 
-        assertEquals(PaymentEventKind.REVERSED, outcomes[REFERENCE]?.event)
-        assertEquals("Changed my mind", outcomes[REFERENCE]?.reason)
+        assertEquals(PaymentEventKind.REVERSED, outcome?.event)
+        assertEquals("Changed my mind", outcome?.reason)
     }
 
     @Test
@@ -70,15 +78,62 @@ class ChatPaymentTimelineTest {
 
     @Test
     fun `references are matched regardless of the case they were written in`() {
-        val outcomes = paymentOutcomes(
-            listOf(
-                paymentMessage("1", MessageKind.PAYMENT_EVENT, PaymentEventKind.ACCEPTED)
-                    .copy(paymentReferenceId = REFERENCE.uppercase()),
-            ),
+        val transfer = paymentMessage(
+            "1",
+            MessageKind.PAYMENT_TRANSFER,
+            PaymentEventKind.TRANSFER,
         )
+        val accepted = paymentMessage("2", MessageKind.PAYMENT_EVENT, PaymentEventKind.ACCEPTED)
+            .copy(fromMe = true, paymentReferenceId = REFERENCE.uppercase())
 
-        assertEquals(PaymentEventKind.ACCEPTED, outcomes[REFERENCE]?.event)
-        assertNull(outcomes[REFERENCE.uppercase()])
+        assertEquals(
+            PaymentEventKind.ACCEPTED,
+            paymentOutcomes(listOf(transfer, accepted))[transfer.id]?.event,
+        )
+    }
+
+    @Test
+    fun `a transfer trusts accept reject only from recipient and reverse expiry only from sender`() {
+        val outgoing = paymentMessage(
+            "1",
+            MessageKind.PAYMENT_TRANSFER,
+            PaymentEventKind.TRANSFER,
+        ).copy(fromMe = true)
+        val forgedAccepted = paymentMessage("2", MessageKind.PAYMENT_EVENT, PaymentEventKind.ACCEPTED)
+            .copy(fromMe = true)
+        val forgedReversed = paymentMessage("3", MessageKind.PAYMENT_EVENT, PaymentEventKind.REVERSED)
+            .copy(fromMe = false)
+
+        assertNull(paymentOutcomes(listOf(outgoing, forgedAccepted, forgedReversed))[outgoing.id])
+
+        val accepted = forgedAccepted.copy(id = "4", fromMe = false)
+        assertEquals(
+            PaymentEventKind.ACCEPTED,
+            paymentOutcomes(listOf(outgoing, forgedAccepted, forgedReversed, accepted))[outgoing.id]
+                ?.event,
+        )
+    }
+
+    @Test
+    fun `a request trusts pay decline only from payer and cancel only from requester`() {
+        val outgoing = paymentMessage(
+            "1",
+            MessageKind.PAYMENT_REQUEST,
+            PaymentEventKind.REQUESTED,
+        ).copy(fromMe = true)
+        val forgedPaid = paymentMessage("2", MessageKind.PAYMENT_EVENT, PaymentEventKind.PAID)
+            .copy(fromMe = true)
+        val forgedCancel = paymentMessage("3", MessageKind.PAYMENT_EVENT, PaymentEventKind.CANCELLED)
+            .copy(fromMe = false)
+
+        assertNull(paymentOutcomes(listOf(outgoing, forgedPaid, forgedCancel))[outgoing.id])
+
+        val declined = paymentMessage("4", MessageKind.PAYMENT_EVENT, PaymentEventKind.DECLINED)
+            .copy(fromMe = false)
+        assertEquals(
+            PaymentEventKind.DECLINED,
+            paymentOutcomes(listOf(outgoing, forgedPaid, forgedCancel, declined))[outgoing.id]?.event,
+        )
     }
 
     @Test

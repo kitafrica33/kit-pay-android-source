@@ -9,6 +9,7 @@ import retrofit2.http.PATCH
 import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
+import okhttp3.RequestBody
 
 interface KitWalletApi {
     @GET("api/kit-wallet/v1/capabilities")
@@ -211,7 +212,7 @@ interface KitWalletApi {
 
     @POST("api/kit-wallet/v1/auth/step-up/challenges")
     suspend fun createStepUpChallenge(
-        @Body request: CreateStepUpChallengeRequest,
+        @Body request: RequestBody,
     ): ApiEnvelope<StepUpChallengeDto>
 
     @POST("api/kit-wallet/v1/auth/step-up/challenges/{challengeId}/verify")
@@ -284,6 +285,7 @@ interface KitWalletApi {
     @POST("api/kit-wallet/v1/transfer-claims/{claimId}/reverse")
     suspend fun reverseTransferClaim(
         @Path("claimId") claimId: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: TransferClaimResolutionRequest,
     ): ApiEnvelope<TransferClaimDto>
 

@@ -821,6 +821,11 @@ private fun KitNavHost(
             FeatureRouteContent(signedIn, capabilities, Dest.CONVERSATION) {
                 ConversationScreen(
                     chatId = entry.arguments?.getString("chatId").orEmpty(),
+                    claimableTransfersEnabled = capabilities.allEnabled(
+                        KitFeature.WALLETS,
+                        KitFeature.INTERNAL_TRANSFERS,
+                        KitFeature.CLAIMABLE_TRANSFERS,
+                    ),
                     onBack = { navController.popBackStack() },
                     onVoiceCall = { navController.navigate(Dest.voiceCall(it)) },
                     onVideoCall = { navController.navigate(Dest.videoCall(it)) },

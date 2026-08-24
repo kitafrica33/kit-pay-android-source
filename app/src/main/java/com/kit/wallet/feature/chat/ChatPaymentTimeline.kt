@@ -36,23 +36,70 @@ internal data class PaymentOutcome(
     val reason: String?,
 )
 
+private enum class PaymentOriginKind { REQUEST, TRANSFER }
+
+private data class PaymentOutcomeKey(
+    val reference: String,
+    val origin: PaymentOriginKind,
+    val originFromMe: Boolean,
+)
+
 /**
- * Folds a conversation's payment messages into the last outcome recorded per reference.
+ * Indexes the last terminal receipt each concrete request or transfer card is allowed to trust.
  *
- * Last-wins rather than first-wins: the authenticated ordering is the conversation's own, and a
- * later event is by definition the more recent word on the same money. References are lowercased
- * because a descriptor's id is canonicalised on parse but a card may be keyed from elsewhere.
+ * Signal authentication proves who wrote a message, not that its claim about a payment is true.
+ * Direction therefore binds each receipt to the role allowed to produce it: the other party may
+ * pay/decline a request or accept/reject a transfer; the original sender may cancel, reverse or
+ * document server expiry. The result is keyed by opener message ID (not reference alone), so a
+ * forged duplicate opener cannot change another card's direction binding.
  */
 internal fun paymentOutcomes(messages: List<Message>): Map<String, PaymentOutcome> {
-    val outcomes = LinkedHashMap<String, PaymentOutcome>()
+    val latestByRole = HashMap<PaymentOutcomeKey, PaymentOutcome>()
     for (message in messages) {
         val event = message.paymentEvent ?: continue
         if (!event.isTerminal) continue
         val reference = message.paymentReferenceId?.lowercase()?.takeIf(String::isNotBlank)
             ?: continue
-        outcomes[reference] = PaymentOutcome(event, message.paymentReason)
+        val key = when (event) {
+            PaymentEventKind.PAID, PaymentEventKind.DECLINED -> PaymentOutcomeKey(
+                reference,
+                PaymentOriginKind.REQUEST,
+                originFromMe = !message.fromMe,
+            )
+            PaymentEventKind.CANCELLED -> PaymentOutcomeKey(
+                reference,
+                PaymentOriginKind.REQUEST,
+                originFromMe = message.fromMe,
+            )
+            PaymentEventKind.ACCEPTED, PaymentEventKind.REJECTED -> PaymentOutcomeKey(
+                reference,
+                PaymentOriginKind.TRANSFER,
+                originFromMe = !message.fromMe,
+            )
+            PaymentEventKind.REVERSED, PaymentEventKind.EXPIRED -> PaymentOutcomeKey(
+                reference,
+                PaymentOriginKind.TRANSFER,
+                originFromMe = message.fromMe,
+            )
+            else -> continue
+        }
+        latestByRole[key] = PaymentOutcome(event, message.paymentReason)
     }
-    return outcomes
+
+    return buildMap {
+        for (subject in messages) {
+            val origin = when (subject.paymentEvent) {
+                PaymentEventKind.REQUESTED -> PaymentOriginKind.REQUEST
+                PaymentEventKind.TRANSFER -> PaymentOriginKind.TRANSFER
+                else -> continue
+            }
+            val reference = subject.paymentReferenceId?.lowercase()?.takeIf(String::isNotBlank)
+                ?: continue
+            latestByRole[PaymentOutcomeKey(reference, origin, subject.fromMe)]?.let { outcome ->
+                put(subject.id, outcome)
+            }
+        }
+    }
 }
 
 /**

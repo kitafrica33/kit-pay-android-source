@@ -204,6 +204,7 @@ class AppCapabilitiesTest {
     fun `android capability constants match the backend response contract`() {
         assertEquals("wallets", KitFeature.WALLETS)
         assertEquals("internal_transfers", KitFeature.INTERNAL_TRANSFERS)
+        assertEquals("claimable_transfers", KitFeature.CLAIMABLE_TRANSFERS)
         assertEquals("payment_requests", KitFeature.PAYMENT_REQUESTS)
         assertEquals("merchant_payments", KitFeature.MERCHANT_PAYMENTS)
         assertEquals("qr_payments", KitFeature.QR_PAYMENTS)

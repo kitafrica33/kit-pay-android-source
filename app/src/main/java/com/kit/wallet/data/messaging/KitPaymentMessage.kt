@@ -120,6 +120,16 @@ internal data class KitPaymentMessage(
 
         fun isPaymentText(text: String): Boolean = text.startsWith(PREFIX)
 
+        /**
+         * User-authored text cannot enter the payment wire namespace. The parser remains strict
+         * about byte zero; this broader boundary also catches pasted descriptors hidden behind
+         * whitespace before a composer or notification reply trims them.
+         */
+        fun beginsWithReservedPrefix(text: String): Boolean =
+            text.dropWhile(Char::isWhitespace).startsWith(PREFIX)
+
+        fun allowsUserAuthoredText(text: String): Boolean = !beginsWithReservedPrefix(text)
+
         /** Strict parse; returns null for anything that is not a well-formed v1 payment descriptor. */
         fun parse(text: String): KitPaymentMessage? {
             if (!text.startsWith(PREFIX) || text.length > MAX_DESCRIPTOR_LENGTH) return null

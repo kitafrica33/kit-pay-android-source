@@ -94,7 +94,7 @@ class SendMoneyViewModel @Inject constructor(
         // its own canonical round trip would render as raw text in every client that receives it.
         if (KitPaymentMessage.parse(descriptor) == null) return
         try {
-            chats.sendMessage(chats.openDirectConversation(recipient), descriptor)
+            chats.sendPaymentEvent(chats.openDirectConversation(recipient), descriptor)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {

@@ -140,6 +140,8 @@ fun TransferClaimDto.toUiModel(): TransferClaim? {
             "system" -> TransferClaimActor.SYSTEM
             else -> null
         },
+        senderUserId = sender?.id?.takeIf(String::isNotBlank),
+        recipientUserId = recipient?.id?.takeIf(String::isNotBlank),
         senderName = sender?.name?.takeIf(String::isNotBlank),
         recipientName = recipient?.name?.takeIf(String::isNotBlank),
         expiresAtEpochMillis = expiresAt?.toEpochMillisOrNull() ?: 0L,

@@ -69,6 +69,36 @@ class BiometricPaymentAuthorizerTest {
         assertFalse(verification.contains("signature"))
     }
 
+    @Test fun `an explicit PIN is honored even when a biometric key is enrolled`() = runTest {
+        server.enqueue(ok("""{"id":"challenge","purpose":"wallet_transfer_reverse","intent_hash":"hash","nonce":"nonce","signing_payload":"signed payload","methods":["pin","biometric_signature"],"expires_at":"2099-01-01T00:00:00Z"}"""))
+        server.enqueue(ok("""{"step_up_token":"token","expires_at":"2099-01-01T00:01:00Z","method":"pin"}"""))
+        val api = Retrofit.Builder().baseUrl(server.url("/"))
+            .addConverterFactory(MoshiConverterFactory.create(Moshi.Builder().add(KotlinJsonAdapterFactory()).build()))
+            .build().create(KitWalletApi::class.java)
+        val authorizer = PaymentAuthorizer(
+            api, ApiCallExecutor(Moshi.Builder().add(KotlinJsonAdapterFactory()).build()),
+            sessionStore(), object : BiometricPaymentApprover {
+                override fun availableFor(accountId: String) = true
+                override suspend fun sign(accountId: String, payload: String, reason: String) =
+                    error("An explicit PIN must not open biometric approval")
+            },
+        )
+
+        assertEquals(
+            "token",
+            authorizer.authorize(
+                "wallet_transfer_reverse",
+                mapOf("action" to "reverse", "claim_id" to "claim", "reason" to null),
+                "2580",
+            ),
+        )
+        val challenge = server.takeRequest()
+        assertTrue(challenge.body.readUtf8().contains("\"reason\":null"))
+        val verification = server.takeRequest().body.readUtf8()
+        assertTrue(verification.contains("\"pin\":\"2580\""))
+        assertFalse(verification.contains("signature"))
+    }
+
     private class RecordingApprover : BiometricPaymentApprover {
         var payload: String? = null
         override fun availableFor(accountId: String) = accountId == "account"

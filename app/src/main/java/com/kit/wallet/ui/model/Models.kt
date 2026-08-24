@@ -117,6 +117,9 @@ data class TransferClaim(
     /** Why the money went back, in the words of whoever sent it back. */
     val reason: String? = null,
     val resolvedBy: TransferClaimActor? = null,
+    /** Public account IDs used to bind actions to this exact direct conversation. */
+    val senderUserId: String? = null,
+    val recipientUserId: String? = null,
     val senderName: String? = null,
     val recipientName: String? = null,
     val expiresAtEpochMillis: Long = 0,

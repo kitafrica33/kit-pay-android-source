@@ -49,6 +49,13 @@ class KitPaymentMessageTest {
     }
 
     @Test
+    fun userTextCannotBeginWithTheReservedPaymentPrefix() {
+        assertFalse(KitPaymentMessage.allowsUserAuthoredText(request.encode()))
+        assertFalse(KitPaymentMessage.allowsUserAuthoredText(" \n\tKITPAY1:not-valid-either"))
+        assertTrue(KitPaymentMessage.allowsUserAuthoredText("Please review KITPAY1: later"))
+    }
+
+    @Test
     fun rejectsOversizedAmountsAndNotes() {
         assertNull(
             KitPaymentMessage.parse(

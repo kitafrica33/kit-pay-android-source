@@ -68,6 +68,10 @@ interface UserRepository {
 }
 
 interface WalletRepository {
+    /** Authenticated public account ID used to bind wallet objects to a direct conversation. */
+    val currentAccountId: String?
+        get() = null
+
     val balanceMinor: StateFlow<Long>
     val transactions: StateFlow<List<Transaction>>
     val beneficiaries: StateFlow<List<Beneficiary>>
@@ -123,6 +127,13 @@ interface WalletRepository {
      */
     suspend fun transferClaims(): List<TransferClaim> = emptyList()
 
+    /** Re-fetches the current server capability; false/missing fails closed. */
+    suspend fun refreshClaimableTransfersCapability(): Boolean = false
+
+    /** Reads one authoritative claim immediately before a resolution action. */
+    suspend fun transferClaim(claimId: String): TransferClaim =
+        error("Held transfers are unavailable")
+
     /** Takes a held transfer. Once accepted the payment is final and cannot be reversed. */
     suspend fun acceptTransferClaim(claimId: String): TransferClaim =
         error("Held transfers are unavailable")
@@ -132,7 +143,11 @@ interface WalletRepository {
         error("Held transfers are unavailable")
 
     /** Takes back a transfer the recipient has not accepted yet, with the sender's reason. */
-    suspend fun reverseTransferClaim(claimId: String, reason: String?): TransferClaim =
+    suspend fun reverseTransferClaim(
+        claimId: String,
+        reason: String?,
+        paymentPin: String,
+    ): TransferClaim =
         error("Held transfers are unavailable")
 
     suspend fun payBill(
@@ -215,9 +230,24 @@ interface ChatRepository {
         text: String,
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
     )
+
+    /** Sends a canonical descriptor produced by a payment flow, never by a text composer. */
+    suspend fun sendPaymentEvent(
+        chatId: String,
+        descriptor: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit = {},
+    ) = sendMessage(chatId, descriptor, onDurablyCommitted)
+
     suspend fun retryMessage(chatId: String, clientMessageId: String, text: String) {
         error("This chat repository does not support explicit secure-message retries")
     }
+
+    /** Retries an already-durable canonical payment descriptor through its original outbox row. */
+    suspend fun retryPaymentEvent(
+        chatId: String,
+        clientMessageId: String,
+        descriptor: String,
+    ) = retryMessage(chatId, clientMessageId, descriptor)
 
     /** Sends one image end-to-end encrypted; the server stores only opaque ciphertext. */
     suspend fun sendImageMessage(

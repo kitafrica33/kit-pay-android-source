@@ -4,6 +4,7 @@ package com.kit.wallet.data.remote
 object KitFeature {
     const val WALLETS = "wallets"
     const val INTERNAL_TRANSFERS = "internal_transfers"
+    const val CLAIMABLE_TRANSFERS = "claimable_transfers"
     const val PAYMENT_REQUESTS = "payment_requests"
     const val MERCHANT_PAYMENTS = "merchant_payments"
     const val QR_PAYMENTS = "qr_payments"
@@ -18,4 +19,12 @@ object KitFeature {
     const val EMAIL_REGISTRATION = "email_registration"
     const val EMAIL_RECOVERY = "email_recovery"
     const val ACCOUNT_DELETION = "account_deletion"
+}
+
+/** Held-transfer actions require their wallet and send dependencies as well as the rollout flag. */
+internal fun CapabilitiesDto.claimableTransfersAvailable(): Boolean {
+    val advertised = features.orEmpty()
+    return advertised[KitFeature.WALLETS] == true &&
+        advertised[KitFeature.INTERNAL_TRANSFERS] == true &&
+        advertised[KitFeature.CLAIMABLE_TRANSFERS] == true
 }

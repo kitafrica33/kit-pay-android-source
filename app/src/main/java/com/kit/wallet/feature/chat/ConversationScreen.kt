@@ -154,6 +154,7 @@ import kotlinx.coroutines.withContext
 @Composable
 fun ConversationScreen(
     chatId: String,
+    claimableTransfersEnabled: Boolean,
     onBack: () -> Unit,
     onVoiceCall: (String) -> Unit,
     onVideoCall: (String) -> Unit,
@@ -353,10 +354,18 @@ fun ConversationScreen(
         onPayRequest = viewModel::payPaymentRequest,
         onDeclineRequest = { message -> viewModel.declinePaymentRequest(message) },
         onCancelRequest = { message -> viewModel.cancelPaymentRequest(message) },
+        claimableTransfersEnabled = claimableTransfersEnabled,
+        currentAccountId = viewModel.currentAccountId,
         transferClaims = transferClaims,
-        onAcceptTransfer = { message -> viewModel.acceptTransfer(message) },
-        onRejectTransfer = { message, reason -> viewModel.rejectTransfer(message, reason) },
-        onReverseTransfer = { message, reason -> viewModel.reverseTransfer(message, reason) },
+        onAcceptTransfer = { message ->
+            viewModel.acceptTransfer(message, claimableTransfersEnabled)
+        },
+        onRejectTransfer = { message, reason ->
+            viewModel.rejectTransfer(message, reason, claimableTransfersEnabled)
+        },
+        onReverseTransfer = { message, reason, pin ->
+            viewModel.reverseTransfer(message, reason, pin, claimableTransfersEnabled)
+        },
         // Dormant-feature guard: the composer hides the affordances, and these keep even a
         // stale composition from opening a picker while the release profile is text-only.
         onAttachLibrary = {
@@ -507,10 +516,12 @@ private fun ConversationContent(
     onPayRequest: (Message, String, () -> Unit) -> Unit = { _, _, done -> done() },
     onDeclineRequest: (Message) -> Unit = {},
     onCancelRequest: (Message) -> Unit = {},
+    claimableTransfersEnabled: Boolean = false,
+    currentAccountId: String? = null,
     transferClaims: Map<String, TransferClaim> = emptyMap(),
     onAcceptTransfer: (Message) -> Unit = {},
     onRejectTransfer: (Message, String?) -> Unit = { _, _ -> },
-    onReverseTransfer: (Message, String?) -> Unit = { _, _ -> },
+    onReverseTransfer: (Message, String?, String) -> Unit = { _, _, _ -> },
     onAttachLibrary: () -> Unit = {},
     onAttachCamera: () -> Unit = {},
     onAttachVideoNote: () -> Unit = {},
@@ -627,9 +638,9 @@ private fun ConversationContent(
             prompt = prompt,
             sending = sending,
             onDismiss = { reasonTarget = null },
-            onConfirm = { reason ->
+            onConfirm = { reason, pin ->
                 if (prompt.reverse) {
-                    onReverseTransfer(prompt.message, reason)
+                    onReverseTransfer(prompt.message, reason, pin)
                 } else {
                     onRejectTransfer(prompt.message, reason)
                 }
@@ -873,8 +884,18 @@ private fun ConversationContent(
                         onOpenMedia = { onOpenMedia(message) },
                         onRetryMedia = { onRetryMedia(message) },
                         onOpenViewer = { onOpenViewer(message) },
-                        outcome = message.paymentReferenceId?.lowercase()?.let(outcomes::get),
-                        claim = message.paymentReferenceId?.lowercase()?.let(claimsByReference::get),
+                        outcome = outcomes[message.id],
+                        claim = TransferClaimResolutionPolicy.forPresentation(
+                            message = message,
+                            claim = message.paymentReferenceId
+                                ?.lowercase()
+                                ?.let(claimsByReference::get),
+                            binding = TransferClaimPartyBinding.create(
+                                currentUserId = currentAccountId,
+                                peerUserId = chat.peerUserId,
+                            ),
+                            capabilityEnabled = claimableTransfersEnabled,
+                        ),
                         onPayRequest = { payTarget = message },
                         onDeclineRequest = { onDeclineRequest(message) },
                         onCancelRequest = { onCancelRequest(message) },
@@ -1615,9 +1636,10 @@ private fun TransferReasonDialog(
     prompt: TransferReasonPrompt,
     sending: Boolean,
     onDismiss: () -> Unit,
-    onConfirm: (String?) -> Unit,
+    onConfirm: (String?, String) -> Unit,
 ) {
     var reason by remember(prompt.message.id, prompt.reverse) { mutableStateOf("") }
+    var pin by remember(prompt.message.id, prompt.reverse) { mutableStateOf("") }
     val amountText = Money.format(
         abs(prompt.message.amountMinor),
         prompt.message.paymentCurrencyCode,
@@ -1631,7 +1653,8 @@ private fun TransferReasonDialog(
                 Text(
                     if (prompt.reverse) {
                         "The money goes back to your wallet straight away. Your reason is shown " +
-                            "in this chat so they know why."
+                            "in this chat so they know why. Approve with your enrolled biometrics, " +
+                            "or enter your wallet PIN if biometrics are unavailable."
                     } else {
                         "The money goes back to them straight away. Your reason is shown in this " +
                             "chat so they know why."
@@ -1647,12 +1670,26 @@ private fun TransferReasonDialog(
                     label = { Text("Reason (optional)") },
                     singleLine = true,
                 )
+                if (prompt.reverse) {
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = pin,
+                        onValueChange = { value -> pin = value.filter(Char::isDigit).take(4) },
+                        enabled = !sending,
+                        label = { Text("Wallet PIN (optional with biometrics)") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.NumberPassword,
+                        ),
+                    )
+                }
             }
         },
         confirmButton = {
             TextButton(
-                enabled = !sending,
-                onClick = { onConfirm(reason.trim().ifBlank { null }) },
+                enabled = !sending && (!prompt.reverse || pin.isEmpty() || pin.length == 4),
+                onClick = { onConfirm(reason.trim().ifBlank { null }, pin) },
             ) {
                 Text(
                     when {

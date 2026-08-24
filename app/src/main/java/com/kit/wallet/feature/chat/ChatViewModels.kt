@@ -14,6 +14,7 @@ import com.kit.wallet.data.repository.ChatPaymentRequest
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.WalletRepository
+import com.kit.wallet.data.repository.canonicalTransferClaimReason
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.model.ChatPreview
@@ -169,6 +170,10 @@ class ConversationViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle,
     internal val richMediaCapability: MessagingRichMediaCapability? = null,
 ) : ViewModel() {
+
+    /** Current authenticated public ID; used only to bind server claims to this direct chat. */
+    val currentAccountId: String?
+        get() = walletRepo.currentAccountId
 
     private val chatId: String = savedStateHandle.get<String>("chatId")
         ?.trim()
@@ -391,6 +396,10 @@ class ConversationViewModel @Inject constructor(
         val selectedChat = chat.value ?: return
         val normalized = text.trim()
         if (!messagingAvailable.value || normalized.isBlank()) return
+        if (!KitPaymentMessage.allowsUserAuthoredText(normalized)) {
+            mutableError.value = "Messages cannot start with Kit Pay's reserved payment prefix"
+            return
+        }
         viewModelScope.launch {
             val composerReleased = AtomicBoolean(false)
             fun releaseComposer() {
@@ -444,6 +453,7 @@ class ConversationViewModel @Inject constructor(
             selectedChatId = selectedChat.id,
             normalizedText = normalized,
             retryingMessageId = message.id,
+            trustedPaymentEvent = KitPaymentMessage.parse(normalized) != null,
             onSuccess = onRetried,
         )
     }
@@ -507,7 +517,7 @@ class ConversationViewModel @Inject constructor(
                     currencyScale = created.currencyScale,
                     note = created.note?.takeIf(String::isNotBlank),
                 ).encode()
-                chatRepo.sendMessage(selectedChat.id, descriptor) { durablyShared = true }
+                chatRepo.sendPaymentEvent(selectedChat.id, descriptor) { durablyShared = true }
                 unsharedPaymentRequest = null
                 onSent()
             } catch (cancelled: CancellationException) {
@@ -548,7 +558,7 @@ class ConversationViewModel @Inject constructor(
                 )
                 // The paid confirmation is best-effort: the debit already completed above.
                 runCatching {
-                    chatRepo.sendMessage(
+                    chatRepo.sendPaymentEvent(
                         selectedChat.id,
                         descriptor.copy(action = KitPaymentAction.PAID).encode(),
                     )
@@ -583,7 +593,7 @@ class ConversationViewModel @Inject constructor(
             mutableSending.value = true
             mutableError.value = null
             try {
-                chatRepo.sendMessage(
+                chatRepo.sendPaymentEvent(
                     selectedChat.id,
                     descriptor.copy(action = KitPaymentAction.DECLINED).encode(),
                 )
@@ -613,7 +623,7 @@ class ConversationViewModel @Inject constructor(
                 walletRepo.cancelChatPaymentRequest(descriptor.referenceId)
                 // The request is already withdrawn server-side; saying so in chat is best-effort.
                 runCatching {
-                    chatRepo.sendMessage(
+                    chatRepo.sendPaymentEvent(
                         selectedChat.id,
                         descriptor.copy(action = KitPaymentAction.CANCELLED).encode(),
                     )
@@ -630,38 +640,119 @@ class ConversationViewModel @Inject constructor(
     }
 
     /** Takes a held transfer. From here the payment is final and cannot be reversed. */
-    fun acceptTransfer(message: Message, onDone: () -> Unit = {}) =
-        settleTransfer(message, KitPaymentAction.ACCEPTED, null, onDone) { claimId ->
-            walletRepo.acceptTransferClaim(claimId)
-        }
+    fun acceptTransfer(
+        message: Message,
+        claimableTransfersEnabled: Boolean,
+        onDone: () -> Unit = {},
+    ) = settleTransfer(
+        message = message,
+        action = TransferClaimResolutionAction.ACCEPT,
+        outcome = KitPaymentAction.ACCEPTED,
+        expectedStatus = TransferClaimStatus.ACCEPTED,
+        reason = null,
+        claimableTransfersEnabled = claimableTransfersEnabled,
+        onDone = onDone,
+    ) { claimId ->
+        walletRepo.acceptTransferClaim(claimId)
+    }
 
     /** Sends a held transfer back, recording the recipient's reason in the conversation. */
-    fun rejectTransfer(message: Message, reason: String?, onDone: () -> Unit = {}) =
-        settleTransfer(message, KitPaymentAction.REJECTED, reason, onDone) { claimId ->
-            walletRepo.rejectTransferClaim(claimId, reason)
+    fun rejectTransfer(
+        message: Message,
+        reason: String?,
+        claimableTransfersEnabled: Boolean,
+        onDone: () -> Unit = {},
+    ) {
+        val canonicalReason = canonicalTransferClaimReason(reason)
+        settleTransfer(
+            message = message,
+            action = TransferClaimResolutionAction.REJECT,
+            outcome = KitPaymentAction.REJECTED,
+            expectedStatus = TransferClaimStatus.REJECTED,
+            reason = canonicalReason,
+            claimableTransfersEnabled = claimableTransfersEnabled,
+            onDone = onDone,
+        ) { claimId ->
+            walletRepo.rejectTransferClaim(claimId, canonicalReason)
         }
+    }
 
-    /** Takes back a transfer the recipient has not accepted, recording the sender's reason. */
-    fun reverseTransfer(message: Message, reason: String?, onDone: () -> Unit = {}) =
-        settleTransfer(message, KitPaymentAction.REVERSED, reason, onDone) { claimId ->
-            walletRepo.reverseTransferClaim(claimId, reason)
+    /** Takes back a transfer only after a claim-bound biometric-or-PIN approval. */
+    fun reverseTransfer(
+        message: Message,
+        reason: String?,
+        paymentPin: String,
+        claimableTransfersEnabled: Boolean,
+        onDone: () -> Unit = {},
+    ) {
+        val canonicalReason = canonicalTransferClaimReason(reason)
+        settleTransfer(
+            message = message,
+            action = TransferClaimResolutionAction.REVERSE,
+            outcome = KitPaymentAction.REVERSED,
+            expectedStatus = TransferClaimStatus.REVERSED,
+            reason = canonicalReason,
+            claimableTransfersEnabled = claimableTransfersEnabled,
+            onDone = onDone,
+        ) { claimId ->
+            walletRepo.reverseTransferClaim(claimId, canonicalReason, paymentPin)
         }
+    }
 
     private fun settleTransfer(
         message: Message,
+        action: TransferClaimResolutionAction,
         outcome: KitPaymentAction,
+        expectedStatus: TransferClaimStatus,
         reason: String?,
+        claimableTransfersEnabled: Boolean,
         onDone: () -> Unit,
         settle: suspend (String) -> TransferClaim,
     ) {
         val selectedChat = chat.value ?: return
         val claimId = message.paymentReferenceId?.takeIf(String::isNotBlank) ?: return
+        val binding = TransferClaimPartyBinding.create(
+            currentUserId = walletRepo.currentAccountId,
+            peerUserId = selectedChat.peerUserId,
+        )
+        if (!claimableTransfersEnabled || binding == null) {
+            mutableError.value = "Transfer decisions are not available right now"
+            return
+        }
         if (mutableSending.value) return
+        // Claim the in-flight marker before the first suspension so two fast taps cannot race.
+        mutableSending.value = true
+        mutableError.value = null
         viewModelScope.launch {
-            mutableSending.value = true
-            mutableError.value = null
+            var settlementAttempted = false
             try {
-                val settled = settle(claimId)
+                check(walletRepo.refreshClaimableTransfersCapability()) {
+                    "Transfer decisions are not available right now"
+                }
+                // A failed or malformed fresh read never falls back to the polled claim map.
+                val authoritative = walletRepo.transferClaim(claimId)
+                mutableTransferClaims.value += authoritative.id to authoritative
+                check(
+                    TransferClaimResolutionPolicy.allows(
+                        action,
+                        message,
+                        authoritative,
+                        binding,
+                    ),
+                ) {
+                    "This payment is not pending or does not belong to this conversation"
+                }
+                check(walletRepo.currentAccountId.equals(binding.currentUserId, ignoreCase = true)) {
+                    "The signed-in account changed while approving this payment"
+                }
+                settlementAttempted = true
+                val settled = settle(authoritative.id)
+                check(settled.id.equals(authoritative.id, ignoreCase = true)) {
+                    "The server returned a different transfer"
+                }
+                check(settled.status == expectedStatus) {
+                    "The server did not confirm this transfer update"
+                }
                 mutableTransferClaims.value += settled.id to settled
                 postTransferEvent(selectedChat.id, settled, outcome, reason)
                 onDone()
@@ -669,9 +760,15 @@ class ConversationViewModel @Inject constructor(
                 throw cancelled
             } catch (error: Exception) {
                 mutableError.value = error.message ?: "This transfer could not be updated"
-                // The usual cause is a card acting on state the other side already changed.
-                // Re-read the authoritative claim so the buttons match reality on the retry.
-                refreshTransferClaims()
+                if (settlementAttempted) {
+                    // A race can settle between the preflight GET and POST. Re-read this exact
+                    // claim; never replace the fresh result with a cached or broad-list fallback.
+                    runCatching { walletRepo.transferClaim(claimId) }
+                        .getOrNull()
+                        ?.let { refreshed ->
+                            mutableTransferClaims.value += refreshed.id to refreshed
+                        }
+                }
             } finally {
                 mutableSending.value = false
             }
@@ -706,7 +803,7 @@ class ConversationViewModel @Inject constructor(
         ).encode()
         if (KitPaymentMessage.parse(descriptor) == null) return
         try {
-            chatRepo.sendMessage(chatId, descriptor)
+            chatRepo.sendPaymentEvent(chatId, descriptor)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
@@ -859,7 +956,8 @@ class ConversationViewModel @Inject constructor(
 
     private fun cacheMedia(messageId: String, bytes: ByteArray) {
         val erased = mutableListOf<ByteArray>()
-        mediaCache.remove(messageId)?.let { previous ->
+        val previous = mediaCache.remove(messageId)
+        if (previous != null) {
             mediaCacheByteCount -= previous.size
             erased += previous
         }
@@ -899,6 +997,7 @@ class ConversationViewModel @Inject constructor(
         selectedChatId: String,
         normalizedText: String,
         retryingMessageId: String?,
+        trustedPaymentEvent: Boolean,
         onSuccess: () -> Unit,
     ) {
         viewModelScope.launch {
@@ -909,11 +1008,19 @@ class ConversationViewModel @Inject constructor(
                 if (retryingMessageId == null) {
                     chatRepo.sendMessage(selectedChatId, normalizedText)
                 } else {
-                    chatRepo.retryMessage(
-                        chatId = selectedChatId,
-                        clientMessageId = retryingMessageId,
-                        text = normalizedText,
-                    )
+                    if (trustedPaymentEvent) {
+                        chatRepo.retryPaymentEvent(
+                            chatId = selectedChatId,
+                            clientMessageId = retryingMessageId,
+                            descriptor = normalizedText,
+                        )
+                    } else {
+                        chatRepo.retryMessage(
+                            chatId = selectedChatId,
+                            clientMessageId = retryingMessageId,
+                            text = normalizedText,
+                        )
+                    }
                 }
                 onSuccess()
             } catch (cancelled: CancellationException) {
