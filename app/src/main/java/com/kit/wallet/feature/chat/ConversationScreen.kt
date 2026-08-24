@@ -103,6 +103,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.Velocity
@@ -116,6 +117,7 @@ import com.kit.wallet.BuildConfig
 import com.kit.wallet.R
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
 import com.kit.wallet.data.messaging.readBoundedMedia
 import com.kit.wallet.feature.chat.camera.CameraPull
@@ -127,6 +129,9 @@ import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
 import com.kit.wallet.ui.model.Money
+import com.kit.wallet.ui.model.PaymentEventKind
+import com.kit.wallet.ui.model.TransferClaim
+import com.kit.wallet.ui.model.TransferClaimStatus
 import com.kit.wallet.ui.theme.KitGreen300
 import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
@@ -182,6 +187,7 @@ fun ConversationScreen(
     val mediaLoading by viewModel.mediaLoading.collectAsStateWithLifecycle()
     val mediaErrors by viewModel.mediaErrors.collectAsStateWithLifecycle()
     val restoredDraft by viewModel.restoredDraft.collectAsStateWithLifecycle()
+    val transferClaims by viewModel.transferClaims.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     // Every picker/capture result funnels through one bounded reader that hands plaintext
@@ -345,6 +351,12 @@ fun ConversationScreen(
         onRetry = viewModel::retry,
         onSendPaymentRequest = viewModel::sendPaymentRequest,
         onPayRequest = viewModel::payPaymentRequest,
+        onDeclineRequest = { message -> viewModel.declinePaymentRequest(message) },
+        onCancelRequest = { message -> viewModel.cancelPaymentRequest(message) },
+        transferClaims = transferClaims,
+        onAcceptTransfer = { message -> viewModel.acceptTransfer(message) },
+        onRejectTransfer = { message, reason -> viewModel.rejectTransfer(message, reason) },
+        onReverseTransfer = { message, reason -> viewModel.reverseTransfer(message, reason) },
         // Dormant-feature guard: the composer hides the affordances, and these keep even a
         // stale composition from opening a picker while the release profile is text-only.
         onAttachLibrary = {
@@ -493,6 +505,12 @@ private fun ConversationContent(
     onRetry: (Message, () -> Unit) -> Unit,
     onSendPaymentRequest: (Long, String?, () -> Unit) -> Unit = { _, _, done -> done() },
     onPayRequest: (Message, String, () -> Unit) -> Unit = { _, _, done -> done() },
+    onDeclineRequest: (Message) -> Unit = {},
+    onCancelRequest: (Message) -> Unit = {},
+    transferClaims: Map<String, TransferClaim> = emptyMap(),
+    onAcceptTransfer: (Message) -> Unit = {},
+    onRejectTransfer: (Message, String?) -> Unit = { _, _ -> },
+    onReverseTransfer: (Message, String?) -> Unit = { _, _ -> },
     onAttachLibrary: () -> Unit = {},
     onAttachCamera: () -> Unit = {},
     onAttachVideoNote: () -> Unit = {},
@@ -536,14 +554,16 @@ private fun ConversationContent(
     val retryableMessageIds = remember(messages) {
         retryableOutgoingMessageIds(messages)
     }
-    // Request cards stop offering Pay once this thread carries a paid confirmation for them.
-    val settledRequestIds = remember(messages) {
-        messages.mapNotNullTo(mutableSetOf()) { message ->
-            message.paymentRequestId
-                ?.lowercase()
-                ?.takeIf { message.kind == MessageKind.PAYMENT }
-        }
+    // The conversation's own record of how each payment ended. Request cards stop offering Pay
+    // once it carries their settlement, and a transfer card falls back to it whenever the wallet
+    // API has not (or cannot) supply the live claim.
+    val outcomes = remember(messages) { paymentOutcomes(messages) }
+    val claimsByReference = remember(transferClaims) {
+        transferClaims.mapKeys { (id, _) -> id.lowercase() }
     }
+    // Sending money back is the one payment action that owes the other side an explanation, so
+    // Reject and Reverse route through a prompt that collects one.
+    var reasonTarget by remember { mutableStateOf<TransferReasonPrompt?>(null) }
 
     // Keep the newest message visible, just like WhatsApp: jump to the bottom the first time the
     // thread loads, then follow new messages only while the reader is already near the bottom.
@@ -599,6 +619,21 @@ private fun ConversationContent(
             onDismiss = { payTarget = null },
             onConfirm = { pin ->
                 onPayRequest(target, pin) { payTarget = null }
+            },
+        )
+    }
+    reasonTarget?.let { prompt ->
+        TransferReasonDialog(
+            prompt = prompt,
+            sending = sending,
+            onDismiss = { reasonTarget = null },
+            onConfirm = { reason ->
+                if (prompt.reverse) {
+                    onReverseTransfer(prompt.message, reason)
+                } else {
+                    onRejectTransfer(prompt.message, reason)
+                }
+                reasonTarget = null
             },
         )
     }
@@ -814,6 +849,10 @@ private fun ConversationContent(
                             }
                         },
                     )
+                } else if (message.kind == MessageKind.PAYMENT_EVENT) {
+                    // Outcomes are the conversation talking about itself, not either person
+                    // talking. They read like the encryption notice: centred, unattributed.
+                    PaymentEventNotice(message, chat.name)
                 } else {
                     MessageBubble(
                         msg = message,
@@ -834,8 +873,18 @@ private fun ConversationContent(
                         onOpenMedia = { onOpenMedia(message) },
                         onRetryMedia = { onRetryMedia(message) },
                         onOpenViewer = { onOpenViewer(message) },
-                        requestSettled = message.paymentRequestId?.lowercase() in settledRequestIds,
+                        outcome = message.paymentReferenceId?.lowercase()?.let(outcomes::get),
+                        claim = message.paymentReferenceId?.lowercase()?.let(claimsByReference::get),
                         onPayRequest = { payTarget = message },
+                        onDeclineRequest = { onDeclineRequest(message) },
+                        onCancelRequest = { onCancelRequest(message) },
+                        onAcceptTransfer = { onAcceptTransfer(message) },
+                        onRejectTransfer = {
+                            reasonTarget = TransferReasonPrompt(message, reverse = false)
+                        },
+                        onReverseTransfer = {
+                            reasonTarget = TransferReasonPrompt(message, reverse = true)
+                        },
                     )
                 }
             }
@@ -898,8 +947,16 @@ internal fun MessageBubble(
     onOpenMedia: () -> Unit = {},
     onRetryMedia: () -> Unit = {},
     onOpenViewer: () -> Unit = {},
-    requestSettled: Boolean = false,
+    /** How this conversation recorded the payment ending, when it did. */
+    outcome: PaymentOutcome? = null,
+    /** The wallet API's live view of a held transfer; overrides [outcome] when present. */
+    claim: TransferClaim? = null,
     onPayRequest: () -> Unit = {},
+    onDeclineRequest: () -> Unit = {},
+    onCancelRequest: () -> Unit = {},
+    onAcceptTransfer: () -> Unit = {},
+    onRejectTransfer: () -> Unit = {},
+    onReverseTransfer: () -> Unit = {},
 ) {
     val colors = KitTheme.colors
     val bubbleColor = if (msg.fromMe) colors.chatBubbleMe else colors.chatBubbleOther
@@ -919,7 +976,12 @@ internal fun MessageBubble(
             msg.text.takeIf {
                 it.isNotBlank() && it !in setOf("Photo", "Voice note", "Video", "Document")
             }
-        else -> null
+        MessageKind.PAYMENT,
+        MessageKind.PAYMENT_REQUEST,
+        MessageKind.PAYMENT_TRANSFER,
+        MessageKind.PAYMENT_EVENT,
+        MessageKind.CALL,
+        -> null
     }
     var copyMenuOpen by remember(msg.id) { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
@@ -973,9 +1035,20 @@ internal fun MessageBubble(
                         MessageKind.PAYMENT -> PaymentChatCard(msg)
                         MessageKind.PAYMENT_REQUEST -> PaymentRequestChatCard(
                             msg = msg,
-                            settled = requestSettled,
-                            payEnabled = !operationInFlight && !requestSettled,
+                            outcome = outcome,
+                            payEnabled = !operationInFlight && outcome == null,
                             onPay = onPayRequest,
+                            onDecline = onDeclineRequest,
+                            onCancel = onCancelRequest,
+                        )
+                        MessageKind.PAYMENT_TRANSFER -> PaymentTransferChatCard(
+                            msg = msg,
+                            claim = claim,
+                            outcome = outcome,
+                            actionsEnabled = !operationInFlight,
+                            onAccept = onAcceptTransfer,
+                            onReject = onRejectTransfer,
+                            onReverse = onReverseTransfer,
                         )
                         MessageKind.VOICE_NOTE -> SecureVoiceNoteContent(
                             msg = msg,
@@ -1011,7 +1084,12 @@ internal fun MessageBubble(
                             onRetryMedia = onRetryMedia,
                             onOpenViewer = onOpenViewer,
                         )
-                        else -> Text(msg.text, style = MaterialTheme.typography.bodyLarge)
+                        // PAYMENT_EVENT never reaches a bubble — the list renders it centred —
+                        // and CALL is handled by CallLogBubble before this point.
+                        MessageKind.TEXT,
+                        MessageKind.PAYMENT_EVENT,
+                        MessageKind.CALL,
+                        -> Text(msg.text, style = MaterialTheme.typography.bodyLarge)
                     }
                     Row(
                         Modifier
@@ -1207,11 +1285,14 @@ private fun PaymentChatCard(msg: Message) {
 @Composable
 private fun PaymentRequestChatCard(
     msg: Message,
-    settled: Boolean,
+    outcome: PaymentOutcome?,
     payEnabled: Boolean,
     onPay: () -> Unit,
+    onDecline: () -> Unit,
+    onCancel: () -> Unit,
 ) {
     val colors = KitTheme.colors
+    val settled = outcome != null
     Column(
         Modifier
             .background(
@@ -1237,10 +1318,14 @@ private fun PaymentRequestChatCard(
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
                 Text(
-                    when {
-                        settled -> "Payment request • Paid"
-                        msg.fromMe -> "Payment request sent"
-                        else -> "Payment request"
+                    when (outcome?.event) {
+                        PaymentEventKind.PAID -> "Payment request • Paid"
+                        PaymentEventKind.DECLINED -> "Payment request • Declined"
+                        PaymentEventKind.CANCELLED -> "Payment request • Cancelled"
+                        // Anything else against this reference still ends the request; say so
+                        // plainly rather than inventing a label for it.
+                        null -> if (msg.fromMe) "Payment request sent" else "Payment request"
+                        else -> "Payment request • Closed"
                     },
                     style = MaterialTheme.typography.labelSmall,
                     color = Color.White.copy(alpha = 0.75f),
@@ -1261,25 +1346,327 @@ private fun PaymentRequestChatCard(
                 color = Color.White.copy(alpha = 0.85f),
             )
         }
-        if (!msg.fromMe && !settled) {
+        if (!settled) {
             Spacer(Modifier.height(10.dp))
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .background(KitGreen300, MaterialTheme.shapes.small)
-                    .clickable(enabled = payEnabled, onClick = onPay)
-                    .padding(vertical = 9.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    "Pay ${Money.format(abs(msg.amountMinor), msg.paymentCurrencyCode, msg.paymentCurrencyScale)}",
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFF0B2B1A),
+            if (msg.fromMe) {
+                // The requester's only move is to withdraw what they asked for.
+                TransferCardAction(
+                    label = "Cancel request",
+                    enabled = payEnabled,
+                    primary = false,
+                    onClick = onCancel,
+                    modifier = Modifier.fillMaxWidth(),
                 )
+            } else {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TransferCardAction(
+                        label = "Pay ${Money.format(
+                            abs(msg.amountMinor),
+                            msg.paymentCurrencyCode,
+                            msg.paymentCurrencyScale,
+                        )}",
+                        enabled = payEnabled,
+                        primary = true,
+                        onClick = onPay,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TransferCardAction(
+                        label = "Decline",
+                        enabled = payEnabled,
+                        primary = false,
+                        onClick = onDecline,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
             }
         }
     }
+}
+
+/**
+ * A Kit → Kit transfer that is being held for the recipient.
+ *
+ * The recipient sees Accept and Reject; the sender sees Reverse for as long as the money is still
+ * unclaimed. Which actions exist is the server's decision, carried on the claim — the card never
+ * infers them, so a stale screen cannot offer to settle money that is already settled.
+ */
+@Composable
+private fun PaymentTransferChatCard(
+    msg: Message,
+    claim: TransferClaim?,
+    outcome: PaymentOutcome?,
+    actionsEnabled: Boolean,
+    onAccept: () -> Unit,
+    onReject: () -> Unit,
+    onReverse: () -> Unit,
+) {
+    val colors = KitTheme.colors
+    val status = claim?.status ?: outcome?.event?.toTransferClaimStatus()
+    val settledReason = claim?.reason ?: outcome?.reason
+    val amountMinor = claim?.amountMinor ?: abs(msg.amountMinor)
+    val currencyCode = claim?.currencyCode ?: msg.paymentCurrencyCode
+    val currencyScale = claim?.currencyScale ?: msg.paymentCurrencyScale
+    Column(
+        Modifier
+            .background(
+                Brush.linearGradient(listOf(colors.balanceCardStart, colors.balanceCardEnd)),
+                MaterialTheme.shapes.medium,
+            )
+            .padding(14.dp)
+            .widthIn(min = 210.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier
+                    .size(34.dp)
+                    .background(Color.White.copy(alpha = 0.14f), MaterialTheme.shapes.small),
+                contentAlignment = Alignment.Center,
+            ) {
+                Image(
+                    painter = painterResource(R.drawable.ic_kit_mark_white),
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    transferCardLabel(status, msg.fromMe),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White.copy(alpha = 0.75f),
+                )
+                Text(
+                    Money.format(amountMinor, currencyCode, currencyScale),
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                )
+            }
+            if (status == TransferClaimStatus.ACCEPTED) {
+                Icon(
+                    Icons.Rounded.CheckCircle,
+                    contentDescription = "Accepted",
+                    tint = KitGreen300,
+                )
+            }
+        }
+        (claim?.note ?: msg.paymentNote)?.takeIf(String::isNotBlank)?.let { note ->
+            Spacer(Modifier.height(6.dp))
+            Text(
+                note,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.85f),
+            )
+        }
+        settledReason?.takeIf(String::isNotBlank)?.let { reason ->
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Reason: $reason",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.85f),
+            )
+        }
+        if (status == TransferClaimStatus.PENDING) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                if (msg.fromMe) {
+                    "Waiting for this to be accepted. You can take it back until then."
+                } else {
+                    "This money is yours once you accept it."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.7f),
+            )
+        }
+        if (claim?.canAccept == true || claim?.canReject == true) {
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (claim.canAccept) {
+                    TransferCardAction(
+                        label = "Accept",
+                        enabled = actionsEnabled,
+                        primary = true,
+                        onClick = onAccept,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                if (claim.canReject) {
+                    TransferCardAction(
+                        label = "Reject",
+                        enabled = actionsEnabled,
+                        primary = false,
+                        onClick = onReject,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        }
+        if (claim?.canReverse == true) {
+            Spacer(Modifier.height(10.dp))
+            TransferCardAction(
+                label = "Reverse",
+                enabled = actionsEnabled,
+                primary = false,
+                onClick = onReverse,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+@Composable
+private fun TransferCardAction(
+    label: String,
+    enabled: Boolean,
+    primary: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier
+            .background(
+                if (primary) KitGreen300 else Color.White.copy(alpha = 0.16f),
+                MaterialTheme.shapes.small,
+            )
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(vertical = 9.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            color = if (primary) Color(0xFF0B2B1A) else Color.White,
+        )
+    }
+}
+
+private fun PaymentEventKind.toTransferClaimStatus(): TransferClaimStatus? = when (this) {
+    PaymentEventKind.ACCEPTED -> TransferClaimStatus.ACCEPTED
+    PaymentEventKind.REJECTED -> TransferClaimStatus.REJECTED
+    PaymentEventKind.REVERSED -> TransferClaimStatus.REVERSED
+    PaymentEventKind.EXPIRED -> TransferClaimStatus.EXPIRED
+    PaymentEventKind.REQUESTED,
+    PaymentEventKind.PAID,
+    PaymentEventKind.DECLINED,
+    PaymentEventKind.CANCELLED,
+    PaymentEventKind.TRANSFER,
+    PaymentEventKind.SENT,
+    -> null
+}
+
+private fun transferCardLabel(status: TransferClaimStatus?, fromMe: Boolean): String =
+    when (status) {
+        TransferClaimStatus.ACCEPTED -> if (fromMe) "Payment sent • Accepted" else "Payment accepted"
+        TransferClaimStatus.REJECTED -> "Payment returned • Rejected"
+        TransferClaimStatus.REVERSED -> "Payment returned • Reversed"
+        TransferClaimStatus.EXPIRED -> "Payment returned • Not accepted in time"
+        // Both the pending case and the unknown case: the card is still about money in flight,
+        // and its buttons come from the claim, so saying less here costs nothing.
+        TransferClaimStatus.PENDING, null ->
+            if (fromMe) "Payment sent • Waiting" else "Payment received • Accept to keep"
+    }
+
+/**
+ * A settled payment, written into the conversation as its own line.
+ *
+ * Centred and unattributed on purpose: this is the conversation recording what happened to money
+ * both people can see, and — when the money went back — saying in whose words and why.
+ */
+@Composable
+private fun PaymentEventNotice(msg: Message, peerName: String?) {
+    val summary = paymentEventSummary(msg, peerName)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp, horizontal = 24.dp),
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+            shape = MaterialTheme.shapes.small,
+        ) {
+            Text(
+                summary,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+            )
+        }
+    }
+}
+
+/** Which held transfer is being sent back, and by which side. */
+private data class TransferReasonPrompt(
+    val message: Message,
+    /** True when the sender is taking their own transfer back, false when the recipient rejects. */
+    val reverse: Boolean,
+)
+
+/**
+ * Collects why a held transfer is going back.
+ *
+ * Optional, because a payment must never be trapped behind a text field — but asked for every
+ * time, because the reason is what the other side reads in the conversation afterwards.
+ */
+@Composable
+private fun TransferReasonDialog(
+    prompt: TransferReasonPrompt,
+    sending: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (String?) -> Unit,
+) {
+    var reason by remember(prompt.message.id, prompt.reverse) { mutableStateOf("") }
+    val amountText = Money.format(
+        abs(prompt.message.amountMinor),
+        prompt.message.paymentCurrencyCode,
+        prompt.message.paymentCurrencyScale,
+    )
+    AlertDialog(
+        onDismissRequest = { if (!sending) onDismiss() },
+        title = { Text(if (prompt.reverse) "Reverse $amountText" else "Reject $amountText") },
+        text = {
+            Column {
+                Text(
+                    if (prompt.reverse) {
+                        "The money goes back to your wallet straight away. Your reason is shown " +
+                            "in this chat so they know why."
+                    } else {
+                        "The money goes back to them straight away. Your reason is shown in this " +
+                            "chat so they know why."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = reason,
+                    onValueChange = { reason = it.take(KitPaymentMessage.MAX_REASON_LENGTH) },
+                    enabled = !sending,
+                    label = { Text("Reason (optional)") },
+                    singleLine = true,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !sending,
+                onClick = { onConfirm(reason.trim().ifBlank { null }) },
+            ) {
+                Text(
+                    when {
+                        sending -> "Sending…"
+                        prompt.reverse -> "Reverse"
+                        else -> "Reject"
+                    },
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(enabled = !sending, onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 /** Collects the amount and optional note for an in-chat payment request. */

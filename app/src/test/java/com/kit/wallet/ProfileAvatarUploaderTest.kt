@@ -70,7 +70,7 @@ class ProfileAvatarUploaderTest {
     }
 
     @Test
-    fun `rejected scans fail closed without attaching`() = runTest {
+    fun `infected scans fail closed without attaching`() = runTest {
         server.enqueue(jsonResponse(intentJson(uploadUrl = server.url("/direct-upload").toString())))
         server.enqueue(MockResponse().setResponseCode(202).setBody("{}"))
         server.enqueue(jsonResponse(assetJson(status = "processing", scan = "pending")))
@@ -80,7 +80,28 @@ class ProfileAvatarUploaderTest {
             kotlinx.coroutines.runBlocking { uploader.upload(ByteArray(16)) }
         }
 
-        assertTrue(rejection.message.orEmpty().contains("rejected"))
+        assertTrue(rejection.message.orEmpty().contains("safety scan"))
+        assertEquals(4, server.requestCount)
+    }
+
+    /**
+     * The server rejects an avatar it cannot re-encode — wrong dimensions, wrong format — with the
+     * same `rejected`/`failed` pair it uses for storage faults. Blaming the picture's content for
+     * that told people to pick a different photo when every photo would have failed identically.
+     */
+    @Test
+    fun `unprocessable assets fail closed without blaming the photo`() = runTest {
+        server.enqueue(jsonResponse(intentJson(uploadUrl = server.url("/direct-upload").toString())))
+        server.enqueue(MockResponse().setResponseCode(202).setBody("{}"))
+        server.enqueue(jsonResponse(assetJson(status = "processing", scan = "pending")))
+        server.enqueue(jsonResponse(assetJson(status = "rejected", scan = "failed")))
+
+        val failure = assertThrows(IllegalStateException::class.java) {
+            kotlinx.coroutines.runBlocking { uploader.upload(ByteArray(16)) }
+        }
+
+        assertTrue(failure.message.orEmpty().contains("could not be processed"))
+        assertTrue(!failure.message.orEmpty().contains("safety"))
         assertEquals(4, server.requestCount)
     }
 

@@ -91,8 +91,14 @@ class ProfileAvatarUploader @Inject constructor(
             val status = asset.status.lowercase(Locale.ROOT)
             val scan = asset.scan?.status?.lowercase(Locale.ROOT).orEmpty()
             if (status == "ready" && scan == "clean") return
-            check(status !in setOf("failed", "rejected", "deleted") && scan !in setOf("failed", "infected")) {
-                "This photo was rejected by the safety review. Choose a different photo."
+            // Only a malware verdict is a judgement about the picture. Anything else — a size or
+            // format the server would not take, a storage failure — is a processing failure, and
+            // calling it a safety rejection sends people hunting for a "safer" photo.
+            check(scan != "infected") {
+                "This photo was blocked by the safety scan. Choose a different photo."
+            }
+            check(status !in setOf("failed", "rejected", "deleted") && scan != "failed") {
+                "This photo could not be processed. Try another photo or take a new one."
             }
             if (attempt + 1 < MAX_SCAN_POLLS) delay(SCAN_POLL_MILLIS)
         }

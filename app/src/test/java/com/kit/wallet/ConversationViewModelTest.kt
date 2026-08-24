@@ -5,6 +5,8 @@ import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.WalletRepository
+import com.kit.wallet.data.messaging.KitPaymentAction
+import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.SecureMessagingStateNotReadyException
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
 import com.kit.wallet.data.remote.KitWalletApiException
@@ -20,7 +22,10 @@ import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
+import com.kit.wallet.ui.model.PaymentEventKind
 import com.kit.wallet.ui.model.Transaction
+import com.kit.wallet.ui.model.TransferClaim
+import com.kit.wallet.ui.model.TransferClaimStatus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -596,9 +601,255 @@ class ConversationViewModelTest {
         assertTrue(bytes.all { it == 0.toByte() })
     }
 
-    private fun viewModel(repository: ChatRepository) = ConversationViewModel(
+    @Test
+    fun `accepting a held transfer records the acceptance in the conversation`() = runTest {
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim()))
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.acceptTransfer(transferBubble(fromMe = false))
+
+        assertEquals(listOf(CLAIM_ID to null), wallet.accepted)
+        val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
+        assertEquals(KitPaymentAction.ACCEPTED, posted.action)
+        assertEquals(CLAIM_ID, posted.referenceId)
+        assertEquals(250_000L, posted.amountMinor)
+        assertEquals(null, posted.reason)
+        assertEquals(null, viewModel.error.value)
+        // The card's live state comes straight back from the settled claim, with no extra poll.
+        assertEquals(
+            TransferClaimStatus.ACCEPTED,
+            viewModel.transferClaims.value[CLAIM_ID]?.status,
+        )
+    }
+
+    @Test
+    fun `reversing a transfer documents the reason it was reversed`() = runTest {
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim()))
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.reverseTransfer(transferBubble(fromMe = true), "  Sent to the wrong person  ")
+
+        assertEquals(listOf(CLAIM_ID to "  Sent to the wrong person  "), wallet.reversed)
+        val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
+        assertEquals(KitPaymentAction.REVERSED, posted.action)
+        assertEquals("Sent to the wrong person", posted.reason)
+        // The transfer's own note stays on the card above; the line carries only the reason.
+        assertEquals(null, posted.note)
+    }
+
+    @Test
+    fun `rejecting a transfer documents the reason it was sent back`() = runTest {
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim()))
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.rejectTransfer(transferBubble(fromMe = false), "I did not expect this")
+
+        assertEquals(listOf(CLAIM_ID to "I did not expect this"), wallet.rejected)
+        val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
+        assertEquals(KitPaymentAction.REJECTED, posted.action)
+        assertEquals("I did not expect this", posted.reason)
+    }
+
+    @Test
+    fun `an oversized reason is trimmed to what the descriptor can carry, not dropped`() = runTest {
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim()))
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.reverseTransfer(transferBubble(fromMe = true), "x".repeat(400))
+
+        val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
+        assertEquals("x".repeat(KitPaymentMessage.MAX_REASON_LENGTH), posted.reason)
+    }
+
+    @Test
+    fun `a refused settlement surfaces the reason and writes nothing into the chat`() = runTest {
+        val wallet = FakeWalletRepository(
+            claims = listOf(pendingClaim().copy(status = TransferClaimStatus.ACCEPTED)),
+            settleFailure = IllegalStateException("This transfer has already been accepted"),
+        )
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.reverseTransfer(transferBubble(fromMe = true), "too late")
+
+        assertTrue(repository.sent.isEmpty())
+        assertEquals("This transfer has already been accepted", viewModel.error.value)
+        // The claim is re-read so the card's buttons match reality before the next attempt.
+        assertEquals(
+            TransferClaimStatus.ACCEPTED,
+            viewModel.transferClaims.value[CLAIM_ID]?.status,
+        )
+        assertFalse(viewModel.sending.value)
+    }
+
+    @Test
+    fun `a bubble with no claim reference settles nothing`() = runTest {
+        val wallet = FakeWalletRepository(claims = listOf(pendingClaim()))
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.acceptTransfer(transferBubble(fromMe = false).copy(paymentReferenceId = null))
+
+        assertTrue(wallet.accepted.isEmpty())
+        assertTrue(repository.sent.isEmpty())
+    }
+
+    @Test
+    fun `an expired transfer is written into the sender's chat exactly once`() = runTest {
+        val wallet = FakeWalletRepository(
+            claims = listOf(pendingClaim().copy(status = TransferClaimStatus.EXPIRED)),
+        )
+        val repository = FakeChatRepository().apply {
+            messages.value = listOf(transferBubble(fromMe = true))
+        }
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.setConversationVisible(true)
+        runCurrent()
+        advanceTimeBy(2_000)
+        runCurrent()
+
+        val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
+        assertEquals(KitPaymentAction.EXPIRED, posted.action)
+        assertEquals(CLAIM_ID, posted.referenceId)
+        viewModel.setConversationVisible(false)
+    }
+
+    @Test
+    fun `an expired transfer is not announced by the side that did not send it`() = runTest {
+        val wallet = FakeWalletRepository(
+            claims = listOf(pendingClaim().copy(status = TransferClaimStatus.EXPIRED)),
+        )
+        val repository = FakeChatRepository().apply {
+            messages.value = listOf(transferBubble(fromMe = false))
+        }
+        val viewModel = viewModel(repository, wallet)
+
+        viewModel.setConversationVisible(true)
+        runCurrent()
+
+        assertTrue(repository.sent.isEmpty())
+        viewModel.setConversationVisible(false)
+    }
+
+    @Test
+    fun `declining a request is a chat event, because a request holds no money`() = runTest {
+        val wallet = FakeWalletRepository()
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+        val request = KitPaymentMessage(
+            action = KitPaymentAction.REQUEST,
+            referenceId = REQUEST_ID,
+            amountMinor = 250_000,
+            currencyCode = "UGX",
+            currencyScale = 2,
+            note = "Rent",
+        )
+
+        viewModel.declinePaymentRequest(requestBubble(request, fromMe = false))
+
+        assertTrue(wallet.cancelledRequests.isEmpty())
+        val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
+        assertEquals(KitPaymentAction.DECLINED, posted.action)
+        assertEquals(REQUEST_ID, posted.referenceId)
+        assertEquals("Rent", posted.note)
+    }
+
+    @Test
+    fun `cancelling a request withdraws it server-side before saying so in chat`() = runTest {
+        val wallet = FakeWalletRepository()
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+        val request = KitPaymentMessage(
+            action = KitPaymentAction.REQUEST,
+            referenceId = REQUEST_ID,
+            amountMinor = 250_000,
+            currencyCode = "UGX",
+            currencyScale = 2,
+            note = null,
+        )
+
+        viewModel.cancelPaymentRequest(requestBubble(request, fromMe = true))
+
+        assertEquals(listOf(REQUEST_ID), wallet.cancelledRequests)
+        assertEquals(
+            KitPaymentAction.CANCELLED,
+            KitPaymentMessage.parse(repository.sent.single().second)?.action,
+        )
+    }
+
+    @Test
+    fun `a request that cannot be withdrawn is never reported as cancelled`() = runTest {
+        val wallet = FakeWalletRepository(
+            cancelFailure = IllegalStateException("This request was already paid"),
+        )
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository, wallet)
+        val request = KitPaymentMessage(
+            action = KitPaymentAction.REQUEST,
+            referenceId = REQUEST_ID,
+            amountMinor = 250_000,
+            currencyCode = "UGX",
+            currencyScale = 2,
+            note = null,
+        )
+
+        viewModel.cancelPaymentRequest(requestBubble(request, fromMe = true))
+
+        assertTrue(repository.sent.isEmpty())
+        assertEquals("This request was already paid", viewModel.error.value)
+    }
+
+    private fun pendingClaim() = TransferClaim(
+        id = CLAIM_ID,
+        transactionId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        status = TransferClaimStatus.PENDING,
+        amountMinor = 250_000,
+        currencyCode = "UGX",
+        currencyScale = 2,
+        note = "Rent",
+        canAccept = true,
+        canReject = true,
+        canReverse = true,
+    )
+
+    private fun transferBubble(fromMe: Boolean) = Message(
+        id = "transfer-bubble",
+        text = "",
+        time = "12:00",
+        fromMe = fromMe,
+        kind = MessageKind.PAYMENT_TRANSFER,
+        amountMinor = 250_000,
+        paymentReferenceId = CLAIM_ID,
+        paymentEvent = PaymentEventKind.TRANSFER,
+        paymentCurrencyCode = "UGX",
+        paymentCurrencyScale = 2,
+    )
+
+    private fun requestBubble(descriptor: KitPaymentMessage, fromMe: Boolean) = Message(
+        id = "request-bubble",
+        text = "",
+        time = "12:00",
+        fromMe = fromMe,
+        kind = MessageKind.PAYMENT_REQUEST,
+        mediaDescriptor = descriptor.encode(),
+        amountMinor = descriptor.amountMinor,
+        paymentReferenceId = descriptor.referenceId,
+        paymentEvent = PaymentEventKind.REQUESTED,
+        paymentCurrencyCode = descriptor.currencyCode,
+        paymentCurrencyScale = descriptor.currencyScale,
+    )
+
+    private fun viewModel(
+        repository: ChatRepository,
+        wallet: WalletRepository = FakeWalletRepository(),
+    ) = ConversationViewModel(
         chatRepo = repository,
-        walletRepo = FakeWalletRepository(),
+        walletRepo = wallet,
         callRepo = FakeCallRepository(),
         messageSounds = NoOpMessageSoundPlayer,
         savedStateHandle = SavedStateHandle(mapOf("chatId" to CHAT_ID)),
@@ -616,8 +867,17 @@ class ConversationViewModelTest {
         override suspend fun refresh() = Unit
     }
 
-    /** In-chat payments are exercised separately; these tests only need a compile-safe wallet. */
-    private class FakeWalletRepository : WalletRepository {
+    /** Records what a conversation asks of the wallet, and answers with the claims it is given. */
+    private class FakeWalletRepository(
+        private val claims: List<TransferClaim> = emptyList(),
+        private val settleFailure: Exception? = null,
+        private val cancelFailure: Exception? = null,
+    ) : WalletRepository {
+        val accepted = mutableListOf<Pair<String, String?>>()
+        val rejected = mutableListOf<Pair<String, String?>>()
+        val reversed = mutableListOf<Pair<String, String?>>()
+        val cancelledRequests = mutableListOf<String>()
+
         override val balanceMinor: StateFlow<Long> = MutableStateFlow(0L)
         override val transactions: StateFlow<List<Transaction>> = MutableStateFlow(emptyList())
         override val beneficiaries: StateFlow<List<Beneficiary>> = MutableStateFlow(emptyList())
@@ -630,6 +890,35 @@ class ConversationViewModelTest {
         ): Transaction = error("Unused in conversation tests")
         override suspend fun request(from: Contact, amountMinor: Long, note: String?) =
             error("Unused in conversation tests")
+        override suspend fun transferClaims(): List<TransferClaim> = claims
+        override suspend fun acceptTransferClaim(claimId: String): TransferClaim =
+            settle(claimId, null, accepted, TransferClaimStatus.ACCEPTED)
+        override suspend fun rejectTransferClaim(claimId: String, reason: String?): TransferClaim =
+            settle(claimId, reason, rejected, TransferClaimStatus.REJECTED)
+        override suspend fun reverseTransferClaim(claimId: String, reason: String?): TransferClaim =
+            settle(claimId, reason, reversed, TransferClaimStatus.REVERSED)
+        override suspend fun cancelChatPaymentRequest(requestId: String) {
+            cancelledRequests += requestId
+            cancelFailure?.let { throw it }
+        }
+
+        private fun settle(
+            claimId: String,
+            reason: String?,
+            log: MutableList<Pair<String, String?>>,
+            settled: TransferClaimStatus,
+        ): TransferClaim {
+            log += claimId to reason
+            settleFailure?.let { throw it }
+            val claim = claims.single { it.id == claimId }
+            return claim.copy(
+                status = settled,
+                reason = reason?.trim()?.takeIf(String::isNotBlank),
+                canAccept = false,
+                canReject = false,
+                canReverse = false,
+            )
+        }
         override suspend fun payBill(
             provider: BillProvider,
             account: String,
@@ -775,5 +1064,7 @@ class ConversationViewModelTest {
 
     private companion object {
         const val CHAT_ID = "11111111-1111-4111-8111-111111111111"
+        const val CLAIM_ID = "22222222-2222-4222-8222-222222222222"
+        const val REQUEST_ID = "33333333-3333-4333-8333-333333333333"
     }
 }

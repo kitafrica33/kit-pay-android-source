@@ -61,7 +61,69 @@ data class Transaction(
 )
 
 enum class DeliveryState { SENDING, SENT, DELIVERED, READ, RETRY_REQUIRED, FAILED }
-enum class MessageKind { TEXT, PAYMENT, PAYMENT_REQUEST, VOICE_NOTE, IMAGE, VIDEO, DOCUMENT, CALL }
+
+enum class MessageKind {
+    TEXT,
+    PAYMENT,
+    PAYMENT_REQUEST,
+
+    /** A Kit → Kit transfer the recipient can accept or reject, shown as an actionable card. */
+    PAYMENT_TRANSFER,
+
+    /**
+     * A settled outcome — accepted, declined, reversed, returned. Rendered as a centred line in
+     * the conversation so money that came back says so, and says why, instead of disappearing.
+     */
+    PAYMENT_EVENT,
+    VOICE_NOTE,
+    IMAGE,
+    VIDEO,
+    DOCUMENT,
+    CALL,
+}
+
+/** What a payment bubble records. Mirrors the encrypted descriptor's action. */
+enum class PaymentEventKind {
+    REQUESTED,
+    PAID,
+    DECLINED,
+    CANCELLED,
+    TRANSFER,
+    SENT,
+    ACCEPTED,
+    REJECTED,
+    REVERSED,
+    EXPIRED,
+}
+
+/** Who ended a held transfer. `SYSTEM` means the claim window closed with nobody acting. */
+enum class TransferClaimActor { SENDER, RECIPIENT, SYSTEM }
+
+enum class TransferClaimStatus { PENDING, ACCEPTED, REJECTED, REVERSED, EXPIRED }
+
+/**
+ * Live state of a held Kit → Kit transfer, read from the wallet API rather than from the chat
+ * descriptor. The chat message records that the transfer happened; this records what has become
+ * of it, so a card is never stale just because a follow-up message went missing.
+ */
+data class TransferClaim(
+    val id: String,
+    val transactionId: String,
+    val status: TransferClaimStatus,
+    val amountMinor: Long,
+    val currencyCode: String = "UGX",
+    val currencyScale: Int = Money.SCALE,
+    val note: String? = null,
+    /** Why the money went back, in the words of whoever sent it back. */
+    val reason: String? = null,
+    val resolvedBy: TransferClaimActor? = null,
+    val senderName: String? = null,
+    val recipientName: String? = null,
+    val expiresAtEpochMillis: Long = 0,
+    val canAccept: Boolean = false,
+    val canReject: Boolean = false,
+    val canReverse: Boolean = false,
+)
 
 data class Message(
     val id: String,
@@ -79,10 +141,17 @@ data class Message(
     val mediaPlaintextBytes: Int = 0,
     /** For PAYMENT messages: signed minor units. */
     val amountMinor: Long = 0,
-    /** For payment messages: the backend payment-request identifier this bubble refers to. */
-    val paymentRequestId: String? = null,
+    /**
+     * For payment messages: the backend identifier this bubble refers to — a payment-request id
+     * for request bubbles, a transfer-claim id for transfer bubbles.
+     */
+    val paymentReferenceId: String? = null,
+    /** For payment messages: what the descriptor records happening. */
+    val paymentEvent: PaymentEventKind? = null,
     /** For payment messages: an optional sender note carried inside the encrypted descriptor. */
     val paymentNote: String? = null,
+    /** For returned payments: why it came back, as given by whoever sent it back. */
+    val paymentReason: String? = null,
     /** For payment messages: the descriptor's authoritative currency and minor-unit scale. */
     val paymentCurrencyCode: String = "UGX",
     val paymentCurrencyScale: Int = Money.SCALE,

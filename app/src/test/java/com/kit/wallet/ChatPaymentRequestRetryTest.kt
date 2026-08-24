@@ -54,7 +54,7 @@ class ChatPaymentRequestRetryTest {
         assertEquals(1, wallet.createdRequests.size)
         assertEquals(2, chats.sentDescriptors.size)
         val requestIds = chats.sentDescriptors.map {
-            checkNotNull(KitPaymentMessage.parse(it)).paymentRequestId
+            checkNotNull(KitPaymentMessage.parse(it)).referenceId
         }
         assertEquals(listOf(requestId(1), requestId(1)), requestIds)
         assertNull(viewModel.error.value)
@@ -71,7 +71,7 @@ class ChatPaymentRequestRetryTest {
 
         assertEquals(2, wallet.createdRequests.size)
         val lastRequestId = chats.sentDescriptors.last().let {
-            checkNotNull(KitPaymentMessage.parse(it)).paymentRequestId
+            checkNotNull(KitPaymentMessage.parse(it)).referenceId
         }
         assertEquals(requestId(2), lastRequestId)
     }

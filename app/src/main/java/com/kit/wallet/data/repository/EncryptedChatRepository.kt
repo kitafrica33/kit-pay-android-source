@@ -6,6 +6,7 @@ import com.kit.wallet.data.local.ConversationPrefEntity
 import com.kit.wallet.data.local.ConversationPrefsDao
 import com.kit.wallet.data.messaging.KitChatMediaKind
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionRecord
@@ -41,6 +42,7 @@ import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
+import com.kit.wallet.ui.model.PaymentEventKind
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import java.io.IOException
 import java.time.Clock
@@ -1548,9 +1550,10 @@ class EncryptedChatRepository @Inject internal constructor(
                         val label = KitChatMediaKind.fromMediaType(media.mediaType).previewLabel
                         media.caption?.let { caption -> "$label · $caption" } ?: label
                     }
-                        ?: KitPaymentMessage.parse(text)?.let { payment ->
-                            if (payment.isRequest) "💰 Payment request" else "💸 Payment"
-                        }
+                        ?: KitPaymentMessage.parse(text)?.previewLabel()
+                        // A descriptor this build cannot parse is still a payment, not something
+                        // to spill raw into the chat list.
+                        ?: "💸 Payment".takeIf { KitPaymentMessage.isPaymentText(text) }
                         ?: text
                 }.orEmpty(),
                 time = last?.sentAt?.let(timeFormatter::format).orEmpty(),
@@ -1615,8 +1618,7 @@ class EncryptedChatRepository @Inject internal constructor(
                 mediaKind == KitChatMediaKind.DOCUMENT -> MessageKind.DOCUMENT
                 mediaKind == KitChatMediaKind.IMAGE -> MessageKind.IMAGE
                 payment == null -> MessageKind.TEXT
-                payment.isRequest -> MessageKind.PAYMENT_REQUEST
-                else -> MessageKind.PAYMENT
+                else -> payment.action.toMessageKind()
             },
             // The opaque authenticated descriptor; the UI passes it back for follow-up actions.
             mediaDescriptor = if (media != null || payment != null) projected.text else null,
@@ -1624,16 +1626,73 @@ class EncryptedChatRepository @Inject internal constructor(
             mediaPlaintextBytes = media?.plaintextByteSize ?: 0,
             amountMinor = when {
                 payment == null -> 0
-                // A completed payment reads "sent" for the payer and "received" for the requester.
-                !payment.isRequest && projected.fromCurrentUser -> -payment.amountMinor
+                payment.moneyLeavesCurrentUser(projected.fromCurrentUser) -> -payment.amountMinor
                 else -> payment.amountMinor
             },
-            paymentRequestId = payment?.paymentRequestId,
+            paymentReferenceId = payment?.referenceId,
+            paymentEvent = payment?.action?.toPaymentEventKind(),
             paymentNote = payment?.note,
+            paymentReason = payment?.reason,
             paymentCurrencyCode = payment?.currencyCode ?: "UGX",
             paymentCurrencyScale = payment?.currencyScale ?: com.kit.wallet.ui.model.Money.SCALE,
             sortEpochMillis = projected.sentAt.toEpochMilli(),
         )
+    }
+
+    /**
+     * Whether this descriptor reads as money leaving the person looking at it. A completed payment
+     * or an outgoing transfer is a debit for its sender; a return puts the money back, so it is a
+     * credit for the original sender and never a debit for anyone.
+     */
+    private fun KitPaymentMessage.moneyLeavesCurrentUser(fromCurrentUser: Boolean): Boolean =
+        when (action) {
+            KitPaymentAction.PAID, KitPaymentAction.TRANSFER, KitPaymentAction.SENT -> fromCurrentUser
+            KitPaymentAction.REQUEST,
+            KitPaymentAction.DECLINED,
+            KitPaymentAction.CANCELLED,
+            KitPaymentAction.ACCEPTED,
+            KitPaymentAction.REJECTED,
+            KitPaymentAction.REVERSED,
+            KitPaymentAction.EXPIRED,
+            -> false
+        }
+
+    private fun KitPaymentAction.toMessageKind(): MessageKind = when (this) {
+        KitPaymentAction.REQUEST -> MessageKind.PAYMENT_REQUEST
+        KitPaymentAction.PAID, KitPaymentAction.SENT -> MessageKind.PAYMENT
+        KitPaymentAction.TRANSFER -> MessageKind.PAYMENT_TRANSFER
+        KitPaymentAction.DECLINED,
+        KitPaymentAction.CANCELLED,
+        KitPaymentAction.ACCEPTED,
+        KitPaymentAction.REJECTED,
+        KitPaymentAction.REVERSED,
+        KitPaymentAction.EXPIRED,
+        -> MessageKind.PAYMENT_EVENT
+    }
+
+    private fun KitPaymentAction.toPaymentEventKind(): PaymentEventKind = when (this) {
+        KitPaymentAction.REQUEST -> PaymentEventKind.REQUESTED
+        KitPaymentAction.PAID -> PaymentEventKind.PAID
+        KitPaymentAction.DECLINED -> PaymentEventKind.DECLINED
+        KitPaymentAction.CANCELLED -> PaymentEventKind.CANCELLED
+        KitPaymentAction.TRANSFER -> PaymentEventKind.TRANSFER
+        KitPaymentAction.SENT -> PaymentEventKind.SENT
+        KitPaymentAction.ACCEPTED -> PaymentEventKind.ACCEPTED
+        KitPaymentAction.REJECTED -> PaymentEventKind.REJECTED
+        KitPaymentAction.REVERSED -> PaymentEventKind.REVERSED
+        KitPaymentAction.EXPIRED -> PaymentEventKind.EXPIRED
+    }
+
+    private fun KitPaymentMessage.previewLabel(): String = when (action) {
+        KitPaymentAction.REQUEST -> "💰 Payment request"
+        KitPaymentAction.PAID, KitPaymentAction.SENT -> "💸 Payment"
+        KitPaymentAction.TRANSFER -> "💸 Payment awaiting acceptance"
+        KitPaymentAction.ACCEPTED -> "✅ Payment accepted"
+        KitPaymentAction.DECLINED -> "↩️ Payment request declined"
+        KitPaymentAction.CANCELLED -> "↩️ Payment request cancelled"
+        KitPaymentAction.REJECTED -> "↩️ Payment declined and returned"
+        KitPaymentAction.REVERSED -> "↩️ Payment reversed"
+        KitPaymentAction.EXPIRED -> "↩️ Payment returned"
     }
 
     private fun AuthenticatedTextDeliveryState?.toUiDeliveryState(): DeliveryState = when (this) {

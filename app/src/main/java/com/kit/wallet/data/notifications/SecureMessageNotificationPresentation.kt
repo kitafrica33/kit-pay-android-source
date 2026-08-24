@@ -1,6 +1,7 @@
 package com.kit.wallet.data.notifications
 
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotification
 
@@ -44,11 +45,13 @@ internal object SecureMessageNotificationPresentationFactory {
 
         val payment = KitPaymentMessage.parse(this)
         if (payment != null) {
-            val label = if (payment.isRequest) PAYMENT_REQUEST_LABEL else PAYMENT_LABEL
             return listOfNotNull(
-                label,
+                payment.action.notificationLabel(),
                 payment.amountForNotification(),
                 payment.note?.normalizeNotificationText()?.takeIf(String::isNotBlank),
+                // Money going back is the case where the shade is most likely the only place
+                // this is read, so the reason travels with it.
+                payment.reason?.normalizeNotificationText()?.takeIf(String::isNotBlank),
             ).joinToString(DETAIL_SEPARATOR).truncateNotificationText(MAX_PREVIEW_CODE_POINTS)
         }
         // The same fail-closed rule keeps internal payment-request IDs out of the system UI.
@@ -58,6 +61,22 @@ internal object SecureMessageNotificationPresentationFactory {
             .takeIf(String::isNotBlank)
             ?.truncateNotificationText(MAX_PREVIEW_CODE_POINTS)
             ?: EMPTY_MESSAGE_LABEL
+    }
+
+    /**
+     * What the shade says a payment descriptor is. Exhaustive by design: a new action must be
+     * given a label here rather than quietly inheriting a wrong one.
+     */
+    private fun KitPaymentAction.notificationLabel(): String = when (this) {
+        KitPaymentAction.REQUEST -> PAYMENT_REQUEST_LABEL
+        KitPaymentAction.PAID, KitPaymentAction.SENT -> PAYMENT_LABEL
+        KitPaymentAction.TRANSFER -> PAYMENT_HELD_LABEL
+        KitPaymentAction.ACCEPTED -> PAYMENT_ACCEPTED_LABEL
+        KitPaymentAction.DECLINED -> PAYMENT_REQUEST_DECLINED_LABEL
+        KitPaymentAction.CANCELLED -> PAYMENT_REQUEST_CANCELLED_LABEL
+        KitPaymentAction.REJECTED -> PAYMENT_REJECTED_LABEL
+        KitPaymentAction.REVERSED -> PAYMENT_REVERSED_LABEL
+        KitPaymentAction.EXPIRED -> PAYMENT_RETURNED_LABEL
     }
 
     private fun KitPaymentMessage.amountForNotification(): String {
@@ -105,6 +124,13 @@ internal object SecureMessageNotificationPresentationFactory {
     private const val PHOTO_LABEL = "📷 Photo"
     private const val PAYMENT_REQUEST_LABEL = "💰 Payment request"
     private const val PAYMENT_LABEL = "💸 Payment"
+    private const val PAYMENT_HELD_LABEL = "💸 Payment awaiting acceptance"
+    private const val PAYMENT_ACCEPTED_LABEL = "✅ Payment accepted"
+    private const val PAYMENT_REQUEST_DECLINED_LABEL = "↩️ Payment request declined"
+    private const val PAYMENT_REQUEST_CANCELLED_LABEL = "↩️ Payment request cancelled"
+    private const val PAYMENT_REJECTED_LABEL = "↩️ Payment declined and returned"
+    private const val PAYMENT_REVERSED_LABEL = "↩️ Payment reversed"
+    private const val PAYMENT_RETURNED_LABEL = "↩️ Payment returned"
     private const val DETAIL_SEPARATOR = " · "
     private const val ELLIPSIS = "…"
     private val CANONICAL_UUID = Regex(

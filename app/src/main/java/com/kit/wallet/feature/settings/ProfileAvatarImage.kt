@@ -8,7 +8,14 @@ import com.kit.wallet.data.media.decodeUploadImage
 import com.kit.wallet.data.remote.ProfileAvatarUploader
 import kotlin.math.min
 
-internal const val PROFILE_AVATAR_MAX_DIMENSION = 640
+/**
+ * The window the server accepts, mirroring `media.avatar.min_dimension` / `max_dimension` and the
+ * iOS `ProfileAvatarUploadPolicy`. The server re-encodes the avatar at whatever size it arrives
+ * and rejects anything outside this window as an invalid image, so an avatar that leaves the
+ * device larger than [PROFILE_AVATAR_MAX_DIMENSION] comes back as a scan rejection.
+ */
+internal const val PROFILE_AVATAR_MAX_DIMENSION = 512
+internal const val PROFILE_AVATAR_MIN_DIMENSION = 64
 
 /**
  * Upper bound for the intermediate decode. Cropping to a square before downscaling means a very
@@ -49,14 +56,15 @@ private fun Bitmap.centerSquare(): Bitmap? {
     return square
 }
 
+/**
+ * Clamps the square into the window the server accepts. A thumbnail smaller than
+ * [PROFILE_AVATAR_MIN_DIMENSION] is enlarged rather than refused: the alternative is telling
+ * someone their perfectly ordinary picture was rejected.
+ */
 private fun Bitmap.scaledToAvatar(): Bitmap {
-    if (width <= PROFILE_AVATAR_MAX_DIMENSION) return this
-    val scaled = Bitmap.createScaledBitmap(
-        this,
-        PROFILE_AVATAR_MAX_DIMENSION,
-        PROFILE_AVATAR_MAX_DIMENSION,
-        true,
-    )
+    val side = width.coerceIn(PROFILE_AVATAR_MIN_DIMENSION, PROFILE_AVATAR_MAX_DIMENSION)
+    if (side == width) return this
+    val scaled = Bitmap.createScaledBitmap(this, side, side, true)
     if (scaled !== this) recycle()
     return scaled
 }

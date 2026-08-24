@@ -6,9 +6,13 @@ import com.kit.wallet.data.local.WalletTransactionEntity
 import com.kit.wallet.data.auth.requiresProfileSetup
 import com.kit.wallet.data.auth.profileNameOrPlaceholder
 import com.kit.wallet.data.remote.TransactionDto
+import com.kit.wallet.data.remote.TransferClaimDto
 import com.kit.wallet.data.remote.UserDto
 import com.kit.wallet.data.remote.WalletDto
 import com.kit.wallet.ui.model.Transaction
+import com.kit.wallet.ui.model.TransferClaim
+import com.kit.wallet.ui.model.TransferClaimActor
+import com.kit.wallet.ui.model.TransferClaimStatus
 import com.kit.wallet.ui.model.TxStatus
 import com.kit.wallet.ui.model.TxType
 import com.kit.wallet.ui.model.UserProfile
@@ -99,6 +103,50 @@ fun TransactionDto.toEntity(defaultWalletUuid: String): WalletTransactionEntity 
             ?: "Kit Pay",
         note = note,
         occurredAtEpochMillis = occurredAt.toEpochMillisOrNull() ?: 0L,
+    )
+}
+
+/**
+ * A held Kit → Kit transfer as the wallet API sees it.
+ *
+ * Anything this build cannot make sense of — an unknown status, an unparseable amount — maps to
+ * null rather than to a guess. A card that offers Accept on a claim whose real state is unknown
+ * would invite the user to settle the same money twice.
+ */
+fun TransferClaimDto.toUiModel(): TransferClaim? {
+    val scale = currency.scale.toIntOrNull() ?: return null
+    val minor = runCatching { abs(DecimalMoney.toMinor(amount, scale)) }.getOrNull() ?: return null
+    val claimStatus = when (status.lowercase()) {
+        "pending" -> TransferClaimStatus.PENDING
+        "accepted" -> TransferClaimStatus.ACCEPTED
+        "rejected" -> TransferClaimStatus.REJECTED
+        "reversed" -> TransferClaimStatus.REVERSED
+        "expired" -> TransferClaimStatus.EXPIRED
+        else -> return null
+    }
+    val pending = claimStatus == TransferClaimStatus.PENDING
+    return TransferClaim(
+        id = id,
+        transactionId = transactionId,
+        status = claimStatus,
+        amountMinor = minor,
+        currencyCode = currency.code,
+        currencyScale = scale,
+        note = note?.takeIf(String::isNotBlank),
+        reason = reason?.takeIf(String::isNotBlank),
+        resolvedBy = when (resolvedBy?.lowercase()) {
+            "sender" -> TransferClaimActor.SENDER
+            "recipient" -> TransferClaimActor.RECIPIENT
+            "system" -> TransferClaimActor.SYSTEM
+            else -> null
+        },
+        senderName = sender?.name?.takeIf(String::isNotBlank),
+        recipientName = recipient?.name?.takeIf(String::isNotBlank),
+        expiresAtEpochMillis = expiresAt?.toEpochMillisOrNull() ?: 0L,
+        // A settled claim never offers an action, whatever an older or newer service says.
+        canAccept = canAccept && pending,
+        canReject = canReject && pending,
+        canReverse = canReverse && pending,
     )
 }
 

@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.messaging.KitChatMediaLimits
+import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.MessagingRichMediaCapability
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
@@ -20,6 +21,9 @@ import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
+import com.kit.wallet.ui.model.PaymentEventKind
+import com.kit.wallet.ui.model.TransferClaim
+import com.kit.wallet.ui.model.TransferClaimStatus
 import dagger.hilt.android.lifecycle.HiltViewModel
 import java.time.Instant
 import java.time.ZoneId
@@ -252,6 +256,18 @@ class ConversationViewModel @Inject constructor(
     private val mutableConversationVisible = MutableStateFlow(false)
     private var foregroundSyncJob: Job? = null
 
+    /**
+     * Live state of the held Kit → Kit transfers this account is a party to, keyed by claim id.
+     *
+     * The chat message records that a transfer happened; this records what has become of it. A
+     * card built from here is never stale because a follow-up message was lost.
+     */
+    private val mutableTransferClaims = MutableStateFlow<Map<String, TransferClaim>>(emptyMap())
+    val transferClaims = mutableTransferClaims.asStateFlow()
+
+    /** Expiries this session has already written into the conversation, to avoid a second line. */
+    private val announcedExpiries = mutableSetOf<String>()
+
     // Encrypted composer draft restored once per conversation entry; consumed by the screen.
     private val mutableRestoredDraft = MutableStateFlow<String?>(null)
     val restoredDraft = mutableRestoredDraft.asStateFlow()
@@ -308,6 +324,7 @@ class ConversationViewModel @Inject constructor(
         }
         // Refresh the call log so recent calls appear inline in the conversation.
         viewModelScope.launch { runCatching { callRepo.refresh() } }
+        viewModelScope.launch { refreshTransferClaims() }
         if (foregroundSyncJob?.isActive == true) return
         foregroundSyncJob = viewModelScope.launch {
             var firstIteration = true
@@ -325,6 +342,10 @@ class ConversationViewModel @Inject constructor(
                 // Projection changes attempt immediately through the collector above. If that
                 // POST fails without changing local state, retry it on the next foreground tick.
                 if (!firstIteration) attemptMarkConversationRead()
+                // Held transfers settle from the other side, and expire with nobody acting at
+                // all. There is no push for either, so an open conversation re-reads them on
+                // the same cadence it re-reads messages.
+                if (!firstIteration) refreshTransferClaims()
                 firstIteration = false
                 delay(FOREGROUND_SYNC_INTERVAL_MILLIS)
             }
@@ -479,8 +500,8 @@ class ConversationViewModel @Inject constructor(
                             )
                         }
                 val descriptor = KitPaymentMessage(
-                    action = KitPaymentMessage.ACTION_REQUEST,
-                    paymentRequestId = created.id,
+                    action = KitPaymentAction.REQUEST,
+                    referenceId = created.id,
                     amountMinor = created.amountMinor,
                     currencyCode = created.currencyCode,
                     currencyScale = created.currencyScale,
@@ -521,7 +542,7 @@ class ConversationViewModel @Inject constructor(
             mutableError.value = null
             try {
                 walletRepo.payChatPaymentRequest(
-                    requestId = descriptor.paymentRequestId,
+                    requestId = descriptor.referenceId,
                     amountMinor = descriptor.amountMinor,
                     paymentPin = paymentPin,
                 )
@@ -529,7 +550,7 @@ class ConversationViewModel @Inject constructor(
                 runCatching {
                     chatRepo.sendMessage(
                         selectedChat.id,
-                        descriptor.copy(action = KitPaymentMessage.ACTION_PAID).encode(),
+                        descriptor.copy(action = KitPaymentAction.PAID).encode(),
                     )
                 }
                 onPaid()
@@ -541,6 +562,196 @@ class ConversationViewModel @Inject constructor(
             } finally {
                 mutableSending.value = false
             }
+        }
+    }
+
+    /**
+     * Turns down a payment request received in this conversation.
+     *
+     * Nothing is called on the server, because a request holds no money and the backend has no
+     * payee-side decline — it only lets the requester withdraw. What a decline changes is the
+     * conversation, so that is exactly and only what this writes.
+     */
+    fun declinePaymentRequest(message: Message, onDone: () -> Unit = {}) {
+        val selectedChat = chat.value ?: return
+        val descriptor = message.mediaDescriptor?.let(KitPaymentMessage::parse) ?: return
+        if (
+            !messagingAvailable.value || mutableSending.value ||
+            message.fromMe || !descriptor.isRequest
+        ) return
+        viewModelScope.launch {
+            mutableSending.value = true
+            mutableError.value = null
+            try {
+                chatRepo.sendMessage(
+                    selectedChat.id,
+                    descriptor.copy(action = KitPaymentAction.DECLINED).encode(),
+                )
+                onDone()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "The request could not be declined"
+            } finally {
+                mutableSending.value = false
+            }
+        }
+    }
+
+    /** Withdraws a payment request this account sent, and records the withdrawal in-chat. */
+    fun cancelPaymentRequest(message: Message, onDone: () -> Unit = {}) {
+        val selectedChat = chat.value ?: return
+        val descriptor = message.mediaDescriptor?.let(KitPaymentMessage::parse) ?: return
+        if (
+            !messagingAvailable.value || mutableSending.value ||
+            !message.fromMe || !descriptor.isRequest
+        ) return
+        viewModelScope.launch {
+            mutableSending.value = true
+            mutableError.value = null
+            try {
+                walletRepo.cancelChatPaymentRequest(descriptor.referenceId)
+                // The request is already withdrawn server-side; saying so in chat is best-effort.
+                runCatching {
+                    chatRepo.sendMessage(
+                        selectedChat.id,
+                        descriptor.copy(action = KitPaymentAction.CANCELLED).encode(),
+                    )
+                }
+                onDone()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "The request could not be cancelled"
+            } finally {
+                mutableSending.value = false
+            }
+        }
+    }
+
+    /** Takes a held transfer. From here the payment is final and cannot be reversed. */
+    fun acceptTransfer(message: Message, onDone: () -> Unit = {}) =
+        settleTransfer(message, KitPaymentAction.ACCEPTED, null, onDone) { claimId ->
+            walletRepo.acceptTransferClaim(claimId)
+        }
+
+    /** Sends a held transfer back, recording the recipient's reason in the conversation. */
+    fun rejectTransfer(message: Message, reason: String?, onDone: () -> Unit = {}) =
+        settleTransfer(message, KitPaymentAction.REJECTED, reason, onDone) { claimId ->
+            walletRepo.rejectTransferClaim(claimId, reason)
+        }
+
+    /** Takes back a transfer the recipient has not accepted, recording the sender's reason. */
+    fun reverseTransfer(message: Message, reason: String?, onDone: () -> Unit = {}) =
+        settleTransfer(message, KitPaymentAction.REVERSED, reason, onDone) { claimId ->
+            walletRepo.reverseTransferClaim(claimId, reason)
+        }
+
+    private fun settleTransfer(
+        message: Message,
+        outcome: KitPaymentAction,
+        reason: String?,
+        onDone: () -> Unit,
+        settle: suspend (String) -> TransferClaim,
+    ) {
+        val selectedChat = chat.value ?: return
+        val claimId = message.paymentReferenceId?.takeIf(String::isNotBlank) ?: return
+        if (mutableSending.value) return
+        viewModelScope.launch {
+            mutableSending.value = true
+            mutableError.value = null
+            try {
+                val settled = settle(claimId)
+                mutableTransferClaims.value += settled.id to settled
+                postTransferEvent(selectedChat.id, settled, outcome, reason)
+                onDone()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "This transfer could not be updated"
+                // The usual cause is a card acting on state the other side already changed.
+                // Re-read the authoritative claim so the buttons match reality on the retry.
+                refreshTransferClaims()
+            } finally {
+                mutableSending.value = false
+            }
+        }
+    }
+
+    /**
+     * Writes the outcome of a held transfer into the conversation, reason and all.
+     *
+     * Best-effort on purpose: the money has already moved, and the card's own state comes from
+     * the wallet API. A failure here costs the written record of why, not the truth of what
+     * happened — so it must not be reported as a failed settlement.
+     */
+    private suspend fun postTransferEvent(
+        chatId: String,
+        claim: TransferClaim,
+        outcome: KitPaymentAction,
+        reason: String?,
+    ) {
+        val descriptor = KitPaymentMessage(
+            action = outcome,
+            referenceId = claim.id,
+            amountMinor = claim.amountMinor,
+            currencyCode = claim.currencyCode,
+            currencyScale = claim.currencyScale,
+            // The original note already sits on the transfer card above; repeating it here would
+            // only crowd out the one thing this line exists to say.
+            note = null,
+            reason = reason?.trim()
+                ?.takeIf(String::isNotBlank)
+                ?.take(KitPaymentMessage.MAX_REASON_LENGTH),
+        ).encode()
+        if (KitPaymentMessage.parse(descriptor) == null) return
+        try {
+            chatRepo.sendMessage(chatId, descriptor)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // Swallowed on purpose; see the note above.
+        }
+    }
+
+    private suspend fun refreshTransferClaims() {
+        val claims = try {
+            walletRepo.transferClaims()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // Keep whatever was last known. A card falls back to the conversation's own record
+            // rather than losing its state because one poll failed.
+            return
+        }
+        mutableTransferClaims.value = claims.associateBy(TransferClaim::id)
+        recordExpiredTransfers(claims)
+    }
+
+    /**
+     * Writes the closing line for transfers that timed out.
+     *
+     * The seven-day auto-return happens on the server with nobody watching, so neither party is
+     * told. The sender's app posts it, chosen because exactly one side must and the sender's own
+     * outgoing card identifies them without any further identity plumbing.
+     */
+    private suspend fun recordExpiredTransfers(claims: List<TransferClaim>) {
+        val expired = claims.filter { it.status == TransferClaimStatus.EXPIRED }
+        if (expired.isEmpty() || chatId.isBlank() || !messagingAvailable.value) return
+        val projected = conversationMessages.value
+        val sentFromHere = projected
+            .filter { it.fromMe && it.kind == MessageKind.PAYMENT_TRANSFER }
+            .mapNotNullTo(mutableSetOf()) { it.paymentReferenceId?.lowercase() }
+        val alreadyWritten = projected
+            .filter { it.paymentEvent == PaymentEventKind.EXPIRED }
+            .mapNotNullTo(mutableSetOf()) { it.paymentReferenceId?.lowercase() }
+        for (claim in expired) {
+            val reference = claim.id.lowercase()
+            if (reference !in sentFromHere || reference in alreadyWritten) continue
+            // The projection lags the send by a round trip; this keeps one poll from writing the
+            // same line twice while the first is still in flight.
+            if (!announcedExpiries.add(reference)) continue
+            postTransferEvent(chatId, claim, KitPaymentAction.EXPIRED, claim.reason)
         }
     }
 

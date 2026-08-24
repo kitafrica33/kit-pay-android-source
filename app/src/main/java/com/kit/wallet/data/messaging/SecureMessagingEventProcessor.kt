@@ -1030,12 +1030,12 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             recordInbound(durable, sentAt)
             pending
         }
-        // A committed incoming settlement means money just landed in this account. The backend
+        // A committed incoming payment event means balances just changed for this account —
+        // money landed, a transfer is being held, or a held transfer went back. The backend
         // sends no wallet push, so this authenticated message is the receiver's earliest signal.
         if (
             !authoredOnThisAccount &&
-            KitPaymentMessage.parse(durable.authenticatedText)?.action ==
-            KitPaymentMessage.ACTION_PAID
+            KitPaymentMessage.parse(durable.authenticatedText)?.action?.movesMoney == true
         ) {
             walletRefresh.refreshNow()
         }

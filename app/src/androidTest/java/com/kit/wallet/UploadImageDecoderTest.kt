@@ -48,22 +48,38 @@ class UploadImageDecoderTest {
         }
     }
 
+    /**
+     * The server re-encodes the avatar at the size it arrives and rejects anything outside
+     * 64..512 as an invalid image, which surfaced in the app as a scan rejection on ordinary
+     * photos. Every source size must land inside that window.
+     */
     @Test
-    fun profileAvatarTranscodeProducesASquareJpegWithinTheBudget() {
-        val uri = writeImage(Bitmap.CompressFormat.PNG, "png", width = 1_600, height = 900)
-        try {
-            val jpeg = transcodeProfileAvatar(context.contentResolver, uri)
-            assertNotNull("avatar transcode returned null", jpeg)
-            val bytes = checkNotNull(jpeg)
-            assertTrue(bytes.size <= 384 * 1_024)
-            val decoded = checkNotNull(
-                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size),
-            )
-            assertEquals(decoded.width, decoded.height)
-            assertTrue(decoded.width <= 640)
-            decoded.recycle()
-        } finally {
-            uri.path?.let { File(it).delete() }
+    fun profileAvatarTranscodeProducesASquareJpegTheServerAccepts() {
+        val sources = listOf(
+            1_600 to 900,
+            600 to 600,
+            513 to 900,
+            40 to 40,
+        )
+        for ((width, height) in sources) {
+            val uri = writeImage(Bitmap.CompressFormat.PNG, "png", width = width, height = height)
+            try {
+                val jpeg = transcodeProfileAvatar(context.contentResolver, uri)
+                assertNotNull("avatar transcode returned null for ${width}x$height", jpeg)
+                val bytes = checkNotNull(jpeg)
+                assertTrue(bytes.size <= 384 * 1_024)
+                val decoded = checkNotNull(
+                    android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size),
+                )
+                assertEquals(decoded.width, decoded.height)
+                assertTrue(
+                    "${width}x$height transcoded to ${decoded.width}px",
+                    decoded.width in 64..512,
+                )
+                decoded.recycle()
+            } finally {
+                uri.path?.let { File(it).delete() }
+            }
         }
     }
 

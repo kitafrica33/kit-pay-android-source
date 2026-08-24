@@ -3,11 +3,16 @@ package com.kit.wallet.feature.wallet
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.messaging.KitPaymentAction
+import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
+import com.kit.wallet.data.repository.SentTransfer
 import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Transaction
+import kotlin.math.abs
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asStateFlow
@@ -21,6 +26,7 @@ import javax.inject.Inject
 @HiltViewModel
 class SendMoneyViewModel @Inject constructor(
     private val wallet: WalletRepository,
+    private val chats: ChatRepository,
     contactRepo: ContactRepository,
 ) : ViewModel() {
 
@@ -48,7 +54,9 @@ class SendMoneyViewModel @Inject constructor(
             _sending.value = true
             _error.value = null
             try {
-                _lastSent.value = wallet.send(recipient, amountMinor, note, paymentPin)
+                val sent = wallet.sendToContact(recipient, amountMinor, note, paymentPin)
+                _lastSent.value = sent.transaction
+                announceInChat(recipient, sent)
                 onSent()
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -57,6 +65,40 @@ class SendMoneyViewModel @Inject constructor(
             } finally {
                 _sending.value = false
             }
+        }
+    }
+
+    /**
+     * Puts the payment into the conversation with the person who received it, so money sent from
+     * the wallet still reads as part of the chat rather than vanishing into a separate history.
+     *
+     * Deliberately best-effort: the debit has already happened and the receipt is already in the
+     * wallet. A messaging failure here must never surface as a failed payment — the recipient
+     * still sees the transfer in their wallet, and a held transfer's card is rebuilt from the
+     * wallet API whenever the conversation is opened.
+     */
+    private suspend fun announceInChat(recipient: Contact, sent: SentTransfer) {
+        if (!recipient.isKitUser) return
+        val claim = sent.claim
+        val descriptor = KitPaymentMessage(
+            action = if (claim == null) KitPaymentAction.SENT else KitPaymentAction.TRANSFER,
+            referenceId = claim?.id ?: sent.transaction.id,
+            amountMinor = abs(sent.transaction.amountMinor),
+            currencyCode = sent.transaction.currencyCode,
+            currencyScale = sent.transaction.currencyScale,
+            note = sent.transaction.note
+                ?.takeIf(String::isNotBlank)
+                ?.take(KitPaymentMessage.MAX_NOTE_LENGTH),
+        ).encode()
+        // Post nothing rather than something neither side can read back: a descriptor that fails
+        // its own canonical round trip would render as raw text in every client that receives it.
+        if (KitPaymentMessage.parse(descriptor) == null) return
+        try {
+            chats.sendMessage(chats.openDirectConversation(recipient), descriptor)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // Swallowed on purpose; see the note above.
         }
     }
 }

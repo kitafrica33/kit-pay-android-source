@@ -1,5 +1,6 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -9,8 +10,8 @@ import org.junit.Test
 
 class KitPaymentMessageTest {
     private val request = KitPaymentMessage(
-        action = KitPaymentMessage.ACTION_REQUEST,
-        paymentRequestId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        action = KitPaymentAction.REQUEST,
+        referenceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         amountMinor = 2_500_000,
         currencyCode = "UGX",
         currencyScale = 2,
@@ -28,11 +29,11 @@ class KitPaymentMessageTest {
 
     @Test
     fun paidConfirmationKeepsRequestIdentity() {
-        val paid = request.copy(action = KitPaymentMessage.ACTION_PAID)
+        val paid = request.copy(action = KitPaymentAction.PAID)
         val parsed = KitPaymentMessage.parse(paid.encode())
         assertEquals(paid, parsed)
         assertFalse(parsed!!.isRequest)
-        assertEquals(request.paymentRequestId, parsed.paymentRequestId)
+        assertEquals(request.referenceId, parsed.referenceId)
     }
 
     @Test
@@ -60,5 +61,67 @@ class KitPaymentMessageTest {
             request.copy(note = null).encode(),
             request.copy(note = "   ").encode(),
         )
+    }
+
+    @Test
+    fun transferActionsRoundTripAndCarryTheirReason() {
+        val reversed = KitPaymentMessage(
+            action = KitPaymentAction.REVERSED,
+            referenceId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            amountMinor = 50_000,
+            currencyCode = "UGX",
+            currencyScale = 0,
+            note = null,
+            reason = "Sent to the wrong person & in a hurry",
+        )
+        val parsed = KitPaymentMessage.parse(reversed.encode())
+        assertEquals(reversed, parsed)
+        assertEquals("Sent to the wrong person & in a hurry", parsed?.reason)
+        assertTrue(checkNotNull(parsed).action.returnedFunds)
+        assertTrue(parsed.action.isTransferEvent)
+        assertFalse(parsed.isRequest)
+    }
+
+    @Test
+    fun everyActionSurvivesItsOwnRoundTrip() {
+        for (action in KitPaymentAction.entries) {
+            val descriptor = request.copy(action = action, reason = "why")
+            assertEquals(
+                "Round trip failed for ${action.wire}",
+                descriptor,
+                KitPaymentMessage.parse(descriptor.encode()),
+            )
+        }
+    }
+
+    @Test
+    fun rejectsBlankReorderedAndOversizedReasons() {
+        val reversed = request.copy(action = KitPaymentAction.REVERSED, reason = "wrong person")
+        val encoded = reversed.encode()
+        // Fixed field order: the reason follows the note, never precedes it.
+        assertTrue(encoded.indexOf("&note=") < encoded.indexOf("&rsn="))
+        assertNull(KitPaymentMessage.parse(reversed.copy(reason = "x".repeat(141)).encode()))
+        assertNull(KitPaymentMessage.parse("$encoded&rsn=second"))
+        // A blank reason must be omitted, never encoded.
+        assertEquals(
+            reversed.copy(reason = null).encode(),
+            reversed.copy(reason = "   ").encode(),
+        )
+    }
+
+    @Test
+    fun onlyRequestActionsLeaveMoneyWhereItIs() {
+        val stationary = setOf(
+            KitPaymentAction.REQUEST,
+            KitPaymentAction.DECLINED,
+            KitPaymentAction.CANCELLED,
+        )
+        for (action in KitPaymentAction.entries) {
+            assertEquals(
+                "movesMoney is wrong for ${action.wire}",
+                action !in stationary,
+                action.movesMoney,
+            )
+        }
     }
 }

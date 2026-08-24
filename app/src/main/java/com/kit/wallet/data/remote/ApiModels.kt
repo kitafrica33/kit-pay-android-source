@@ -488,7 +488,56 @@ data class TransactionDto(
     val status: String,
     val counterparty: CounterpartyDto? = null,
     val note: String? = null,
+    /** Present on held Kit → Kit transfers and on the reversal that returned one. */
+    val claim: TransferClaimDto? = null,
     @Json(name = "occurred_at") val occurredAt: String,
+)
+
+/**
+ * A Kit → Kit transfer the recipient has not taken yet, or the record of how one ended.
+ *
+ * `reason` and `resolvedBy` are what let the conversation say why a payment came back rather than
+ * showing money quietly disappearing.
+ */
+@JsonClass(generateAdapter = false)
+data class TransferClaimDto(
+    val id: String,
+    @Json(name = "transaction_id") val transactionId: String,
+    val reference: String? = null,
+    val status: String,
+    val amount: String,
+    val currency: CurrencyDto,
+    val note: String? = null,
+    val sender: TransferClaimPartyDto? = null,
+    val recipient: TransferClaimPartyDto? = null,
+    val reason: String? = null,
+    @Json(name = "resolved_by") val resolvedBy: String? = null,
+    @Json(name = "reversal_transaction_id") val reversalTransactionId: String? = null,
+    @Json(name = "expires_at") val expiresAt: String? = null,
+    @Json(name = "accepted_at") val acceptedAt: String? = null,
+    @Json(name = "returned_at") val returnedAt: String? = null,
+    @Json(name = "created_at") val createdAt: String? = null,
+    @Json(name = "can_accept") val canAccept: Boolean = false,
+    @Json(name = "can_reject") val canReject: Boolean = false,
+    @Json(name = "can_reverse") val canReverse: Boolean = false,
+)
+
+@JsonClass(generateAdapter = false)
+data class TransferClaimPartyDto(
+    val id: String? = null,
+    val name: String? = null,
+    val phone: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class TransferClaimPageDto(
+    val items: List<TransferClaimDto> = emptyList(),
+    val page: CursorPageDto? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class TransferClaimResolutionRequest(
+    val reason: String? = null,
 )
 
 @JsonClass(generateAdapter = false)

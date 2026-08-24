@@ -1,6 +1,7 @@
 package com.kit.wallet.data.notifications
 
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotification
@@ -56,8 +57,8 @@ class SecureMessageNotificationPresentationTest {
     @Test
     fun `payment request notification includes amount and note without internal id`() {
         val descriptor = KitPaymentMessage(
-            action = KitPaymentMessage.ACTION_REQUEST,
-            paymentRequestId = PAYMENT_REQUEST_ID,
+            action = KitPaymentAction.REQUEST,
+            referenceId = PAYMENT_REQUEST_ID,
             amountMinor = 123_456,
             currencyCode = "UGX",
             currencyScale = 2,

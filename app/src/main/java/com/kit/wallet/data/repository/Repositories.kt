@@ -8,6 +8,7 @@ import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.Transaction
+import com.kit.wallet.ui.model.TransferClaim
 import com.kit.wallet.ui.model.UserProfile
 import java.time.Instant
 import kotlinx.coroutines.flow.StateFlow
@@ -30,6 +31,15 @@ data class ProfileEmailChallenge(
     val destination: String,
     val expiresAt: String?,
     val resendAfterSeconds: Long?,
+)
+
+/**
+ * The outcome of a Kit → Kit send: the ledger entry, plus the claim when the money is being held
+ * for the recipient to accept. A null claim means the money has already landed.
+ */
+data class SentTransfer(
+    val transaction: Transaction,
+    val claim: TransferClaim?,
 )
 
 /** A backend payment request created from inside a secure conversation. */
@@ -72,6 +82,18 @@ interface WalletRepository {
         paymentPin: String,
     ): Transaction
 
+    /**
+     * The same debit as [send], but also reporting the claim when the money is being held for
+     * the recipient to accept. That claim is what lets the conversation post a card the recipient
+     * can act on, instead of a line saying money moved that neither side can do anything about.
+     */
+    suspend fun sendToContact(
+        recipient: Contact,
+        amountMinor: Long,
+        note: String?,
+        paymentPin: String,
+    ): SentTransfer = SentTransfer(send(recipient, amountMinor, note, paymentPin), null)
+
     /** Records an outgoing payment request (no balance change). */
     suspend fun request(from: Contact, amountMinor: Long, note: String?)
 
@@ -88,6 +110,30 @@ interface WalletRepository {
         amountMinor: Long,
         paymentPin: String,
     ): Unit = error("Payment requests are unavailable")
+
+    /** Withdraws a payment request this account created; only the requester may. */
+    suspend fun cancelChatPaymentRequest(requestId: String): Unit =
+        error("Payment requests are unavailable")
+
+    /**
+     * Held Kit → Kit transfers this account is a party to, newest first.
+     *
+     * Empty rather than failing: a service without claimable transfers simply has none, and a
+     * conversation must still open when this call cannot be made.
+     */
+    suspend fun transferClaims(): List<TransferClaim> = emptyList()
+
+    /** Takes a held transfer. Once accepted the payment is final and cannot be reversed. */
+    suspend fun acceptTransferClaim(claimId: String): TransferClaim =
+        error("Held transfers are unavailable")
+
+    /** Sends a held transfer back, recording why so the conversation can say so. */
+    suspend fun rejectTransferClaim(claimId: String, reason: String?): TransferClaim =
+        error("Held transfers are unavailable")
+
+    /** Takes back a transfer the recipient has not accepted yet, with the sender's reason. */
+    suspend fun reverseTransferClaim(claimId: String, reason: String?): TransferClaim =
+        error("Held transfers are unavailable")
 
     suspend fun payBill(
         provider: BillProvider,

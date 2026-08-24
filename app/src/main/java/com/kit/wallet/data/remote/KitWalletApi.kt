@@ -258,6 +258,35 @@ interface KitWalletApi {
         @Body request: WalletTransferRequest,
     ): ApiEnvelope<TransactionDto>
 
+    @GET("api/kit-wallet/v1/transfer-claims")
+    suspend fun transferClaims(
+        @Query("status") status: String? = null,
+        @Query("cursor") cursor: String? = null,
+        @Query("limit") limit: Int = 50,
+    ): ApiEnvelope<TransferClaimPageDto>
+
+    @GET("api/kit-wallet/v1/transfer-claims/{claimId}")
+    suspend fun transferClaim(
+        @Path("claimId") claimId: String,
+    ): ApiEnvelope<TransferClaimDto>
+
+    @POST("api/kit-wallet/v1/transfer-claims/{claimId}/accept")
+    suspend fun acceptTransferClaim(
+        @Path("claimId") claimId: String,
+    ): ApiEnvelope<TransferClaimDto>
+
+    @POST("api/kit-wallet/v1/transfer-claims/{claimId}/reject")
+    suspend fun rejectTransferClaim(
+        @Path("claimId") claimId: String,
+        @Body request: TransferClaimResolutionRequest,
+    ): ApiEnvelope<TransferClaimDto>
+
+    @POST("api/kit-wallet/v1/transfer-claims/{claimId}/reverse")
+    suspend fun reverseTransferClaim(
+        @Path("claimId") claimId: String,
+        @Body request: TransferClaimResolutionRequest,
+    ): ApiEnvelope<TransferClaimDto>
+
     @POST("api/kit-wallet/v1/payments/requests")
     suspend fun createPaymentRequest(
         @Header("Idempotency-Key") idempotencyKey: String,
@@ -273,6 +302,12 @@ interface KitWalletApi {
         @Header("Idempotency-Key") idempotencyKey: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: PayPaymentRequestDto,
+    ): ApiEnvelope<PaymentRequestDto>
+
+    @POST("api/kit-wallet/v1/payments/requests/{requestId}/cancel")
+    suspend fun cancelPaymentRequest(
+        @Path("requestId") requestId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
     ): ApiEnvelope<PaymentRequestDto>
 
     @GET("api/kit-wallet/v1/search")

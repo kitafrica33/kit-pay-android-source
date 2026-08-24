@@ -5,6 +5,7 @@ import com.kit.wallet.data.messaging.AccountMessageHistoryAccess
 import com.kit.wallet.data.messaging.CapturedAccountMessageHistory
 import com.kit.wallet.data.messaging.FailClosedSecureMessagingCryptoTransaction
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
@@ -1696,16 +1697,16 @@ class SecureMessagingEventProcessorTest {
     @Test
     fun `incoming paid settlement triggers a wallet refresh and requests do not`() = runTest {
         val paidText = KitPaymentMessage(
-            action = KitPaymentMessage.ACTION_PAID,
-            paymentRequestId = "0198a5b4-6f2d-7e3a-8c1b-2d4e6f8a0b1c",
+            action = KitPaymentAction.PAID,
+            referenceId = "0198a5b4-6f2d-7e3a-8c1b-2d4e6f8a0b1c",
             amountMinor = 250_000,
             currencyCode = "UGX",
             currencyScale = 0,
             note = null,
         ).encode()
         val requestText = KitPaymentMessage(
-            action = KitPaymentMessage.ACTION_REQUEST,
-            paymentRequestId = "0198a5b4-6f2d-7e3a-8c1b-2d4e6f8a0b1d",
+            action = KitPaymentAction.REQUEST,
+            referenceId = "0198a5b4-6f2d-7e3a-8c1b-2d4e6f8a0b1d",
             amountMinor = 250_000,
             currencyCode = "UGX",
             currencyScale = 0,
