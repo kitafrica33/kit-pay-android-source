@@ -19,6 +19,12 @@ import com.kit.wallet.data.session.SessionFence
  * must either use authenticated remote data or fail closed.
  */
 
+/** One local search match: the decrypted message and the conversation it belongs to. */
+data class MessageSearchHit(
+    val chat: ChatPreview,
+    val message: Message,
+)
+
 data class ProfileEmailChallenge(
     val id: String,
     val destination: String,
@@ -151,6 +157,12 @@ interface ChatRepository {
     /** Viewer-local pin/mute preferences; never sent to the server (iOS parity). */
     suspend fun setChatPinned(chatId: String, pinned: Boolean) = Unit
     suspend fun setChatMuted(chatId: String, muted: Boolean) = Unit
+
+    /**
+     * Local-only search over already-decrypted text projections; media and payment descriptors
+     * are deliberately excluded from search text (same policy as iOS).
+     */
+    fun searchMessages(query: String, limit: Int = 50): List<MessageSearchHit> = emptyList()
     suspend fun openDirectConversation(contact: Contact): String
     suspend fun sendMessage(
         chatId: String,

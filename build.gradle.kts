@@ -432,7 +432,7 @@ val verifyReviewedGoogleRuntimeArtifacts = tasks.register("verifyReviewedGoogleR
         val recordedDirectCoordinates = recordedRuntimeRelationships
             .filterValues { it == "direct" }
             .keys
-        check(recordedRuntimeCoordinates.size == 203 &&
+        check(recordedRuntimeCoordinates.size == 209 &&
             selectedRuntimeCoordinates == recordedRuntimeCoordinates
         ) {
             "releaseRuntimeClasspath differs from the complete reviewed runtime inventory. " +

@@ -11,7 +11,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -21,6 +23,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.CircularProgressIndicator
@@ -190,6 +193,7 @@ internal fun SecureVideoContent(
     mediaError: String?,
     onOpenMedia: () -> Unit,
     onRetryMedia: () -> Unit,
+    onOpenViewer: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     var playerFile by remember(msg.id) { mutableStateOf<File?>(null) }
@@ -213,6 +217,7 @@ internal fun SecureVideoContent(
                     when {
                         mediaError != null -> onRetryMedia()
                         mediaBytes == null -> onOpenMedia()
+                        onOpenViewer != null -> onOpenViewer()
                         else -> playerFile = runCatching {
                             writeChatMediaTempFile(
                                 context = context,
@@ -393,6 +398,147 @@ internal fun SecureDocumentContent(
                     accent.copy(alpha = 0.7f)
                 },
             )
+        }
+    }
+}
+
+/**
+ * A grouped-photo grid bubble: 2 side-by-side, 3 as one featured tile plus a stacked pair,
+ * 4 as a 2x2 grid, and 5+ as 2x2 with a "+N" veil on the last visible tile. Every tile maps
+ * to its own message: tap loads it or opens the connected gallery at exactly that photo.
+ */
+@Composable
+internal fun ImageGroupBubble(
+    messages: List<Message>,
+    fromMe: Boolean,
+    mediaBytes: Map<String, ByteArray>,
+    mediaLoading: Set<String>,
+    mediaErrors: Map<String, String>,
+    onOpenMedia: (Message) -> Unit,
+    onOpenViewer: (Message) -> Unit,
+) {
+    val visible = messages.take(4)
+    val hiddenCount = messages.size - visible.size
+    val tileSpacing = 3.dp
+    Box(Modifier.fillMaxWidth()) {
+        Column(
+            Modifier
+                .align(if (fromMe) Alignment.CenterEnd else Alignment.CenterStart)
+                .padding(vertical = 3.dp)
+                .width(262.dp)
+                .clip(RoundedCornerShape(16.dp)),
+            verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(tileSpacing),
+        ) {
+            when (visible.size) {
+                2 -> Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(tileSpacing)) {
+                    visible.forEach { message ->
+                        GroupImageTile(
+                            message, mediaBytes[message.id], message.id in mediaLoading,
+                            mediaErrors.containsKey(message.id), 0,
+                            Modifier.weight(1f).aspectRatio(1f),
+                            onOpenMedia, onOpenViewer,
+                        )
+                    }
+                }
+                3 -> {
+                    GroupImageTile(
+                        visible[0], mediaBytes[visible[0].id], visible[0].id in mediaLoading,
+                        mediaErrors.containsKey(visible[0].id), 0,
+                        Modifier.fillMaxWidth().aspectRatio(16f / 9f),
+                        onOpenMedia, onOpenViewer,
+                    )
+                    Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(tileSpacing)) {
+                        visible.drop(1).forEach { message ->
+                            GroupImageTile(
+                                message, mediaBytes[message.id], message.id in mediaLoading,
+                                mediaErrors.containsKey(message.id), 0,
+                                Modifier.weight(1f).aspectRatio(1f),
+                                onOpenMedia, onOpenViewer,
+                            )
+                        }
+                    }
+                }
+                else -> visible.chunked(2).forEachIndexed { rowIndex, rowMessages ->
+                    Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(tileSpacing)) {
+                        rowMessages.forEachIndexed { columnIndex, message ->
+                            val isLastVisible =
+                                rowIndex == 1 && columnIndex == rowMessages.lastIndex
+                            GroupImageTile(
+                                message, mediaBytes[message.id], message.id in mediaLoading,
+                                mediaErrors.containsKey(message.id),
+                                if (isLastVisible) hiddenCount else 0,
+                                Modifier.weight(1f).aspectRatio(1f),
+                                onOpenMedia, onOpenViewer,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupImageTile(
+    message: Message,
+    bytes: ByteArray?,
+    loading: Boolean,
+    failed: Boolean,
+    overflowCount: Int,
+    modifier: Modifier,
+    onOpenMedia: (Message) -> Unit,
+    onOpenViewer: (Message) -> Unit,
+) {
+    val thumbnail by produceState<ImageBitmap?>(initialValue = null, message.id, bytes != null) {
+        value = bytes?.let { owned ->
+            withOwnedSecureMediaSnapshot(owned) { snapshot ->
+                withContext(Dispatchers.Default) { decodeBoundedSecureImage(snapshot) }
+            }
+        }
+    }
+    Box(
+        modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+            .clickable(enabled = !loading) {
+                if (bytes != null) onOpenViewer(message) else onOpenMedia(message)
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        thumbnail?.let {
+            Image(
+                bitmap = it,
+                contentDescription = "Photo",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+            )
+        }
+        when {
+            loading -> CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            failed -> Text(
+                "Retry",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+            bytes == null -> Icon(
+                Icons.Rounded.Download,
+                contentDescription = "Load photo",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (overflowCount > 0) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.55f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "+$overflowCount",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = Color.White,
+                )
+            }
         }
     }
 }

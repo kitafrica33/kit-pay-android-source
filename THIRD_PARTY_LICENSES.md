@@ -2,8 +2,8 @@
 
 Audit snapshot: 2026-07-22  
 Application ID: `com.kit.wallet`  
-Version name: `0.2.18`  
-Version code: `30`  
+Version name: `0.2.19`  
+Version code: `31`  
 Distribution clearance: `true`  
 Distribution review disposition: `CLEARED`  
 Distribution review record type: `APP_WIDE_INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL`  
@@ -30,9 +30,9 @@ Applicable terms retrieval date: `2026-07-20`
 Applicable terms URL: `https://developer.android.com/studio/terms`  
 Applicable terms SHA-256: `8bd88dc1144a7d12818687d680d6a9f9e8a2f1ee62c43a8e21f5c6a75f6977cd`  
 Decision document: `docs/google-fcm-agpl-clearance-decision-app-wide.md`  
-Decision document SHA-256: `de0b1ed0cb5dcd691fd1b36988842878755422c84bdbe7bef5a3bfee678a25db`  
-Reviewed runtime inventory SHA-256: `6539e43d22c0f644e9ae5865280fb2c4e8338103368726c81eb14222fae82b8e`  
-Reviewed runtime graph manifest SHA-256: `da5db3d86fe0bb7dcef97ff5469bbbb742d2ca79013f12df90a17dbf7da3de04`  
+Decision document SHA-256: `58a26382838bd26e4a80378bfe6dd7cb8466a88abcf64db85f5bf12e6017904e`  
+Reviewed runtime inventory SHA-256: `b367304e080f083c067571c2fbbbd062f92a1a0cb9d3ccca21a16485c5b0ec49`  
+Reviewed runtime graph manifest SHA-256: `08643aebc10c171d79602a7bb6cb698872943cb6a0b6da45e78ea1ae3cba9676`  
 Distribution conditions recorded: `7`  
 Re-review triggers recorded: `9`  
 Unresolved issue IDs: `none`
@@ -41,13 +41,13 @@ This is the release-runtime licence inventory, not legal advice or a publication
 
 ## Scope and method
 
-Gradle's `releaseRuntimeClasspath` identifies 203 Maven components: 34 direct and 169 transitive. Those components resolve to 166 AAR/JAR artifact archives. The release AAB must reproduce this inventory in `BUNDLE-METADATA/com.android.tools.build.libraries/dependencies.pb` before clearance can change. `com.android.tools:desugar_jdk_libs:2.1.5` is reviewed separately because Android's build tools rewrite its code into the application DEX from the `coreLibraryDesugaring` configuration.
+Gradle's `releaseRuntimeClasspath` identifies 209 Maven components: 38 direct and 171 transitive. Those components resolve to 172 AAR/JAR artifact archives. The release AAB must reproduce this inventory in `BUNDLE-METADATA/com.android.tools.build.libraries/dependencies.pb` before clearance can change. `com.android.tools:desugar_jdk_libs:2.1.5` is reviewed separately because Android's build tools rewrite its code into the application DEX from the `coreLibraryDesugaring` configuration.
 
-Licence evidence was checked from exact resolved POMs, artifact contents and, where POM/archive evidence was incomplete, version-pinned upstream sources. The normalized 203-component result is:
+Licence evidence was checked from exact resolved POMs, artifact contents and, where POM/archive evidence was incomplete, version-pinned upstream sources. The normalized 209-component result is:
 
 | Evidence category | Components |
 | --- | ---: |
-| Apache-2.0 | 190 |
+| Apache-2.0 | 196 |
 | Android SDK License | 6 |
 | BSD-3-Clause | 3 |
 | AGPL-3.0-only | 2 |
@@ -89,7 +89,7 @@ The recorded re-review triggers are:
 9. A change to the approved Android application ID or release-signing identity.
 
 The release gates compare the resolved six Google/Firebase AARs and POMs byte-for-byte
-with the reviewed hashes, bind the complete 203-component runtime inventory, preserve
+with the reviewed hashes, bind the complete 209-component runtime inventory, preserve
 the required notices, and verify the attested Gradle, CycloneDX and final-AAB dependency
 graphs before distribution. The graph-manifest digest is derived release evidence, not
 additional reviewer identity or a replacement legal opinion. A material trigger
@@ -188,6 +188,11 @@ The “declared evidence” column reports metadata/evidence, not a compatibilit
 | `androidx.arch.core:core-runtime:2.2.0` | transitive | `Apache-2.0` |
 | `androidx.autofill:autofill:1.0.0` | transitive | `Apache-2.0` |
 | `androidx.biometric:biometric:1.1.0` | direct | `Apache-2.0` |
+| `androidx.camera:camera-camera2:1.4.2` | direct | `Apache-2.0` |
+| `androidx.camera:camera-core:1.4.2` | transitive | `Apache-2.0` |
+| `androidx.camera:camera-lifecycle:1.4.2` | direct | `Apache-2.0` |
+| `androidx.camera:camera-video:1.4.2` | direct | `Apache-2.0` |
+| `androidx.camera:camera-view:1.4.2` | direct | `Apache-2.0` |
 | `androidx.collection:collection-jvm:1.4.4` | transitive | `Apache-2.0` |
 | `androidx.collection:collection-ktx:1.4.4` | transitive | `Apache-2.0` |
 | `androidx.collection:collection:1.4.4` | transitive | `Apache-2.0` |
@@ -320,6 +325,7 @@ The “declared evidence” column reports metadata/evidence, not a compatibilit
 | `com.google.android.gms:play-services-cloud-messaging:17.2.0` | transitive | `LicenseRef-Android-SDK-License` |
 | `com.google.android.gms:play-services-stats:17.0.2` | transitive | `LicenseRef-Android-SDK-License` |
 | `com.google.android.gms:play-services-tasks:18.1.0` | transitive | `LicenseRef-Android-SDK-License` |
+| `com.google.auto.value:auto-value-annotations:1.6.3` | transitive | `Apache-2.0` |
 | `com.google.code.findbugs:jsr305:3.0.2` | transitive | `Apache-2.0` |
 | `com.google.code.gson:gson:2.8.9` | transitive | `Apache-2.0` |
 | `com.google.dagger:dagger-lint-aar:2.58` | transitive | `Apache-2.0` |

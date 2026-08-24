@@ -2,6 +2,10 @@ package com.kit.wallet.data.messaging
 
 import java.io.InputStream
 
+// Raising this cap requires a streaming/file-backed media pipeline first: the send and receive
+// paths hold plaintext + ciphertext fully in heap, so the cap is heap-sized. The capability gate
+// (MessagingRichMediaCapability) already clamps to min(compiled, advertised), so a future raise
+// is a one-constant change plus that pipeline work.
 internal const val MAX_IMAGE_PLAINTEXT_BYTES = 10 * 1024 * 1024
 internal const val MAX_IMAGE_CIPHERTEXT_BYTES = 10L * 1024L * 1024L + 64L
 

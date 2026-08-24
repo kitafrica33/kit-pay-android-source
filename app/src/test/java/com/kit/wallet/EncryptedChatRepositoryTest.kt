@@ -72,10 +72,52 @@ class EncryptedChatRepositoryTest {
         runtime.activate(null)
         runCurrent()
 
+        // A lifecycle blip keeps the last publication visible (readiness only drops), so the
+        // open chat never blanks; a real sign-out erases the plaintext after the short grace.
+        assertFalse(repository.readiness.value)
+        assertEquals(listOf(CONVERSATION_ONE), repository.chats.value.map { it.id })
+        assertEquals("hello", repository.conversation(CONVERSATION_ONE).value.single().text)
+
+        advanceTimeBy(16_000L)
+        runCurrent()
+
         assertFalse(repository.readiness.value)
         assertTrue(repository.chats.value.isEmpty())
         assertTrue(repository.conversation(CONVERSATION_ONE).value.isEmpty())
     }
+
+    @Test
+    fun `published chats survive a same-identity lifecycle blip without an empty emission`() =
+        runTest {
+            val runtime = FakeRuntime(epoch = null).apply {
+                conversations += conversation(CONVERSATION_ONE, "Grace")
+                projected += message("out:one", CONVERSATION_ONE, "hello", fromMe = true)
+            }
+            val repository = repository(runtime)
+            runtime.activate("session-blip")
+            runCurrent()
+            assertTrue(repository.readiness.value)
+
+            val chatEmissions = mutableListOf<Int>()
+            val messageEmissions = mutableListOf<Int>()
+            backgroundScope.launch { repository.chats.collect { chatEmissions += it.size } }
+            backgroundScope.launch {
+                repository.conversation(CONVERSATION_ONE).collect { messageEmissions += it.size }
+            }
+            runCurrent()
+
+            // A key-revalidation/roster-resync blip retains the registry momentarily and then
+            // republishes the SAME activation under a fresh wrapper. The visible chats and the
+            // open conversation must never blank, and no destructive re-baseline may run.
+            runtime.blipSameIdentity()
+            runCurrent()
+
+            assertTrue(repository.readiness.value)
+            assertEquals(listOf(CONVERSATION_ONE), repository.chats.value.map { it.id })
+            assertEquals("hello", repository.conversation(CONVERSATION_ONE).value.single().text)
+            assertTrue("chats blanked: $chatEmissions", chatEmissions.none { it == 0 })
+            assertTrue("messages blanked: $messageEmissions", messageEmissions.none { it == 0 })
+        }
 
     @Test
     fun `new epoch readiness waits until its projection baseline is published`() = runTest {
@@ -176,7 +218,9 @@ class EncryptedChatRepositoryTest {
         runCurrent()
 
         assertTrue(runtime.activeSession.value === active)
-        assertEquals(5, runtime.baselineAttempts)
+        // The completion cuts the cooldown short (attempt 5 succeeds) and the same signal then
+        // performs one ordinary republication of the now-ready projection (attempt 6).
+        assertEquals(6, runtime.baselineAttempts)
         assertTrue(repository.readiness.value)
     }
 
@@ -831,6 +875,17 @@ class EncryptedChatRepositoryTest {
                 }
                 authoritativeSession = activated
                 activeSession.value = activated
+            }
+        }
+
+        /** Retains the registry momentarily, then republishes the same activation rewrapped. */
+        fun blipSameIdentity() {
+            synchronized(authorityLock) {
+                val current = checkNotNull(authoritativeSession)
+                val rewrapped = SecureMessagingChatSession(current.sessionEpoch, current.identity)
+                activeSession.value = null
+                authoritativeSession = rewrapped
+                activeSession.value = rewrapped
             }
         }
 

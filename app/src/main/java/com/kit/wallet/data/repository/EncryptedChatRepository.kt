@@ -68,10 +68,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.stateIn
@@ -1134,12 +1137,6 @@ class EncryptedChatRepository @Inject internal constructor(
     private val timeFormatter = DateTimeFormatter.ofPattern("HH:mm").withZone(clock.zone)
     private var publishedSession: SecureMessagingChatSession? = null
 
-    private data class ProjectionRefreshRequest(
-        val session: SecureMessagingChatSession?,
-        val contacts: List<Contact>,
-        val baselineRetryOnly: Boolean,
-    )
-
     private data class ProjectionPublication(
         val chats: List<ChatPreview>,
         val messagesByConversation: Map<String, List<Message>>,
@@ -1155,52 +1152,49 @@ class EncryptedChatRepository @Inject internal constructor(
             }
         }
         scope.launch {
-            val stateRequests = combine(
-                runtime.activeSession,
-                runtime.projectionChanges,
-                contacts.contacts,
-            ) { session, _, contactList ->
-                ProjectionRefreshRequest(
-                    session = session,
-                    contacts = contactList,
-                    baselineRetryOnly = false,
-                )
-            }
-            val successfulSyncRetries = runtime.baselineRetrySessions
-                // Filtering before merge prevents an obsolete completion from cancelling the
-                // current identity's collectLatest baseline before the handler can reject it.
-                .filter(runtime::isCurrent)
-                .map { session ->
-                    ProjectionRefreshRequest(
-                        session = session,
-                        contacts = contacts.contacts.value,
-                        baselineRetryOnly = true,
-                    )
+            // Only a REAL activation change (a different identity, or none at all) may cancel
+            // in-flight projection work. Signals for the same activation are conflated and
+            // served sequentially below, so a long rebuild can never be starved by the
+            // 2-second foreground sync ticks or draft writes — the livelock that used to
+            // blank every chat exactly while the user was typing.
+            runtime.activeSession
+                .distinctUntilChanged { previous, next ->
+                    previous?.identity === next?.identity
                 }
-            merge(stateRequests, successfulSyncRetries)
-                .collectLatest { request ->
-                    val session = request.session
-                    val contactList = request.contacts
+                .collectLatest { session ->
                     if (session == null) {
+                        // Lifecycle blips (key revalidation, roster resync) retain the registry
+                        // for a moment; keep the last published chats visible instead of
+                        // blanking the app. A real sign-out never returns, so the retained
+                        // plaintext is erased after a short grace that a returning session
+                        // cancels via collectLatest.
+                        synchronized(publicationLock) { mutableReadiness.value = false }
+                        delay(SIGNED_OUT_CLEAR_GRACE_MILLIS)
                         clearPublishedStateIfCurrent(null)
-                    } else if (request.baselineRetryOnly) {
-                        if (
-                            runtime.isCurrent(session) &&
-                            needsProjectionBaseline(session)
-                        ) {
-                            establishProjectionBaseline(session, contactList)
-                        }
-                    } else if (needsProjectionBaseline(session)) {
-                        establishProjectionBaseline(session, contactList)
-                    } else {
+                        return@collectLatest
+                    }
+                    val signals = merge(
+                        combine(
+                            runtime.projectionChanges,
+                            contacts.contacts,
+                        ) { _, contactList -> contactList },
+                        runtime.baselineRetrySessions
+                            .filter { it.identity === session.identity }
+                            .map { contacts.contacts.value },
+                    )
+                    signals.conflate().collect { contactList ->
+                        if (!runtime.isCurrent(session)) return@collect
                         try {
-                            refresh(session, contactList)
+                            if (needsProjectionBaseline(session)) {
+                                establishProjectionBaseline(session, contactList)
+                            } else {
+                                refresh(session, contactList)
+                            }
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (_: Exception) {
-                            if (!runtime.isCurrent(session) || !isPublishedSession(session)) {
-                                clearPublishedStateIfOwnedBy(session)
-                            }
+                            // Keep the last good publication visible; the next conflated
+                            // signal (sync tick, projection change) retries the rebuild.
                         }
                     }
                 }
@@ -1216,27 +1210,30 @@ class EncryptedChatRepository @Inject internal constructor(
         session: SecureMessagingChatSession,
         localContacts: List<Contact>,
     ) {
-        // Revoke every projection from the previous activation before the replacement baseline
-        // performs network, archive, or Keystore work. The exact-session publication primitive
-        // prevents an obsolete collector from clearing a newer activation.
-        if (!clearPublishedStateIfCurrent(session)) return
+        // A previous activation's projections must never remain visible while this identity's
+        // baseline touches the network, so an identity change erases them first. A readiness
+        // blip on the SAME activation deliberately keeps the last publication on screen: the
+        // rebuild replaces it atomically on commit, and a cancelled or failed rebuild leaves
+        // the user's chats intact instead of blanking the app.
+        val previousIdentity = synchronized(publicationLock) { publishedSession?.identity }
+        if (previousIdentity != null && previousIdentity !== session.identity) {
+            if (!clearPublishedStateIfCurrent(session)) return
+        } else if (!runtime.isCurrent(session)) {
+            return
+        }
         var attempt = 0
         var permanentRecoveryAttempted = false
         var retryCooldownMillis = BASELINE_REFRESH_COOLDOWN_MILLIS
         while (runtime.isCurrent(session) && !isReadyFor(session)) {
             if (!runtime.isCurrent(session) || isReadyFor(session)) return
             try {
-                if (!refresh(session, localContacts, establishReadiness = true)) {
-                    clearPublishedStateIfOwnedBy(session)
-                }
+                refresh(session, localContacts, establishReadiness = true)
                 return
             } catch (cancelled: CancellationException) {
-                clearPublishedStateIfOwnedBy(session)
                 throw cancelled
             } catch (error: Exception) {
                 debugProjectionBaselineFailure(error)
                 if (!runtime.isCurrent(session)) {
-                    clearPublishedStateIfOwnedBy(session)
                     return
                 }
                 if (
@@ -1244,19 +1241,13 @@ class EncryptedChatRepository @Inject internal constructor(
                     isRecoverableSecureMessagingStateLoss(error)
                 ) {
                     permanentRecoveryAttempted = true
-                    val recovered = try {
-                        retrySecureMessagingOperation(
-                            isCurrent = { runtime.isCurrent(session) },
-                            operation = {
-                                runtime.recoverPermanentlyUnavailableState(error)
-                            },
-                        )
-                    } catch (cancelled: CancellationException) {
-                        clearPublishedStateIfOwnedBy(session)
-                        throw cancelled
-                    }
+                    val recovered = retrySecureMessagingOperation(
+                        isCurrent = { runtime.isCurrent(session) },
+                        operation = {
+                            runtime.recoverPermanentlyUnavailableState(error)
+                        },
+                    )
                     if (!runtime.isCurrent(session)) {
-                        clearPublishedStateIfOwnedBy(session)
                         return
                     }
                     if (recovered) {
@@ -1271,18 +1262,35 @@ class EncryptedChatRepository @Inject internal constructor(
                 attempt++
                 if (isReadyFor(session) || !runtime.isCurrent(session)) return
                 if (attempt < BASELINE_REFRESH_ATTEMPTS) {
-                    delay(BASELINE_REFRESH_RETRY_DELAY_MILLIS)
+                    awaitBaselineRetryWindow(session, BASELINE_REFRESH_RETRY_DELAY_MILLIS)
                 } else {
                     // A healthy activation must not depend on another flow emission to recover
-                    // from a transient provider/network outage. The collectLatest owner cancels
-                    // this delay immediately on logout, replacement, or another refresh signal.
+                    // from a transient provider/network outage; the identity-change collector
+                    // cancels this wait on logout or replacement, and a successful sync
+                    // completion for this activation cuts it short immediately.
                     attempt = 0
-                    delay(retryCooldownMillis)
+                    awaitBaselineRetryWindow(session, retryCooldownMillis)
                     retryCooldownMillis = (retryCooldownMillis * 2)
                         .coerceAtMost(MAX_BASELINE_REFRESH_COOLDOWN_MILLIS)
                 }
             }
         }
+    }
+
+    /** Waits [millis], or less when this activation reports a successful sync completion. */
+    private suspend fun awaitBaselineRetryWindow(
+        session: SecureMessagingChatSession,
+        millis: Long,
+    ) {
+        merge(
+            flow {
+                delay(millis)
+                emit(Unit)
+            },
+            runtime.baselineRetrySessions
+                .filter { it.identity === session.identity }
+                .map { },
+        ).first()
     }
 
     private fun isRetryableProjectionBaselineFailure(error: Throwable): Boolean {
@@ -1299,17 +1307,20 @@ class EncryptedChatRepository @Inject internal constructor(
         }
     }
 
+    // Session wrappers are re-minted per activation emission; the underlying identity is the
+    // activation. Comparing identities keeps a same-activation re-emission from forcing a
+    // destructive full re-baseline after every lifecycle blip.
     private fun needsProjectionBaseline(session: SecureMessagingChatSession): Boolean =
         synchronized(publicationLock) {
-            publishedSession !== session || !mutableReadiness.value
+            publishedSession?.identity !== session.identity || !mutableReadiness.value
         }
 
     private fun isPublishedSession(session: SecureMessagingChatSession): Boolean =
-        synchronized(publicationLock) { publishedSession === session }
+        synchronized(publicationLock) { publishedSession?.identity === session.identity }
 
     private fun isReadyFor(session: SecureMessagingChatSession): Boolean =
         synchronized(publicationLock) {
-            publishedSession === session && mutableReadiness.value
+            publishedSession?.identity === session.identity && mutableReadiness.value
         }
 
     /**
@@ -1335,6 +1346,28 @@ class EncryptedChatRepository @Inject internal constructor(
     }
 
     override fun chat(chatId: String): ChatPreview? = chats.value.singleOrNull { it.id == chatId }
+
+    override fun searchMessages(query: String, limit: Int): List<MessageSearchHit> {
+        val needle = query.trim()
+        if (needle.length < 2) return emptyList()
+        val previews = chats.value.associateBy(ChatPreview::id)
+        val snapshot = synchronized(conversationLock) {
+            conversationFlows.mapValues { (_, flow) -> flow.value }
+        }
+        val hits = mutableListOf<MessageSearchHit>()
+        for ((conversationId, messages) in snapshot) {
+            val preview = previews[conversationId] ?: continue
+            for (message in messages.asReversed()) {
+                // Only ordinary decrypted text is searchable; media captions ride inside
+                // authenticated descriptors and payment cards are excluded like on iOS.
+                if (message.kind != MessageKind.TEXT) continue
+                if (!message.text.contains(needle, ignoreCase = true)) continue
+                hits += MessageSearchHit(preview, message)
+                if (hits.size >= limit) return hits
+            }
+        }
+        return hits
+    }
 
     override fun conversation(chatId: String): StateFlow<List<Message>> =
         synchronized(conversationLock) {
@@ -1436,14 +1469,16 @@ class EncryptedChatRepository @Inject internal constructor(
             synchronized(publicationLock) {
                 if (
                     establishReadiness ||
-                    (publishedSession === session && mutableReadiness.value)
+                    (publishedSession?.identity === session.identity && mutableReadiness.value)
                 ) {
                     commitPublicationLocked(session, publication)
                     committed = true
                 }
             }
         }
-        if (!current) clearPublishedStateIfOwnedBy(session)
+        // An obsolete refresh simply does not commit: the successor activation's own baseline
+        // replaces (or, on identity change, erases) the publication. Eagerly clearing here used
+        // to blank the UI whenever the registry retained the session mid-refresh.
         current && committed
     }
 
@@ -1539,7 +1574,14 @@ class EncryptedChatRepository @Inject internal constructor(
         publication: ProjectionPublication,
     ) {
         synchronized(conversationLock) {
-            conversationFlows.values.forEach { it.value = emptyList() }
+            // Replace each conversation atomically: a collector never observes an empty list
+            // between commits. Only conversations absent from the new publication are erased
+            // (a departed conversation, or a different account's leftovers after re-login).
+            conversationFlows.forEach { (conversationId, flow) ->
+                if (conversationId !in publication.messagesByConversation) {
+                    flow.value = emptyList()
+                }
+            }
             publication.messagesByConversation.forEach { (conversationId, messages) ->
                 conversationFlows
                     .getOrPut(conversationId) { MutableStateFlow(emptyList()) }
@@ -1616,7 +1658,7 @@ class EncryptedChatRepository @Inject internal constructor(
     private fun clearPublishedStateIfOwnedBy(
         session: SecureMessagingChatSession,
     ): Boolean = synchronized(publicationLock) {
-        if (publishedSession !== session) return@synchronized false
+        if (publishedSession?.identity !== session.identity) return@synchronized false
         clearPublishedStateLocked(owner = null)
         true
     }
@@ -1638,6 +1680,7 @@ class EncryptedChatRepository @Inject internal constructor(
         const val BASELINE_REFRESH_RETRY_DELAY_MILLIS = 5_000L
         const val BASELINE_REFRESH_COOLDOWN_MILLIS = 30_000L
         const val MAX_BASELINE_REFRESH_COOLDOWN_MILLIS = 5 * 60_000L
+        const val SIGNED_OUT_CLEAR_GRACE_MILLIS = 15_000L
     }
 }
 

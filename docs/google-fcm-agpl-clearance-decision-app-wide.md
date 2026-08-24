@@ -59,12 +59,12 @@ Signing certificate.
 
 ## 4. Reviewed runtime baseline
 
-- Reviewed runtime inventory SHA-256: `6539e43d22c0f644e9ae5865280fb2c4e8338103368726c81eb14222fae82b8e`
-- Reviewed runtime graph manifest SHA-256: `da5db3d86fe0bb7dcef97ff5469bbbb742d2ca79013f12df90a17dbf7da3de04`
-- Release runtime components: 203
-- Direct components: 34
-- Transitive components: 169
-- Runtime artifact archives: 166
+- Reviewed runtime inventory SHA-256: `b367304e080f083c067571c2fbbbd062f92a1a0cb9d3ccca21a16485c5b0ec49`
+- Reviewed runtime graph manifest SHA-256: `08643aebc10c171d79602a7bb6cb698872943cb6a0b6da45e78ea1ae3cba9676`
+- Release runtime components: 209
+- Direct components: 38
+- Transitive components: 171
+- Runtime artifact archives: 172
 
 ### Reviewed Google components
 

@@ -2173,8 +2173,8 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         )
 
-        /** Matches the backend's messaging attachment blob size bound. */
-        const val MAX_ATTACHMENT_DOWNLOAD_BYTES = 100L * 1024L * 1024L
+        /** Must cover the largest authenticated ciphertext a kit-media-v1 descriptor can carry. */
+        const val MAX_ATTACHMENT_DOWNLOAD_BYTES = MAX_IMAGE_CIPHERTEXT_BYTES
 
         fun sha256Hex(bytes: ByteArray): String =
             MessageDigest.getInstance("SHA-256").digest(bytes)

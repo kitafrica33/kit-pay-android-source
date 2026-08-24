@@ -4,6 +4,7 @@ import android.graphics.BitmapFactory
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animate
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -36,6 +38,7 @@ import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CheckCircle
@@ -70,29 +73,39 @@ import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.Lifecycle
@@ -105,6 +118,8 @@ import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
 import com.kit.wallet.data.messaging.readBoundedMedia
+import com.kit.wallet.feature.chat.camera.CameraPull
+import com.kit.wallet.feature.chat.camera.KitChatCameraFlow
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.ChatPreview
@@ -117,6 +132,7 @@ import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
 import kotlin.coroutines.coroutineContext
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -218,59 +234,40 @@ fun ConversationScreen(
             }
         }
     }
-    var captureTarget by remember { mutableStateOf<android.net.Uri?>(null) }
-    var captureFile by remember { mutableStateOf<java.io.File?>(null) }
-    fun newCaptureTarget(extension: String): android.net.Uri {
-        val directory = java.io.File(context.cacheDir, "chat-capture").apply { mkdirs() }
-        val file = java.io.File(directory, "capture-${java.util.UUID.randomUUID()}.$extension")
-        captureFile = file
-        return androidx.core.content.FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.chatmedia",
-            file,
-        ).also { captureTarget = it }
-    }
-    val takePhoto = rememberLauncherForActivityResult(
-        ActivityResultContracts.TakePicture(),
-    ) { saved ->
-        val target = captureTarget
-        val file = captureFile
-        captureTarget = null
-        captureFile = null
-        if (saved && target != null) {
-            sendPickedMedia {
-                try {
-                    val bytes = transcodeChatImage(context.contentResolver, target)
-                        ?: error("The captured photo could not be prepared")
-                    Triple(bytes, "image/jpeg", null)
-                } finally {
-                    file?.delete()
-                }
-            }
+    // The in-app CameraX flow replaced the platform capture intents: tap for a photo, hold for
+    // a video, edit, then send. CameraX itself still requires CAMERA to be granted before it
+    // binds; RECORD_AUDIO is requested alongside so held recordings carry sound, and a refusal
+    // only mutes them.
+    var cameraFlowOpen by remember { mutableStateOf(false) }
+    fun capturePermissionGranted(permission: String): Boolean =
+        androidx.core.content.ContextCompat.checkSelfPermission(context, permission) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+    val capturePermissions = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        // The camera may not have been part of this request (already granted); audio alone
+        // being refused only mutes recordings.
+        val cameraGranted = grants[android.Manifest.permission.CAMERA]
+            ?: capturePermissionGranted(android.Manifest.permission.CAMERA)
+        if (cameraGranted) {
+            cameraFlowOpen = true
         } else {
-            file?.delete()
+            viewModel.reportMediaSelectionError("Camera access is needed to capture media.")
         }
     }
-    val captureVideoNote = rememberLauncherForActivityResult(
-        ActivityResultContracts.CaptureVideo(),
-    ) { saved ->
-        val target = captureTarget
-        val file = captureFile
-        captureTarget = null
-        captureFile = null
-        if (saved && target != null) {
-            sendPickedMedia {
-                try {
-                    val bytes = context.contentResolver.openInputStream(target)?.use {
-                        it.readBoundedMedia(MAX_IMAGE_PLAINTEXT_BYTES)
-                    } ?: error("The recorded video could not be opened")
-                    Triple(bytes, "video/mp4", null)
-                } finally {
-                    file?.delete()
-                }
+    fun openCameraFlow() {
+        val missing = buildList {
+            if (!capturePermissionGranted(android.Manifest.permission.CAMERA)) {
+                add(android.Manifest.permission.CAMERA)
             }
+            if (!capturePermissionGranted(android.Manifest.permission.RECORD_AUDIO)) {
+                add(android.Manifest.permission.RECORD_AUDIO)
+            }
+        }
+        if (missing.isEmpty()) {
+            cameraFlowOpen = true
         } else {
-            file?.delete()
+            capturePermissions.launch(missing.toTypedArray())
         }
     }
     val pickDocument = rememberLauncherForActivityResult(
@@ -299,13 +296,40 @@ fun ConversationScreen(
         }
     }
     val currentChat = chat
-    if (!messagingAvailable) {
+    // A transient readiness blip (key revalidation, roster resync) must not replace an open
+    // conversation with an error screen; the retained messages stay visible and sending
+    // simply fails inline until readiness returns.
+    if (!messagingAvailable && messages.isEmpty()) {
         SecureMessagingUnavailable(onBack)
         return
     }
     if (currentChat == null) {
         SecureConversationLoading(onBack)
         return
+    }
+    var galleryMessageId by remember { mutableStateOf<String?>(null) }
+    galleryMessageId?.let { openedId ->
+        ConversationMediaGallery(
+            chatName = currentChat.name,
+            mediaMessages = messages.filter { it.kind in GALLERY_MEDIA_KINDS },
+            initialMessageId = openedId,
+            mediaBytes = mediaBytes,
+            mediaLoading = mediaLoading,
+            mediaErrors = mediaErrors,
+            onLoad = viewModel::openMedia,
+            onRetry = viewModel::retryMedia,
+            onDismiss = { galleryMessageId = null },
+        )
+    }
+    if (cameraFlowOpen) {
+        KitChatCameraFlow(
+            maxTransferBytes = viewModel.captureByteLimit(),
+            onDismiss = { cameraFlowOpen = false },
+            onSendMedia = { bytes, mediaType, caption ->
+                viewModel.sendMedia(bytes, mediaType, caption)
+            },
+            onError = viewModel::reportMediaSelectionError,
+        )
     }
     ConversationContent(
         chat = currentChat,
@@ -333,12 +357,13 @@ fun ConversationScreen(
             }
         },
         onAttachCamera = {
-            if (BuildConfig.MEDIA_MESSAGING_ENABLED) takePhoto.launch(newCaptureTarget("jpg"))
+            if (BuildConfig.MEDIA_MESSAGING_ENABLED) openCameraFlow()
         },
         onAttachVideoNote = {
-            if (BuildConfig.MEDIA_MESSAGING_ENABLED) {
-                captureVideoNote.launch(newCaptureTarget("mp4"))
-            }
+            if (BuildConfig.MEDIA_MESSAGING_ENABLED) openCameraFlow()
+        },
+        onOpenCamera = {
+            if (BuildConfig.MEDIA_MESSAGING_ENABLED) openCameraFlow()
         },
         onAttachDocument = {
             if (BuildConfig.MEDIA_MESSAGING_ENABLED) {
@@ -358,6 +383,7 @@ fun ConversationScreen(
         mediaErrors = mediaErrors,
         onOpenMedia = viewModel::openMedia,
         onRetryMedia = viewModel::retryMedia,
+        onOpenViewer = { message -> galleryMessageId = message.id },
         restoredDraft = restoredDraft,
         onRestoredDraftConsumed = viewModel::consumeRestoredDraft,
         onPersistDraft = viewModel::persistDraft,
@@ -471,6 +497,7 @@ private fun ConversationContent(
     onAttachCamera: () -> Unit = {},
     onAttachVideoNote: () -> Unit = {},
     onAttachDocument: () -> Unit = {},
+    onOpenCamera: () -> Unit = {},
     onSendVoiceNote: (ByteArray) -> Unit = {},
     mediaEnabled: Boolean = false,
     mediaBytes: Map<String, ByteArray> = emptyMap(),
@@ -478,6 +505,7 @@ private fun ConversationContent(
     mediaErrors: Map<String, String> = emptyMap(),
     onOpenMedia: (Message) -> Unit = {},
     onRetryMedia: (Message) -> Unit = {},
+    onOpenViewer: (Message) -> Unit = {},
     restoredDraft: String? = null,
     onRestoredDraftConsumed: () -> Unit = {},
     onPersistDraft: (String) -> Unit = {},
@@ -518,21 +546,35 @@ private fun ConversationContent(
     }
 
     // Keep the newest message visible, just like WhatsApp: jump to the bottom the first time the
-    // thread loads, then smoothly follow every message that is sent or arrives afterwards.
+    // thread loads, then follow new messages only while the reader is already near the bottom.
+    // A reader who scrolled up to older history is never yanked; a chip offers the way back.
     val listState = rememberLazyListState()
+    val conversationRows = remember(messages) { groupConversationRows(messages) }
     var renderedMessageCount by remember { mutableStateOf(0) }
-    LaunchedEffect(messages.size) {
-        if (messages.isEmpty()) {
-            renderedMessageCount = 0
-            return@LaunchedEffect
+    var pendingNewMessages by remember { mutableStateOf(0) }
+    val coroutineScopeForScroll = rememberCoroutineScope()
+    // The list header adds two leading items (date + encryption notice) and a trailing spacer,
+    // so the newest message sits just above the final index.
+    val nearBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+            lastVisible >= info.totalItemsCount - 3
         }
-        // The list header adds two leading items (date + encryption notice) and a trailing spacer,
-        // so the newest message sits just above the final index.
-        val bottomIndex = messages.size + 2
-        if (renderedMessageCount == 0) {
-            listState.scrollToItem(bottomIndex)
-        } else if (messages.size > renderedMessageCount) {
-            listState.animateScrollToItem(bottomIndex)
+    }
+    LaunchedEffect(nearBottom) {
+        if (nearBottom) pendingNewMessages = 0
+    }
+    LaunchedEffect(messages.size, messages.lastOrNull()?.id) {
+        if (messages.isEmpty()) return@LaunchedEffect
+        val bottomIndex = conversationRows.size + 2
+        val lastFromMe = messages.lastOrNull()?.fromMe == true
+        when {
+            renderedMessageCount == 0 -> listState.scrollToItem(bottomIndex)
+            messages.size > renderedMessageCount && (nearBottom || lastFromMe) ->
+                listState.animateScrollToItem(bottomIndex)
+            messages.size > renderedMessageCount ->
+                pendingNewMessages += messages.size - renderedMessageCount
         }
         renderedMessageCount = messages.size
     }
@@ -638,11 +680,65 @@ private fun ConversationContent(
             }
         },
     ) { padding ->
+        // Pull-beyond-latest: dragging up past the newest message reveals a camera panel behind
+        // the list, and releasing past the threshold opens the in-app camera (the TikTok feel).
+        val density = LocalDensity.current
+        val cameraPullMaxPx = with(density) { CAMERA_PULL_MAX_REVEAL.toPx() }
+        val cameraPullThresholdPx = with(density) { CAMERA_PULL_OPEN_THRESHOLD.toPx() }
+        var cameraRevealPx by remember { mutableFloatStateOf(0f) }
+        val currentOnOpenCamera by rememberUpdatedState(onOpenCamera)
+        val cameraPullConnection = remember(mediaEnabled, cameraPullMaxPx, cameraPullThresholdPx) {
+            object : NestedScrollConnection {
+                override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                    if (!mediaEnabled || source != NestedScrollSource.UserInput) return Offset.Zero
+                    val result = CameraPull.collapse(cameraRevealPx, available.y)
+                    cameraRevealPx = result.revealPx
+                    return Offset(0f, result.consumedY)
+                }
+
+                override fun onPostScroll(
+                    consumed: Offset,
+                    available: Offset,
+                    source: NestedScrollSource,
+                ): Offset {
+                    if (!mediaEnabled || source != NestedScrollSource.UserInput) return Offset.Zero
+                    val next = CameraPull.pull(cameraRevealPx, available.y, cameraPullMaxPx)
+                    val used = next - cameraRevealPx
+                    cameraRevealPx = next
+                    return Offset(0f, -used)
+                }
+
+                override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                    if (cameraRevealPx > 0f) {
+                        if (CameraPull.shouldOpen(cameraRevealPx, cameraPullThresholdPx)) {
+                            currentOnOpenCamera()
+                        }
+                        animate(cameraRevealPx, 0f) { value, _ -> cameraRevealPx = value }
+                    }
+                    return Velocity.Zero
+                }
+            }
+        }
+        Box(
+            Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .nestedScroll(cameraPullConnection),
+        ) {
+        if (cameraRevealPx > 0f) {
+            CameraPeekPanel(
+                pastThreshold = CameraPull.shouldOpen(cameraRevealPx, cameraPullThresholdPx),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .height(with(density) { cameraRevealPx.toDp() }),
+            )
+        }
         LazyColumn(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
+                .offset { IntOffset(0, -cameraRevealPx.roundToInt()) }
                 .padding(horizontal = 14.dp),
         ) {
             item {
@@ -687,8 +783,26 @@ private fun ConversationContent(
                     }
                 }
             }
-            items(messages.size) { i ->
-                val message = messages[i]
+            items(
+                count = conversationRows.size,
+                // Stable keys keep scroll anchoring and item state correct when the projection
+                // republishes the whole list (which happens on every sync commit).
+                key = { index -> conversationRows[index].key },
+            ) { i ->
+                val group = conversationRows[i] as? ConversationRow.ImageGroup
+                if (group != null) {
+                    ImageGroupBubble(
+                        messages = group.messages,
+                        fromMe = group.messages.first().fromMe,
+                        mediaBytes = mediaBytes,
+                        mediaLoading = mediaLoading,
+                        mediaErrors = mediaErrors,
+                        onOpenMedia = onOpenMedia,
+                        onOpenViewer = onOpenViewer,
+                    )
+                    return@items
+                }
+                val message = (conversationRows[i] as ConversationRow.Single).message
                 if (message.kind == MessageKind.CALL) {
                     CallLogBubble(
                         msg = message,
@@ -719,12 +833,53 @@ private fun ConversationContent(
                         mediaError = mediaErrors[message.id],
                         onOpenMedia = { onOpenMedia(message) },
                         onRetryMedia = { onRetryMedia(message) },
+                        onOpenViewer = { onOpenViewer(message) },
                         requestSettled = message.paymentRequestId?.lowercase() in settledRequestIds,
                         onPayRequest = { payTarget = message },
                     )
                 }
             }
             item { Spacer(Modifier.height(8.dp)) }
+        }
+        if (pendingNewMessages > 0) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.secondary,
+                shadowElevation = 4.dp,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 12.dp)
+                    .clickable {
+                        val target = conversationRows.size + 2
+                        pendingNewMessages = 0
+                        coroutineScopeForScroll.launch {
+                            listState.animateScrollToItem(target)
+                        }
+                    },
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Rounded.ArrowDownward,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSecondary,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        if (pendingNewMessages == 1) {
+                            "1 new message"
+                        } else {
+                            "$pendingNewMessages new messages"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSecondary,
+                    )
+                }
+            }
+        }
         }
     }
 }
@@ -742,6 +897,7 @@ internal fun MessageBubble(
     mediaError: String? = null,
     onOpenMedia: () -> Unit = {},
     onRetryMedia: () -> Unit = {},
+    onOpenViewer: () -> Unit = {},
     requestSettled: Boolean = false,
     onPayRequest: () -> Unit = {},
 ) {
@@ -836,6 +992,7 @@ internal fun MessageBubble(
                             mediaError = mediaError,
                             onOpenMedia = onOpenMedia,
                             onRetryMedia = onRetryMedia,
+                            onOpenViewer = onOpenViewer,
                         )
                         MessageKind.DOCUMENT -> SecureDocumentContent(
                             msg = msg,
@@ -852,6 +1009,7 @@ internal fun MessageBubble(
                             mediaError = mediaError,
                             onOpenMedia = onOpenMedia,
                             onRetryMedia = onRetryMedia,
+                            onOpenViewer = onOpenViewer,
                         )
                         else -> Text(msg.text, style = MaterialTheme.typography.bodyLarge)
                     }
@@ -1287,6 +1445,32 @@ private fun CallLogBubble(msg: Message, onCall: () -> Unit) {
     }
 }
 
+/** The camera panel peeking from behind the conversation while the pull gesture is held. */
+@Composable
+private fun CameraPeekPanel(pastThreshold: Boolean, modifier: Modifier = Modifier) {
+    Box(
+        modifier.background(Color(0xFF10151B)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Rounded.PhotoCamera,
+                contentDescription = null,
+                tint = if (pastThreshold) KitGreen300 else Color.White.copy(alpha = 0.8f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                if (pastThreshold) "Release to open the camera" else "Keep pulling for the camera",
+                color = Color.White.copy(alpha = 0.85f),
+                style = MaterialTheme.typography.labelMedium,
+            )
+        }
+    }
+}
+
+private val CAMERA_PULL_MAX_REVEAL = 160.dp
+private val CAMERA_PULL_OPEN_THRESHOLD = 110.dp
+
 private fun formatCallDuration(seconds: Long): String {
     val minutes = seconds / 60
     val secs = seconds % 60
@@ -1309,6 +1493,7 @@ private fun SecureImageContent(
     mediaError: String?,
     onOpenMedia: () -> Unit,
     onRetryMedia: () -> Unit,
+    onOpenViewer: () -> Unit = {},
 ) {
     var bitmap by remember(mediaBytes) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     var decodeFailed by remember(mediaBytes) { mutableStateOf(false) }
@@ -1343,7 +1528,8 @@ private fun SecureImageContent(
                 modifier = Modifier
                     .widthIn(max = 260.dp)
                     .heightIn(max = 320.dp)
-                    .clip(RoundedCornerShape(12.dp)),
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable(onClick = onOpenViewer),
                 contentScale = ContentScale.Fit,
             )
             displayError != null -> Column {

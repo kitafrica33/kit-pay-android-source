@@ -1,8 +1,8 @@
 {
   "schema_version": 3,
   "application_id": "com.kit.wallet",
-  "version_name": "0.2.18",
-  "version_code": 30,
+  "version_name": "0.2.19",
+  "version_code": 31,
   "audit_date": "2026-07-22",
   "distribution_clearance": true,
   "unresolved_issue_ids": [],
@@ -61,9 +61,9 @@
     ],
     "rationale": "Namisi Arnold Paul, Chief Executive Officer of Kit POS Uganda Limited, approved all future Kit Pay releases under the app-specific standing policy. The clearance is not bound to a candidate, version name, version code, tag, commit, APK, or AAB. Version and artifact metadata changes do not require a new approval by themselves; material dependency, licence, signing-identity, or distribution-architecture changes require re-review before the affected release may rely on the app-wide clearance.",
     "decision_document": "docs/google-fcm-agpl-clearance-decision-app-wide.md",
-    "decision_document_sha256": "de0b1ed0cb5dcd691fd1b36988842878755422c84bdbe7bef5a3bfee678a25db",
-    "reviewed_runtime_inventory_sha256": "6539e43d22c0f644e9ae5865280fb2c4e8338103368726c81eb14222fae82b8e",
-    "reviewed_runtime_graph_manifest_sha256": "da5db3d86fe0bb7dcef97ff5469bbbb742d2ca79013f12df90a17dbf7da3de04",
+    "decision_document_sha256": "58a26382838bd26e4a80378bfe6dd7cb8466a88abcf64db85f5bf12e6017904e",
+    "reviewed_runtime_inventory_sha256": "b367304e080f083c067571c2fbbbd062f92a1a0cb9d3ccca21a16485c5b0ec49",
+    "reviewed_runtime_graph_manifest_sha256": "08643aebc10c171d79602a7bb6cb698872943cb6a0b6da45e78ea1ae3cba9676",
     "reviewed_artifacts": [
       {
         "coordinate": "com.google.android.gms:play-services-base:18.1.0",
@@ -98,14 +98,14 @@
     ]
   },
   "inventory": {
-    "release_runtime_components": 203,
-    "direct_components": 34,
-    "transitive_components": 169,
-    "artifact_archives": 166,
+    "release_runtime_components": 209,
+    "direct_components": 38,
+    "transitive_components": 171,
+    "artifact_archives": 172,
     "separate_core_library_desugaring_inputs": 1
   },
   "normalized_license_counts": {
-    "Apache-2.0": 190,
+    "Apache-2.0": 196,
     "LicenseRef-Android-SDK-License": 6,
     "BSD-3-Clause": 3,
     "AGPL-3.0-only": 2,
@@ -156,6 +156,18 @@
       "issue_ids": []
     },
     {
+      "coordinate": "androidx.appcompat:appcompat-resources:1.6.1",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.appcompat:appcompat:1.6.1",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
       "coordinate": "androidx.arch.core:core-common:2.2.0",
       "relationship": "transitive",
       "declared_evidence": "Apache-2.0",
@@ -170,6 +182,42 @@
     {
       "coordinate": "androidx.autofill:autofill:1.0.0",
       "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.biometric:biometric:1.1.0",
+      "relationship": "direct",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.camera:camera-camera2:1.4.2",
+      "relationship": "direct",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.camera:camera-core:1.4.2",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.camera:camera-lifecycle:1.4.2",
+      "relationship": "direct",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.camera:camera-video:1.4.2",
+      "relationship": "direct",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.camera:camera-view:1.4.2",
+      "relationship": "direct",
       "declared_evidence": "Apache-2.0",
       "issue_ids": []
     },
@@ -432,6 +480,12 @@
       "issue_ids": []
     },
     {
+      "coordinate": "androidx.cursoradapter:cursoradapter:1.0.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
       "coordinate": "androidx.customview:customview-poolingcontainer:1.0.0",
       "relationship": "transitive",
       "declared_evidence": "Apache-2.0",
@@ -522,7 +576,25 @@
       "issue_ids": []
     },
     {
+      "coordinate": "androidx.drawerlayout:drawerlayout:1.0.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.emoji2:emoji2-views-helper:1.3.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
       "coordinate": "androidx.emoji2:emoji2:1.3.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.exifinterface:exifinterface:1.3.7",
       "relationship": "transitive",
       "declared_evidence": "Apache-2.0",
       "issue_ids": []
@@ -750,6 +822,12 @@
       "issue_ids": []
     },
     {
+      "coordinate": "androidx.resourceinspection:resourceinspection-annotation:1.0.1",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
       "coordinate": "androidx.room:room-common-jvm:2.7.2",
       "relationship": "transitive",
       "declared_evidence": "Apache-2.0",
@@ -834,6 +912,18 @@
       "issue_ids": []
     },
     {
+      "coordinate": "androidx.vectordrawable:vectordrawable-animated:1.1.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "androidx.vectordrawable:vectordrawable:1.1.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
       "coordinate": "androidx.versionedparcelable:versionedparcelable:1.1.1",
       "relationship": "transitive",
       "declared_evidence": "Apache-2.0",
@@ -858,6 +948,12 @@
       "issue_ids": []
     },
     {
+      "coordinate": "com.android.tools:desugar_jdk_libs:2.1.5",
+      "relationship": "coreLibraryDesugaring",
+      "declared_evidence": "GPL-2.0-with-Classpath-Exception",
+      "issue_ids": []
+    },
+    {
       "coordinate": "com.auth0.android:jwtdecode:2.0.2",
       "relationship": "transitive",
       "declared_evidence": "MIT",
@@ -865,6 +961,12 @@
     },
     {
       "coordinate": "com.github.davidliu:audioswitch:039a35aefab7747c557242fa216c9ea11743b604",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "com.google.accompanist:accompanist-drawablepainter:0.32.0",
       "relationship": "transitive",
       "declared_evidence": "Apache-2.0",
       "issue_ids": []
@@ -915,6 +1017,12 @@
       "coordinate": "com.google.android.gms:play-services-tasks:18.1.0",
       "relationship": "transitive",
       "declared_evidence": "LicenseRef-Android-SDK-License",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "com.google.auto.value:auto-value-annotations:1.6.3",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
       "issue_ids": []
     },
     {
@@ -1068,6 +1176,18 @@
       "issue_ids": []
     },
     {
+      "coordinate": "com.squareup.okio:okio-jvm:3.9.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "com.squareup.okio:okio:3.9.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
       "coordinate": "com.squareup.retrofit2:converter-moshi:2.11.0",
       "relationship": "direct",
       "declared_evidence": "Apache-2.0",
@@ -1083,6 +1203,30 @@
       "coordinate": "com.vdurmont:semver4j:3.1.0",
       "relationship": "transitive",
       "declared_evidence": "MIT",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "io.coil-kt:coil-base:2.7.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "io.coil-kt:coil-compose-base:2.7.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "io.coil-kt:coil-compose:2.7.0",
+      "relationship": "direct",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "io.coil-kt:coil:2.7.0",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
       "issue_ids": []
     },
     {
@@ -1129,6 +1273,12 @@
     },
     {
       "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.25",
+      "relationship": "transitive",
+      "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.0",
       "relationship": "transitive",
       "declared_evidence": "Apache-2.0",
       "issue_ids": []
@@ -1221,120 +1371,6 @@
       "coordinate": "org.signal:libsignal-client:0.97.4",
       "relationship": "direct",
       "declared_evidence": "AGPL-3.0-only",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "com.android.tools:desugar_jdk_libs:2.1.5",
-      "relationship": "coreLibraryDesugaring",
-      "declared_evidence": "GPL-2.0-with-Classpath-Exception",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "androidx.biometric:biometric:1.1.0",
-      "relationship": "direct",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "androidx.cursoradapter:cursoradapter:1.0.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "androidx.drawerlayout:drawerlayout:1.0.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "androidx.vectordrawable:vectordrawable-animated:1.1.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "androidx.vectordrawable:vectordrawable:1.1.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "androidx.appcompat:appcompat-resources:1.6.1",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "androidx.appcompat:appcompat:1.6.1",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "androidx.emoji2:emoji2-views-helper:1.3.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "androidx.exifinterface:exifinterface:1.3.7",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "androidx.resourceinspection:resourceinspection-annotation:1.0.1",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "com.google.accompanist:accompanist-drawablepainter:0.32.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "com.squareup.okio:okio-jvm:3.9.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "com.squareup.okio:okio:3.9.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "io.coil-kt:coil-base:2.7.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "io.coil-kt:coil-compose-base:2.7.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "io.coil-kt:coil-compose:2.7.0",
-      "relationship": "direct",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "io.coil-kt:coil:2.7.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
-      "issue_ids": []
-    },
-    {
-      "coordinate": "org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.0",
-      "relationship": "transitive",
-      "declared_evidence": "Apache-2.0",
       "issue_ids": []
     }
   ]

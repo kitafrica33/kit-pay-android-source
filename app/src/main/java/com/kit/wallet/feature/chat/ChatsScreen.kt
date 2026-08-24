@@ -44,6 +44,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -59,8 +60,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.data.demo.DemoData
+import kotlinx.coroutines.delay
+import com.kit.wallet.data.repository.MessageSearchHit
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.model.ChatPreview
+import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
@@ -73,6 +77,7 @@ fun ChatsScreen(
 ) {
     val chats by viewModel.chats.collectAsStateWithLifecycle()
     val messagingAvailable by viewModel.messagingAvailable.collectAsStateWithLifecycle()
+    val contacts by viewModel.searchableContacts.collectAsStateWithLifecycle()
     ChatsContent(
         allChats = chats,
         messagingAvailable = messagingAvailable,
@@ -81,6 +86,9 @@ fun ChatsScreen(
         onSetPinned = viewModel::setPinned,
         onSetMuted = viewModel::setMuted,
         onMarkRead = viewModel::markRead,
+        searchableContacts = contacts,
+        searchMessages = viewModel::searchMessages,
+        onSearchedContact = { contact -> viewModel.openDirectConversation(contact, onChat) },
     )
 }
 
@@ -93,12 +101,33 @@ private fun ChatsContent(
     onSetPinned: (Collection<String>, Boolean) -> Unit = { _, _ -> },
     onSetMuted: (Collection<String>, Boolean) -> Unit = { _, _ -> },
     onMarkRead: (Collection<String>) -> Unit = {},
+    searchableContacts: List<Contact> = emptyList(),
+    searchMessages: (String) -> List<MessageSearchHit> = { emptyList() },
+    onSearchedContact: (Contact) -> Unit = {},
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf("All") }
     // Multi-select is a transient gesture mode; it deliberately resets on process death.
     var selected by remember { mutableStateOf(setOf<String>()) }
     val selecting = selected.isNotEmpty()
+    val searching = query.isNotBlank()
+
+    // Debounced local search over decrypted projections, matching iOS's 220 ms search sheet.
+    var messageHits by remember { mutableStateOf(emptyList<MessageSearchHit>()) }
+    LaunchedEffect(query) {
+        if (query.isBlank()) {
+            messageHits = emptyList()
+        } else {
+            delay(220)
+            messageHits = searchMessages(query)
+        }
+    }
+    val contactHits = if (searching) {
+        searchableContacts.filter { it.name.contains(query, true) || it.phone.contains(query) }
+            .take(6)
+    } else {
+        emptyList()
+    }
 
     val chats = allChats.filter { c ->
         val q = query.isBlank() || c.name.contains(query, true) || c.lastMessage.contains(query, true)
@@ -233,6 +262,38 @@ private fun ChatsContent(
                     )
                 }
             }
+            if (searching && contactHits.isNotEmpty()) {
+                item { SearchSectionHeader("Contacts") }
+                items(contactHits.size) { i ->
+                    val contact = contactHits[i]
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { onSearchedContact(contact) }
+                            .padding(horizontal = 20.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        KitAvatar(contact.name, size = 40.dp, avatarUrl = contact.avatarUrl)
+                        Spacer(Modifier.width(12.dp))
+                        Column {
+                            Text(
+                                contact.name,
+                                style = MaterialTheme.typography.titleSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                contact.phone,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+            if (searching && chats.isNotEmpty()) {
+                item { SearchSectionHeader("Chats") }
+            }
             items(chats.size) { i ->
                 val chat = chats[i]
                 ChatRow(
@@ -252,9 +313,56 @@ private fun ChatsContent(
                     onMarkRead = { onMarkRead(listOf(chat.id)) },
                 )
             }
+            if (searching && messageHits.isNotEmpty()) {
+                item { SearchSectionHeader("Messages") }
+                items(messageHits.size) { i ->
+                    val hit = messageHits[i]
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { onChat(hit.chat.id) }
+                            .padding(horizontal = 20.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        KitAvatar(hit.chat.name, size = 40.dp, avatarUrl = hit.chat.avatarUrl)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                hit.chat.name,
+                                style = MaterialTheme.typography.titleSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                hit.message.text,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            hit.message.time,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
             item { Spacer(Modifier.height(90.dp)) }
         }
     }
+}
+
+@Composable
+private fun SearchSectionHeader(title: String) {
+    Text(
+        title,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(start = 20.dp, top = 14.dp, bottom = 4.dp),
+    )
 }
 
 /** Friendly first-run/empty content so the tab never renders as a bare search box. */

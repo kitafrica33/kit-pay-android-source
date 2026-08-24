@@ -3,6 +3,7 @@ package com.kit.wallet.feature.chat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.messaging.KitChatMediaLimits
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.MessagingRichMediaCapability
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
@@ -10,10 +11,12 @@ import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatPaymentRequest
 import com.kit.wallet.data.repository.ChatRepository
+import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.model.ChatPreview
+import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
@@ -98,9 +101,28 @@ internal class ConversationSoundBaseline {
 }
 
 @HiltViewModel
-class ChatsViewModel @Inject constructor(private val chatRepo: ChatRepository) : ViewModel() {
+class ChatsViewModel @Inject constructor(
+    private val chatRepo: ChatRepository,
+    contactRepo: ContactRepository,
+) : ViewModel() {
     val messagingAvailable = chatRepo.readiness
     val chats = chatRepo.chats
+
+    /** Kit contacts for the global-search Contacts section, like the iOS search sheet. */
+    val searchableContacts = contactRepo.contacts
+        .map { contacts -> contacts.filter { it.isKitUser && it.id.isNotBlank() } }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Local-only search across decrypted text projections. */
+    fun searchMessages(query: String) = chatRepo.searchMessages(query)
+
+    /** Opens (or creates) the direct conversation for a searched contact. */
+    fun openDirectConversation(contact: Contact, onOpened: (String) -> Unit) {
+        viewModelScope.launch {
+            runCatching { chatRepo.openDirectConversation(contact) }
+                .onSuccess(onOpened)
+        }
+    }
 
     /** Total unread messages across every conversation, for the navigation badge. */
     val totalUnread: StateFlow<Int> = chatRepo.chats
@@ -525,6 +547,14 @@ class ConversationViewModel @Inject constructor(
     fun sendImage(bytes: ByteArray, mediaType: String, onSent: () -> Unit = {}) =
         sendMedia(bytes, mediaType, caption = null, onSent = onSent)
 
+    /**
+     * Recording/encoding cap for the in-app camera: the compiled policy clamped to what this
+     * service currently accepts, so the camera improves for free when the service limit rises.
+     */
+    fun captureByteLimit(): Long =
+        richMediaCapability?.maximumSendableBytes()
+            ?: KitChatMediaLimits.MAX_TRANSFER_BYTES.toLong()
+
     /** Sends any kit-media-v1 attachment (photo, voice note, video or document) end-to-end. */
     fun sendMedia(
         bytes: ByteArray,
@@ -539,6 +569,15 @@ class ConversationViewModel @Inject constructor(
             bytes.isEmpty() ||
             mutableSending.value
         ) {
+            // Dropping a capture without a word would present a fake success (the camera has
+            // already closed); say why the attachment was not queued.
+            if (bytes.isNotEmpty() && selectedChat != null) {
+                mutableError.value = if (mutableSending.value) {
+                    "Wait for the current attachment to finish sending, then try again"
+                } else {
+                    "Secure messaging is temporarily unavailable"
+                }
+            }
             bytes.fill(0)
             return
         }
@@ -546,7 +585,7 @@ class ConversationViewModel @Inject constructor(
             mutableSending.value = true
             mutableError.value = null
             try {
-                richMediaCapability?.requireAvailable(mediaType.trim().lowercase())
+                richMediaCapability?.requireSendable(mediaType.trim().lowercase(), bytes.size.toLong())
                 chatRepo.sendImageMessage(selectedChat.id, bytes, mediaType, caption)
                 onSent()
             } catch (cancelled: CancellationException) {
