@@ -51,7 +51,50 @@ class MoneyTest {
     }
 
     @Test fun `formats currency using its authoritative scale`() {
-        assertEquals("UGX 1000", Money.format(1_000, "UGX", 0))
+        assertEquals("UGX 1,000", Money.format(1_000, "UGX", 0))
         assertEquals("+USD 10.5", Money.format(1_050, "usd", 2, signed = true))
+    }
+
+    @Test
+    fun `currency-aware formatting groups whole units like the wallet balance`() {
+        assertEquals("UGX 120,000", Money.format(12_000_000, "UGX", 2))
+        assertEquals("UGX 1,284,500", Money.format(128_450_000, "UGX", 2))
+        assertEquals(Money.format(2_500_000), Money.format(2_500_000, "UGX", 2))
+        assertEquals("−KES 1,234.56", Money.format(-123_456, "KES", 2))
+        assertEquals("JPY 500", Money.format(500, "JPY", 0))
+        assertEquals("BHD 1,000.001", Money.format(1_000_001, "BHD", 3))
+    }
+
+    @Test
+    fun `typed amounts are grouped for display without altering the entry`() {
+        assertEquals("25,000", Money.groupTypedAmount("25000"))
+        assertEquals("1,284,500", Money.groupTypedAmount("1284500"))
+        assertEquals("100", Money.groupTypedAmount("100"))
+        assertEquals("", Money.groupTypedAmount(""))
+        // A half-typed decimal keeps every character the keypad produced.
+        assertEquals("25,000.", Money.groupTypedAmount("25000."))
+        assertEquals("25,000.5", Money.groupTypedAmount("25000.5"))
+        assertEquals(".5", Money.groupTypedAmount(".5"))
+        // Anything that is not a plain digit run is echoed untouched rather than mangled.
+        assertEquals("1e5", Money.groupTypedAmount("1e5"))
+        assertEquals("-100", Money.groupTypedAmount("-100"))
+    }
+
+    @Test
+    fun `grouping a typed amount never changes what it parses to`() {
+        listOf("0", "7", "25000", "1284500", "0.29", "1000.05").forEach { typed ->
+            assertEquals(
+                Money.parseMinor(typed),
+                Money.parseMinor(Money.groupTypedAmount(typed).replace(",", "")),
+            )
+        }
+    }
+
+    @Test
+    fun `currency-aware formatting survives the minimum long value`() {
+        assertEquals(
+            "−UGX 92,233,720,368,547,758.08",
+            Money.format(Long.MIN_VALUE, "UGX", 2),
+        )
     }
 }

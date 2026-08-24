@@ -2,5 +2,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Debug-only support for local/emulator HTTP backends selected with
          -PKIT_WALLET_BASE_URL. Release builds keep Android's HTTPS default. -->
-    <application android:usesCleartextTraffic="true" />
+    <application android:usesCleartextTraffic="true">
+
+        <!-- Renders one production screen filled with fictional data so the Play listing
+             screenshots can be captured from an emulator. Debug source set only: it is not
+             merged into any distributable build, so the exported flag never ships. -->
+        <activity
+            android:name="com.kit.wallet.screenshots.StoreScreenshotActivity"
+            android:exported="true"
+            android:label="Kit Pay"
+            android:theme="@style/Theme.KitWallet" />
+    </application>
 </manifest>

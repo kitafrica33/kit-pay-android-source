@@ -321,7 +321,7 @@ private fun AmountEntry(
         Spacer(Modifier.weight(1f))
         Text(
             if (amountText.isEmpty()) "${Money.SYMBOL} 0"
-            else "${Money.SYMBOL} $amountText",
+            else "${Money.SYMBOL} ${Money.groupTypedAmount(amountText)}",
             style = MaterialTheme.typography.displayMedium,
             color = if (amountText.isEmpty()) MaterialTheme.colorScheme.outline
             else MaterialTheme.colorScheme.onSurface,

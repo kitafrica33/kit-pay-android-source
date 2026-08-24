@@ -40,6 +40,20 @@ object Money {
         return if (withSymbol) "$sign$SYMBOL $body" else "$sign$body"
     }
 
+    /**
+     * Groups a half-typed amount for display without changing what was typed: only the digits
+     * ahead of the decimal point gain separators, and everything from the point onwards is
+     * echoed back verbatim so a keypad entry mid-decimal still reads as the user left it.
+     * Anything that is not a plain digit string is returned untouched.
+     */
+    fun groupTypedAmount(text: String): String {
+        val point = text.indexOf('.')
+        val units = if (point < 0) text else text.substring(0, point)
+        val rest = if (point < 0) "" else text.substring(point)
+        if (!units.all(Char::isDigit)) return text
+        return units.reversed().chunked(3).joinToString(",").reversed() + rest
+    }
+
     fun format(
         amountMinor: Long,
         currencyCode: String,
@@ -54,6 +68,12 @@ object Money {
         }
         val amount = BigDecimal(BigInteger.valueOf(amountMinor).abs(), scale)
             .stripTrailingZeros().toPlainString()
-        return "$sign${currencyCode.uppercase()} $amount"
+        // Group the whole units the same way the single-currency formatter does, so a payment
+        // card and the wallet balance never disagree about how UGX 120,000 is written.
+        val units = amount.substringBefore('.')
+        val fraction = amount.substringAfter('.', "")
+        val grouped = units.reversed().chunked(3).joinToString(",").reversed()
+        val body = if (fraction.isEmpty()) grouped else "$grouped.$fraction"
+        return "$sign${currencyCode.uppercase()} $body"
     }
 }

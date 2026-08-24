@@ -500,7 +500,7 @@ internal data class ConversationComposerState(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ConversationContent(
+internal fun ConversationContent(
     chat: ChatPreview,
     messages: List<Message>,
     onBack: () -> Unit,

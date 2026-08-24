@@ -93,7 +93,7 @@ fun ChatsScreen(
 }
 
 @Composable
-private fun ChatsContent(
+internal fun ChatsContent(
     allChats: List<ChatPreview>,
     messagingAvailable: Boolean,
     onChat: (String) -> Unit,

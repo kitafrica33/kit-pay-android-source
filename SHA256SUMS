@@ -5,11 +5,11 @@
 0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0  ./LICENSE
 f295946ff6ca41eb018f8df87506cab9a421ce760083ca96ff1964f1a1ea51c5  ./NOTICE
 be1bc834fb0a6828c6d04e38970f14f983fec06df21849e9b51ea90d89f34631  ./README.md
-5f74900aa73b286f212db4e9f8dcb59e68015573138691b0befb8c9f0c4ba12c  ./SOURCE_PROVENANCE.json
-c8c720901bea099c12771ea025eb00f06ef49286e71cd124e46f015e565e9ae1  ./THIRD_PARTY_LICENSES.json
-e1fdcd3af61c6a871e5e99db602277c3433465c29eb0451a77c6aacf55014f6e  ./THIRD_PARTY_LICENSES.md
+1468a8d9ca24e881367edd3196032b1e1bcc84f2801f9d6a0105f0893b464915  ./SOURCE_PROVENANCE.json
+28943f2b37b6410278db84870e7d561f72c2c9b9d28cdaeb2193e8f21163fbc8  ./THIRD_PARTY_LICENSES.json
+b6b4c91807c4c1d8be6a50da56eadf3c7855f5007e9e368f13d2961b51cba1db  ./THIRD_PARTY_LICENSES.md
 a02b20bf3674b986e8c225a4b0c090b089059c21576a501ce340e13e5966f353  ./TRADEMARKS.md
-035b093b9ed6cb7f6ee4ad49486c089b907405b53f861e79ad1cc6122185465a  ./app/build.gradle.kts
+d320e88ae6fc7f1d7af94113ba20fca29a8cf817fbc624faf4b23889f10303fb  ./app/build.gradle.kts
 2bfae17243d236862b699f0c1d87c7cd3dc610c0d594fd84be69135414ea64c0  ./app/proguard-rules.pro
 ee7e1ffb1720a585935d3e55e8c9c93c643a6cc3083e872e02b06cbd2a07894e  ./app/schemas/com.kit.wallet.data.local.KitWalletDatabase/1.json
 6fa9cf82212b6efbd52d86d9c4d35129da1162c922ff13ebc7fec54168553532  ./app/schemas/com.kit.wallet.data.local.KitWalletDatabase/2.json
@@ -38,7 +38,9 @@ a4e90edd956cf1c9282e97d989bcdf0f680f45081f180294b534cbd1f54ad961  ./app/src/andr
 b65e9de669823a7ee0712d07f5f2de26b9003e7529d98d9f9e3f36125905af9a  ./app/src/androidTest/java/com/kit/wallet/SecureMessagingResetCrashFenceAndroid9Test.kt
 5c3af0838bf06b135978175c1178a3f353641617df1b7683675b470f70146974  ./app/src/androidTest/java/com/kit/wallet/SendMoneyPreselectionComposeTest.kt
 1ed585034269312673281a7c84878258d335d561d3a29de4f140c2cc95249c54  ./app/src/androidTest/java/com/kit/wallet/UploadImageDecoderTest.kt
-91af5684972d00b9f23bdfd67a0329be62a1be554dae8863c5364694773223e9  ./app/src/debug/AndroidManifest.xml
+8776adc5088ad5929a3695cd1eeeaf492577fc005febb02c79f97779d61ad789  ./app/src/debug/AndroidManifest.xml
+3047ce5bc5f792f50689af146e599d821c8373cbf8a9f86f677d2787a37eab7d  ./app/src/debug/java/com/kit/wallet/screenshots/StoreScreenshotActivity.kt
+a0cbb8d0b37db9cdfc4d215a39463516c42e058598041818255f7945bc044a95  ./app/src/debug/java/com/kit/wallet/screenshots/StoreScreenshotData.kt
 e4005f28b07564ab3732b8a1236ab16e9a37db37a6ee394224303d182802da67  ./app/src/main/AndroidManifest.xml
 0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0  ./app/src/main/assets/legal/AGPL-3.0-only.txt
 cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  ./app/src/main/assets/legal/APACHE-2.0.txt
@@ -49,7 +51,7 @@ a44eb7b5caf5534c6ef536b21edb40b4d6babf91bf97d9d45596868618b2c6fb  ./app/src/main
 dae3375b7a34fa5e154f989e88942fda5919eabba5d6f6e70ae88854cd3ae984  ./app/src/main/assets/legal/LIVEKIT_NOTICE.txt
 fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85  ./app/src/main/assets/legal/MPL-2.0.txt
 6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d  ./app/src/main/assets/legal/PROTOBUF_BSD-3-Clause.txt
-c8c720901bea099c12771ea025eb00f06ef49286e71cd124e46f015e565e9ae1  ./app/src/main/assets/legal/RUNTIME_LICENSE_CLEARANCE.json
+28943f2b37b6410278db84870e7d561f72c2c9b9d28cdaeb2193e8f21163fbc8  ./app/src/main/assets/legal/RUNTIME_LICENSE_CLEARANCE.json
 f2648977a7ce48a6a48962a11ff33b3c754fc23780ac1c4c388d40a96b0815b9  ./app/src/main/assets/legal/SEMVER4J_LICENSE.txt
 f295946ff6ca41eb018f8df87506cab9a421ce760083ca96ff1964f1a1ea51c5  ./app/src/main/assets/legal/THIRD_PARTY_NOTICES.txt
 e6b282fe6c0fb353928923470457f31b44cbab203effd60c0cde4a5bb96c8aec  ./app/src/main/assets/legal/WEBRTC_ANDROID_WRAPPER_MIT_LICENSE.txt
@@ -184,7 +186,7 @@ ff29783aa8409a838b32e09129ff61ba2265ebbe8f5eacb847d9ce4522d3bf16  ./app/src/main
 f6440c134ddf856580258912f064df2551e9389de224459b157874d5d357a5ed  ./app/src/main/java/com/kit/wallet/feature/calls/CallRinger.kt
 f6d5422195b9daa268e6a52d7d8fc55957d65c128a0c1617242c60cfd90f6c16  ./app/src/main/java/com/kit/wallet/feature/calls/CallTerminationQueue.kt
 13f1071f853e0e81f6dcc3171c62b3bde3abc46ab0f1a0893bb0b3fe7c8c5181  ./app/src/main/java/com/kit/wallet/feature/calls/CallTonePlayer.kt
-6d3dd224482d9542fc55b1f1561e7a6bd8163fb3c1324cd0ec11b8bda6843e8e  ./app/src/main/java/com/kit/wallet/feature/calls/CallsScreen.kt
+09aeba2aadad40ac07ae407fc26200c4a2ffd9da8e10ebe21734bf2b397f4685  ./app/src/main/java/com/kit/wallet/feature/calls/CallsScreen.kt
 4e644f49116a8c73b001e6d487d91e3d40bc6c2a5206e95289e0f7f6d6769e13  ./app/src/main/java/com/kit/wallet/feature/calls/CallsViewModel.kt
 bee04342be55c057f051c0336224b8b1943cb6ce08079c4ed3d0153c609c42b5  ./app/src/main/java/com/kit/wallet/feature/calls/DeferredCallTermination.kt
 4d3d1868dc7328188358b52b80572d5395cdfc0194bfa56f5111f77995793dd9  ./app/src/main/java/com/kit/wallet/feature/calls/KitCallConnectionService.kt
@@ -197,8 +199,8 @@ e3b3ba9c948f8d0b8108a30cc340041559d19eca5fcb9499e226db45aaae9d8e  ./app/src/main
 7cc004e6952f0c8c1f71702d83143703273cdb21d360b646cd6f71fc07688029  ./app/src/main/java/com/kit/wallet/feature/chat/ChatMessageGrouping.kt
 b8806e1aadabacee1f0e34a8ea1fa8c20384ae9f0efca1f9fd1f435eba9cfd62  ./app/src/main/java/com/kit/wallet/feature/chat/ChatPaymentTimeline.kt
 131f084f0d78f2f68e3f7e83a3ba6b5dfbb32950189ea89bf53621172a56f606  ./app/src/main/java/com/kit/wallet/feature/chat/ChatViewModels.kt
-de83431462e585226e19f18831f07712fa050471c4fb15d3cae23d0b81619901  ./app/src/main/java/com/kit/wallet/feature/chat/ChatsScreen.kt
-7c493e1eae563246d523385cbecc315e05ccbb02d552d993c8684e1ba3a1506a  ./app/src/main/java/com/kit/wallet/feature/chat/ConversationScreen.kt
+0dafbabba8f2abcc55f7c22875694d2c0bda46e3076760034981c5ddd778b91a  ./app/src/main/java/com/kit/wallet/feature/chat/ChatsScreen.kt
+fffa89efab99e962aaae8da7ae8572a2e972f8a3f841c48eb093366ecd674f36  ./app/src/main/java/com/kit/wallet/feature/chat/ConversationScreen.kt
 dd2ea5c407d24db181b9b0cccad3834bcc082179c72ef2e7ea132f9f717e6fae  ./app/src/main/java/com/kit/wallet/feature/chat/IncomingTextShare.kt
 8c94bade13518fa5d640a73773af62bc2c962137677a749dc91028ce47132658  ./app/src/main/java/com/kit/wallet/feature/chat/IncomingTextShareCoordinator.kt
 394234a47ba937d1c1a8f46779d5521d605522c146c05fc3224a01bb27dbbdeb  ./app/src/main/java/com/kit/wallet/feature/chat/MediaGalleryViewer.kt
@@ -235,10 +237,10 @@ ec7e1afc33fa448ceac3d61b605ecbc42e02d444245e3092f46a702471d78dc5  ./app/src/main
 3f931c1049f41290169ed1da54c8cc95bea44bf9aec0aeed73792e113aeb3f50  ./app/src/main/java/com/kit/wallet/feature/wallet/ReceiveScreen.kt
 715603249cb31f8806167c56bfaa24491f4c98347258add64b52ccf9f4283943  ./app/src/main/java/com/kit/wallet/feature/wallet/RequestMoneyScreen.kt
 dc918f94991110f98d366a2142d17c063df670e53a064d0f97fe0484b1277944  ./app/src/main/java/com/kit/wallet/feature/wallet/ScanScreen.kt
-19cb28af6e238e67d34d900f42be6399d4034fc2d78ae6f20099d055720fc89a  ./app/src/main/java/com/kit/wallet/feature/wallet/SendMoneyScreen.kt
+9f31ae86f15f9b44261aee03160942f995ffc1044f72a0a1e435cb129df965f6  ./app/src/main/java/com/kit/wallet/feature/wallet/SendMoneyScreen.kt
 10e25df49f6aa74f0759f33c17bdd982998030e14da1b37073aa8d6000b67986  ./app/src/main/java/com/kit/wallet/feature/wallet/SystemTextShare.kt
 ef30f30ce6164ffbb2d7b7bbd7322a38ef5dd3e30aa272bbb23e3dcbab2e5a79  ./app/src/main/java/com/kit/wallet/feature/wallet/TransactionDetailScreen.kt
-6da20eb61da3bbd004d19d9469ac87154a5bb5b61e5810db2eb451b879e0878e  ./app/src/main/java/com/kit/wallet/feature/wallet/TransactionsScreen.kt
+76b4120a23ab55cb0adb0d4bebe3a18e9b935ed3c1d66232da94e90ef7cafb00  ./app/src/main/java/com/kit/wallet/feature/wallet/TransactionsScreen.kt
 799fbbb248d18c0e927618826f1715a5a3c85c7b3086b9d52c878adaf8776c90  ./app/src/main/java/com/kit/wallet/feature/wallet/WalletShareText.kt
 ff27591caa6302dd472b06e84378cd382070f06983f97621913cc2a1a5a234da  ./app/src/main/java/com/kit/wallet/feature/wallet/WalletViewModels.kt
 65d106af20a4c45d71800d4b6257a0ea55dc39554f7af1e4e9c54001cc5c5c1f  ./app/src/main/java/com/kit/wallet/navigation/AppCapabilitiesViewModel.kt
@@ -253,7 +255,7 @@ b401eb1da1121ad555fdbac60fc4ecacadd7b45cd97e24b01b1b2b81ef611a0d  ./app/src/main
 39f4eb1bf7bd4dcabff6e0e35cfdaea8ba646d3f7fdd20be008bf854c8d7f7f0  ./app/src/main/java/com/kit/wallet/ui/components/TransactionRow.kt
 0d7b602ce16ab2de5ae8c33112be8092d1162ef666620eb523c9c1676bea0498  ./app/src/main/java/com/kit/wallet/ui/model/MobileMoneyModels.kt
 417009306390f388299797a4d1034260ed3f5961a1d6ea3ddc009b3b1f19056a  ./app/src/main/java/com/kit/wallet/ui/model/Models.kt
-5aeaebacb7e4c72855e9cd37e8f60768f7b5b3e2b2c1dd601fd409580a70be73  ./app/src/main/java/com/kit/wallet/ui/model/Money.kt
+6e2e7229907cddcab5dc4e206fc1e523a09fe8e66593e2c5d804d724c9245416  ./app/src/main/java/com/kit/wallet/ui/model/Money.kt
 f41c51d4ea3e473022296960d33df69453f47963a11d6fd0077947054057515d  ./app/src/main/java/com/kit/wallet/ui/security/SecureScreen.kt
 f69b7cf0b6c129f0f9ec12fc0028811f93016be3a8bd2cd0bb4d836766e5db58  ./app/src/main/java/com/kit/wallet/ui/security/SensitiveClipboard.kt
 9a63eb2cd862785839fba8a4154c88e4b429e8cd65d1d43868cdc709ec03f358  ./app/src/main/java/com/kit/wallet/ui/theme/Color.kt
@@ -336,7 +338,7 @@ ae0c9ae803265d15609ccb06eb074c49cb853537c974eba0453f6953a1081020  ./app/src/test
 91ed92fbb02c3273a8bb011ba9e10664cc2956520844d8a61a863e252ead414c  ./app/src/test/java/com/kit/wallet/MfaSecurityTest.kt
 ffb4f775470e3d51d0b2bb3b97d5c2d076318f2a69b301a97107f9c7f5f7f961  ./app/src/test/java/com/kit/wallet/MissingNavigationArgumentsTest.kt
 ec30206893d30b1fbb462456e754bc487d2b0b57172fac034b7ea71036c25356  ./app/src/test/java/com/kit/wallet/MobileMoneyQuoteContractTest.kt
-4a6e2cc144c1cabb5a890fa2033a964af1cde400d560f5e2377c17343535612c  ./app/src/test/java/com/kit/wallet/MoneyTest.kt
+68e8e5befdbc7602bbfa5c40cdc800fd4e7159b6468a6d5a134d3877bc8dec3b  ./app/src/test/java/com/kit/wallet/MoneyTest.kt
 7863fc3b7ad122263b9ca16b52d78b6952a2dbcf75b51389633430393248db88  ./app/src/test/java/com/kit/wallet/NullableApiFlagsTest.kt
 673ac4eed8a3b09765429baaf5e8b59132a58aff1fc1266fecef2ab18b636b03  ./app/src/test/java/com/kit/wallet/OfflineUserRepositoryTest.kt
 9c26ced2b3f7785bf5320d0622850db0b089edcd55d34c9c7ff0b57093b83a0e  ./app/src/test/java/com/kit/wallet/OfflineWalletSyncRepositoryTest.kt

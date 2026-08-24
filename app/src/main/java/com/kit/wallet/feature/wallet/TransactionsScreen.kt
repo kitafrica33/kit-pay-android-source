@@ -98,7 +98,7 @@ fun TransactionsScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TransactionsContent(
+internal fun TransactionsContent(
     transactions: List<Transaction>,
     onBack: () -> Unit,
     onTransaction: (String) -> Unit,

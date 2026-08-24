@@ -64,7 +64,7 @@ fun CallsScreen(
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
-private fun CallsContent(
+internal fun CallsContent(
     allCalls: List<CallEntry>,
     onVoiceCall: (String) -> Unit,
     onVideoCall: (String) -> Unit,
