@@ -5,11 +5,11 @@
 0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0  ./LICENSE
 f295946ff6ca41eb018f8df87506cab9a421ce760083ca96ff1964f1a1ea51c5  ./NOTICE
 be1bc834fb0a6828c6d04e38970f14f983fec06df21849e9b51ea90d89f34631  ./README.md
-912c1b17f2ec89aa65c7c8c0224edbfce28d660307b0e13d94563c03e9c173ca  ./SOURCE_PROVENANCE.json
-53e821255b5cb733bb5f6ccf8ff0bcebc9e77a83cea8186f22d0050e92af8912  ./THIRD_PARTY_LICENSES.json
-bae5e96581ff5d7e82c8f1d8aa7c68802af9e0ff64413e126a9e0f0dffbd6625  ./THIRD_PARTY_LICENSES.md
+8285eb7e4494d905031e4c1bcda621b22bab2e9fac7d4d5bca4042d461dcae2a  ./SOURCE_PROVENANCE.json
+3dd666d555a50ff63af00106159c4d10f5ee3fb7e0c02a7923812b7c370b4857  ./THIRD_PARTY_LICENSES.json
+db9b5fba576fe16ed73937a18c957d97cc8cdf598f9e7d558667d1457d02c340  ./THIRD_PARTY_LICENSES.md
 a02b20bf3674b986e8c225a4b0c090b089059c21576a501ce340e13e5966f353  ./TRADEMARKS.md
-4003229418488c38253740e9ddfe51a6abe1263f290b3d9c493e528853187f69  ./app/build.gradle.kts
+701dcb38da87b52f83ede304ce64f6c54ada209aac2c7c3b46ee4f1ec71771ea  ./app/build.gradle.kts
 2bfae17243d236862b699f0c1d87c7cd3dc610c0d594fd84be69135414ea64c0  ./app/proguard-rules.pro
 ee7e1ffb1720a585935d3e55e8c9c93c643a6cc3083e872e02b06cbd2a07894e  ./app/schemas/com.kit.wallet.data.local.KitWalletDatabase/1.json
 7e606af3a39fe4c2c18ed713df21b9a15ddc08084358d9da3711d2732a79dcfc  ./app/schemas/com.kit.wallet.data.local.KitWalletDatabase/10.json
@@ -56,7 +56,7 @@ a44eb7b5caf5534c6ef536b21edb40b4d6babf91bf97d9d45596868618b2c6fb  ./app/src/main
 dae3375b7a34fa5e154f989e88942fda5919eabba5d6f6e70ae88854cd3ae984  ./app/src/main/assets/legal/LIVEKIT_NOTICE.txt
 fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85  ./app/src/main/assets/legal/MPL-2.0.txt
 6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d  ./app/src/main/assets/legal/PROTOBUF_BSD-3-Clause.txt
-53e821255b5cb733bb5f6ccf8ff0bcebc9e77a83cea8186f22d0050e92af8912  ./app/src/main/assets/legal/RUNTIME_LICENSE_CLEARANCE.json
+3dd666d555a50ff63af00106159c4d10f5ee3fb7e0c02a7923812b7c370b4857  ./app/src/main/assets/legal/RUNTIME_LICENSE_CLEARANCE.json
 f2648977a7ce48a6a48962a11ff33b3c754fc23780ac1c4c388d40a96b0815b9  ./app/src/main/assets/legal/SEMVER4J_LICENSE.txt
 f295946ff6ca41eb018f8df87506cab9a421ce760083ca96ff1964f1a1ea51c5  ./app/src/main/assets/legal/THIRD_PARTY_NOTICES.txt
 e6b282fe6c0fb353928923470457f31b44cbab203effd60c0cde4a5bb96c8aec  ./app/src/main/assets/legal/WEBRTC_ANDROID_WRAPPER_MIT_LICENSE.txt
@@ -506,6 +506,7 @@ c2448c3ee6157fcbb3a3408c59c421cd3388778eebae467d7cd49827f6620fdd  ./app/src/test
 28b98b191b5047bd71f8c9e5f009a1b3c872d6d599d14c6196006dc9205162e9  ./app/src/test/java/com/kit/wallet/WalletInteractionPolicyTest.kt
 06a544e902e4aba7040eba8e41b3d742c853ddcb6742243b17cb95d942b2bc2d  ./app/src/test/java/com/kit/wallet/WalletShareTextTest.kt
 f8a835840bd850393995918bdc208e4acd9d951606c412fcf4b0732f2ebce2ca  ./app/src/test/java/com/kit/wallet/WalletSyncTestDoubles.kt
+8753f6f392d3d8e6eeee290dc7fd871761239931d923bfb25cd4a38bea918454  ./app/src/test/java/com/kit/wallet/data/backup/DriveBackupJsonCodegenTest.kt
 390873fa472d8a8e7404d6da3c3da2f140834461bacca705336b4cd355090b65  ./app/src/test/java/com/kit/wallet/data/notifications/IncomingCallDeliveryPlanTest.kt
 80a98da07505d1155f932df7c65bb37c513d1b4ce71c8ff8a27c84d275c71617  ./app/src/test/java/com/kit/wallet/data/notifications/RingDeadlineSchedulerTest.kt
 bf1c82fca6b8ba3b4599254b8f40776b204cf0a527a32de7e9f8a798a2414051  ./app/src/test/java/com/kit/wallet/data/notifications/SecureMessageNotificationPresentationTest.kt
@@ -523,7 +524,7 @@ a2eb5e4aa5c50b1a725e2b992ad1fbfe3bd6b9f8617dbe92e2de00b64555a590  ./build.gradle
 5841c3d0df141eb43d895644e9b165fda8267ffd45d07748e98cef3d85555a83  ./gradle/cyclonedx.init.gradle.kts
 3a6b7b3fede2a5b54ce709372cd60ecdbfa08d29140ea4435a81adb3f5b4cd65  ./gradle/drive-authorization.json
 74cd93df68ecdda5e6a8be75cedfded9d52b844e7d0e0e7cf87bb7a4a022afd0  ./gradle/google-fcm-reviewed-artifacts.json
-eeef2d25e8f979b0e27913d7021b34113367faed958bc71d3363bab28536b238  ./gradle/libs.versions.toml
+8b06d596c6d5504e8647dca23e1cd3f712411c505e06c09ce4219c90c5ba9a47  ./gradle/libs.versions.toml
 79ee70a67f8606b49ec5d779102f8bcecdc9ae75a61450aca48020994fac3c30  ./gradle/release-artifact-verification.init.gradle.kts
 9c0c81142cf5bf27ca93e0f5c7569fc56419c7df21fa41e2b82688f41eef2f03  ./gradle/reviewed-runtime-graph.json
 7d3a4ac4de1c32b59bc6a4eb8ecb8e612ccd0cf1ae1e99f66902da64df296172  ./gradle/wrapper/gradle-wrapper.jar
