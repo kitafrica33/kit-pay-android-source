@@ -1,8 +1,8 @@
 {
   "schema_version": 3,
   "application_id": "com.kit.wallet",
-  "version_name": "0.2.22",
-  "version_code": 34,
+  "version_name": "0.2.25",
+  "version_code": 36,
   "audit_date": "2026-07-22",
   "distribution_clearance": true,
   "unresolved_issue_ids": [],
@@ -61,10 +61,20 @@
     ],
     "rationale": "Namisi Arnold Paul, Chief Executive Officer of Kit POS Uganda Limited, approved all future Kit Pay releases under the app-specific standing policy. The clearance is not bound to a candidate, version name, version code, tag, commit, APK, or AAB. Version and artifact metadata changes do not require a new approval by themselves; material dependency, licence, signing-identity, or distribution-architecture changes require re-review before the affected release may rely on the app-wide clearance.",
     "decision_document": "docs/google-fcm-agpl-clearance-decision-app-wide.md",
-    "decision_document_sha256": "58a26382838bd26e4a80378bfe6dd7cb8466a88abcf64db85f5bf12e6017904e",
-    "reviewed_runtime_inventory_sha256": "b367304e080f083c067571c2fbbbd062f92a1a0cb9d3ccca21a16485c5b0ec49",
-    "reviewed_runtime_graph_manifest_sha256": "08643aebc10c171d79602a7bb6cb698872943cb6a0b6da45e78ea1ae3cba9676",
+    "decision_document_sha256": "72b01195cc7366bbf2bfedfc0bb382046e23048841703c7af8e18b4586b478b3",
+    "reviewed_runtime_inventory_sha256": "5c3a5b03b1e620bec8daf4a7b40089661cbbb4fdbd92d288810e50a3b284b0f2",
+    "reviewed_runtime_graph_manifest_sha256": "9c0c81142cf5bf27ca93e0f5c7569fc56419c7df21fa41e2b82688f41eef2f03",
     "reviewed_artifacts": [
+      {
+        "coordinate": "com.google.android.gms:play-services-auth-base:18.0.4",
+        "aar_sha256": "ab524b18725d90a3060da75c41d431d337b6d90f5e9539efeedf215a75deb63f",
+        "pom_sha256": "54f0140924ae1e88787fc9a15d1932a5f397f94bd68f0b8be444bf1c812902bb"
+      },
+      {
+        "coordinate": "com.google.android.gms:play-services-auth:20.7.0",
+        "aar_sha256": "150494d7a052abaaac9bb829a28c8ad26ac3ca59c576c16967bdbe28aaaa4e16",
+        "pom_sha256": "ee85c1294da9874c70403b9f63986b9c4af356ddc88de46ef89518acefdb8089"
+      },
       {
         "coordinate": "com.google.android.gms:play-services-base:18.1.0",
         "aar_sha256": "4eca56ceecd4325a376cd843af56377e2376ce284d0c6f05a5d0a82f4c1bf8cd",
@@ -98,15 +108,15 @@
     ]
   },
   "inventory": {
-    "release_runtime_components": 209,
-    "direct_components": 38,
-    "transitive_components": 171,
-    "artifact_archives": 172,
+    "release_runtime_components": 211,
+    "direct_components": 39,
+    "transitive_components": 172,
+    "artifact_archives": 174,
     "separate_core_library_desugaring_inputs": 1
   },
   "normalized_license_counts": {
     "Apache-2.0": 196,
-    "LicenseRef-Android-SDK-License": 6,
+    "LicenseRef-Android-SDK-License": 8,
     "BSD-3-Clause": 3,
     "AGPL-3.0-only": 2,
     "MIT": 2,
@@ -987,6 +997,18 @@
       "coordinate": "com.google.android.datatransport:transport-runtime:3.1.9",
       "relationship": "transitive",
       "declared_evidence": "Apache-2.0",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "com.google.android.gms:play-services-auth-base:18.0.4",
+      "relationship": "transitive",
+      "declared_evidence": "LicenseRef-Android-SDK-License",
+      "issue_ids": []
+    },
+    {
+      "coordinate": "com.google.android.gms:play-services-auth:20.7.0",
+      "relationship": "direct",
+      "declared_evidence": "LicenseRef-Android-SDK-License",
       "issue_ids": []
     },
     {

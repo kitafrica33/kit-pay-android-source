@@ -1633,9 +1633,28 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
     private val readinessInvalidationListeners = linkedSetOf<() -> Unit>()
     private var currentActivationIdentity: Any? = null
     private var currentCapability: IssuedSecureMessagingActivationCapability? = null
+    private val mutableLocalReadActivation =
+        MutableStateFlow<SecureMessagingActivationCapability?>(null)
 
     /** Authoritative, process-local activation state for repositories and background sync. */
     val runtime: StateFlow<SecureMessagingRuntimeSnapshot> = mutableRuntime.asStateFlow()
+
+    /**
+     * The authority to *read* this device's own encrypted state, published as soon as an
+     * activation begins rather than when message exchange becomes possible.
+     *
+     * Reading local records has never required stage READY — every local lease already defaults to
+     * `readyRequired = false`, and only exchange passes `true`. What was missing was a way to
+     * observe that authority before [SecureMessagingActiveSessionRegistry] publishes its session,
+     * which it deliberately does only at READY. Without it the chat list could not be drawn from
+     * the encrypted store until three network round trips had succeeded.
+     *
+     * This carries no transport, so it can open the local store and nothing else: it cannot send,
+     * cannot decrypt an incoming envelope and cannot advance a sync cursor. It is cleared the
+     * moment the activation is quarantined, erased or replaced.
+     */
+    val localReadActivation: StateFlow<SecureMessagingActivationCapability?> =
+        mutableLocalReadActivation.asStateFlow()
 
     fun snapshot(): SecureMessagingRuntimeSnapshot = synchronized(lock) { current.copy() }
 
@@ -1886,6 +1905,10 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
     private fun setCurrentLocked(snapshot: SecureMessagingRuntimeSnapshot) {
         current = snapshot
         mutableRuntime.value = snapshot
+        // Derived here rather than at each transition so no future stage change can forget to
+        // withdraw it: the local-read authority exists exactly while an activation does.
+        mutableLocalReadActivation.value = currentCapability
+            ?.takeIf { snapshot.stage !in LOCAL_READ_WITHDRAWN_STAGES }
     }
 
     private fun notifyReadinessInvalidated(listeners: List<() -> Unit>) {
@@ -1954,6 +1977,15 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
                 "Secure messaging is not ready for message exchange"
             }
         }
+    }
+
+    private companion object {
+        /** Exactly the stages at which no capability may touch local state, ready or not. */
+        val LOCAL_READ_WITHDRAWN_STAGES = setOf(
+            SecureMessagingRuntimeStage.NO_SESSION,
+            SecureMessagingRuntimeStage.QUARANTINED,
+            SecureMessagingRuntimeStage.ERASING,
+        )
     }
 }
 

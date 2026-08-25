@@ -4,6 +4,7 @@ import androidx.annotation.VisibleForTesting
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
 import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
+import com.kit.wallet.data.remote.ENCRYPTED_REACTION_MESSAGE_KIND
 import com.kit.wallet.data.remote.KitWalletApiException
 import java.io.IOException
 import java.time.Instant
@@ -103,6 +104,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     private val historyContinuationScheduler: SecureMessagingHistoryContinuationScheduler =
         NoOpSecureMessagingHistoryContinuationScheduler,
     private val walletRefresh: WalletRefreshTrigger = NoOpWalletRefreshTrigger,
+    private val systemEvents: ConversationSystemEventStore? = null,
 ) {
     private class SessionState(
         val session: RemoteSecureMessagingTransport.Session,
@@ -116,7 +118,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         val deliveryTokens = mutableListOf<RemoteSecureMessagingTransport.Session.DeliveryToken>()
         var persistedBatchPosition: SecureMessagingSyncResumePosition? = null
         var pendingDecryption: PendingDecryption? = null
-        var conversations: Map<String, RemoteSecureMessagingTransport.Session.DirectConversation>? =
+        var conversations: Map<String, RemoteSecureMessagingTransport.Session.SecureConversation>? =
             null
         val historicalPlans = mutableMapOf<HistoricalRosterKey, HistoricalRosterPlan>()
 
@@ -150,7 +152,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     )
 
     private data class HistoricalRosterPlan(
-        val conversation: RemoteSecureMessagingTransport.Session.DirectConversation,
+        val conversation: RemoteSecureMessagingTransport.Session.SecureConversation,
         val roster: RemoteSecureMessagingTransport.Session.AuthoritativeRoster,
         val plan: SecureMessagingEncryptionPlan,
     )
@@ -219,7 +221,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             val pending = pendingOutboundRecords(session)
             if (pending.isEmpty()) return@withLock
 
-            val conversations = session.directConversations().associateBy { it.conversationId }
+            val conversations = session.conversations().associateBy { it.conversationId }
             val plans = mutableMapOf<String, SecureMessagingEncryptionPlan>()
             pending.forEach { durable ->
                 if (durable.sender.userId != session.binding.userId ||
@@ -235,9 +237,16 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     session.withProjectionLease { markOutboundRetryRequired(durable) }
                     return@forEach
                 }
-                val plan = plans.getOrPut(durable.conversationId) {
+                val reaction = KitReactionMessage.parse(durable.authenticatedText)
+                val plan = if (reaction != null) {
                     val roster = session.roster(conversation)
+                    session.requireReactionCapability(conversation, roster)
                     session.encryptionPlan(conversation, roster)
+                } else {
+                    plans.getOrPut(durable.conversationId) {
+                        val roster = session.roster(conversation)
+                        session.encryptionPlan(conversation, roster)
+                    }
                 }
                 val planSnapshot = SecureMessagingCryptoWireMapper.requireEncryptionPlan(plan)
                 val durableRecipients = durable.ciphertextFanout()
@@ -312,8 +321,8 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         session: RemoteSecureMessagingTransport.Session,
     ) = mutex.withLock {
         val conversations = try {
-            session.directConversations()
-                .associateBy(RemoteSecureMessagingTransport.Session.DirectConversation::conversationId)
+            session.conversations()
+                .associateBy(RemoteSecureMessagingTransport.Session.SecureConversation::conversationId)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
@@ -370,7 +379,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
 
     private suspend fun reconcileHistoryTargets(
         session: RemoteSecureMessagingTransport.Session,
-        conversations: Map<String, RemoteSecureMessagingTransport.Session.DirectConversation>,
+        conversations: Map<String, RemoteSecureMessagingTransport.Session.SecureConversation>,
     ): Map<String, RemoteSecureMessagingTransport.Session.AuthoritativeRoster> {
         val activation = session.activationCapability()
         if (historyReconciledActivation === activation) return emptyMap()
@@ -397,7 +406,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     private suspend fun attemptHistoryTask(
         session: RemoteSecureMessagingTransport.Session,
         task: SecureMessagingHistoryBackfillTask,
-        conversations: Map<String, RemoteSecureMessagingTransport.Session.DirectConversation>,
+        conversations: Map<String, RemoteSecureMessagingTransport.Session.SecureConversation>,
         rosters: MutableMap<String, RemoteSecureMessagingTransport.Session.AuthoritativeRoster>,
     ): Boolean = try {
         backfillRetainedHistoryPage(session, task, conversations, rosters)
@@ -533,10 +542,46 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 is RemoteSecureMessagingTransport.Session.RosterRefreshEvent ->
                     processRosterRefresh(state, event)
                 is RemoteSecureMessagingTransport.Session.MetadataEvent ->
-                    state.invalidateConversation(event.conversationId)
+                    processMetadata(state, event)
             }
             state.eventIndex++
         }
+    }
+
+    /**
+     * A metadata event carries no ciphertext, so the only thing it can change is what the next
+     * refresh reads back — except for a membership change, which is also the only record that a
+     * group's timeline will ever have of somebody joining or leaving.
+     *
+     * The system-message record is written *before* the conversation is invalidated so a refresh
+     * racing this event cannot publish a roster the timeline has no line for. It is best-effort:
+     * a failed write costs one timeline annotation and must never stall the sync cursor, because
+     * a stalled cursor is undelivered messages.
+     */
+    private suspend fun processMetadata(
+        state: SessionState,
+        event: RemoteSecureMessagingTransport.Session.MetadataEvent,
+    ) {
+        val subject = event.memberUserId
+        if (subject != null && event.type in MEMBERSHIP_SYSTEM_EVENT_TYPES) {
+            try {
+                systemEvents?.record(
+                    conversationId = event.conversationId,
+                    event = ConversationSystemEvent(
+                        eventId = event.eventId,
+                        type = event.type,
+                        userId = subject,
+                        role = event.memberRole,
+                        occurredAt = event.occurredAt,
+                    ),
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Deliberately swallowed; see the note above.
+            }
+        }
+        state.invalidateConversation(event.conversationId)
     }
 
     private suspend fun processRosterRefresh(
@@ -627,7 +672,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     private suspend fun backfillRetainedHistoryPage(
         session: RemoteSecureMessagingTransport.Session,
         task: SecureMessagingHistoryBackfillTask,
-        conversations: Map<String, RemoteSecureMessagingTransport.Session.DirectConversation>,
+        conversations: Map<String, RemoteSecureMessagingTransport.Session.SecureConversation>,
         rosters: MutableMap<String, RemoteSecureMessagingTransport.Session.AuthoritativeRoster>,
     ) {
         val conversation = conversations[task.conversationId]
@@ -721,7 +766,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
 
     private suspend fun commitHistoryEncryption(
         session: RemoteSecureMessagingTransport.Session,
-        conversation: RemoteSecureMessagingTransport.Session.DirectConversation,
+        conversation: RemoteSecureMessagingTransport.Session.SecureConversation,
         roster: RemoteSecureMessagingTransport.Session.AuthoritativeRoster,
         plan: SecureMessagingEncryptionPlan,
         transferClientMessageId: String,
@@ -1022,7 +1067,11 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     ) {
         val authoredOnThisAccount = durable.sender.userId == state.session.binding.userId
         val notificationPending = state.withProjectionLease {
+            // A reaction is an annotation on a bubble the user has already been told about, and
+            // its descriptor is not readable copy. It commits to the projection like any other
+            // message but never reaches the shade.
             val pending = !authoredOnThisAccount &&
+                !KitReactionMessage.isReactionText(durable.authenticatedText) &&
                 prepareInboundNotificationPublication(durable, sentAt)
             // Commit and signal the conversation projection before making a shade notification
             // externally visible. An interrupted reconnect can now duplicate only the stable-tag
@@ -1043,7 +1092,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
 
         // Resolve the sender only after the message is locally visible. A temporary conversation
         // lookup failure can delay the alert, but can no longer produce an alert-only state.
-        val notificationPeer = authenticatedNotificationPeer(state, durable)
+        val notificationSender = authenticatedNotificationSender(state, durable)
         // Re-enter the exact activation lease for the external publication. Erasure drains this
         // phase before cancelAll, so an obsolete activation cannot notify after logout/replacement.
         state.withProjectionLease {
@@ -1054,7 +1103,8 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                         messageId = durable.messageId,
                         conversationId = durable.conversationId,
                         sessionEpoch = state.session.binding.sessionEpoch,
-                        senderName = notificationPeer.peerName,
+                        senderName = notificationSender.name,
+                        groupTitle = notificationSender.groupTitle,
                         authenticatedText = durable.authenticatedText,
                         sentAt = sentAt,
                     ),
@@ -1068,21 +1118,31 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         }
     }
 
-    /** Resolves display identity only from the authenticated direct-conversation membership. */
-    private suspend fun authenticatedNotificationPeer(
+    /** Who the shade may name, resolved only from authenticated conversation membership. */
+    private data class NotificationSender(val name: String?, val groupTitle: String?)
+
+    /** Resolves display identity only from the authenticated conversation membership. */
+    private suspend fun authenticatedNotificationSender(
         state: SessionState,
         durable: LibSignalCompanionRecord,
-    ): RemoteSecureMessagingTransport.Session.DirectConversation {
-        val conversations = state.conversations ?: state.session.directConversations()
-            .associateBy(RemoteSecureMessagingTransport.Session.DirectConversation::conversationId)
+    ): NotificationSender {
+        val conversations = state.conversations ?: state.session.conversations()
+            .associateBy(RemoteSecureMessagingTransport.Session.SecureConversation::conversationId)
             .also { state.conversations = it }
         val conversation = checkNotNull(conversations[durable.conversationId]) {
-            "Incoming secure message belongs to an unavailable direct conversation"
+            "Incoming secure message belongs to an unavailable conversation"
         }
-        check(conversation.peerUserId == durable.sender.userId) {
-            "Incoming secure message sender is not the authenticated direct peer"
-        }
-        return conversation
+        // Membership, not peer equality: a group has many authentic senders, and the shade must
+        // name the one who actually sent this. A sender outside the membership is still refused.
+        val sender = checkNotNull(
+            conversation.members.firstOrNull {
+                it.userId.equals(durable.sender.userId, ignoreCase = true)
+            },
+        ) { "Incoming secure message sender is not an authenticated conversation member" }
+        return NotificationSender(
+            name = sender.name,
+            groupTitle = conversation.title.takeIf { conversation.isGroup },
+        )
     }
 
     private fun historyDeliveryToken(
@@ -1101,15 +1161,20 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         durable: LibSignalCompanionRecord,
     ): Boolean {
         val descriptor = KitMediaMessage.parse(durable.authenticatedText)
+        val reaction = KitReactionMessage.parse(durable.authenticatedText)
+        if (KitReactionMessage.isReactionText(durable.authenticatedText) && reaction == null) {
+            return false
+        }
         val authenticatedAttachments = descriptor?.let { listOf(it.toAttachmentRequest()) }
             ?: emptyList()
-        val authenticatedKind = if (authenticatedAttachments.isEmpty()) {
-            ENCRYPTED_MESSAGE_KIND
-        } else {
-            ENCRYPTED_ATTACHMENT_MESSAGE_KIND
+        val authenticatedKind = when {
+            authenticatedAttachments.isNotEmpty() -> ENCRYPTED_ATTACHMENT_MESSAGE_KIND
+            reaction != null -> ENCRYPTED_REACTION_MESSAGE_KIND
+            else -> ENCRYPTED_MESSAGE_KIND
         }
         return envelope.kind == authenticatedKind &&
-            envelope.attachments == authenticatedAttachments
+            envelope.attachments == authenticatedAttachments &&
+            (reaction == null || reaction.targetMessageId == envelope.replyToMessageId)
     }
 
     private suspend fun commitDecryption(
@@ -1160,28 +1225,28 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         state: SessionState,
         event: RemoteSecureMessagingTransport.Session.ReadReceiptEvent,
     ) {
-        val conversations = state.conversations ?: state.session.directConversations()
-            .associateBy(RemoteSecureMessagingTransport.Session.DirectConversation::conversationId)
+        val conversations = state.conversations ?: state.session.conversations()
+            .associateBy(RemoteSecureMessagingTransport.Session.SecureConversation::conversationId)
             .also { state.conversations = it }
         val conversation = checkNotNull(conversations[event.conversationId]) {
-            "Read receipt belongs to an unavailable direct conversation"
+            "Read receipt belongs to an unavailable conversation"
         }
         if (event.readerUserId == state.session.binding.userId) {
             // The backend broadcasts this account's marker to every enrolled device. It is not
             // peer-read evidence for self-authored bubbles, but it does clear authenticated inbound
-            // messages from the direct peer on this account's other devices.
+            // messages from the other members on this account's other devices.
             state.withProjectionLease {
                 markInboundReadThroughCanonicalIfKnown(
                     conversationId = event.conversationId,
-                    peerUserId = conversation.peerUserId,
+                    senderUserIds = conversation.otherMemberUserIds(state.session.binding.userId),
                     canonicalLastReadMessageId = event.lastReadMessageId,
                     canonicalReadAt = event.readAt,
                 )
             }
             return
         }
-        check(conversation.peerUserId == event.readerUserId) {
-            "Read receipt actor is not the authenticated direct peer"
+        check(conversation.contains(event.readerUserId)) {
+            "Read receipt actor is not an authenticated conversation member"
         }
         state.withProjectionLease {
             markAuthoredReadThrough(
@@ -1189,6 +1254,12 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 lastReadMessageId = event.lastReadMessageId,
                 currentUserId = state.session.binding.userId,
                 readAt = event.readAt,
+                // In a direct chat the only other person having read it is exactly what the read
+                // tick claims. In a group it is not: the backend reports one member's marker, and
+                // showing "read" for the whole group off one reader would overclaim. The honest
+                // thing that marker proves is that the message reached and was opened on at least
+                // one member's device, so a group advances to delivered and stops there.
+                authoredRead = !conversation.isGroup,
             )
         }
     }
@@ -1199,8 +1270,8 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     ): HistoricalRosterPlan {
         val key = HistoricalRosterKey(envelope.conversationId, envelope.transferRosterRevision)
         state.historicalPlans[key]?.let { return it }
-        val conversations = state.conversations ?: state.session.directConversations()
-            .associateBy(RemoteSecureMessagingTransport.Session.DirectConversation::conversationId)
+        val conversations = state.conversations ?: state.session.conversations()
+            .associateBy(RemoteSecureMessagingTransport.Session.SecureConversation::conversationId)
             .also { state.conversations = it }
         val conversation = checkNotNull(conversations[envelope.conversationId]) {
             "Incoming secure message belongs to an unavailable direct conversation"

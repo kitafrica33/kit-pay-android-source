@@ -1,5 +1,7 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.contacts.ContactDiscoveryAuthorization
+import com.kit.wallet.data.contacts.ContactDiscoveryConsent
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.repository.BlockedCommunicationUser
 import com.kit.wallet.data.repository.CommunicationPreferenceChanges
@@ -8,6 +10,7 @@ import com.kit.wallet.data.repository.CommunicationPrivacyRepository
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.feature.settings.CommunicationPrivacyViewModel
 import com.kit.wallet.ui.model.Contact
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -47,10 +50,36 @@ class CommunicationPrivacyViewModelTest {
         assertFalse(viewModel.state.value.preferences.phoneDiscoverable)
         assertFalse(viewModel.state.value.preferences.directMessageRequestsEnabled)
         assertFalse(viewModel.state.value.preferences.incomingCallsEnabled)
+        // Presence defaults to on server-side, so the one flag that could leak here is
+        // this one: until a load succeeds the screen has to show the private state.
+        assertFalse(viewModel.state.value.preferences.messagingPresenceVisible)
 
         viewModel.setPhoneDiscoverable(true)
 
         assertTrue(repository.updates.isEmpty())
+    }
+
+    @Test
+    fun `hiding messaging presence sends only that flag and is reflected at once`() = runTest {
+        val repository = FakePrivacyRepository()
+        val viewModel = CommunicationPrivacyViewModel(repository, FakeContactRepository())
+
+        assertTrue(viewModel.state.value.preferences.messagingPresenceVisible)
+
+        viewModel.setMessagingPresenceVisible(false)
+
+        val (expectedVersion, changes) = repository.updates.single()
+        assertEquals(1L, expectedVersion)
+        assertEquals(false, changes.messagingPresenceVisible)
+        // Every other flag stays null: an omitted field is "unchanged" to the server,
+        // and sending the screen's whole view of the world would let a stale render
+        // silently re-assert a value another device just changed.
+        assertNull(changes.phoneDiscoverable)
+        assertNull(changes.directMessageRequestsEnabled)
+        assertNull(changes.incomingCallsEnabled)
+
+        assertFalse(viewModel.state.value.preferences.messagingPresenceVisible)
+        assertNull(viewModel.state.value.savingField)
     }
 
     @Test
@@ -82,6 +111,9 @@ class CommunicationPrivacyViewModelTest {
         assertEquals(7L, viewModel.state.value.preferences.version)
         assertTrue(viewModel.state.value.preferences.phoneDiscoverable)
         assertFalse(viewModel.state.value.preferences.incomingCallsEnabled)
+        // The other device turned presence off. The refresh has to carry that across,
+        // or the screen keeps offering a state the server no longer holds.
+        assertFalse(viewModel.state.value.preferences.messagingPresenceVisible)
         assertNull(viewModel.state.value.savingField)
         assertTrue(viewModel.state.value.error.orEmpty().contains("another device"))
     }
@@ -164,12 +196,50 @@ class CommunicationPrivacyViewModelTest {
         assertEquals(listOf(USER_ID), repository.unblockCalls)
     }
 
+    @Test
+    fun `enabling account consent starts contact synchronization immediately`() = runTest {
+        val contacts = FakeContactRepository()
+        val consent = FakeContactDiscoveryConsent()
+        val viewModel = CommunicationPrivacyViewModel(
+            FakePrivacyRepository(),
+            contacts,
+            consent,
+        )
+
+        viewModel.setShareDeviceContacts(true)
+
+        assertTrue(consent.shareDeviceContacts.value)
+        assertEquals(1, contacts.syncCalls)
+    }
+
+    @Test
+    fun `disabling closes consent before cancelling an in-flight sync`() = runTest {
+        val consent = FakeContactDiscoveryConsent()
+        val contacts = FakeContactRepository(blockSync = true)
+        val viewModel = CommunicationPrivacyViewModel(
+            FakePrivacyRepository(),
+            contacts,
+            consent,
+        )
+
+        viewModel.setShareDeviceContacts(true)
+        assertTrue(contacts.syncStarted)
+        viewModel.setShareDeviceContacts(false)
+
+        assertFalse(consent.shareDeviceContacts.value)
+        assertTrue(contacts.syncCancelled)
+        assertEquals(listOf(true, false), consent.writes)
+    }
+
     private class FakePrivacyRepository : CommunicationPrivacyRepository {
         var current = CommunicationPreferences(
             version = 1,
             phoneDiscoverable = false,
             directMessageRequestsEnabled = false,
             incomingCallsEnabled = false,
+            // The server's default, and the one flag whose default is on — so a loaded
+            // account differs from `DEFAULT_OFF` in exactly this field.
+            messagingPresenceVisible = true,
             updatedAt = null,
         )
         var preferencesError: Exception? = null
@@ -201,6 +271,7 @@ class CommunicationPrivacyViewModelTest {
                     phoneDiscoverable = true,
                     directMessageRequestsEnabled = false,
                     incomingCallsEnabled = false,
+                    messagingPresenceVisible = false,
                     updatedAt = null,
                 )
                 if (failConflictRefresh) {
@@ -219,6 +290,8 @@ class CommunicationPrivacyViewModelTest {
                     ?: current.directMessageRequestsEnabled,
                 incomingCallsEnabled = changes.incomingCallsEnabled
                     ?: current.incomingCallsEnabled,
+                messagingPresenceVisible = changes.messagingPresenceVisible
+                    ?: current.messagingPresenceVisible,
             )
             return current
         }
@@ -242,11 +315,43 @@ class CommunicationPrivacyViewModelTest {
 
     private class FakeContactRepository(
         initial: List<Contact> = emptyList(),
+        private val blockSync: Boolean = false,
     ) : ContactRepository {
         private val mutableContacts = MutableStateFlow(initial)
         override val contacts: StateFlow<List<Contact>> = mutableContacts
         override suspend fun refresh() = Unit
-        override suspend fun syncDeviceContacts() = Unit
+        var syncCalls = 0
+        var syncStarted = false
+        var syncCancelled = false
+        override suspend fun syncDeviceContacts() {
+            syncCalls++
+            syncStarted = true
+            if (blockSync) {
+                try {
+                    awaitCancellation()
+                } finally {
+                    syncCancelled = true
+                }
+            }
+        }
+    }
+
+    private class FakeContactDiscoveryConsent : ContactDiscoveryConsent {
+        override val shareDeviceContacts = MutableStateFlow(false)
+        override val available = MutableStateFlow(true)
+        val writes = mutableListOf<Boolean>()
+
+        override fun setShareDeviceContacts(allowed: Boolean): Boolean {
+            writes += allowed
+            shareDeviceContacts.value = allowed
+            return true
+        }
+
+        override fun authorizationFor(
+            expected: com.kit.wallet.data.session.SessionFence,
+        ): ContactDiscoveryAuthorization? = null
+
+        override fun isAuthorized(authorization: ContactDiscoveryAuthorization): Boolean = false
     }
 
     private companion object {

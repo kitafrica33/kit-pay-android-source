@@ -2,13 +2,22 @@ package com.kit.wallet.di
 
 import android.content.Context
 import androidx.room.Room
+import com.kit.wallet.data.contacts.ContactDiscoveryConsent
+import com.kit.wallet.data.contacts.ContactDiscoveryPreferences
+import com.kit.wallet.data.local.BeneficiaryContactDao
 import com.kit.wallet.data.local.ConversationPrefsDao
 import com.kit.wallet.data.local.KitWalletDatabase
 import com.kit.wallet.data.local.ProfileDao
+import com.kit.wallet.data.local.ProfilePhotoDao
 import com.kit.wallet.data.local.SecureMessagingMetadataDao
 import com.kit.wallet.data.local.SyncStateDao
 import com.kit.wallet.data.local.WalletDao
 import com.kit.wallet.data.local.WalletTransactionDao
+import com.kit.wallet.data.media.ProfileAvatarByteStore
+import com.kit.wallet.data.media.ProfileAvatarImages
+import com.kit.wallet.data.remote.UpdateProfileRequestAdapter
+import com.kit.wallet.data.repository.AndroidKeystoreBeneficiaryPhoneIdentity
+import com.kit.wallet.data.repository.BeneficiaryPhoneIdentity
 import com.kit.wallet.data.session.KeystoreSessionStore
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.messaging.AndroidKeystoreMessagingRecordCipher
@@ -48,6 +57,18 @@ abstract class SessionModule {
     @Binds
     @Singleton
     abstract fun bindSessionStore(implementation: KeystoreSessionStore): SessionStore
+
+    @Binds
+    @Singleton
+    abstract fun bindContactDiscoveryConsent(
+        implementation: ContactDiscoveryPreferences,
+    ): ContactDiscoveryConsent
+
+    @Binds
+    @Singleton
+    abstract fun bindBeneficiaryPhoneIdentity(
+        implementation: AndroidKeystoreBeneficiaryPhoneIdentity,
+    ): BeneficiaryPhoneIdentity
 }
 
 @Module
@@ -114,6 +135,9 @@ object StorageModule {
     @Provides
     @Singleton
     fun provideMoshi(): Moshi = Moshi.Builder()
+        // Ahead of the reflective factory, which would otherwise claim the type and drop the
+        // explicit null that clears a username.
+        .add(UpdateProfileRequestAdapter())
         .add(KotlinJsonAdapterFactory())
         .build()
 
@@ -130,6 +154,9 @@ object StorageModule {
                 KitWalletDatabase.MIGRATION_6_7,
                 KitWalletDatabase.MIGRATION_7_8,
                 KitWalletDatabase.MIGRATION_8_9,
+                KitWalletDatabase.MIGRATION_9_10,
+                KitWalletDatabase.MIGRATION_10_11,
+                KitWalletDatabase.MIGRATION_11_12,
             )
             .fallbackToDestructiveMigrationOnDowngrade()
             .build()
@@ -150,6 +177,20 @@ object StorageModule {
     @Provides
     fun provideConversationPrefsDao(database: KitWalletDatabase): ConversationPrefsDao =
         database.conversationPrefsDao()
+
+    @Provides
+    fun provideProfilePhotoDao(database: KitWalletDatabase): ProfilePhotoDao =
+        database.profilePhotoDao()
+
+    @Provides
+    fun provideBeneficiaryContactDao(database: KitWalletDatabase): BeneficiaryContactDao =
+        database.beneficiaryContactDao()
+
+    @Provides
+    @Singleton
+    fun provideProfileAvatarByteStore(
+        @ApplicationContext context: Context,
+    ): ProfileAvatarByteStore = ProfileAvatarByteStore { ProfileAvatarImages.clear(context) }
 
     @Provides
     fun provideSecureMessagingMetadataDao(

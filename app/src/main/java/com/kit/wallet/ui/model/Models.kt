@@ -22,8 +22,10 @@ data class Contact(
 )
 
 data class UserProfile(
+    /** The chosen display name. Anything the user likes; not proof of who they are. */
     val name: String,
     val phone: String,
+    /** The chosen username, without the leading `@`. Empty once it is optional and unset. */
     val tag: String,
     val kycLabel: String,
     val email: String? = null,
@@ -31,7 +33,29 @@ data class UserProfile(
     val profileSetupRequired: Boolean = false,
     /** Absolute URL of the moderated profile photo, when one is attached. */
     val avatarUrl: String? = null,
-)
+    /**
+     * The name on the verified identity document. Set only by identity verification, never by
+     * anything typed in the app, and never overwritten by [name] or [tag]. Null until verification
+     * has been approved.
+     */
+    val legalName: String? = null,
+    /** Whether a username still has to be chosen. False once a verified [legalName] exists. */
+    val usernameRequired: Boolean = true,
+) {
+    /** The name to put in front of someone in a financial context: verified first, chosen after. */
+    val displayIdentityName: String
+        get() = legalName?.takeIf(String::isNotBlank) ?: name
+
+    /**
+     * Whether identity verification has produced a name this account can be known by.
+     *
+     * The same fact [usernameRequired] is the server's report of, kept as one derived property so
+     * that a label reading "optional" and the rule that decides whether Save is allowed can never
+     * disagree.
+     */
+    val identityVerified: Boolean
+        get() = !legalName.isNullOrBlank()
+}
 
 fun formatKitTag(value: String): String = value.trim().trimStart('@')
     .takeIf(String::isNotBlank)
@@ -60,7 +84,27 @@ data class Transaction(
     val feeMode: String? = null,
 )
 
-enum class DeliveryState { SENDING, SENT, DELIVERED, READ, RETRY_REQUIRED, FAILED }
+enum class DeliveryState {
+    SENDING,
+    SENT,
+    DELIVERED,
+    READ,
+    RETRY_REQUIRED,
+    FAILED,
+
+    /**
+     * Composed, saved and waiting for the time its author chose. Nothing has been encrypted for
+     * anyone yet, and the peer has no idea it exists.
+     */
+    SCHEDULED,
+
+    /**
+     * A scheduled send whose device stopped between handing the message over and recording that it
+     * had. Sending it again might duplicate it and dropping it might lose it, so it stays here
+     * until the person who wrote it says which.
+     */
+    UNCONFIRMED,
+}
 
 enum class MessageKind {
     TEXT,
@@ -80,6 +124,13 @@ enum class MessageKind {
     VIDEO,
     DOCUMENT,
     CALL,
+
+    /**
+     * A group saying what happened to it — somebody joined, somebody is no longer in it, somebody
+     * became an admin. Centred and unattributed like [PAYMENT_EVENT], because it is the
+     * conversation talking about itself rather than any member talking.
+     */
+    SYSTEM,
 }
 
 /** What a payment bubble records. Mirrors the encrypted descriptor's action. */
@@ -128,6 +179,20 @@ data class TransferClaim(
     val canReverse: Boolean = false,
 )
 
+/**
+ * One emoji on a message, together with everyone who put it there.
+ *
+ * [reactorNames] is display copy resolved from the authenticated conversation membership, so a
+ * peer can never attribute its reaction to somebody else. "You" is always listed first.
+ */
+data class MessageReaction(
+    val emoji: String,
+    val reactorNames: List<String>,
+    val fromMe: Boolean,
+) {
+    val count: Int get() = reactorNames.size
+}
+
 data class Message(
     val id: String,
     val text: String,
@@ -160,14 +225,50 @@ data class Message(
     val paymentCurrencyScale: Int = Money.SCALE,
     /** Epoch millis used to interleave messages with call-log entries in a conversation. */
     val sortEpochMillis: Long = 0,
+    /**
+     * When a [DeliveryState.SCHEDULED] entry is due to go out; zero for everything else.
+     *
+     * Carried separately from [sortEpochMillis] because a scheduled entry sits at the foot of the
+     * thread regardless of when it will be sent, and the bubble still has to say the real time.
+     */
+    val scheduledAtEpochMillis: Long = 0,
     /** For CALL entries: direction, whether it was a video call and the connected duration. */
     val callDirection: CallDirection? = null,
     val callVideo: Boolean = false,
     val callDurationSeconds: Long = 0,
-    val reactions: List<String> = emptyList(),
+    /** Emoji reactions on this message, most-reacted first, then by first appearance. */
+    val reactions: List<MessageReaction> = emptyList(),
     val replyToText: String? = null,
     val durationSec: Int = 0,
+    /** Authenticated public sender ID; required to bind group-message safety actions. */
+    val senderUserId: String? = null,
 )
+
+/**
+ * Whether this entry can carry reactions.
+ *
+ * A reaction pins its target's message ID, and a send that has not been acknowledged is still
+ * identified by its local client ID — the server ID replaces it once the send lands, which would
+ * strand a reaction authored in between. Calls, settled payment outcomes and membership lines are
+ * centred timeline records rather than bubbles, so they have nothing to attach a chip to.
+ */
+val Message.acceptsReactions: Boolean
+    get() = when {
+        kind == MessageKind.CALL ||
+            kind == MessageKind.PAYMENT_EVENT ||
+            kind == MessageKind.SYSTEM -> false
+        else -> when (state) {
+            DeliveryState.SENDING,
+            DeliveryState.RETRY_REQUIRED,
+            DeliveryState.FAILED,
+            // A scheduled entry exists on this device only. There is nobody to react to yet, and
+            // the message ID it would be pinned to has not been minted.
+            DeliveryState.SCHEDULED,
+            DeliveryState.UNCONFIRMED,
+            -> false
+            DeliveryState.SENT, DeliveryState.DELIVERED, DeliveryState.READ -> true
+        }
+    }
 
 data class ChatPreview(
     val id: String,
@@ -180,12 +281,46 @@ data class ChatPreview(
     val isGroup: Boolean = false,
     val online: Boolean = false,
     val typing: Boolean = false,
+    /**
+     * Who is typing, for a group that has more than one possible typist.
+     *
+     * Empty for a direct chat: the one person who can be typing there is already named at the top
+     * of the screen, and repeating them would read as a second person.
+     */
+    val typingNames: List<String> = emptyList(),
     val pinned: Boolean = false,
     val muted: Boolean = false,
     val lastFromMe: Boolean = false,
     val lastState: DeliveryState = DeliveryState.READ,
     /** The peer's profile photo URL, resolved from the local address book. */
     val avatarUrl: String? = null,
+)
+
+/** What a group grants a member. Anything the server sends that is not one of these reads as a
+ * plain member, so an unfamiliar future role can never be mistaken for elevated rights. */
+enum class ChatMemberRole { OWNER, ADMIN, MEMBER;
+
+    val canManageMembers: Boolean get() = this == OWNER || this == ADMIN
+
+    val label: String
+        get() = when (this) {
+            OWNER -> "Owner"
+            ADMIN -> "Admin"
+            MEMBER -> "Member"
+        }
+}
+
+/** One participant of a group, as the server last reported it. */
+data class ChatMember(
+    val userId: String,
+    val name: String,
+    val role: ChatMemberRole = ChatMemberRole.MEMBER,
+    /** True for the account looking at the list. */
+    val isSelf: Boolean = false,
+    val online: Boolean = false,
+    val avatarUrl: String? = null,
+    /** True when this person is in the local address book, so their name is the saved one. */
+    val savedInDevice: Boolean = false,
 )
 
 enum class CallDirection { INCOMING, OUTGOING, MISSED }
@@ -224,6 +359,13 @@ data class Beneficiary(
     val verified: Boolean = true,
     val kind: String? = null,
     val bankId: String? = null,
+    /** The Kit Pay account this beneficiary belongs to, when the server says it belongs to one. */
+    val kitUserId: String? = null,
+    /**
+     * The photo to draw over this row's glyph; null leaves the glyph alone. Resolved by
+     * [BeneficiaryIdentity], which will not guess.
+     */
+    val avatarUrl: String? = null,
 )
 
 data class BankInstitution(

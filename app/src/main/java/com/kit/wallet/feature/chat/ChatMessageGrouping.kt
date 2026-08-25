@@ -51,6 +51,10 @@ internal fun groupConversationRows(messages: List<Message>): List<ConversationRo
         val previous = pending.lastOrNull()
         val joins = previous != null &&
             previous.fromMe == message.fromMe &&
+            // In a group two people's photos can arrive back to back, and both are "not from me".
+            // A grid carries one author label, so a second author starts a second grid. A direct
+            // chat never sets a sender name, which leaves its grouping exactly as it was.
+            previous.senderName == message.senderName &&
             pending.size < IMAGE_GROUP_MAX_SIZE &&
             abs(message.sortEpochMillis - previous.sortEpochMillis) <= IMAGE_GROUP_WINDOW_MILLIS
         if (previous != null && !joins) flush()

@@ -3,6 +3,7 @@ package com.kit.wallet.data.notifications
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotification
 
 /** Private notification copy derived only from locally authenticated secure-message state. */
@@ -21,15 +22,23 @@ internal data class SecureMessageNotificationPresentation(
 internal object SecureMessageNotificationPresentationFactory {
     fun create(
         notification: SecureMessagingIncomingNotification,
-    ): SecureMessageNotificationPresentation = SecureMessageNotificationPresentation(
-        sender = notification.senderName
-            ?.normalizeNotificationText()
-            ?.takeUnless(CANONICAL_UUID::matches)
-            ?.truncateNotificationText(MAX_SENDER_CODE_POINTS)
-            ?.takeIf(String::isNotBlank)
-            ?: DEFAULT_SENDER,
-        preview = notification.authenticatedText.toNotificationPreview(),
-    )
+    ): SecureMessageNotificationPresentation {
+        val sender = notification.senderName.toNotificationName() ?: DEFAULT_SENDER
+        // In a group the person alone is not enough to act on — the shade has to say which group
+        // it landed in, exactly as the chat list does. Both halves are bounded separately so a
+        // long group name cannot crowd out the sender.
+        val group = notification.groupTitle.toNotificationName()
+        return SecureMessageNotificationPresentation(
+            sender = if (group == null) sender else "$sender$DETAIL_SEPARATOR$group",
+            preview = notification.authenticatedText.toNotificationPreview(),
+        )
+    }
+
+    private fun String?.toNotificationName(): String? = this
+        ?.normalizeNotificationText()
+        ?.takeUnless(CANONICAL_UUID::matches)
+        ?.truncateNotificationText(MAX_SENDER_CODE_POINTS)
+        ?.takeIf(String::isNotBlank)
 
     private fun String.toNotificationPreview(): String {
         val media = KitMediaMessage.parse(this)
@@ -42,6 +51,14 @@ internal object SecureMessageNotificationPresentationFactory {
         // Fail closed if a future/malformed secure-media descriptor cannot be parsed. In
         // particular, never surface its embedded attachment key material in the notification.
         if (KitMediaMessage.isMediaText(this)) return PHOTO_LABEL
+
+        // Reactions are suppressed upstream and never reach the shade. If one ever does, it is
+        // summarized rather than surfaced as its raw descriptor.
+        KitReactionMessage.parse(this)?.let { reaction ->
+            return "$REACTION_LABEL ${reaction.emoji}"
+                .truncateNotificationText(MAX_PREVIEW_CODE_POINTS)
+        }
+        if (KitReactionMessage.isReactionText(this)) return REACTION_LABEL
 
         val payment = KitPaymentMessage.parse(this)
         if (payment != null) {
@@ -122,6 +139,7 @@ internal object SecureMessageNotificationPresentationFactory {
     private const val DEFAULT_SENDER = "Kit Pay contact"
     private const val EMPTY_MESSAGE_LABEL = "New secure message"
     private const val PHOTO_LABEL = "📷 Photo"
+    private const val REACTION_LABEL = "Reacted to your message"
     private const val PAYMENT_REQUEST_LABEL = "💰 Payment request"
     private const val PAYMENT_LABEL = "💸 Payment"
     private const val PAYMENT_HELD_LABEL = "💸 Payment awaiting acceptance"

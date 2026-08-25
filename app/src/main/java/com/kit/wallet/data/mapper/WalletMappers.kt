@@ -1,8 +1,11 @@
 package com.kit.wallet.data.mapper
 
+import com.kit.wallet.data.repository.KycVerificationState
+import com.kit.wallet.data.repository.kycVerificationStateOf
 import com.kit.wallet.data.local.ProfileEntity
 import com.kit.wallet.data.local.WalletEntity
 import com.kit.wallet.data.local.WalletTransactionEntity
+import com.kit.wallet.data.auth.hasVerifiedLegalName
 import com.kit.wallet.data.auth.requiresProfileSetup
 import com.kit.wallet.data.auth.profileNameOrPlaceholder
 import com.kit.wallet.data.remote.TransactionDto
@@ -39,18 +42,29 @@ object DecimalMoney {
     }
 }
 
-fun UserDto.toEntity(nowEpochMillis: Long): ProfileEntity = ProfileEntity(
-    userId = id,
-    name = profileNameOrPlaceholder(name),
-    phone = phone.orEmpty(),
-    tag = tag.orEmpty(),
-    kycLabel = kycStatus.toKycLabel(),
-    email = email,
-    emailVerified = emailVerified == true,
-    profileSetupRequired = profileSetupRequired == true || requiresProfileSetup(name, tag),
-    avatarUrl = avatarUrl?.takeIf(String::isNotBlank),
-    updatedAtEpochMillis = nowEpochMillis,
-)
+fun UserDto.toEntity(nowEpochMillis: Long): ProfileEntity {
+    val verifiedLegalName = legalName?.takeIf(String::isNotBlank)
+    return ProfileEntity(
+        userId = id,
+        // The placeholder stands in for a missing *display* name only. It is never written over
+        // legalName, and legalName is never copied into it: a screen that wants the verified name
+        // has to ask for the verified name.
+        name = profileNameOrPlaceholder(name),
+        phone = phone.orEmpty(),
+        tag = tag.orEmpty(),
+        kycLabel = kycStatus.toKycLabel(),
+        email = email,
+        emailVerified = emailVerified == true,
+        profileSetupRequired = profileSetupRequired == true ||
+            requiresProfileSetup(name, tag, verifiedLegalName),
+        avatarUrl = avatarUrl?.takeIf(String::isNotBlank),
+        legalName = verifiedLegalName,
+        // A server that predates the field says nothing, so read the legal name instead of
+        // assuming either answer.
+        usernameRequired = usernameRequired ?: !hasVerifiedLegalName(verifiedLegalName),
+        updatedAtEpochMillis = nowEpochMillis,
+    )
+}
 
 fun ProfileEntity.toUiModel(): UserProfile = UserProfile(
     name = name,
@@ -59,8 +73,10 @@ fun ProfileEntity.toUiModel(): UserProfile = UserProfile(
     kycLabel = kycLabel,
     email = email,
     emailVerified = emailVerified,
-    profileSetupRequired = profileSetupRequired || requiresProfileSetup(name, tag),
+    profileSetupRequired = profileSetupRequired || requiresProfileSetup(name, tag, legalName),
     avatarUrl = avatarUrl,
+    legalName = legalName,
+    usernameRequired = usernameRequired,
 )
 
 fun WalletDto.toEntity(nowEpochMillis: Long): WalletEntity {
@@ -179,11 +195,23 @@ fun WalletTransactionEntity.toUiModel(
     )
 }
 
-private fun String?.toKycLabel(): String = when (this?.lowercase()) {
-    "verified", "approved" -> "KYC verified"
-    "pending", "in_review" -> "KYC pending"
-    "rejected" -> "KYC needs attention"
-    else -> "KYC not started"
+/**
+ * The stored label for an account's identity standing.
+ *
+ * Derived through [kycVerificationStateOf] rather than a private list of words, so the profile row
+ * cannot recognise a different set of statuses from the verification screen — a disagreement that
+ * once had verified accounts labelled "not started" and prompted to verify all over again. The
+ * labels round-trip back through the same reader, so a screen holding only the label still gets
+ * the state right.
+ */
+private fun String?.toKycLabel(): String = when (kycVerificationStateOf(this)) {
+    KycVerificationState.VERIFIED -> "KYC verified"
+    KycVerificationState.IN_REVIEW -> "KYC pending"
+    KycVerificationState.ACTION_NEEDED -> "KYC needs attention"
+    KycVerificationState.NOT_STARTED -> "KYC not started"
+    // Deliberately not "not started": an unreadable status is the app's ignorance, not a claim
+    // about the user, and it must not be turned into one.
+    KycVerificationState.UNKNOWN -> "KYC status unavailable"
 }
 
 private fun String.toUiType(direction: String): TxType = when (lowercase()) {

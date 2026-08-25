@@ -1,6 +1,7 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.auth.BiometricPaymentApprover
+import com.kit.wallet.data.auth.serverAcceptsBiometrics
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.repository.PaymentAuthorizer
@@ -97,6 +98,35 @@ class BiometricPaymentAuthorizerTest {
         val verification = server.takeRequest().body.readUtf8()
         assertTrue(verification.contains("\"pin\":\"2580\""))
         assertFalse(verification.contains("signature"))
+    }
+
+    @Test fun `unknown cached server methods never advertise biometric approval`() {
+        assertFalse(serverAcceptsBiometrics(emptyList()))
+        assertFalse(serverAcceptsBiometrics(listOf("pin")))
+        assertTrue(serverAcceptsBiometrics(listOf("PIN", "BIOMETRIC_SIGNATURE")))
+    }
+
+    @Test fun `exact payment challenge can withdraw biometric approval before prompting`() = runTest {
+        server.enqueue(ok("""{"id":"challenge","purpose":"wallet_transfer","intent_hash":"hash","nonce":"nonce","signing_payload":"signed payload","methods":["pin"],"expires_at":"2099-01-01T00:00:00Z"}"""))
+        val api = Retrofit.Builder().baseUrl(server.url("/"))
+            .addConverterFactory(MoshiConverterFactory.create(Moshi.Builder().add(KotlinJsonAdapterFactory()).build()))
+            .build().create(KitWalletApi::class.java)
+        val approver = RecordingApprover()
+        val authorizer = PaymentAuthorizer(
+            api, ApiCallExecutor(Moshi.Builder().add(KotlinJsonAdapterFactory()).build()),
+            sessionStore(), approver,
+        )
+
+        val failure = runCatching {
+            authorizer.authorize("wallet_transfer", mapOf("amount" to "100"), "")
+        }.exceptionOrNull()
+
+        assertEquals(
+            "Biometric approval is not available for this payment. Use your wallet PIN.",
+            failure?.message,
+        )
+        assertEquals(1, server.requestCount)
+        assertEquals(null, approver.payload)
     }
 
     private class RecordingApprover : BiometricPaymentApprover {

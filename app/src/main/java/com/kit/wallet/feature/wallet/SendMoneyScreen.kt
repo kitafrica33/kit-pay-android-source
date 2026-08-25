@@ -20,7 +20,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Check
-import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -42,14 +41,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.data.demo.DemoData
+import com.kit.wallet.feature.auth.PaymentApproval
+import com.kit.wallet.feature.auth.rememberBiometricApprovalAvailable
+import com.kit.wallet.feature.funding.TopUpSheet
+import com.kit.wallet.feature.funding.TopUpViewModel
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.KitKeypad
@@ -57,6 +57,7 @@ import com.kit.wallet.ui.components.KitOutlinedButton
 import com.kit.wallet.ui.components.SectionHeader
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Money
+import com.kit.wallet.ui.model.TopUpRequirement
 import com.kit.wallet.ui.model.Transaction
 import com.kit.wallet.ui.theme.KitWalletTheme
 
@@ -69,12 +70,23 @@ fun SendMoneyScreen(
     onBack: () -> Unit,
     onDone: () -> Unit,
     viewModel: SendMoneyViewModel = hiltViewModel(),
+    topUp: TopUpViewModel = hiltViewModel(),
 ) {
     val contacts by viewModel.contacts.collectAsStateWithLifecycle()
     val balanceMinor by viewModel.balanceMinor.collectAsStateWithLifecycle()
     val sending by viewModel.sending.collectAsStateWithLifecycle()
     val lastSent by viewModel.lastSent.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
+    val topUpRequirement by topUp.requirement.collectAsStateWithLifecycle()
+    val refusedForFunds by viewModel.topUpRequired.collectAsStateWithLifecycle()
+
+    // A shortfall the server reported hands over to the top-up and is then let go of, so the two
+    // do not both believe they own it.
+    LaunchedEffect(refusedForFunds) {
+        val shortfall = refusedForFunds ?: return@LaunchedEffect
+        topUp.start(shortfall)
+        viewModel.clearTopUpRequired()
+    }
 
     SendMoneyContent(
         initialContactId = initialContactId,
@@ -86,6 +98,20 @@ fun SendMoneyScreen(
         onBack = onBack,
         onDone = onDone,
         onSend = viewModel::send,
+        shortfallFor = viewModel::shortfallFor,
+        topUpRequirement = topUpRequirement,
+        onTopUpNeeded = topUp::start,
+        topUpSheet = { onFunded ->
+            TopUpSheet(
+                viewModel = topUp,
+                onDismiss = topUp::dismiss,
+                onFunded = {
+                    topUp.dismiss()
+                    onFunded()
+                },
+            )
+        },
+        biometricsAvailable = rememberBiometricApprovalAvailable(),
     )
 }
 
@@ -101,6 +127,15 @@ internal fun SendMoneyContent(
     onBack: () -> Unit,
     onDone: () -> Unit,
     onSend: (Contact, Long, String?, String, () -> Unit) -> Unit,
+    /** How far the wallet falls short of an amount, or null when it covers it. */
+    shortfallFor: (Long) -> TopUpRequirement? = { null },
+    /** The shortfall currently being covered; while one is, the approval sheet stands aside. */
+    topUpRequirement: TopUpRequirement? = null,
+    onTopUpNeeded: (TopUpRequirement) -> Unit = {},
+    /** The top-up sheet, given the callback that returns to approving the payment. */
+    topUpSheet: (@Composable (onFunded: () -> Unit) -> Unit)? = null,
+    /** Whether this device can approve with biometrics; false falls back to the wallet PIN. */
+    biometricsAvailable: Boolean = false,
 ) {
     var step by rememberSaveable { mutableStateOf(SendStep.PICK_RECIPIENT) }
     var recipientId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -175,7 +210,12 @@ internal fun SendMoneyContent(
                         }
                     },
                     onBackspace = { amountText = amountText.dropLast(1) },
-                    onContinue = { confirmSheet = true },
+                    onContinue = {
+                        // Checked here rather than only after the server refuses, so nobody is
+                        // asked to approve a payment this wallet was never going to afford.
+                        val shortfall = shortfallFor(amountMinor)
+                        if (shortfall != null) onTopUpNeeded(shortfall) else confirmSheet = true
+                    },
                     canContinue = amountMinor > 0,
                 )
                 SendStep.SUCCESS -> SendSuccess(
@@ -188,18 +228,22 @@ internal fun SendMoneyContent(
         }
     }
 
-    if (confirmSheet && recipient != null) {
-        var paymentPin by rememberSaveable { mutableStateOf("") }
+    if (topUpRequirement != null && topUpSheet != null) {
+        // Funding hands the payment straight back to its approval step, which is where it was
+        // when the money ran out.
+        topUpSheet { confirmSheet = true }
+    }
+
+    if (confirmSheet && recipient != null && topUpRequirement == null) {
         ModalBottomSheet(onDismissRequest = { if (!sending) confirmSheet = false }) {
             ConfirmPayment(
                 recipient = recipient,
                 amountMinor = amountMinor,
                 note = note,
                 sending = sending,
-                paymentPin = paymentPin,
+                biometricsAvailable = biometricsAvailable,
                 error = error,
-                onPaymentPin = { paymentPin = it.filter(Char::isDigit).take(4) },
-                onConfirm = {
+                onConfirm = { paymentPin ->
                     onSend(recipient, amountMinor, note, paymentPin) {
                         confirmSheet = false
                         step = SendStep.SUCCESS
@@ -250,7 +294,7 @@ private fun RecipientPicker(contacts: List<Contact>, onPick: (Contact) -> Unit) 
                             )
                             .padding(4.dp),
                     ) {
-                        KitAvatar(c.name, size = 52.dp)
+                        KitAvatar(c.name, size = 52.dp, avatarUrl = c.avatarUrl)
                         Spacer(Modifier.height(6.dp))
                         Text(c.name.substringBefore(" "), style = MaterialTheme.typography.labelMedium)
                     }
@@ -270,7 +314,7 @@ private fun RecipientPicker(contacts: List<Contact>, onPick: (Contact) -> Unit) 
                     .padding(horizontal = 20.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                KitAvatar(c.name, size = 46.dp)
+                KitAvatar(c.name, size = 46.dp, avatarUrl = c.avatarUrl)
                 Spacer(Modifier.width(14.dp))
                 Column(Modifier.weight(1f)) {
                     Text(c.name, style = MaterialTheme.typography.titleSmall)
@@ -313,7 +357,7 @@ private fun AmountEntry(
         Spacer(Modifier.height(10.dp))
         if (recipient != null) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                KitAvatar(recipient.name, size = 32.dp)
+                KitAvatar(recipient.name, size = 32.dp, avatarUrl = recipient.avatarUrl)
                 Spacer(Modifier.width(8.dp))
                 Text(recipient.phone, style = MaterialTheme.typography.bodyMedium)
             }
@@ -362,10 +406,9 @@ private fun ConfirmPayment(
     amountMinor: Long,
     note: String,
     sending: Boolean,
-    paymentPin: String,
+    biometricsAvailable: Boolean,
     error: String?,
-    onPaymentPin: (String) -> Unit,
-    onConfirm: () -> Unit,
+    onConfirm: (paymentPin: String) -> Unit,
 ) {
     Column(
         Modifier
@@ -376,7 +419,7 @@ private fun ConfirmPayment(
     ) {
         Text("Confirm payment", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(20.dp))
-        KitAvatar(recipient.name, size = 64.dp)
+        KitAvatar(recipient.name, size = 64.dp, avatarUrl = recipient.avatarUrl)
         Spacer(Modifier.height(10.dp))
         Text(recipient.name, style = MaterialTheme.typography.titleMedium)
         Text(
@@ -405,33 +448,14 @@ private fun ConfirmPayment(
             )
             Text("Free", style = MaterialTheme.typography.bodyMedium)
         }
-        OutlinedTextField(
-            value = paymentPin,
-            onValueChange = onPaymentPin,
-            label = { Text("Wallet PIN (optional with biometrics)") },
-            supportingText = { Text("Authorizes this exact payment; leave blank to use biometrics") },
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-            singleLine = true,
-            isError = error != null,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        if (error != null) {
-            Text(
-                error,
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 6.dp),
-            )
-        }
-        KitGreenButton(
-            text = "Send ${Money.format(amountMinor)}",
-            icon = Icons.Rounded.Lock,
-            loading = sending,
-            onClick = onConfirm,
-            enabled = paymentPin.isEmpty() || paymentPin.length == 4,
+        Spacer(Modifier.height(8.dp))
+        PaymentApproval(
+            actionLabel = "Send ${Money.format(amountMinor)}",
+            biometricsAvailable = biometricsAvailable,
+            busy = sending,
+            error = error,
+            onApprove = onConfirm,
+            pinSubtitle = "Authorizes ${Money.format(amountMinor)} to ${recipient.name}.",
         )
     }
 }

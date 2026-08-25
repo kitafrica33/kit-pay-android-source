@@ -43,6 +43,7 @@ class StoreScreenshotActivity : ComponentActivity() {
                     "transfer" -> TransferShot()
                     "reversal" -> ReversalShot()
                     "request" -> RequestShot()
+                    "media" -> MediaShot()
                     "home" -> HomeShot()
                     "transactions" -> TransactionsShot()
                     "calls" -> CallsShot()
@@ -156,6 +157,25 @@ class StoreScreenshotActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun MediaShot() {
+        ConversationContent(
+            chat = StoreScreenshotData.mediaChat,
+            messages = StoreScreenshotData.mediaConversation,
+            onBack = {},
+            onVoiceCall = {},
+            onVideoCall = {},
+            sending = false,
+            retryingMessageId = null,
+            error = null,
+            onClearError = {},
+            onSend = { _, onSent -> onSent() },
+            onRetry = { _, onRetried -> onRetried() },
+            mediaEnabled = true,
+            mediaBytes = StoreScreenshotData.mediaBytes,
+        )
+    }
+
+    @Composable
     private fun HomeShot() {
         val snackbar = remember { SnackbarHostState() }
         HomeDashboard(
@@ -205,7 +225,11 @@ class StoreScreenshotActivity : ComponentActivity() {
             KitFeature.INTERNAL_TRANSFERS to true,
             KitFeature.PAYMENT_REQUESTS to true,
             KitFeature.MERCHANT_PAYMENTS to true,
-            KitFeature.QR_PAYMENTS to true,
+            // QR stays off, exactly as production advertises it. The home top bar draws the
+            // scanner icon either way and reports the journey unavailable on tap, so the
+            // capture is unchanged — but a fixture that switched the capability on would be
+            // claiming an availability the listing explicitly disclaims.
+            KitFeature.QR_PAYMENTS to false,
             KitFeature.BILLS to true,
             KitFeature.AIRTIME to true,
             KitFeature.BANK_TRANSFERS to true,
@@ -213,7 +237,7 @@ class StoreScreenshotActivity : ComponentActivity() {
             KitFeature.KYC to true,
         ),
         loaded = true,
-        qrScannerClientReady = true,
+        qrScannerClientReady = false,
     )
 
     private companion object {

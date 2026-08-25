@@ -44,6 +44,7 @@ class RemoteMobileMoneyRepository @Inject constructor(
     private val walletCache: WalletCache,
     private val paymentAuthorizer: PaymentAuthorizer,
     private val walletRefreshTrigger: WalletRefreshTrigger,
+    private val beneficiaryContacts: BeneficiaryContactDirectory,
     private val sessions: SessionStore,
     @ApplicationScope private val scope: CoroutineScope,
 ) : MobileMoneyRepository {
@@ -79,6 +80,12 @@ class RemoteMobileMoneyRepository @Inject constructor(
         val accounts = accountRequest.await().map { it.toUiModel() }
         val operations = operationRequest.await().map { it.toUiModel() }
         sessions.withCurrentSession(fence) {
+            // Only ids this repository already knew to be mobile money accounts are named as gone,
+            // so a refresh here can never drop a bank beneficiary's link out of the shared table.
+            beneficiaryContacts.forget(
+                fence,
+                mutableAccounts.value.map { it.id } - accounts.map { it.id }.toSet(),
+            )
             mutableNetworks.value = networks
             mutableAccounts.value = accounts
             mutableOperations.value = operations
@@ -98,6 +105,9 @@ class RemoteMobileMoneyRepository @Inject constructor(
         label: String,
         kind: String,
     ) {
+        val expected = requireNotNull(sessions.current()) {
+            "Sign in again to save a mobile money account"
+        }.fence()
         val normalizedNetwork = networkCode.trim().uppercase()
         val normalizedPhone = phoneNumber.filterNot { it.isWhitespace() || it == '-' }
         val normalizedLabel = label.trim()
@@ -131,15 +141,21 @@ class RemoteMobileMoneyRepository @Inject constructor(
             verification.failure?.message
                 ?: "The account is still being verified. Try again shortly."
         }
-        apiCalls.execute {
+        val saved = apiCalls.execute {
             api.createMobileMoneyAccount(
                 idempotencyKey("account"),
                 CreateMobileMoneyAccountRequest(verification.id, kind, normalizedLabel),
             )
         }
-        mutableAccounts.value = apiCalls.execute { api.mobileMoneyAccounts() }
+        // Every later response masks this number, so this is the one moment the app can record
+        // which contact the destination belongs to. See [BeneficiaryContactDirectory].
+        beneficiaryContacts.remember(expected, saved.id, normalizedPhone)
+        val refreshedAccounts = apiCalls.execute { api.mobileMoneyAccounts() }
             .items
             .map { it.toUiModel() }
+        sessions.withCurrentSession(expected) {
+            mutableAccounts.value = refreshedAccounts
+        }
     }
 
     override suspend fun createOperation(
@@ -255,7 +271,10 @@ class RemoteMobileMoneyRepository @Inject constructor(
         }
     }
 
-    override suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String) {
+    override suspend fun submitOperation(
+        quote: FinancialOperationQuote,
+        paymentPin: String,
+    ): String {
         require(quote.operationType in OPERATION_ACTIONS) { "The mobile money quote is invalid" }
         check(sessions.current()?.fence() == quote.sessionFence) {
             "The signed-in account changed after this quote was created"
@@ -296,6 +315,7 @@ class RemoteMobileMoneyRepository @Inject constructor(
         mergeOperation(operation.toUiModel())
         walletRefreshTrigger.refreshNow()
         scope.launch { pollOperation(operation.id) }
+        return operation.id
     }
 
     private suspend fun findNetwork(code: String): MobileMoneyNetwork {
@@ -382,6 +402,8 @@ class RemoteMobileMoneyRepository @Inject constructor(
             currencyCode = mappedNetwork.currencyCode,
             currencyScale = mappedNetwork.currencyScale,
             status = status.lowercase(),
+            kitUserId = kitUser?.id?.trim()?.takeIf(String::isNotEmpty),
+            avatarUrl = kitUser?.avatarUrl?.trim()?.takeIf(String::isNotEmpty),
         )
     }
 

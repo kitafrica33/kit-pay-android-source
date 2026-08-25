@@ -48,12 +48,16 @@ import com.kit.wallet.data.remote.MessagingSyncDto
 import com.kit.wallet.data.remote.MessagingSyncEventDataDto
 import com.kit.wallet.data.remote.MessagingSyncEventDto
 import com.kit.wallet.data.remote.SecureMessagingWireApi
+import com.kit.wallet.data.remote.SessionHeaderInterceptor
+import com.kit.wallet.data.session.SessionInvalidatedException
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
@@ -134,6 +138,38 @@ class RemoteSecureMessagingTransportTest {
     }
 
     @Test
+    fun `removing a member and leaving remain available when the group rollout gate is off`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        server.enqueue(
+            jsonResponse(
+                READY_CAPABILITIES.replace("\"messaging_groups\":true", "\"messaging_groups\":false"),
+            ),
+        )
+        server.enqueue(jsonResponse(PROFILE))
+        server.enqueue(jsonResponse(DEVICES))
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        finishActivation(lifecycle, fence)
+        server.enqueue(jsonResponse(GROUP_CONVERSATIONS))
+        val group = session.conversations().single()
+        assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
+
+        server.enqueue(jsonResponse("""{"ok":true,"data":${GROUP_CONVERSATION_JSON.replace(THIRD_MEMBER_ROW, "")}}"""))
+        val afterRemoval = session.removeGroupMember(group, OTHER_USER_ID)
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/conversations/$CONVERSATION_ID/members/$OTHER_USER_ID",
+            server.takeRequest().path,
+        )
+
+        server.enqueue(jsonResponse("""{"ok":true,"data":$GROUP_CONVERSATION_JSON}"""))
+        session.leaveGroup(afterRemoval)
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/conversations/$CONVERSATION_ID/members/$CURRENT_USER_ID",
+            server.takeRequest().path,
+        )
+    }
+
+    @Test
     fun `read receipt accepts a different canonical marker from monotonic server state`() = runTest {
         val (lifecycle, fence) = newActivation()
         enqueueActivation()
@@ -141,7 +177,7 @@ class RemoteSecureMessagingTransportTest {
         assertActivationRequests()
         finishActivation(lifecycle, fence)
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val conversation = session.directConversations().first()
+        val conversation = session.conversations().first()
         assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
         val response = MessagingReadReceiptDto(
             conversationId = CONVERSATION_ID,
@@ -301,7 +337,7 @@ class RemoteSecureMessagingTransportTest {
         val first = transport.openSession(firstLifecycle, firstFence)
         assertActivationRequests()
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val conversation = first.directConversations().first()
+        val conversation = first.conversations().first()
         assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
 
         val (secondLifecycle, secondFence) = newActivation()
@@ -323,7 +359,7 @@ class RemoteSecureMessagingTransportTest {
         val session = transport.openSession(lifecycle, fence)
         assertActivationRequests()
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val conversation = session.directConversations().first()
+        val conversation = session.conversations().first()
         assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
         enqueueRoster(authoritativeRoster())
         val roster = session.roster(conversation)
@@ -351,7 +387,7 @@ class RemoteSecureMessagingTransportTest {
         val session = transport.openSession(lifecycle, fence)
         assertActivationRequests()
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val conversation = session.directConversations().first()
+        val conversation = session.conversations().first()
         server.takeRequest()
         enqueueRoster(authoritativeRoster())
         val roster = session.roster(conversation)
@@ -389,7 +425,7 @@ class RemoteSecureMessagingTransportTest {
         val session = transport.openSession(lifecycle, fence)
         assertActivationRequests()
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val conversations = session.directConversations()
+        val conversations = session.conversations()
         assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
         enqueueRoster(authoritativeRoster())
         val roster = session.roster(conversations.first())
@@ -421,7 +457,7 @@ class RemoteSecureMessagingTransportTest {
         val first = transport.openSession(lifecycle, firstFence)
         assertActivationRequests()
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val firstConversation = first.directConversations().first()
+        val firstConversation = first.conversations().first()
         server.takeRequest()
         enqueueRoster(authoritativeRoster())
         val firstRoster = first.roster(firstConversation)
@@ -445,7 +481,7 @@ class RemoteSecureMessagingTransportTest {
         lifecycle.beginRosterSync(replacementFence)
         lifecycle.finishActivation(replacementFence)
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val replacementConversation = replacement.directConversations().first()
+        val replacementConversation = replacement.conversations().first()
         server.takeRequest()
         val before = server.requestCount
 
@@ -459,13 +495,66 @@ class RemoteSecureMessagingTransportTest {
     }
 
     @Test
+    fun `owner tagged ciphertext cannot post with a replacement login`() = runTest {
+        val authentication = MutableTestSessionStore(
+            testSession(CURRENT_USER_ID, sessionId = BINDING.sessionEpoch),
+        )
+        var replaceBeforeMessage = false
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                if (replaceBeforeMessage && chain.request().url.encodedPath.endsWith("/messages")) {
+                    runBlocking {
+                        authentication.save(
+                            testSession(OTHER_USER_ID, sessionId = "replacement-session"),
+                        )
+                    }
+                }
+                chain.proceed(chain.request())
+            }
+            .addInterceptor(SessionHeaderInterceptor(authentication))
+            .build()
+        val retrofit = Retrofit.Builder()
+            .baseUrl(server.url("/"))
+            .client(client)
+            .addConverterFactory(MoshiConverterFactory.create(moshi))
+            .build()
+        val fencedTransport = RemoteSecureMessagingTransport(
+            retrofit.create(KitWalletApi::class.java),
+            retrofit.create(SecureMessagingWireApi::class.java),
+            ApiCallExecutor(moshi),
+        )
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation()
+        val session = fencedTransport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        finishActivation(lifecycle, fence)
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        val conversation = session.conversations().first()
+        server.takeRequest()
+        enqueueRoster(authoritativeRoster())
+        val roster = session.roster(conversation)
+        server.takeRequest()
+        val encrypted = encryptedSendFor(session, conversation, roster, lifecycle, fence)
+        val owner = checkNotNull(authentication.current()).fence()
+        val before = server.requestCount
+
+        replaceBeforeMessage = true
+        val failure = runCatching {
+            session.send(conversation, encrypted, emptyList(), expectedOwner = owner)
+        }.exceptionOrNull()
+
+        assertTrue("expected session invalidation, got $failure", failure is SessionInvalidatedException)
+        assertEquals(before, server.requestCount)
+    }
+
+    @Test
     fun `authoritative roster and its plan cannot cross session or roster handles`() = runTest {
         val (firstLifecycle, firstFence) = newActivation()
         enqueueActivation()
         val first = transport.openSession(firstLifecycle, firstFence)
         assertActivationRequests()
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val firstConversation = first.directConversations().first()
+        val firstConversation = first.conversations().first()
         server.takeRequest()
         enqueueRoster(authoritativeRoster())
         val firstRoster = first.roster(firstConversation)
@@ -477,7 +566,7 @@ class RemoteSecureMessagingTransportTest {
         val second = transport.openSession(secondLifecycle, secondFence)
         assertActivationRequests()
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val secondConversation = second.directConversations().first()
+        val secondConversation = second.conversations().first()
         server.takeRequest()
         val beforeCrossSession = server.requestCount
 
@@ -512,7 +601,7 @@ class RemoteSecureMessagingTransportTest {
         assertActivationRequests()
         beginRosterSync(lifecycle, fence)
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val conversation = session.directConversations().first()
+        val conversation = session.conversations().first()
         server.takeRequest()
         val historicalDto = authoritativeRoster()
         enqueueRoster(historicalDto)
@@ -610,7 +699,7 @@ class RemoteSecureMessagingTransportTest {
         assertActivationRequests()
         beginRosterSync(lifecycle, fence)
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val conversation = session.directConversations().first()
+        val conversation = session.conversations().first()
         server.takeRequest()
         val rosterDto = authoritativeRoster()
         enqueueRoster(rosterDto)
@@ -740,7 +829,7 @@ class RemoteSecureMessagingTransportTest {
         assertActivationRequests()
         beginRosterSync(lifecycle, fence)
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
-        val conversation = session.directConversations().first()
+        val conversation = session.conversations().first()
         server.takeRequest()
         val rosterDto = authoritativeRoster()
         enqueueRoster(rosterDto)
@@ -989,7 +1078,7 @@ class RemoteSecureMessagingTransportTest {
 
     private suspend fun encryptedSendFor(
         session: RemoteSecureMessagingTransport.Session,
-        conversation: RemoteSecureMessagingTransport.Session.DirectConversation,
+        conversation: RemoteSecureMessagingTransport.Session.SecureConversation,
         roster: RemoteSecureMessagingTransport.Session.AuthoritativeRoster,
         lifecycle: SecureMessagingLifecycleGuard,
         fence: SecureMessagingSessionFence,
@@ -1217,7 +1306,7 @@ class RemoteSecureMessagingTransportTest {
         )
         const val READY_CAPABILITIES = """
             {"ok":true,"data":{"api_version":"v1","currency":{"code":"UGX","scale":"2"},
-            "features":{"messaging":true},"authentication":{},"protocols":{"messaging":{
+            "features":{"messaging":true,"messaging_groups":true,"messaging_reactions_e2ee_v1":true},"authentication":{},"protocols":{"messaging":{
             "ready":true,"version":"v2","suite":"signal-pqxdh-kyber1024-double-ratchet-v2",
             "post_quantum":true}}}}
         """
@@ -1243,6 +1332,18 @@ class RemoteSecureMessagingTransportTest {
             "joined_at":"$TIMESTAMP"},{"user_id":"$PEER_USER_ID","name":"Peer",
             "role":"member","joined_at":"$TIMESTAMP"}],"created_at":"$TIMESTAMP",
             "updated_at":"$TIMESTAMP"}]}}
+        """
+        const val THIRD_MEMBER_ROW = """{"user_id":"$OTHER_USER_ID","name":"Peer","role":"member","joined_at":"$TIMESTAMP"},"""
+        const val GROUP_CONVERSATION_JSON = """
+            {"id":"$CONVERSATION_ID","type":"group","title":"Weekend savings","parent_id":null,
+            "created_by":"$CURRENT_USER_ID","role":"owner","members":[
+            $THIRD_MEMBER_ROW
+            {"user_id":"$CURRENT_USER_ID","name":"Current User","role":"owner",
+            "joined_at":"$TIMESTAMP"}],"created_at":"$TIMESTAMP",
+            "updated_at":"$TIMESTAMP"}
+        """
+        const val GROUP_CONVERSATIONS = """
+            {"ok":true,"data":{"items":[$GROUP_CONVERSATION_JSON]}}
         """
     }
 }

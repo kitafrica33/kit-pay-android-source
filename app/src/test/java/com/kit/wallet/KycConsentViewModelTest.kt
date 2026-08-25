@@ -67,7 +67,10 @@ class KycConsentViewModelTest {
         const val VERIFICATION_URL = "https://verify.didit.me/session/example_123"
         val STATUS = KycStatus(
             status = "not_started",
+            accountStatus = "unverified",
+            deviceCheckRequired = false,
             caseReference = null,
+            caseStatus = null,
             decisionCode = null,
             provider = "didit",
             providerStatus = null,

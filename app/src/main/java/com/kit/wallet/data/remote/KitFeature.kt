@@ -15,6 +15,7 @@ object KitFeature {
     const val MESSAGING = "messaging"
     const val CALLS = "calls"
     const val NOTIFICATIONS = "notifications"
+    const val ABUSE_REPORTING = "abuse_reporting"
     const val KYC = "kyc"
     const val EMAIL_REGISTRATION = "email_registration"
     const val EMAIL_RECOVERY = "email_recovery"

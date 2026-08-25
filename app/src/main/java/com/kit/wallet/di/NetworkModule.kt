@@ -58,6 +58,25 @@ object NetworkModule {
         .authenticator(sessionAuthenticator)
         .build()
 
+    /**
+     * Google gets its own client, deliberately built from nothing.
+     *
+     * It shares no interceptor with the Kit Pay clients, so there is no way for a session bearer,
+     * a device header or a request ID to end up on a request to Google. Timeouts are generous
+     * because a backup upload is a long transfer over whatever connection the user has, and the
+     * call timeout stays off so a slow upload is slow rather than failed.
+     */
+    @Provides
+    @Singleton
+    @GoogleHttpClient
+    fun provideGoogleHttpClient(): OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(120, TimeUnit.SECONDS)
+        .callTimeout(0, TimeUnit.MILLISECONDS)
+        .retryOnConnectionFailure(true)
+        .build()
+
     @Provides
     @Singleton
     fun provideKitWalletApi(

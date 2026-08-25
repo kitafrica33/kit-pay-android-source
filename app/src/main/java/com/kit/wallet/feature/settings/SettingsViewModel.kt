@@ -57,31 +57,47 @@ class SettingsViewModel @Inject constructor(
     val deletionState = mutableDeletionState.asStateFlow()
 
     init {
+        refreshProfile()
+    }
+
+    /**
+     * Re-reads the profile from the server.
+     *
+     * Cached profile data keeps this screen useful offline; a failed refresh must not replace it
+     * or prevent a later explicit edit. Called again whenever the editor resumes, because identity
+     * verification can hand the account a legal name while the editor sits behind it on the stack,
+     * and the screen would otherwise still be asking for a name the account already has.
+     */
+    fun refreshProfile() {
         viewModelScope.launch {
-            // Cached profile data keeps this screen useful offline; a failed refresh must not
-            // replace it or prevent a later explicit edit.
             runCatching { userRepo.refreshProfile() }
         }
     }
 
     fun saveProfile(name: String, tag: String, onSaved: () -> Unit) {
-        if (mutableEditorState.value.saving) return
+        if (mutableEditorState.value.let { it.saving || it.uploadingAvatar }) return
         val normalizedName = normalizeProfileName(name)
         val normalizedTag = normalizeProfileTag(tag)
-        profileValidationError(normalizedName, normalizedTag)?.let { error ->
-            mutableEditorState.value = ProfileEditorUiState(error = error)
+        // A verified legal name makes both of these optional, exactly as the API has it. Validate
+        // against the same fact the server will, or the screen refuses a save the API would take.
+        profileValidationError(normalizedName, normalizedTag, profile.value.legalName)?.let { error ->
+            mutableEditorState.value = mutableEditorState.value.copy(error = error)
             return
         }
 
         viewModelScope.launch {
-            mutableEditorState.value = ProfileEditorUiState(saving = true)
+            mutableEditorState.value = mutableEditorState.value.copy(saving = true, error = null)
             runCatching { userRepo.updateProfile(normalizedName, normalizedTag) }
                 .onSuccess {
-                    mutableEditorState.value = ProfileEditorUiState()
+                    mutableEditorState.value = mutableEditorState.value.copy(
+                        saving = false,
+                        error = null,
+                    )
                     onSaved()
                 }
                 .onFailure { error ->
-                    mutableEditorState.value = ProfileEditorUiState(
+                    mutableEditorState.value = mutableEditorState.value.copy(
+                        saving = false,
                         error = error.message ?: "Could not update your profile",
                     )
                 }
@@ -94,7 +110,7 @@ class SettingsViewModel @Inject constructor(
 
     /** Uploads an already-transcoded JPEG profile photo through the moderated media pipeline. */
     fun attachAvatar(jpegBytes: ByteArray) {
-        if (mutableEditorState.value.uploadingAvatar) return
+        if (mutableEditorState.value.let { it.saving || it.uploadingAvatar }) return
         viewModelScope.launch {
             mutableEditorState.value = mutableEditorState.value.copy(
                 uploadingAvatar = true,
@@ -281,8 +297,11 @@ class SettingsViewModel @Inject constructor(
 internal fun normalizeProfileTag(value: String): String =
     canonicalProfileTag(value)
 
-internal fun profileValidationError(name: String, tag: String): String? =
-    profileIdentityValidationError(name, tag)
+internal fun profileValidationError(
+    name: String,
+    tag: String,
+    legalName: String? = null,
+): String? = profileIdentityValidationError(name, tag, legalName)
 
 internal fun profileEmailResendDeadline(
     nowEpochMillis: Long,

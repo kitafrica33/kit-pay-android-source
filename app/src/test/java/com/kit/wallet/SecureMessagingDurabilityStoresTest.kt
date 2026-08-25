@@ -158,11 +158,11 @@ class SecureMessagingDurabilityStoresTest {
         val revisionBeforeRead = restarted.changes.value
         assertEquals(
             INCOMING_MESSAGE_ID,
-            restarted.newestUnreadInboundMessageId(CONVERSATION_ID, PEER_USER_ID),
+            restarted.newestUnreadInboundMessageId(CONVERSATION_ID, setOf(PEER_USER_ID)),
         )
         restarted.markInboundReadThrough(
             conversationId = CONVERSATION_ID,
-            peerUserId = PEER_USER_ID,
+            senderUserIds = setOf(PEER_USER_ID),
             requestedLastReadMessageId = INCOMING_MESSAGE_ID,
             canonicalLastReadMessageId = INCOMING_MESSAGE_ID,
             canonicalReadAt = Instant.parse("2026-07-20T14:00:00Z"),
@@ -177,13 +177,13 @@ class SecureMessagingDurabilityStoresTest {
             readAfterRestart.readPage(limit = 2).messages().first().deliveryState,
         )
         assertNull(
-            readAfterRestart.newestUnreadInboundMessageId(CONVERSATION_ID, PEER_USER_ID),
+            readAfterRestart.newestUnreadInboundMessageId(CONVERSATION_ID, setOf(PEER_USER_ID)),
         )
         // An idempotent sync replay must not turn a locally read message unread again.
         readAfterRestart.recordInbound(inbound, inboundSentAt)
         readAfterRestart.markInboundReadThrough(
             conversationId = CONVERSATION_ID,
-            peerUserId = PEER_USER_ID,
+            senderUserIds = setOf(PEER_USER_ID),
             requestedLastReadMessageId = INCOMING_MESSAGE_ID,
             canonicalLastReadMessageId = INCOMING_MESSAGE_ID,
             canonicalReadAt = Instant.parse("2026-07-20T14:00:00Z"),
@@ -253,7 +253,7 @@ class SecureMessagingDurabilityStoresTest {
             assertEquals(OLD_MESSAGE_ID, secondPage.messages().single().serverMessageId)
             assertEquals(
                 OLD_MESSAGE_ID,
-                restarted.newestUnreadInboundMessageId(CONVERSATION_ID, PEER_USER_ID),
+                restarted.newestUnreadInboundMessageId(CONVERSATION_ID, setOf(PEER_USER_ID)),
             )
 
             // Replayed suppression is idempotent and cannot make the record visible again.
@@ -275,14 +275,14 @@ class SecureMessagingDurabilityStoresTest {
         recordInbound(durableState, projection, REQUESTED_MESSAGE_ID, REQUESTED_CLIENT_ID, 1)
         assertEquals(
             REQUESTED_MESSAGE_ID,
-            projection.newestUnreadInboundMessageId(CONVERSATION_ID, PEER_USER_ID),
+            projection.newestUnreadInboundMessageId(CONVERSATION_ID, setOf(PEER_USER_ID)),
         )
 
         // This projection appears while the selected marker's POST is in flight.
         recordInbound(durableState, projection, LATER_MESSAGE_ID, LATER_CLIENT_ID, 2)
         projection.markInboundReadThrough(
             conversationId = CONVERSATION_ID,
-            peerUserId = PEER_USER_ID,
+            senderUserIds = setOf(PEER_USER_ID),
             requestedLastReadMessageId = REQUESTED_MESSAGE_ID,
             canonicalLastReadMessageId = REQUESTED_MESSAGE_ID,
             canonicalReadAt = Instant.parse("2026-07-20T14:00:00Z"),
@@ -311,7 +311,7 @@ class SecureMessagingDurabilityStoresTest {
 
         projection.markInboundReadThrough(
             conversationId = CONVERSATION_ID,
-            peerUserId = PEER_USER_ID,
+            senderUserIds = setOf(PEER_USER_ID),
             requestedLastReadMessageId = REQUESTED_MESSAGE_ID,
             canonicalLastReadMessageId = UNKNOWN_CANONICAL_MESSAGE_ID,
             canonicalReadAt = Instant.parse("2026-07-20T14:00:00Z"),
@@ -325,7 +325,7 @@ class SecureMessagingDurabilityStoresTest {
         )
         assertEquals(
             REQUESTED_MESSAGE_ID,
-            projection.newestUnreadInboundMessageId(CONVERSATION_ID, PEER_USER_ID),
+            projection.newestUnreadInboundMessageId(CONVERSATION_ID, setOf(PEER_USER_ID)),
         )
     }
 
@@ -340,12 +340,12 @@ class SecureMessagingDurabilityStoresTest {
             recordInbound(durableState, projection, LATER_MESSAGE_ID, LATER_CLIENT_ID, 0)
             assertEquals(
                 LATER_MESSAGE_ID,
-                projection.newestUnreadInboundMessageId(CONVERSATION_ID, PEER_USER_ID),
+                projection.newestUnreadInboundMessageId(CONVERSATION_ID, setOf(PEER_USER_ID)),
             )
 
             projection.markInboundReadThrough(
                 conversationId = CONVERSATION_ID,
-                peerUserId = PEER_USER_ID,
+                senderUserIds = setOf(PEER_USER_ID),
                 requestedLastReadMessageId = REQUESTED_MESSAGE_ID,
                 canonicalLastReadMessageId = CANONICAL_MESSAGE_ID,
                 canonicalReadAt = Instant.parse("2026-07-20T14:00:00Z"),
@@ -373,7 +373,7 @@ class SecureMessagingDurabilityStoresTest {
             runCatching {
                 projection.markInboundReadThrough(
                     conversationId = CONVERSATION_ID,
-                    peerUserId = PEER_USER_ID,
+                    senderUserIds = setOf(PEER_USER_ID),
                     requestedLastReadMessageId = REQUESTED_MESSAGE_ID,
                     canonicalLastReadMessageId = REQUESTED_MESSAGE_ID,
                     canonicalReadAt = Instant.parse("2026-07-20T12:59:59Z"),
@@ -454,7 +454,7 @@ class SecureMessagingDurabilityStoresTest {
 
             projection.markInboundReadThrough(
                 conversationId = CONVERSATION_ID,
-                peerUserId = PEER_USER_ID,
+                senderUserIds = setOf(PEER_USER_ID),
                 requestedLastReadMessageId = REQUESTED_MESSAGE_ID,
                 canonicalLastReadMessageId = CANONICAL_MESSAGE_ID,
                 canonicalReadAt = Instant.parse("2026-07-20T14:00:00Z"),
@@ -484,7 +484,7 @@ class SecureMessagingDurabilityStoresTest {
                 runCatching {
                     separateProjection.markInboundReadThrough(
                         conversationId = CONVERSATION_ID,
-                        peerUserId = PEER_USER_ID,
+                        senderUserIds = setOf(PEER_USER_ID),
                         requestedLastReadMessageId = REQUESTED_MESSAGE_ID,
                         canonicalLastReadMessageId = OLD_MESSAGE_ID,
                         canonicalReadAt = Instant.parse("2026-07-20T14:00:00Z"),

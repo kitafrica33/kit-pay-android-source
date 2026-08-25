@@ -719,7 +719,11 @@ class RemoteAuthRepository @Inject constructor(
             val profileName = profileNameOrPlaceholder(authenticatedUser.name)
             val setupState = if (
                 authenticatedUser.profileSetupRequired == true ||
-                requiresProfileSetup(authenticatedUser.name, authenticatedUser.tag)
+                requiresProfileSetup(
+                    authenticatedUser.name,
+                    authenticatedUser.tag,
+                    authenticatedUser.legalName,
+                )
             ) {
                 ProfileSetupState.REQUIRED
             } else {
@@ -849,7 +853,24 @@ internal fun challengeLifetimeMillis(expiresAt: Instant?, serverTime: Instant?):
         ?.takeIf { it > 0L }
 }
 
-internal fun requiresProfileSetup(name: String?, tag: String?): Boolean {
+/**
+ * Whether this account still has to be sent through profile setup.
+ *
+ * The client re-derives this rather than trusting the server flag alone, so that a profile cached
+ * by an older build cannot slip past the gate. That re-derivation has to know about the legal name:
+ * the server's rule is that a verified identity document already gives the account a usable name,
+ * at which point the display name and the username are both optional. Without [legalName] here the
+ * client would keep insisting on a username the API no longer requires, and a verified user who
+ * declined one would be held in setup forever by the app's own second opinion.
+ */
+internal fun requiresProfileSetup(
+    name: String?,
+    tag: String?,
+    legalName: String? = null,
+): Boolean {
+    if (hasVerifiedLegalName(legalName)) {
+        return profileIdentityValidationError(name.orEmpty(), tag.orEmpty(), legalName) != null
+    }
     return tag == null || profileIdentityValidationError(name.orEmpty(), tag) != null
 }
 

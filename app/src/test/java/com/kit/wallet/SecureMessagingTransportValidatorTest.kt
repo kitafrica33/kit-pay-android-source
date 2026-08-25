@@ -20,8 +20,11 @@ import com.kit.wallet.data.remote.SecureMessagingWireValidationException
 import com.kit.wallet.data.remote.ValidatedMessagingSyncEvent
 import com.kit.wallet.data.remote.CursorPageDto
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.Base64
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -61,19 +64,21 @@ class SecureMessagingTransportValidatorTest {
     }
 
     @Test
-    fun `direct conversation validation filters other types and binds the peer and current role`() {
+    fun `conversation validation filters unencryptable types and binds the peer and current role`() {
         val direct = directConversation()
-        val group = direct.copy(
+        // A community/channel resource this build cannot encrypt for is skipped rather than
+        // rejected: it is a valid server object, just not one this client speaks.
+        val channel = direct.copy(
             id = GROUP_ID,
-            type = "group",
-            title = "Existing group resource",
+            type = "channel",
+            title = "Existing channel resource",
             role = null,
             members = emptyList(),
             createdBy = null,
         )
 
-        val validated = SecureMessagingTransportValidator.validateDirectConversations(
-            MessagingConversationListDto(listOf(group, direct)),
+        val validated = SecureMessagingTransportValidator.validateConversations(
+            MessagingConversationListDto(listOf(channel, direct)),
             CURRENT_USER_ID,
         )
 
@@ -82,6 +87,59 @@ class SecureMessagingTransportValidatorTest {
         assertEquals(OTHER_USER_ID, validated.single().peerUserId)
         assertEquals("Amina", validated.single().peerName)
         assertEquals("owner", validated.single().currentUserRole)
+        assertFalse(validated.single().isGroup)
+    }
+
+    @Test
+    fun `group validation keeps every member, names no peer, and requires a title`() {
+        val validated = SecureMessagingTransportValidator.validateConversations(
+            MessagingConversationListDto(listOf(groupConversation())),
+            CURRENT_USER_ID,
+        ).single()
+
+        assertTrue(validated.isGroup)
+        assertEquals(GROUP_ID, validated.conversationId)
+        assertEquals("Weekend savings", validated.title)
+        assertEquals("owner", validated.currentUserRole)
+        assertEquals(CURRENT_USER_ID, validated.viewerUserId)
+        assertEquals(
+            setOf(CURRENT_USER_ID, OTHER_USER_ID, THIRD_USER_ID),
+            validated.memberUserIds(),
+        )
+        assertEquals(setOf(OTHER_USER_ID, THIRD_USER_ID), validated.others.map { it.userId }.toSet())
+        // A group deliberately has no peer: naming one would put a single member's identity on a
+        // conversation that belongs to all of them.
+        assertNull(validated.peerUserId)
+        assertNull(validated.peerName)
+    }
+
+    @Test
+    fun `malformed groups fail closed`() {
+        val valid = groupConversation()
+        val members = valid.members.orEmpty()
+        val invalidResponses = listOf(
+            // A group must be named; the title is the only thing the server may show for it.
+            MessagingConversationListDto(listOf(valid.copy(title = null))),
+            MessagingConversationListDto(listOf(valid.copy(title = "   "))),
+            MessagingConversationListDto(listOf(valid.copy(title = "t".repeat(65)))),
+            MessagingConversationListDto(listOf(valid.copy(title = "😀".repeat(31)))),
+            // The viewer must appear exactly once, with the role the server claims for them.
+            MessagingConversationListDto(listOf(valid.copy(members = members.drop(1)))),
+            MessagingConversationListDto(
+                listOf(valid.copy(members = members + members.first())),
+            ),
+            MessagingConversationListDto(listOf(valid.copy(role = "member"))),
+            MessagingConversationListDto(listOf(valid.copy(members = emptyList()))),
+        )
+
+        invalidResponses.forEach { response ->
+            assertRejected {
+                SecureMessagingTransportValidator.validateConversations(
+                    response,
+                    CURRENT_USER_ID,
+                )
+            }
+        }
     }
 
     @Test
@@ -95,7 +153,7 @@ class SecureMessagingTransportValidatorTest {
 
         assertEquals(
             1,
-            SecureMessagingTransportValidator.validateDirectConversations(
+            SecureMessagingTransportValidator.validateConversations(
                 MessagingConversationListDto(listOf(memberJoinedAfterInitialUpdate)),
                 CURRENT_USER_ID,
             ).size,
@@ -107,7 +165,7 @@ class SecureMessagingTransportValidatorTest {
             },
         )
         assertRejected {
-            SecureMessagingTransportValidator.validateDirectConversations(
+            SecureMessagingTransportValidator.validateConversations(
                 MessagingConversationListDto(listOf(joinedBeforeCreation)),
                 CURRENT_USER_ID,
             )
@@ -143,7 +201,7 @@ class SecureMessagingTransportValidatorTest {
 
         invalidResponses.forEach { response ->
             assertRejected {
-                SecureMessagingTransportValidator.validateDirectConversations(
+                SecureMessagingTransportValidator.validateConversations(
                     response,
                     CURRENT_USER_ID,
                 )
@@ -172,6 +230,33 @@ class SecureMessagingTransportValidatorTest {
         assertEquals(11L, validated.lastEventId)
         assertTrue(validated.events[0] is ValidatedMessagingSyncEvent.IncomingMessage)
         assertTrue(validated.events[1] is ValidatedMessagingSyncEvent.OutboundMessage)
+    }
+
+    @Test
+    fun `outbound projection accepts the server six digit message timestamp`() {
+        val precise = "2026-07-19T12:02:00.123456Z"
+        val eventTime = "2026-07-19T12:02:00.234567Z"
+        val event = outgoingMessageEvent(id = "11").let { original ->
+            original.copy(
+                data = original.data?.copy(sentAt = precise),
+                occurredAt = eventTime,
+            )
+        }
+        val validated = SecureMessagingTransportValidator.validateSyncPage(
+            response = MessagingSyncDto(
+                events = listOf(event),
+                page = CursorPageDto(nextCursor = "precise_cursor", hasMore = false, limit = 1),
+            ),
+            currentUserId = CURRENT_USER_ID,
+            currentDeviceId = CURRENT_DEVICE_ID,
+            requestedCursor = "old_cursor",
+            requestedLimit = 1,
+            previousEventId = 10,
+        )
+
+        val projected = validated.events.single() as ValidatedMessagingSyncEvent.OutboundMessage
+        assertEquals(Instant.parse(precise), projected.message.sentAt)
+        assertEquals(Instant.parse(eventTime), projected.occurredAt)
     }
 
     @Test
@@ -220,6 +305,203 @@ class SecureMessagingTransportValidatorTest {
                     requestedCursor = "old_cursor",
                     requestedLimit = 1,
                     previousEventId = 9,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `delivery and read transitions accept seconds or exact six digit precision`() {
+        val precise = "2026-07-19T12:04:00.123456Z"
+        val events = listOf(
+            deliveryReceiptEvent("12").let { event ->
+                event.copy(
+                    data = event.data?.copy(deliveredAt = precise),
+                    occurredAt = precise,
+                )
+            },
+            readReceiptEvent("13").let { event ->
+                event.copy(
+                    data = event.data?.copy(readAt = precise),
+                    occurredAt = precise,
+                )
+            },
+        )
+        val validated = SecureMessagingTransportValidator.validateSyncPage(
+            response = MessagingSyncDto(
+                events = events,
+                page = CursorPageDto(nextCursor = "precise_receipts", hasMore = false, limit = 2),
+            ),
+            currentUserId = CURRENT_USER_ID,
+            currentDeviceId = CURRENT_DEVICE_ID,
+            requestedCursor = "old_cursor",
+            requestedLimit = 2,
+            previousEventId = 11,
+        )
+
+        assertEquals(
+            Instant.parse(precise),
+            (validated.events[0] as ValidatedMessagingSyncEvent.DeliveryReceipt).deliveredAt,
+        )
+        assertEquals(
+            Instant.parse(precise),
+            (validated.events[1] as ValidatedMessagingSyncEvent.ReadReceipt).readAt,
+        )
+        assertEquals(
+            Instant.parse(precise),
+            SecureMessagingTransportValidator.validateDeliveryAcknowledgement(
+                response = MessageDeliveryAcknowledgementDto(
+                    deliveryState = "delivered_to_device",
+                    deviceId = CURRENT_DEVICE_ID,
+                    acknowledgedCount = 1,
+                    newlyAcknowledgedCount = 1,
+                    items = listOf(MessageDeliveryReceiptDto(MESSAGE_ID, precise)),
+                ),
+                expectedCurrentDeviceId = CURRENT_DEVICE_ID,
+                expectedMessageIds = listOf(MESSAGE_ID),
+            ).items.single().deliveredAt,
+        )
+        assertEquals(
+            Instant.parse(precise),
+            SecureMessagingTransportValidator.validateReadReceipt(
+                response = MessagingReadReceiptDto(
+                    conversationId = CONVERSATION_ID,
+                    userId = CURRENT_USER_ID,
+                    lastReadMessageId = MESSAGE_ID,
+                    readAt = precise,
+                ),
+                expectedConversationId = CONVERSATION_ID,
+                expectedCurrentUserId = CURRENT_USER_ID,
+                requestedMessageId = MESSAGE_ID,
+            ).readAt,
+        )
+
+        listOf(
+            deliveryReceiptEvent("12").let { event ->
+                event.copy(data = event.data?.copy(deliveredAt = "2026-07-19T12:04:00.123Z"))
+            },
+            readReceiptEvent("12").let { event ->
+                event.copy(data = event.data?.copy(readAt = "2026-07-19T12:04:00.123Z"))
+            },
+        ).forEach { malformed ->
+            assertRejected {
+                SecureMessagingTransportValidator.validateSyncPage(
+                    response = MessagingSyncDto(
+                        events = listOf(malformed),
+                        page = CursorPageDto(nextCursor = "bad_precision", hasMore = false, limit = 1),
+                    ),
+                    currentUserId = CURRENT_USER_ID,
+                    currentDeviceId = CURRENT_DEVICE_ID,
+                    requestedCursor = "old_cursor",
+                    requestedLimit = 1,
+                    previousEventId = 11,
+                )
+            }
+        }
+        assertRejected {
+            SecureMessagingTransportValidator.validateDeliveryAcknowledgement(
+                response = MessageDeliveryAcknowledgementDto(
+                    deliveryState = "delivered_to_device",
+                    deviceId = CURRENT_DEVICE_ID,
+                    acknowledgedCount = 1,
+                    newlyAcknowledgedCount = 1,
+                    items = listOf(MessageDeliveryReceiptDto(MESSAGE_ID, "2026-07-19T12:04:00.123Z")),
+                ),
+                expectedCurrentDeviceId = CURRENT_DEVICE_ID,
+                expectedMessageIds = listOf(MESSAGE_ID),
+            )
+        }
+        assertRejected {
+            SecureMessagingTransportValidator.validateReadReceipt(
+                response = MessagingReadReceiptDto(
+                    conversationId = CONVERSATION_ID,
+                    userId = CURRENT_USER_ID,
+                    lastReadMessageId = MESSAGE_ID,
+                    readAt = "2026-07-19T12:04:00.123Z",
+                ),
+                expectedConversationId = CONVERSATION_ID,
+                expectedCurrentUserId = CURRENT_USER_ID,
+                requestedMessageId = MESSAGE_ID,
+            )
+        }
+    }
+
+    @Test
+    fun `membership events carry the subject and its new role and nothing else`() {
+        val validated = SecureMessagingTransportValidator.validateSyncPage(
+            response = MessagingSyncDto(
+                events = listOf(
+                    membershipEvent(id = "14", type = "membership.added", role = null),
+                    membershipEvent(id = "15", type = "membership.role_changed", role = "admin"),
+                    membershipEvent(id = "16", type = "membership.removed", role = null),
+                ),
+                page = CursorPageDto(nextCursor = "membership_cursor", hasMore = false, limit = 3),
+            ),
+            currentUserId = CURRENT_USER_ID,
+            currentDeviceId = CURRENT_DEVICE_ID,
+            requestedCursor = "old_cursor",
+            requestedLimit = 3,
+            previousEventId = 13,
+        )
+
+        val metadata = validated.events.map { it as ValidatedMessagingSyncEvent.Metadata }
+        assertEquals(
+            listOf("membership.added", "membership.role_changed", "membership.removed"),
+            metadata.map { it.type },
+        )
+        assertEquals(listOf(THIRD_USER_ID, THIRD_USER_ID, THIRD_USER_ID), metadata.map { it.memberUserId })
+        assertEquals(listOf(null, "admin", null), metadata.map { it.memberRole })
+    }
+
+    @Test
+    fun `conversation updated uses the canonical lifecycle name`() {
+        val event = MessagingSyncEventDto(
+            id = "14",
+            type = "conversation.updated",
+            conversationId = GROUP_ID,
+            resourceType = "conversation",
+            resourceId = GROUP_ID,
+            data = MessagingSyncEventDataDto(),
+            occurredAt = UPDATED_AT,
+        )
+        val validated = SecureMessagingTransportValidator.validateSyncPage(
+            response = MessagingSyncDto(
+                events = listOf(event),
+                page = CursorPageDto(nextCursor = "updated_cursor", hasMore = false, limit = 1),
+            ),
+            currentUserId = CURRENT_USER_ID,
+            currentDeviceId = CURRENT_DEVICE_ID,
+            requestedCursor = "old_cursor",
+            requestedLimit = 1,
+            previousEventId = 13,
+        )
+
+        assertEquals("conversation.updated", (validated.events.single() as ValidatedMessagingSyncEvent.Metadata).type)
+    }
+
+    @Test
+    fun `membership events without a valid subject or a known role fail closed`() {
+        listOf(
+            membershipEvent("14").copy(resourceType = "conversation"),
+            membershipEvent("14").copy(resourceId = GROUP_ID),
+            membershipEvent("14").copy(resourceId = "$CONVERSATION_ID:7"),
+            membershipEvent("14").copy(data = null),
+            membershipEvent("14", userId = null),
+            membershipEvent("14", userId = "not-a-user-id"),
+            // An unfamiliar role would otherwise be rendered as a membership line nobody can read.
+            membershipEvent("14", role = "superuser"),
+        ).forEach { rejected ->
+            assertRejected {
+                SecureMessagingTransportValidator.validateSyncPage(
+                    response = MessagingSyncDto(
+                        events = listOf(rejected),
+                        page = CursorPageDto(nextCursor = "next_cursor", hasMore = false, limit = 1),
+                    ),
+                    currentUserId = CURRENT_USER_ID,
+                    currentDeviceId = CURRENT_DEVICE_ID,
+                    requestedCursor = "old_cursor",
+                    requestedLimit = 1,
+                    previousEventId = 13,
                 )
             }
         }
@@ -466,6 +748,18 @@ class SecureMessagingTransportValidatorTest {
         updatedAt = UPDATED_AT,
     )
 
+    private fun groupConversation() = directConversation().copy(
+        id = GROUP_ID,
+        type = "group",
+        title = "Weekend savings",
+        members = directConversation().members.orEmpty() + MessagingConversationMemberDto(
+            userId = THIRD_USER_ID,
+            name = "Brian",
+            role = "member",
+            joinedAt = JOINED_AT,
+        ),
+    )
+
     private fun incomingMessageEvent(id: String): MessagingSyncEventDto {
         val message = incomingMessage()
         return messageEvent(id, message)
@@ -514,6 +808,21 @@ class SecureMessagingTransportValidatorTest {
             lastReadMessageId = MESSAGE_ID,
             readAt = READ_AT,
         ),
+        occurredAt = READ_AT,
+    )
+
+    private fun membershipEvent(
+        id: String,
+        type: String = "membership.added",
+        userId: String? = THIRD_USER_ID,
+        role: String? = "member",
+    ) = MessagingSyncEventDto(
+        id = id,
+        type = type,
+        conversationId = GROUP_ID,
+        resourceType = "conversation_member",
+        resourceId = "$GROUP_ID:7",
+        data = MessagingSyncEventDataDto(userId = userId, role = role),
         occurredAt = READ_AT,
     )
 

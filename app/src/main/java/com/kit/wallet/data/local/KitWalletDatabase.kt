@@ -15,8 +15,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         SecureMessagingMetadataEntity::class,
         AccountMessageArchiveEntity::class,
         ConversationPrefEntity::class,
+        ProfilePhotoEntity::class,
+        BeneficiaryContactEntity::class,
     ],
-    version = 9,
+    version = 12,
     exportSchema = true,
 )
 abstract class KitWalletDatabase : RoomDatabase() {
@@ -28,6 +30,8 @@ abstract class KitWalletDatabase : RoomDatabase() {
     abstract fun secureMessagingMetadataDao(): SecureMessagingMetadataDao
     abstract fun accountMessageArchiveDao(): AccountMessageArchiveDao
     abstract fun conversationPrefsDao(): ConversationPrefsDao
+    abstract fun profilePhotoDao(): ProfilePhotoDao
+    abstract fun beneficiaryContactDao(): BeneficiaryContactDao
 
     companion object {
         val MIGRATION_1_2: Migration = object : Migration(1, 2) {
@@ -136,6 +140,88 @@ abstract class KitWalletDatabase : RoomDatabase() {
                         "pinned INTEGER NOT NULL DEFAULT 0, " +
                         "muted INTEGER NOT NULL DEFAULT 0, " +
                         "PRIMARY KEY(conversationId))",
+                )
+            }
+        }
+
+        val MIGRATION_9_10: Migration = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS profile_photos (" +
+                        "userId TEXT NOT NULL, " +
+                        "avatarUrl TEXT NOT NULL, " +
+                        "updatedAtEpochMillis INTEGER NOT NULL, " +
+                        "PRIMARY KEY(userId))",
+                )
+            }
+        }
+
+        val MIGRATION_10_11: Migration = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS beneficiary_contacts (" +
+                        "beneficiaryId TEXT NOT NULL, " +
+                        "phoneKey TEXT NOT NULL, " +
+                        "updatedAtEpochMillis INTEGER NOT NULL, " +
+                        "PRIMARY KEY(beneficiaryId))",
+                )
+            }
+        }
+
+        val MIGRATION_11_12: Migration = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE profile ADD COLUMN legalName TEXT")
+                // Required until the server says otherwise, which is the safe way round: an
+                // account wrongly told its username is optional would be offered a Save the API
+                // rejects. The next profile refresh replaces both values with the truth.
+                db.execSQL(
+                    "ALTER TABLE profile ADD COLUMN usernameRequired INTEGER NOT NULL DEFAULT 1",
+                )
+
+                // A profile-photo URL can be retained only when the old unified cache has an
+                // authenticated owner. Copy it into the composite owner/user key before replacing
+                // the table. Rows with no owner are deliberately discarded.
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS profile_photos_v12 (" +
+                        "ownerScopeId TEXT NOT NULL, " +
+                        "userId TEXT NOT NULL, " +
+                        "avatarUrl TEXT NOT NULL, " +
+                        "updatedAtEpochMillis INTEGER NOT NULL, " +
+                        "PRIMARY KEY(ownerScopeId, userId))",
+                )
+                db.execSQL(
+                    "INSERT OR REPLACE INTO profile_photos_v12 " +
+                        "(ownerScopeId, userId, avatarUrl, updatedAtEpochMillis) " +
+                        "SELECT owner.value, LOWER(TRIM(photos.userId)), photos.avatarUrl, " +
+                        "photos.updatedAtEpochMillis FROM profile_photos AS photos " +
+                        "JOIN sync_state AS owner ON owner.`key` = " +
+                        "'$AUTHENTICATED_CACHE_OWNER_KEY' " +
+                        "WHERE owner.value IS NOT NULL AND TRIM(owner.value) != '' " +
+                        "AND TRIM(photos.userId) != ''",
+                )
+                db.execSQL("DROP TABLE profile_photos")
+                db.execSQL("ALTER TABLE profile_photos_v12 RENAME TO profile_photos")
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_profile_photos_ownerScopeId " +
+                        "ON profile_photos(ownerScopeId)",
+                )
+
+                // Version 11 retained only the final nine digits. It cannot distinguish equal
+                // subscriber numbers in two countries and cannot be upgraded into a keyed digest
+                // because the canonical number no longer exists. Dropping those display-only links
+                // is safer than assigning a potentially wrong face to a payment destination.
+                db.execSQL("DROP TABLE beneficiary_contacts")
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS beneficiary_contacts (" +
+                        "ownerScopeId TEXT NOT NULL, " +
+                        "beneficiaryId TEXT NOT NULL, " +
+                        "phoneIdentity TEXT NOT NULL, " +
+                        "updatedAtEpochMillis INTEGER NOT NULL, " +
+                        "PRIMARY KEY(ownerScopeId, beneficiaryId))",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_beneficiary_contacts_ownerScopeId " +
+                        "ON beneficiary_contacts(ownerScopeId)",
                 )
             }
         }

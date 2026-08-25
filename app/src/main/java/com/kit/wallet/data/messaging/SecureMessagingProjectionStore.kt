@@ -421,6 +421,22 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         limit = limit,
     )
 
+    /**
+     * Reads one page for display while the activation is still preparing.
+     *
+     * The lease is the same one every local read takes, at its default `readyRequired = false`;
+     * only message exchange requires READY. Archiving is deliberately left to [readPageAndArchive]:
+     * the account history export is exchange-side work, and a transcript the user is already
+     * entitled to read must not wait for it.
+     */
+    suspend fun readLocalPage(
+        activation: SecureMessagingActivationCapability,
+        afterRecordKey: String? = null,
+        limit: Int,
+    ): SecureMessagingProjectionPage = withActivationLease(activation) {
+        readPage(afterRecordKey, limit)
+    }
+
     /** Reads activation-scoped state, releases its lease, then writes the captured account archive. */
     suspend fun readPageAndArchive(
         activation: SecureMessagingActivationCapability,
@@ -627,14 +643,14 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         )) signalChanged()
     }
 
-    /** Selects only a durably authenticated, still-unread message from the direct peer. */
+    /** Selects only a durably authenticated, still-unread message from another member. */
     suspend fun newestUnreadInboundMessageId(
         conversationId: String,
-        peerUserId: String,
+        senderUserIds: Set<String>,
     ): String? {
         require(isCanonicalUuid(conversationId)) { "Invalid unread conversation ID" }
-        require(isCanonicalUuid(peerUserId)) { "Invalid unread peer user ID" }
-        return readInboundPeerProjections(conversationId, peerUserId)
+        requireSenderUserIds(senderUserIds, "unread")
+        return readInboundPeerProjections(conversationId, senderUserIds)
             .asSequence()
             .filter {
                 it.deliveryState == SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED
@@ -647,26 +663,26 @@ internal class SecureMessagingProjectionStore @Inject constructor(
      * Applies a successful server receipt only through a locally authenticated marker.
      *
      * The response can contain a newer canonical marker advanced by another device. It is used
-     * only when that message is already an authenticated inbound projection from this peer and is
-     * not behind the marker this device posted. A message arriving concurrently after the chosen
-     * boundary therefore remains unread unless the canonical response specifically covers it.
+     * only when that message is already an authenticated inbound projection from a current member
+     * and is not behind the marker this device posted. A message arriving concurrently after the
+     * chosen boundary therefore remains unread unless the canonical response specifically covers it.
      */
     suspend fun markInboundReadThrough(
         conversationId: String,
-        peerUserId: String,
+        senderUserIds: Set<String>,
         requestedLastReadMessageId: String,
         canonicalLastReadMessageId: String,
         canonicalReadAt: Instant,
     ) {
         require(isCanonicalUuid(conversationId)) { "Invalid read-marker conversation ID" }
-        require(isCanonicalUuid(peerUserId)) { "Invalid read-marker peer user ID" }
+        requireSenderUserIds(senderUserIds, "read-marker")
         require(isCanonicalUuid(requestedLastReadMessageId)) {
             "Invalid requested last-read message ID"
         }
         require(isCanonicalUuid(canonicalLastReadMessageId)) {
             "Invalid canonical last-read message ID"
         }
-        val inbound = readInboundPeerProjections(conversationId, peerUserId)
+        val inbound = readInboundPeerProjections(conversationId, senderUserIds)
         val requested = checkNotNull(
             inbound.singleOrNull { it.serverMessageId == requestedLastReadMessageId },
         ) { "The posted read marker has no authenticated inbound projection" }
@@ -685,20 +701,20 @@ internal class SecureMessagingProjectionStore @Inject constructor(
      * A newly enrolled device can receive a receipt event without owning the historical target
      * envelope. Such an unknown marker cannot be ordered against local plaintext projections and
      * is therefore ignored. When the target is present, only messages authenticated as coming from
-     * the direct peer are advanced; self-authored cross-device copies remain sender-state bubbles.
+     * another member are advanced; self-authored cross-device copies remain sender-state bubbles.
      */
     suspend fun markInboundReadThroughCanonicalIfKnown(
         conversationId: String,
-        peerUserId: String,
+        senderUserIds: Set<String>,
         canonicalLastReadMessageId: String,
         canonicalReadAt: Instant,
     ) {
         require(isCanonicalUuid(conversationId)) { "Invalid read-marker conversation ID" }
-        require(isCanonicalUuid(peerUserId)) { "Invalid read-marker peer user ID" }
+        requireSenderUserIds(senderUserIds, "read-marker")
         require(isCanonicalUuid(canonicalLastReadMessageId)) {
             "Invalid canonical last-read message ID"
         }
-        val inbound = readInboundPeerProjections(conversationId, peerUserId)
+        val inbound = readInboundPeerProjections(conversationId, senderUserIds)
         val target = inbound.singleOrNull {
             it.serverMessageId == canonicalLastReadMessageId
         } ?: return
@@ -733,6 +749,7 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         lastReadMessageId: String,
         currentUserId: String,
         readAt: Instant,
+        authoredRead: Boolean = true,
     ) {
         require(isCanonicalUuid(conversationId)) { "Invalid read-receipt conversation ID" }
         require(isCanonicalUuid(lastReadMessageId)) { "Invalid last-read message ID" }
@@ -746,7 +763,7 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         try {
             authored.forEach { projected ->
                 if (compareServerMessageOrder(projected, target) <= 0) {
-                    changed = advanceAuthored(projected, currentUserId, authoredRead = true) || changed
+                    changed = advanceAuthored(projected, currentUserId, authoredRead) || changed
                 }
             }
         } finally {
@@ -923,9 +940,22 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         error("Outbound projection write retry bound was exhausted")
     }
 
+    /**
+     * The senders a read marker may cover: the other members, never this account.
+     *
+     * A group is simply the wider case of the same rule — the set is whatever membership the
+     * caller proved, and an empty set would silently mark nothing, so it is refused outright.
+     */
+    private fun requireSenderUserIds(senderUserIds: Set<String>, label: String) {
+        require(senderUserIds.isNotEmpty()) { "Invalid $label sender set" }
+        senderUserIds.forEach {
+            require(isCanonicalUuid(it)) { "Invalid $label sender user ID" }
+        }
+    }
+
     private suspend fun readInboundPeerProjections(
         conversationId: String,
-        peerUserId: String,
+        senderUserIds: Set<String>,
     ): List<SecureMessagingProjectedMessage> {
         val inbound = mutableListOf<SecureMessagingProjectedMessage>()
         var afterRecordKey: String? = null
@@ -935,7 +965,7 @@ internal class SecureMessagingProjectionStore @Inject constructor(
                 val durable = projected.durableRecord
                 durable.direction == LibSignalCompanionDirection.INBOUND &&
                     durable.conversationId == conversationId &&
-                    durable.sender.userId == peerUserId &&
+                    durable.sender.userId in senderUserIds &&
                     projected.serverMessageId != null
             }
             val next = page.nextAfterRecordKey

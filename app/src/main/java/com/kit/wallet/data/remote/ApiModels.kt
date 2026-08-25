@@ -29,9 +29,43 @@ data class RichMediaProtocolDto(
     @Json(name = "media_types") val mediaTypes: List<String>? = null,
 )
 
+/**
+ * The optional `protocols.realtime` block.
+ *
+ * Optional in the strongest sense: an absent block, an absent member or a `v` this
+ * build does not speak all mean "open no socket and keep polling", which is the
+ * server-side kill switch for the whole transport and needs no app release. Every
+ * member is nullable for that reason — the negotiation rule lives in
+ * `KitRealtimeConfig.from`, not in the parse.
+ */
+@JsonClass(generateAdapter = false)
+data class RealtimeProtocolDto(
+    val v: Int? = null,
+    val scheme: String? = null,
+    val host: String? = null,
+    val port: Int? = null,
+    /** The complete connect path including the app key segment. Used verbatim. */
+    val path: String? = null,
+    val key: String? = null,
+    val protocol: Int? = null,
+    @Json(name = "auth_path") val authPath: String? = null,
+    @Json(name = "activity_timeout") val activityTimeoutSeconds: Int? = null,
+    @Json(name = "max_connection_seconds") val maxConnectionSeconds: Int? = null,
+    val channels: RealtimeChannelsDto? = null,
+    val presence: Boolean? = null,
+    val typing: Boolean? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class RealtimeChannelsDto(
+    val user: String? = null,
+    val conversation: String? = null,
+)
+
 @JsonClass(generateAdapter = false)
 data class ProtocolsDto(
     val messaging: MessagingProtocolDto? = null,
+    val realtime: RealtimeProtocolDto? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -299,6 +333,21 @@ data class UserDto(
     // Some legacy phone-created profiles can explicitly serialize a null name. Normalize that
     // presentation field to the setup placeholder instead of rejecting the authenticated response.
     val name: String? = null,
+    /**
+     * The name printed on the verified identity document.
+     *
+     * Server-owned and read-only: no request can set it, and neither the chosen display name nor
+     * the username ever overwrites it. Null until identity verification has been approved, and on
+     * any server that predates the field — which is why nothing here may treat null as "not that
+     * person" rather than "not answered".
+     */
+    @Json(name = "legal_name") val legalName: String? = null,
+    /**
+     * False once a verified legal name exists, at which point the username is an optional public
+     * handle. Null on a server that predates the field; the client then falls back to its own
+     * reading of the legal name rather than assuming either answer.
+     */
+    @Json(name = "username_required") val usernameRequired: Boolean? = null,
     val email: String? = null,
     val phone: String? = null,
     val tag: String? = null,
@@ -355,10 +404,22 @@ data class AttachProfileAvatarRequest(
     @Json(name = "asset_id") val assetId: String,
 )
 
+/**
+ * A profile edit, where "not mentioned" and "set to nothing" are different requests.
+ *
+ * Every field is optional and an omitted one is left alone. [clearUsername] is the only way to say
+ * "drop my username", which the server accepts once a verified legal name exists — and which has to
+ * travel as an explicit JSON null, so this type is written by [UpdateProfileRequestAdapter] rather
+ * than by the reflective adapter that would silently drop it.
+ *
+ * An entirely empty request is meaningful: it is how someone who verified their identity and chose
+ * no username at all completes profile setup.
+ */
 @JsonClass(generateAdapter = false)
 data class UpdateProfileRequest(
-    val name: String,
-    val tag: String,
+    val name: String? = null,
+    val tag: String? = null,
+    val clearUsername: Boolean = false,
 )
 
 @JsonClass(generateAdapter = false)
@@ -370,6 +431,11 @@ data class CommunicationPreferencesDto(
     @Json(name = "direct_message_requests_enabled")
     val directMessageRequestsEnabled: Boolean? = null,
     @Json(name = "incoming_calls_enabled") val incomingCallsEnabled: Boolean? = null,
+    // The one flag whose server default is `true`, and therefore the one null the repository must
+    // not read as `false`: a server old enough to omit it has no presence channels at all, so
+    // rendering "hidden" would promise a privacy state nothing is actually enforcing, and would
+    // silently become a lie the moment that server gained the column.
+    @Json(name = "messaging_presence_visible") val messagingPresenceVisible: Boolean? = null,
     @Json(name = "updated_at") val updatedAt: String? = null,
 )
 
@@ -380,6 +446,7 @@ data class UpdateCommunicationPreferencesRequest(
     @Json(name = "direct_message_requests_enabled")
     val directMessageRequestsEnabled: Boolean? = null,
     @Json(name = "incoming_calls_enabled") val incomingCallsEnabled: Boolean? = null,
+    @Json(name = "messaging_presence_visible") val messagingPresenceVisible: Boolean? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -993,6 +1060,7 @@ data class BankBeneficiaryDto(
     @Json(name = "account_name") val accountName: String? = null,
     @Json(name = "account_number_masked") val accountNumberMasked: String,
     val status: String,
+    @Json(name = "kit_user") val kitUser: BeneficiaryKitUserDto? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -1100,6 +1168,20 @@ data class MobileMoneyAccountDto(
     @Json(name = "account_name") val accountName: String? = null,
     @Json(name = "phone_number_masked") val phoneNumberMasked: String,
     val status: String,
+    @Json(name = "kit_user") val kitUser: BeneficiaryKitUserDto? = null,
+)
+
+/**
+ * The Kit Pay account behind a saved payout destination, when the server can match one.
+ *
+ * Optional and absent from every response until the backend supplies it, which is deliberate: an
+ * older or partial payload simply produces no photo rather than a wrong one. The server has to be
+ * the one to answer this, because the number it matched on is masked by the time this app sees it.
+ */
+@JsonClass(generateAdapter = false)
+data class BeneficiaryKitUserDto(
+    val id: String,
+    @Json(name = "avatar_url") val avatarUrl: String? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -1228,8 +1310,29 @@ data class KycDocumentDto(
 )
 
 @JsonClass(generateAdapter = false)
-data class KycStatusDto(
+data class KycDeviceVerificationDto(
     val status: String,
+    val required: Boolean = false,
+    val epoch: Int? = null,
+    @Json(name = "verified_at") val verifiedAt: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class KycStatusDto(
+    /**
+     * The single status the server wants acted on, which is the *device* check whenever one is
+     * outstanding and the account's own standing otherwise.
+     */
+    val status: String,
+    /**
+     * The account's identity standing, independent of any device.
+     *
+     * Older builds only read [status] and so could not tell "you have never verified" apart from
+     * "you are verified, this new device just has not proved itself yet" — which is how a verified
+     * user ended up being offered a fresh identity check.
+     */
+    @Json(name = "account_status") val accountStatus: String? = null,
+    @Json(name = "device_verification") val deviceVerification: KycDeviceVerificationDto? = null,
     val case: KycCaseDto? = null,
     @Json(name = "provider_session") val providerSession: KycProviderSessionDto? = null,
     val documents: List<KycDocumentDto>? = null,

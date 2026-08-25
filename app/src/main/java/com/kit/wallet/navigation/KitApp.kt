@@ -81,6 +81,9 @@ import com.kit.wallet.feature.calls.CallsScreen
 import com.kit.wallet.feature.chat.ChatsScreen
 import com.kit.wallet.feature.chat.ChatsViewModel
 import com.kit.wallet.feature.chat.ConversationScreen
+import com.kit.wallet.feature.chat.GroupAddParticipantsScreen
+import com.kit.wallet.feature.chat.GroupProfileScreen
+import com.kit.wallet.feature.chat.NewGroupScreen
 import com.kit.wallet.feature.chat.IncomingTextShareCoordinator
 import com.kit.wallet.feature.chat.IncomingTextShareRequest
 import com.kit.wallet.feature.contacts.ContactPickerPurpose
@@ -88,6 +91,7 @@ import com.kit.wallet.feature.contacts.ContactsScreen
 import com.kit.wallet.feature.home.HomeScreen
 import com.kit.wallet.feature.mobilemoney.MobileMoneyScreen
 import com.kit.wallet.feature.onboarding.OnboardingScreen
+import com.kit.wallet.feature.backup.ChatBackupScreen
 import com.kit.wallet.feature.settings.SecurityScreen
 import com.kit.wallet.feature.settings.MfaScreen
 import com.kit.wallet.feature.settings.KycScreen
@@ -158,7 +162,10 @@ fun KitApp(
                 ),
             )
         }
-        if (capabilities.enabled(KitFeature.CALLS)) {
+        // Both of these tabs lead to screens backed by local storage, so they are kept on the bar
+        // through a failed capability poll rather than disappearing out from under a thumb —
+        // matching `routeUsable`, which no longer evicts a reader from either.
+        if (capabilities.lastKnownEnabled(KitFeature.CALLS)) {
             add(Tab(Dest.CALLS, "Calls", Icons.Outlined.Call, Icons.Filled.Call))
         }
         add(Tab(Dest.SETTINGS, "Profile", Icons.Outlined.Person, Icons.Filled.Person))
@@ -632,6 +639,13 @@ private fun KitNavHost(
                 ProfileEditorScreen(
                     setup = true,
                     onDone = continueAfterProfile,
+                    // Offered from inside setup so the order is verify, then name. Only when the
+                    // feature is actually on, or the button would lead to a route that evicts.
+                    onVerifyIdentity = if (capabilities.enabled(KitFeature.KYC)) {
+                        { navController.navigate(Dest.KYC) { launchSingleTop = true } }
+                    } else {
+                        null
+                    },
                 )
             }
         }
@@ -669,6 +683,7 @@ private fun KitNavHost(
                 ChatsScreen(
                     onChat = { navController.navigate(Dest.conversation(it)) },
                     onNewChat = { navController.navigate(Dest.CONTACTS) },
+                    onNewGroup = { navController.navigate(Dest.NEW_GROUP) },
                 )
             }
         }
@@ -687,6 +702,7 @@ private fun KitNavHost(
                     capabilities = capabilities,
                     onEditProfile = { navController.navigate(Dest.PROFILE_EDIT) },
                     onSecurity = { navController.navigate(Dest.SECURITY) },
+                    onChatBackup = { navController.navigate(Dest.CHAT_BACKUP) },
                     onKyc = { navController.navigate(Dest.KYC) },
                     onLogoutCurrentDevice = authViewModel::logoutCurrentDevice,
                     logoutBusy = authState.loading,
@@ -804,6 +820,7 @@ private fun KitNavHost(
                             launchSingleTop = true
                         }
                     },
+                    onNewGroup = { navController.navigate(Dest.NEW_GROUP) },
                 )
             }
         }
@@ -826,10 +843,49 @@ private fun KitNavHost(
                         KitFeature.INTERNAL_TRANSFERS,
                         KitFeature.CLAIMABLE_TRANSFERS,
                     ),
+                    abuseReportingEnabled = capabilities.enabled(KitFeature.ABUSE_REPORTING),
                     onBack = { navController.popBackStack() },
                     onVoiceCall = { navController.navigate(Dest.voiceCall(it)) },
                     onVideoCall = { navController.navigate(Dest.videoCall(it)) },
+                    onOpenGroup = { navController.navigate(Dest.groupProfile(it)) },
                 )
+            }
+        }
+        composable(Dest.NEW_GROUP) {
+            FeatureRouteContent(signedIn, capabilities, Dest.NEW_GROUP) {
+                NewGroupScreen(
+                    onBack = { navController.popBackStack() },
+                    // The picker is done with once the group exists; going back from the new
+                    // conversation should land on the chat list, not on a half-built group.
+                    onCreated = { chatId ->
+                        navController.navigate(Dest.conversation(chatId)) {
+                            popUpTo(Dest.NEW_GROUP) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
+                )
+            }
+        }
+        composable(Dest.GROUP_PROFILE) { entry ->
+            FeatureRouteContent(signedIn, capabilities, Dest.GROUP_PROFILE) {
+                val chatId = entry.arguments?.getString("chatId").orEmpty()
+                GroupProfileScreen(
+                    onBack = { navController.popBackStack() },
+                    onAddParticipants = { navController.navigate(Dest.groupAdd(chatId)) },
+                    // A group that has been left has no conversation and no group screen left to
+                    // return to, so both come off the stack together.
+                    onLeft = {
+                        navController.navigate(Dest.CHATS) {
+                            popUpTo(Dest.CHATS) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
+                )
+            }
+        }
+        composable(Dest.GROUP_ADD) {
+            FeatureRouteContent(signedIn, capabilities, Dest.GROUP_ADD) {
+                GroupAddParticipantsScreen(onBack = { navController.popBackStack() })
             }
         }
         composable(Dest.VOICE_CALL) { entry ->
@@ -897,6 +953,11 @@ private fun KitNavHost(
                 MfaScreen(onBack = { navController.popBackStack() })
             }
         }
+        composable(Dest.CHAT_BACKUP) {
+            AuthenticatedRouteContent(signedIn) {
+                ChatBackupScreen(onBack = { navController.popBackStack() })
+            }
+        }
         composable(Dest.KYC) {
             FeatureRouteContent(signedIn, capabilities, Dest.KYC) {
                 KycScreen(onBack = { navController.popBackStack() })
@@ -920,6 +981,10 @@ internal fun shouldRequireProfileSetup(
     Dest.PIN_SETUP,
     Dest.PROFILE_SETUP,
     Dest.PROFILE_EDIT,
+    // Identity verification is now part of setup rather than something that follows it: the
+    // verified legal name is what makes the chosen name and username optional. Bouncing someone
+    // back to the setup form mid-verification would make the offered order impossible to take.
+    Dest.KYC,
 )
 
 private tailrec fun Context.findActivity(): Activity? = when (this) {

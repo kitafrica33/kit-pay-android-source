@@ -11,15 +11,17 @@ import javax.inject.Singleton
 
 /**
  * Notification input surfaced only after authenticated ciphertext and ratchet state commit
- * together. [senderName] must come from the authoritative direct conversation whose peer ID was
- * matched to the durable authenticated sender; [authenticatedText] is the committed Signal
- * plaintext, never server push content; and [sentAt] is authenticated message ordering metadata.
+ * together. [senderName] must come from the authoritative conversation membership that the durable
+ * authenticated sender was matched against; [groupTitle] is the server-visible group name and is
+ * null for a direct chat; [authenticatedText] is the committed Signal plaintext, never server push
+ * content; and [sentAt] is authenticated message ordering metadata.
  */
 internal data class SecureMessagingIncomingNotification(
     val messageId: String,
     val conversationId: String,
     val sessionEpoch: String,
     val senderName: String?,
+    val groupTitle: String? = null,
     val authenticatedText: String,
     val sentAt: Instant,
 )

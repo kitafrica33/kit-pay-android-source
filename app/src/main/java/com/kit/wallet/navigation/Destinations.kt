@@ -37,11 +37,15 @@ object Dest {
     const val CONTACTS = "contacts"
     const val CALL_CONTACTS = "calls/contacts"
     const val CONVERSATION = "chat/{chatId}"
+    const val NEW_GROUP = "groups/new"
+    const val GROUP_PROFILE = "chat/{chatId}/group"
+    const val GROUP_ADD = "chat/{chatId}/group/add"
     const val VOICE_CALL = "call/voice/{name}"
     const val VIDEO_CALL = "call/video/{name}"
     const val INCOMING_CALL = "call/incoming/{callId}?accept={accept}"
     const val SECURITY = "settings/security"
     const val PROFILE_EDIT = "settings/profile/edit"
+    const val CHAT_BACKUP = "settings/chats/backup"
 
     fun txDetail(id: String) = "wallet/tx/$id"
     fun send(contactId: String? = null) = contactId
@@ -50,6 +54,8 @@ object Dest {
         ?: SEND
     fun billPay(providerId: String) = "bills/pay/$providerId"
     fun conversation(chatId: String) = "chat/${Uri.encode(chatId)}"
+    fun groupProfile(chatId: String) = "chat/${Uri.encode(chatId)}/group"
+    fun groupAdd(chatId: String) = "chat/${Uri.encode(chatId)}/group/add"
     fun voiceCall(name: String) = "call/voice/${Uri.encode(name)}"
     fun videoCall(name: String) = "call/video/${Uri.encode(name)}"
     fun incomingCall(callId: String, accept: Boolean = false) =

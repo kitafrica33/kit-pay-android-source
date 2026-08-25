@@ -139,18 +139,56 @@ class SecureMessagingSyncEngineTest {
             assertEquals("/api/kit-wallet/v1/profile", server.takeRequest().path)
             assertEquals("/api/kit-wallet/v1/devices", server.takeRequest().path)
 
+            // The recheck runs against a live resolve, so this needs a resolver whose epoch cache
+            // is still cold; the replacement lands between the profile response and the recheck.
+            val coldResolver = resolver(server, sessionStore)
             server.dispatcher = object : Dispatcher() {
                 override fun dispatch(request: RecordedRequest): MockResponse {
                     sessionStore.replace(TOKENS.copy(sessionId = "replacement-session"))
                     return jsonResponse(PROFILE)
                 }
             }
-            val changed = runCatching { resolver.resolve(TOKENS.sessionId) }.exceptionOrNull()
+            val changed = runCatching { coldResolver.resolve(TOKENS.sessionId) }.exceptionOrNull()
             assertTrue(changed is SecureMessagingAuthenticationEpochChangedException)
         } finally {
             server.shutdown()
         }
     }
+
+    @Test
+    fun `binding resolver resolves one profile and device pair per authentication epoch`() =
+        runTest {
+            val server = MockWebServer().apply { start() }
+            try {
+                val sessionStore = FakeSessionStore(TOKENS)
+                val resolver = resolver(server, sessionStore)
+                server.enqueue(jsonResponse(PROFILE))
+                server.enqueue(jsonResponse(DEVICES))
+
+                val first = resolver.resolve(TOKENS.sessionId)
+                val second = resolver.resolve(TOKENS.sessionId)
+                val third = resolver.resolve(TOKENS.sessionId)
+
+                assertEquals(first, second)
+                assertEquals(first, third)
+                // One profile call and one devices call for the whole epoch, not per resolve.
+                assertEquals(2, server.requestCount)
+
+                // A replaced epoch is a different key, so it must re-resolve rather than reuse a
+                // binding that was authenticated for the session it replaced.
+                val replacement = TOKENS.copy(sessionId = "replacement-session")
+                sessionStore.replace(replacement)
+                server.enqueue(jsonResponse(PROFILE))
+                server.enqueue(jsonResponse(DEVICES))
+
+                val rebound = resolver.resolve(replacement.sessionId)
+
+                assertEquals(replacement.sessionId, rebound.sessionEpoch)
+                assertEquals(4, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
 
     @Test
     fun `ready implementation activates a fresh login when registry starts empty`() = runTest {
@@ -394,12 +432,11 @@ class SecureMessagingSyncEngineTest {
             server.enqueue(jsonResponse(PROFILE))
             server.enqueue(jsonResponse(DEVICES))
             server.enqueue(jsonResponse(READY_CAPABILITIES))
-            // Each bounded retry revalidates the authenticated profile/device before touching
-            // retained key state. The final pair belongs to initial encrypted synchronization.
-            repeat(4) {
-                server.enqueue(jsonResponse(PROFILE))
-                server.enqueue(jsonResponse(DEVICES))
-            }
+            // The resolver pins the authenticated profile/device once for this session epoch, so
+            // bounded key retries reuse that binding instead of multiplying API traffic. This pair
+            // is the transport's own post-capability re-check, which is deliberately never cached.
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
             enqueueEmptySync(server, moshi, "initial_cursor")
             enqueueWakeSync(server, moshi, "wake_cursor")
 
@@ -408,7 +445,7 @@ class SecureMessagingSyncEngineTest {
             assertEquals(4, keyAttempts)
             assertEquals(15_000L, currentTime)
             assertEquals(SecureMessagingRuntimeStage.READY, guard.snapshot().stage)
-            assertEquals(14, server.requestCount)
+            assertEquals(8, server.requestCount)
         } finally {
             server.shutdown()
         }
@@ -500,6 +537,8 @@ class SecureMessagingSyncEngineTest {
                     authRepository = unusedAuthRepository(),
                 )
                 // Activate A completely before the foreground recovery captures its exact fence.
+                // The first pair binds the epoch; the pair after capabilities is the transport's
+                // own post-capability re-check, which is deliberately never cached.
                 server.enqueue(jsonResponse(PROFILE))
                 server.enqueue(jsonResponse(DEVICES))
                 server.enqueue(jsonResponse(READY_CAPABILITIES))
@@ -514,12 +553,8 @@ class SecureMessagingSyncEngineTest {
 
                 // Recovery first re-enters A and proves the missing key, then resets and performs
                 // the complete activation plus wake sync for its one pinned successor B.
-                server.enqueue(jsonResponse(PROFILE))
-                server.enqueue(jsonResponse(DEVICES))
                 enqueueEmptySync(server, moshi, "a_missing_cursor")
                 repeat(1) { activationIndex ->
-                    server.enqueue(jsonResponse(PROFILE))
-                    server.enqueue(jsonResponse(DEVICES))
                     server.enqueue(jsonResponse(READY_CAPABILITIES))
                     server.enqueue(jsonResponse(PROFILE))
                     server.enqueue(jsonResponse(DEVICES))
@@ -546,7 +581,7 @@ class SecureMessagingSyncEngineTest {
                 val successor = registry.requireCurrent()
                 assertTrue(successor.fence !== initial.fence)
                 assertEquals(TOKENS.sessionId, successor.binding.sessionEpoch)
-                assertEquals(19, server.requestCount)
+                assertEquals(15, server.requestCount)
             } finally {
                 server.shutdown()
             }
@@ -636,12 +671,8 @@ class SecureMessagingSyncEngineTest {
             val initial = registry.requireCurrent()
 
             failNextCursorWrite = true
-            server.enqueue(jsonResponse(PROFILE))
-            server.enqueue(jsonResponse(DEVICES))
             enqueueEmptySync(server, moshi, "a_missing_cursor")
             // These B responses make accidental redirection deterministic instead of hanging.
-            server.enqueue(jsonResponse(PROFILE))
-            server.enqueue(jsonResponse(DEVICES))
             server.enqueue(jsonResponse(READY_CAPABILITIES))
             server.enqueue(jsonResponse(PROFILE))
             server.enqueue(jsonResponse(DEVICES))
@@ -657,7 +688,7 @@ class SecureMessagingSyncEngineTest {
             assertEquals(3, cursorWrites)
             assertEquals(SecureMessagingRuntimeStage.NO_SESSION, guard.snapshot().stage)
             assertTrue(registry.currentOrNull() == null)
-            assertEquals(11, server.requestCount)
+            assertEquals(9, server.requestCount)
         } finally {
             server.shutdown()
         }
@@ -742,8 +773,6 @@ class SecureMessagingSyncEngineTest {
             val initial = registry.requireCurrent()
 
             failNextCursorWrite = true
-            server.enqueue(jsonResponse(PROFILE))
-            server.enqueue(jsonResponse(DEVICES))
             enqueueEmptySync(server, moshi, "a_retry_cursor")
             val staleExactSync = async {
                 runCatching { engine.synchronize(initial.fence) }.exceptionOrNull()
@@ -1770,7 +1799,7 @@ class SecureMessagingSyncEngineTest {
         """
         const val READY_CAPABILITIES = """
             {"ok":true,"data":{"api_version":"v1","currency":{"code":"UGX","scale":"2"},
-            "features":{"messaging":true},"authentication":{},"protocols":{"messaging":{
+            "features":{"messaging":true,"messaging_groups":true,"messaging_reactions_e2ee_v1":true},"authentication":{},"protocols":{"messaging":{
             "ready":true,"version":"v2","suite":"signal-pqxdh-kyber1024-double-ratchet-v2",
             "post_quantum":true}}}}
         """

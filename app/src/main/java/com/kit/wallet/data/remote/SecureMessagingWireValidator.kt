@@ -113,19 +113,72 @@ object SecureMessagingWireValidator {
         return status
     }
 
+    /**
+     * Asserts the membership a roster is about to be checked against is itself well formed.
+     *
+     * A direct conversation is exactly two people. A group is between two and
+     * [MAX_GROUP_MEMBERS], and the difference matters below: a group roster may cover fewer
+     * users than the group has, because a member who has never enrolled a messaging device
+     * contributes no devices and must not be able to freeze the conversation for everybody
+     * else. Neither may ever cover *more* — a roster naming somebody outside the conversation
+     * is the direction that would encrypt a message to a stranger.
+     */
+    private fun requireExpectedMembership(
+        expectedMemberUserIds: Set<String>,
+        currentUserId: String,
+        groupMembership: Boolean,
+    ) {
+        val label = if (groupMembership) "group" else "direct"
+        requireWire(
+            if (groupMembership) {
+                expectedMemberUserIds.size in 2..MAX_GROUP_MEMBERS
+            } else {
+                expectedMemberUserIds.size == 2
+            },
+            "$label roster member count",
+        )
+        requireWire(
+            currentUserId in expectedMemberUserIds,
+            "current user is not a $label roster member",
+        )
+        expectedMemberUserIds.forEach { requireUuid(it, "$label roster member user ID") }
+    }
+
+    private fun requireRosterCoversMembership(
+        rosterUserIds: Set<String>,
+        expectedMemberUserIds: Set<String>,
+        currentUserId: String,
+        groupMembership: Boolean,
+    ) {
+        if (groupMembership) {
+            requireWire(
+                expectedMemberUserIds.containsAll(rosterUserIds),
+                "roster devices name a user outside the group",
+            )
+            requireWire(
+                currentUserId in rosterUserIds,
+                "roster devices omit the current account",
+            )
+        } else {
+            requireWire(
+                rosterUserIds == expectedMemberUserIds,
+                "roster devices do not exactly match the direct conversation members",
+            )
+        }
+    }
+
     fun validateAuthoritativeRoster(
         roster: MessagingDeviceRosterDto,
         expectedConversationId: String,
         currentDeviceId: String,
         currentUserId: String,
         expectedMemberUserIds: Set<String>,
+        groupMembership: Boolean = false,
     ): ValidatedMessagingDeviceRoster {
         requireUuid(expectedConversationId, "expected conversation ID")
         requireUuid(currentDeviceId, "current device ID")
         requireUuid(currentUserId, "current user ID")
-        requireWire(expectedMemberUserIds.size == 2, "direct roster member count")
-        requireWire(currentUserId in expectedMemberUserIds, "current user is not a direct roster member")
-        expectedMemberUserIds.forEach { requireUuid(it, "direct roster member user ID") }
+        requireExpectedMembership(expectedMemberUserIds, currentUserId, groupMembership)
         val conversationId = required(roster.conversationId, "roster conversation ID")
         requireUuid(conversationId, "roster conversation ID")
         requireWire(conversationId == expectedConversationId, "roster conversation does not match request")
@@ -155,9 +208,12 @@ object SecureMessagingWireValidator {
             validated.map { it.userId to it.signalDeviceId }.toSet().size == validated.size,
             "roster reuses a Signal device ID for one user",
         )
-        requireWire(
-            validated.map { it.userId }.toSet() == expectedMemberUserIds,
-            "roster devices do not exactly match the direct conversation members",
+        val rosterUserIds = validated.map { it.userId }.toSet()
+        requireRosterCoversMembership(
+            rosterUserIds = rosterUserIds,
+            expectedMemberUserIds = expectedMemberUserIds,
+            currentUserId = currentUserId,
+            groupMembership = groupMembership,
         )
         requireWire(
             validated.count { it.deviceId == currentDeviceId } == 1,
@@ -186,7 +242,11 @@ object SecureMessagingWireValidator {
             rosterRevision = rosterRevision,
             currentDeviceId = currentDeviceId,
             currentUserId = currentUserId,
-            memberUserIds = expectedMemberUserIds,
+            // The users the roster actually covers, not the ones it was checked against. For
+            // a direct chat those are the same set; for a group the roster is the authority
+            // on who is reachable, and recording the wider membership here would claim a
+            // device for someone who has never enrolled one.
+            memberUserIds = rosterUserIds,
             devices = validated,
         )
     }
@@ -197,20 +257,24 @@ object SecureMessagingWireValidator {
         currentDeviceId: String,
         currentUserId: String,
         expectedMemberUserIds: Set<String>,
+        groupMembership: Boolean = false,
     ): ValidatedMessagingDeviceRoster {
         requireUuid(expectedConversationId, "expected conversation ID")
         requireUuid(currentDeviceId, "current device ID")
         requireUuid(currentUserId, "current user ID")
-        requireWire(expectedMemberUserIds.size == 2, "direct roster member count")
-        requireWire(currentUserId in expectedMemberUserIds, "current user is not a direct roster member")
-        expectedMemberUserIds.forEach { requireUuid(it, "direct roster member user ID") }
+        requireExpectedMembership(expectedMemberUserIds, currentUserId, groupMembership)
         val issuedRoster = requireValidatedRoster(roster)
         requireWire(
             issuedRoster.conversationId == expectedConversationId &&
                 roster.currentDeviceId == currentDeviceId &&
-                roster.currentUserId == currentUserId &&
-                roster.memberUserIds() == expectedMemberUserIds,
+                roster.currentUserId == currentUserId,
             "validated roster binding changed",
+        )
+        requireRosterCoversMembership(
+            rosterUserIds = roster.memberUserIds(),
+            expectedMemberUserIds = expectedMemberUserIds,
+            currentUserId = currentUserId,
+            groupMembership = groupMembership,
         )
         return roster
     }
@@ -222,6 +286,7 @@ object SecureMessagingWireValidator {
         currentUserId: String,
         expectedMemberUserIds: Set<String>,
         requestedDeviceIds: Set<String>,
+        groupMembership: Boolean = false,
     ) {
         val boundRoster = requireAuthoritativeRosterBinding(
             roster,
@@ -229,6 +294,7 @@ object SecureMessagingWireValidator {
             currentDeviceId,
             currentUserId,
             expectedMemberUserIds,
+            groupMembership,
         )
         requireWire(requestedDeviceIds.isNotEmpty(), "requested key-bundle device set is empty")
         requestedDeviceIds.forEach { requireUuid(it, "requested key-bundle device ID") }
@@ -251,6 +317,7 @@ object SecureMessagingWireValidator {
         currentDeviceId: String,
         currentUserId: String,
         expectedMemberUserIds: Set<String>,
+        groupMembership: Boolean = false,
     ): ValidatedConsumedMessagingKeyBundles {
         val roster = requireAuthoritativeRosterBinding(
             authoritativeRoster,
@@ -258,6 +325,7 @@ object SecureMessagingWireValidator {
             currentDeviceId,
             currentUserId,
             expectedMemberUserIds,
+            groupMembership,
         )
         val rosterDevices = roster.devices().associateBy(ValidatedMessagingRosterDevice::deviceId)
         requireUuid(currentDeviceId, "current device ID")
@@ -487,7 +555,7 @@ object SecureMessagingWireValidator {
         requireWire(conversationId == expectedConversationId, "messaging event conversation changed")
         val data = required(event.data, "messaging event data")
         requireWire(event.resourceId == data.id, "messaging event resource ID changed")
-        val occurredAt = requireTimestamp(event.occurredAt, "messaging event occurrence time")
+        val occurredAt = requireEventTimestamp(event.occurredAt, "messaging event occurrence time")
 
         val validated = validateIncoming(
             IncomingMessageWire(
@@ -541,7 +609,7 @@ object SecureMessagingWireValidator {
         requireUuid(userId, "messaging lifecycle user ID")
         requireWire(data.rosterRefreshRequired == true, "messaging lifecycle omitted roster refresh")
         val transitionedAt = requireTimestamp(data.transitionedAt, "messaging lifecycle transition time")
-        val occurredAt = requireTimestamp(event.occurredAt, "messaging lifecycle occurrence time")
+        val occurredAt = requireEventTimestamp(event.occurredAt, "messaging lifecycle occurrence time")
         requireWire(!occurredAt.isBefore(transitionedAt), "messaging lifecycle event predates transition")
         val transitionHash = requireSha256(data.transitionHash, "messaging lifecycle transition hash")
 
@@ -691,10 +759,7 @@ object SecureMessagingWireValidator {
         }
         val validatedAttachments = validateAttachments(attachments)
         val kind = required(message.kind, "encrypted message kind")
-        requireWire(
-            kind == ENCRYPTED_MESSAGE_KIND || kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
-            "encrypted message kind",
-        )
+        requireWire(kind in SECURE_MESSAGE_KINDS, "encrypted message kind")
         // Attachment metadata accompanies exactly the encrypted_attachment kind. The end-to-end
         // media descriptor (including key material) still travels only inside the text ciphertext.
         requireWire(
@@ -704,10 +769,14 @@ object SecureMessagingWireValidator {
         val replyToMessageId = message.replyToMessageId
         replyToMessageId?.let { requireUuid(it, "encrypted message reply target") }
         requireWire(
+            kind != ENCRYPTED_REACTION_MESSAGE_KIND || replyToMessageId != null,
+            "encrypted reaction reply target",
+        )
+        requireWire(
             required(message.reactions, "encrypted message reactions").isEmpty(),
             "v2 encrypted text messages cannot contain reactions",
         )
-        val sentAt = requireTimestamp(message.sentAt, "encrypted message send time")
+        val sentAt = requireMessageTimestamp(message.sentAt, "encrypted message send time")
         requireWire(message.revokedAt == null, "revoked encrypted message is not decryptable")
 
         val envelope = required(message.envelope, "encrypted message device envelope")
@@ -927,6 +996,7 @@ object SecureMessagingWireValidator {
             signedPrekey = signedPrekey,
             publishedAt = publishedAtValue,
             rotatedAt = device.rotatedAt,
+            clientCapabilities = device.client?.capabilities.orEmpty(),
         )
     }
 
@@ -1203,6 +1273,26 @@ object SecureMessagingWireValidator {
         }
     }
 
+    private fun requireMessageTimestamp(value: String?, field: String): Instant {
+        val timestamp = required(value, field)
+        requireWire(MESSAGE_TIMESTAMP.matches(timestamp), field)
+        return try {
+            Instant.parse(timestamp)
+        } catch (_: RuntimeException) {
+            failWire(field)
+        }
+    }
+
+    private fun requireEventTimestamp(value: String?, field: String): Instant {
+        val timestamp = required(value, field)
+        requireWire(MESSAGE_TIMESTAMP.matches(timestamp), field)
+        return try {
+            Instant.parse(timestamp)
+        } catch (_: RuntimeException) {
+            failWire(field)
+        }
+    }
+
     private fun requireSignalDeviceId(value: Int?, field: String): Int {
         val id = required(value, field)
         requireWire(id in MIN_SIGNAL_DEVICE_ID..MAX_SIGNAL_DEVICE_ID, field)
@@ -1311,6 +1401,8 @@ object SecureMessagingWireValidator {
     private val SHA256_HEX = Regex("^[a-f0-9]{64}$")
     private val POSITIVE_DECIMAL = Regex("^[0-9]+$")
     private val UTC_TIMESTAMP = Regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+    private val MESSAGE_TIMESTAMP =
+        Regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{6})?Z$")
     private val TRANSPARENCY_EVENT_TYPES = setOf(
         "device.enrolled",
         "identity.changed",
@@ -1375,6 +1467,8 @@ sealed interface ValidatedMessagingRosterDevice {
     val signedPrekey: ValidatedMessagingPrekey
     val publishedAt: String
     val rotatedAt: String?
+
+    fun supportsClientCapability(name: String): Boolean
 
     fun identityKeyBytes(): ByteArray
 }
@@ -1445,10 +1539,15 @@ private class ValidatedMessagingRosterDeviceValue(
     override val signedPrekey: ValidatedMessagingPrekey,
     override val publishedAt: String,
     override val rotatedAt: String?,
+    clientCapabilities: Map<String, Boolean?>,
 ) : ValidatedMessagingRosterDevice {
     private val immutableIdentityKey = identityKey.copyOf()
+    private val immutableClientCapabilities = clientCapabilities.toMap()
 
     override fun identityKeyBytes(): ByteArray = immutableIdentityKey.copyOf()
+
+    override fun supportsClientCapability(name: String): Boolean =
+        immutableClientCapabilities[name] == true
 }
 
 private class ValidatedMessagingPrekeyValue(

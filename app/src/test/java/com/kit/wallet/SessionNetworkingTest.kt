@@ -14,6 +14,7 @@ import com.kit.wallet.data.remote.AuthTokenRefresher
 import com.kit.wallet.data.remote.RefreshSessionRequest
 import com.kit.wallet.data.remote.SessionAuthenticator
 import com.kit.wallet.data.remote.SessionDto
+import com.kit.wallet.data.remote.SessionFenceMismatchIOException
 import com.kit.wallet.data.remote.SessionHeaderInterceptor
 import com.kit.wallet.data.remote.SessionRefreshApi
 import com.kit.wallet.data.remote.UserDto
@@ -36,10 +37,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -49,6 +53,44 @@ import retrofit2.HttpException
 import retrofit2.Response as RetrofitResponse
 
 class SessionNetworkingTest {
+    @Test
+    fun `owner tagged request is rejected after switch and never rewritten for successor`() {
+        val server = MockWebServer().apply {
+            enqueue(MockResponse().setResponseCode(200).setBody("{}"))
+            start()
+        }
+        try {
+            val sessions = MutableTestSessionStore(OLD_SESSION)
+            var atNetworkBoundary: Request? = null
+            val client = OkHttpClient.Builder()
+                .addInterceptor(SessionHeaderInterceptor(sessions))
+                .addInterceptor { chain ->
+                    runBlocking { sessions.save(NEW_ACCOUNT_SESSION) }
+                    atNetworkBoundary = chain.request()
+                    chain.proceed(chain.request())
+                }
+                .build()
+            val tagged = Request.Builder()
+                .url(server.url("/scheduled-request"))
+                .tag(SessionFence::class.java, OLD_SESSION.fence())
+                .build()
+
+            client.newCall(tagged).execute().use { }
+
+            assertEquals("Bearer ${OLD_SESSION.accessToken}", atNetworkBoundary?.header("Authorization"))
+            assertEquals(
+                OLD_SESSION.sessionId,
+                atNetworkBoundary?.header(SessionHeaderInterceptor.SESSION_ID_HEADER),
+            )
+
+            val rejected = runCatching { client.newCall(tagged).execute() }.exceptionOrNull()
+            assertTrue(rejected is SessionFenceMismatchIOException)
+            assertEquals(1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
     @Test
     fun `migrated legacy nonce recovers a lost refresh response after process restart`() {
         val adapter = Moshi.Builder()

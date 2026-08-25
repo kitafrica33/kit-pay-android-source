@@ -72,6 +72,62 @@ class ConversationCameraPullTest {
     }
 
     @Test
+    fun `crossing the threshold does not open the camera while a finger is still down`() {
+        // The peek panel already promises "release to open the camera" at this point, so the
+        // label and the behaviour have to agree: past the threshold, still pressed, still closed.
+        assertTrue(CameraPull.shouldOpen(revealPx = 250f, thresholdPx = 120f))
+        assertFalse(
+            CameraPull.shouldOpenOnRelease(
+                revealPx = 250f,
+                thresholdPx = 120f,
+                pointerDown = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `releasing past the threshold opens the camera`() {
+        assertTrue(
+            CameraPull.shouldOpenOnRelease(
+                revealPx = 120f,
+                thresholdPx = 120f,
+                pointerDown = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `releasing below the threshold does not open the camera`() {
+        assertFalse(
+            CameraPull.shouldOpenOnRelease(
+                revealPx = 119.9f,
+                thresholdPx = 120f,
+                pointerDown = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `a full drag only opens at the moment of release`() {
+        val maxPx = 300f
+        val thresholdPx = 120f
+        var reveal = 0f
+        var opened = 0
+
+        // Every intermediate sample of a single continuous drag, with the finger still down.
+        for (delta in listOf(-40f, -50f, -35f, -60f, -80f)) {
+            reveal = CameraPull.pull(reveal, availableY = delta, maxPx = maxPx)
+            if (CameraPull.shouldOpenOnRelease(reveal, thresholdPx, pointerDown = true)) opened++
+        }
+        assertEquals(265f, reveal, EPSILON)
+        assertEquals(0, opened)
+
+        // The finger lifts.
+        if (CameraPull.shouldOpenOnRelease(reveal, thresholdPx, pointerDown = false)) opened++
+        assertEquals(1, opened)
+    }
+
+    @Test
     fun `a realistic pull, partial collapse and second pull sequence`() {
         val maxPx = 300f
         val thresholdPx = 120f

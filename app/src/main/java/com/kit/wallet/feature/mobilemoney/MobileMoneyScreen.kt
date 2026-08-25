@@ -34,6 +34,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,10 +44,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.kit.wallet.feature.funding.TopUpSheetContent
+import com.kit.wallet.feature.funding.TopUpViewModel
+import com.kit.wallet.ui.components.GroupedAmountTransformation
+import com.kit.wallet.ui.components.KitAvatarPhoto
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.SectionHeader
 import com.kit.wallet.ui.components.StatusChip
@@ -56,6 +60,8 @@ import com.kit.wallet.ui.model.MobileMoneyOperation
 import com.kit.wallet.ui.model.MobileMoneyVerificationState
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.data.repository.FinancialOperationQuote
+import com.kit.wallet.feature.auth.PaymentApproval
+import com.kit.wallet.feature.auth.rememberBiometricApprovalAvailable
 import com.kit.wallet.ui.theme.KitTheme
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -63,6 +69,7 @@ import com.kit.wallet.ui.theme.KitTheme
 fun MobileMoneyScreen(
     onBack: () -> Unit,
     viewModel: MobileMoneyViewModel = hiltViewModel(),
+    topUp: TopUpViewModel = hiltViewModel(),
 ) {
     val networks by viewModel.networks.collectAsStateWithLifecycle()
     val accounts by viewModel.accounts.collectAsStateWithLifecycle()
@@ -71,8 +78,19 @@ fun MobileMoneyScreen(
     val busy by viewModel.busy.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
     val quote by viewModel.quote.collectAsStateWithLifecycle()
+    val shortOfFunds by viewModel.topUpRequired.collectAsStateWithLifecycle()
+    val topUpRequirement by topUp.requirement.collectAsStateWithLifecycle()
+    val topUpBusy by topUp.busy.collectAsStateWithLifecycle()
+    val operationBusy = busy || (topUpRequirement != null && topUpBusy)
+    val biometricsAvailable = rememberBiometricApprovalAvailable()
     var addingAccount by remember { mutableStateOf(false) }
     var operationAction by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(shortOfFunds) {
+        val shortfall = shortOfFunds ?: return@LaunchedEffect
+        topUp.start(shortfall)
+        viewModel.clearTopUpRequired()
+    }
 
     Scaffold(
         topBar = {
@@ -128,15 +146,37 @@ fun MobileMoneyScreen(
         MobileMoneyOperationSheet(
             action = action,
             accounts = accounts.filter { action != "collection" || it.isOwnAccount },
-            busy = busy,
+            // While the operation sheet is showing its top-up state, dismissal and loading are
+            // owned by TopUpViewModel rather than by the now-idle payout command.
+            busy = operationBusy,
             error = error,
             quote = quote,
-            onDismiss = { if (!busy) { viewModel.clearQuote(); operationAction = null } },
+            onDismiss = {
+                if (!operationBusy) {
+                    if (topUpRequirement != null) topUp.dismiss()
+                    viewModel.clearQuote()
+                    operationAction = null
+                }
+            },
             onQuoteInvalidated = viewModel::clearQuote,
             onReview = { accountId, amountMinor, feeMode ->
                 viewModel.preview(action, accountId, amountMinor, feeMode)
             },
             onSubmit = { pin -> viewModel.submit(pin) { operationAction = null } },
+            // Shown in place of the cash-out, inside the sheet that is already open, so the amount
+            // and account behind it survive the detour.
+            topUp = if (topUpRequirement == null) {
+                null
+            } else {
+                {
+                    TopUpSheetContent(
+                        viewModel = topUp,
+                        onDismiss = topUp::dismiss,
+                        onFunded = topUp::dismiss,
+                    )
+                }
+            },
+            biometricsAvailable = biometricsAvailable,
         )
     }
 }
@@ -266,6 +306,9 @@ private fun MobileMoneyAccountRow(account: MobileMoneyAccount) {
             contentAlignment = Alignment.Center,
         ) {
             Icon(Icons.Rounded.PhoneAndroid, contentDescription = null)
+            // Laid over the glyph rather than replacing it, so a row is complete at every moment:
+            // the icon is right until the face arrives, and right again if it never does.
+            KitAvatarPhoto(avatarUrl = account.avatarUrl, size = 44.dp)
         }
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
@@ -322,7 +365,7 @@ private fun MobileMoneyOperationRow(operation: MobileMoneyOperation) {
             )
             operation.feeMinor?.let { fee ->
                 Text(
-                    "Fee ${operation.currencyCode} ${decimalAmount(fee, operation.currencyScale)}" +
+                    "Fee ${Money.format(fee, operation.currencyCode, operation.currencyScale)}" +
                         if (operation.providerFeeEstimated == true) " estimated" else "",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -331,7 +374,7 @@ private fun MobileMoneyOperationRow(operation: MobileMoneyOperation) {
         }
         Column(horizontalAlignment = Alignment.End) {
             Text(
-                "${operation.currencyCode} ${decimalAmount(operation.amountMinor, operation.currencyScale)}",
+                Money.format(operation.amountMinor, operation.currencyCode, operation.currencyScale),
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.SemiBold,
             )
@@ -453,10 +496,18 @@ private fun MobileMoneyOperationSheet(
     onQuoteInvalidated: () -> Unit,
     onReview: (String, Long, String) -> Unit,
     onSubmit: (String) -> Unit,
+    /** Shown instead of the cash-out while the wallet is being topped up to afford it. */
+    topUp: (@Composable () -> Unit)? = null,
+    /** Whether this device can approve with biometrics; false falls back to the wallet PIN. */
+    biometricsAvailable: Boolean = false,
 ) {
-    var accountId by remember(accounts) { mutableStateOf(accounts.firstOrNull()?.id.orEmpty()) }
+    // Corrected only when the chosen account is gone, rather than reset whenever the list changes:
+    // topping up mid-payment adds an account, and that must not quietly move the destination.
+    var accountId by remember { mutableStateOf(accounts.firstOrNull()?.id.orEmpty()) }
+    LaunchedEffect(accounts) {
+        if (accounts.none { it.id == accountId }) accountId = accounts.firstOrNull()?.id.orEmpty()
+    }
     var amount by remember { mutableStateOf("") }
-    var pin by remember { mutableStateOf("") }
     var feeMode by remember(action) {
         mutableStateOf(if (action == "collection") "inclusive" else "sender_absorbs")
     }
@@ -469,7 +520,8 @@ private fun MobileMoneyOperationSheet(
     }
     androidx.compose.runtime.LaunchedEffect(accountId, amountMinor, feeMode) { onQuoteInvalidated() }
     ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 32.dp)) {
+        if (topUp != null) topUp()
+        else Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 32.dp)) {
             Text(
                 if (action == "collection") "Cash in from mobile money" else "Cash out to mobile money",
                 style = MaterialTheme.typography.titleLarge,
@@ -498,6 +550,7 @@ private fun MobileMoneyOperationSheet(
                 label = { Text("Amount (UGX)") },
                 supportingText = { Text("Enter a whole-shilling amount") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                visualTransformation = GroupedAmountTransformation,
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -516,30 +569,31 @@ private fun MobileMoneyOperationSheet(
                     label = { Text(if (action == "collection") "Add fees" else "Deduct fees") },
                 )
             }
-            if (reviewedQuote != null) {
+            if (reviewedQuote == null) {
+                ErrorText(error)
+                KitGreenButton(
+                    text = "Review amount and fees",
+                    loading = busy,
+                    enabled = accountId.isNotBlank() && amountMinor > 0,
+                    onClick = { onReview(accountId, amountMinor, feeMode) },
+                )
+            } else {
                 Spacer(Modifier.height(12.dp))
                 MobileMoneyQuoteSummary(reviewedQuote, action)
-                OutlinedTextField(
-                    value = pin,
-                    onValueChange = { pin = it.filter(Char::isDigit).take(4) },
-                    label = { Text("Wallet PIN (optional with biometrics)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
+                Spacer(Modifier.height(12.dp))
+                PaymentApproval(
+                    actionLabel = "Confirm payment",
+                    biometricsAvailable = biometricsAvailable,
+                    busy = busy,
+                    error = error,
+                    onApprove = onSubmit,
+                    pinSubtitle = if (action == "collection") {
+                        "Authorizes this cash-in from your mobile money account."
+                    } else {
+                        "Authorizes this cash-out to mobile money."
+                    },
                 )
             }
-            ErrorText(error)
-            KitGreenButton(
-                text = if (reviewedQuote == null) "Review amount and fees" else "Confirm payment",
-                loading = busy,
-                enabled = accountId.isNotBlank() && amountMinor > 0 &&
-                    (reviewedQuote == null || pin.isEmpty() || pin.length == 4),
-                onClick = {
-                    if (reviewedQuote == null) onReview(accountId, amountMinor, feeMode)
-                    else onSubmit(pin)
-                },
-            )
         }
     }
 }
@@ -600,6 +654,3 @@ private fun ErrorText(error: String?) {
         )
     }
 }
-
-private fun decimalAmount(amountMinor: Long, scale: Int): String =
-    java.math.BigDecimal.valueOf(amountMinor, scale).stripTrailingZeros().toPlainString()

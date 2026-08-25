@@ -51,12 +51,17 @@ internal fun initialCallPresentation(target: String?, contacts: List<Contact>): 
     }
 }
 
-/** Resolves LiveKit's `public-user-uuid:device-id` identity without displaying either UUID. */
-internal fun resolveRoomParticipantName(
+/**
+ * Resolves LiveKit's `public-user-uuid:device-id` identity without displaying either UUID.
+ *
+ * Returns the whole presentation rather than just the name: a participant whose camera is off is
+ * drawn as their avatar, and an avatar wants the photo as much as it wants the initials.
+ */
+internal fun resolveRoomParticipant(
     identity: String?,
     serverName: String?,
     contacts: List<Contact>,
-): String {
+): CallPresentation {
     val publicUserId = identity
         ?.substringBefore(':')
         ?.trim()
@@ -65,8 +70,14 @@ internal fun resolveRoomParticipantName(
         serverName = serverName,
         participantUserIds = listOfNotNull(publicUserId),
         contacts = contacts,
-    ).name
+    )
 }
+
+internal fun resolveRoomParticipantName(
+    identity: String?,
+    serverName: String?,
+    contacts: List<Contact>,
+): String = resolveRoomParticipant(identity, serverName, contacts).name
 
 internal fun String?.toCallDisplayName(): String =
     this.safeCallDisplayText() ?: DEFAULT_CALL_DISPLAY_NAME

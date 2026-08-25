@@ -6,8 +6,11 @@ import com.kit.wallet.data.auth.normalizeProfileName
 import com.kit.wallet.data.auth.requiresProfileSetup
 import com.kit.wallet.data.mapper.toEntity
 import com.kit.wallet.data.mapper.toUiModel
+import com.kit.wallet.data.remote.UpdateProfileRequest
+import com.kit.wallet.data.remote.UpdateProfileRequestAdapter
 import com.kit.wallet.data.remote.UserDto
 import com.kit.wallet.feature.settings.normalizeProfileTag
+import com.kit.wallet.feature.settings.profileIdentitySubtitle
 import com.kit.wallet.feature.settings.mergeProfileEditorInitialValues
 import com.kit.wallet.feature.settings.ProfileEditorInitialValues
 import com.kit.wallet.feature.settings.profileEditorInitialValues
@@ -107,15 +110,15 @@ class ProfileContractTest {
         assertTrue(isProvisionalProfileTag(provisional.tag))
         assertTrue(requiresProfileSetup(provisional.name, provisional.tag))
         assertEquals(
-            "Enter a username / display name (2–120 characters).",
+            "Enter a display name (2–120 characters).",
             profileValidationError("", "amina"),
         )
         assertEquals(
-            "Choose the username / display name people should see.",
+            "Choose the display name people should see.",
             profileValidationError(provisional.name, "amina"),
         )
         assertEquals(
-            "Choose your own Kit Pay tag.",
+            "Choose your own username.",
             profileValidationError("Amina", provisional.tag),
         )
     }
@@ -142,7 +145,7 @@ class ProfileContractTest {
     fun `display name length uses Unicode characters like the backend`() {
         assertNull(profileValidationError("😀".repeat(120), "emoji_name"))
         assertEquals(
-            "Enter a username / display name (2–120 characters).",
+            "Enter a display name (2–120 characters).",
             profileValidationError("😀".repeat(121), "emoji_name"),
         )
     }
@@ -150,11 +153,11 @@ class ProfileContractTest {
     @Test
     fun `reserved deleted and malformed tags keep profile setup gated`() {
         assertEquals(
-            "This Kit Pay tag is reserved.",
+            "This username is reserved.",
             profileValidationError("Amina", "support"),
         )
         assertEquals(
-            "This Kit Pay tag is reserved.",
+            "This username is reserved.",
             profileValidationError("Amina", "deleted_user"),
         )
         assertTrue(requiresProfileSetup("Amina", "kit_pay"))
@@ -183,6 +186,135 @@ class ProfileContractTest {
         assertFalse(shouldRequireProfileSetup(true, true, Dest.PROFILE_SETUP))
         assertFalse(shouldRequireProfileSetup(false, true, Dest.HOME))
         assertFalse(shouldRequireProfileSetup(true, false, Dest.HOME))
+    }
+
+    @Test
+    fun `identity verification is reachable from inside profile setup`() {
+        // Verifying is now the first step of setup, so the gate that herds an unfinished account
+        // back to the form must not evict it from the flow that finishes the account.
+        assertFalse(shouldRequireProfileSetup(true, true, Dest.KYC))
+    }
+
+    @Test
+    fun `a verified legal name makes the display name and username optional`() {
+        assertNull(profileValidationError("", "", "Amina Yusuf"))
+        assertNull(profileValidationError("Kit Pay User", "kit_a1b2c3d4e5", "Amina Yusuf"))
+        // Optional is not unvalidated: whatever is actually typed still has to be usable.
+        assertEquals(
+            "This username is reserved.",
+            profileValidationError("", "support", "Amina Yusuf"),
+        )
+        assertEquals(
+            "Enter a display name (2–120 characters).",
+            profileValidationError("A", "", "Amina Yusuf"),
+        )
+        // A legal name of whitespace is no legal name at all.
+        assertEquals(
+            "Enter a display name (2–120 characters).",
+            profileValidationError("", "", "   "),
+        )
+    }
+
+    @Test
+    fun `a verified account without a username is not trapped in setup`() {
+        val verified = UserDto(
+            id = "user-1",
+            name = null,
+            tag = null,
+            legalName = "Amina Yusuf",
+            usernameRequired = false,
+            profileSetupRequired = false,
+        ).toEntity(nowEpochMillis = 123L)
+
+        assertFalse(requiresProfileSetup(null, null, "Amina Yusuf"))
+        assertFalse(verified.profileSetupRequired)
+        assertFalse(verified.toUiModel().profileSetupRequired)
+        // Unverified, the original rule stands: an account with no name at all is not usable.
+        assertTrue(requiresProfileSetup(null, null, null))
+    }
+
+    @Test
+    fun `the legal name is cached separately and never becomes the chosen name`() {
+        val verified = UserDto(
+            id = "user-1",
+            // What the server presents when no display name was chosen: the legal name itself.
+            name = "Amina Yusuf",
+            tag = null,
+            legalName = "Amina Yusuf",
+            usernameRequired = false,
+        ).toEntity(nowEpochMillis = 123L)
+        val profile = verified.toUiModel()
+
+        assertEquals("Amina Yusuf", profile.legalName)
+        assertFalse(profile.usernameRequired)
+        assertTrue(profile.identityVerified)
+        assertEquals("Amina Yusuf", profile.displayIdentityName)
+        // The verified name is not offered back as an editable display name, in setup or in
+        // Settings: editing it there would silently turn a fallback into a chosen name.
+        assertEquals("", profileEditorInitialValues(profile, setup = true).name)
+        assertEquals("", profileEditorInitialValues(profile, setup = false).name)
+    }
+
+    @Test
+    fun `a chosen display name is kept and named as the nickname it is`() {
+        val profile = profile(name = "Ash", tag = "ash").copy(
+            legalName = "Amina Yusuf",
+            usernameRequired = false,
+        )
+
+        assertEquals("Amina Yusuf", profile.displayIdentityName)
+        assertEquals("Ash", profileEditorInitialValues(profile, setup = false).name)
+        assertEquals(
+            "Goes by Ash • @ash • +256700000200",
+            profileIdentitySubtitle(profile),
+        )
+        // Nothing to distinguish when the account has no verified name of its own.
+        assertEquals(
+            "@ash • +256700000200",
+            profileIdentitySubtitle(profile(name = "Ash", tag = "ash")),
+        )
+    }
+
+    @Test
+    fun `an older server that reports no username flag is read from the legal name`() {
+        val adapter = Moshi.Builder()
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(UserDto::class.java)
+        val user = requireNotNull(
+            adapter.fromJson("""{"id":"user-1","name":"Amina Yusuf","tag":"amina"}"""),
+        )
+
+        assertNull(user.legalName)
+        assertNull(user.usernameRequired)
+        // No verified name reported, so the username stays required rather than being assumed away.
+        assertTrue(user.toEntity(nowEpochMillis = 1L).usernameRequired)
+    }
+
+    @Test
+    fun `dropping a username is sent as an explicit null rather than omitted`() {
+        val adapter = Moshi.Builder()
+            .add(UpdateProfileRequestAdapter())
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(UpdateProfileRequest::class.java)
+
+        assertEquals(
+            """{"tag":null}""",
+            adapter.toJson(UpdateProfileRequest(clearUsername = true)),
+        )
+        assertEquals(
+            """{"name":"Amina Yusuf","tag":"amina"}""",
+            adapter.toJson(UpdateProfileRequest(name = "Amina Yusuf", tag = "amina")),
+        )
+        // Absent means "leave it alone". A verified user finishing setup without choosing
+        // anything sends exactly this, and the server completes the profile on it.
+        assertEquals("{}", adapter.toJson(UpdateProfileRequest()))
+        // An explicit clear wins over a stale value rather than sending both.
+        assertEquals(
+            """{"tag":null}""",
+            adapter.toJson(UpdateProfileRequest(tag = "amina", clearUsername = true)),
+        )
     }
 
     @Test

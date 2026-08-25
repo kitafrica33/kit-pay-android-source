@@ -264,3 +264,39 @@ interface ConversationPrefsDao {
     @Query("DELETE FROM conversation_prefs")
     suspend fun clear()
 }
+
+@Dao
+interface ProfilePhotoDao {
+    @Query("SELECT * FROM profile_photos WHERE ownerScopeId = :ownerScopeId")
+    fun observeForOwner(ownerScopeId: String): Flow<List<ProfilePhotoEntity>>
+
+    @Upsert
+    suspend fun put(photos: List<ProfilePhotoEntity>)
+
+    @Query(
+        "DELETE FROM profile_photos WHERE ownerScopeId = :ownerScopeId " +
+            "AND userId IN (:userIds)",
+    )
+    suspend fun forget(ownerScopeId: String, userIds: List<String>)
+
+    @Query("DELETE FROM profile_photos")
+    suspend fun clear()
+}
+
+@Dao
+interface BeneficiaryContactDao {
+    @Query("SELECT * FROM beneficiary_contacts WHERE ownerScopeId = :ownerScopeId")
+    fun observeForOwner(ownerScopeId: String): Flow<List<BeneficiaryContactEntity>>
+
+    @Upsert
+    suspend fun put(links: List<BeneficiaryContactEntity>)
+
+    @Query(
+        "DELETE FROM beneficiary_contacts WHERE ownerScopeId = :ownerScopeId " +
+            "AND beneficiaryId IN (:beneficiaryIds)",
+    )
+    suspend fun forget(ownerScopeId: String, beneficiaryIds: List<String>)
+
+    @Query("DELETE FROM beneficiary_contacts")
+    suspend fun clear()
+}

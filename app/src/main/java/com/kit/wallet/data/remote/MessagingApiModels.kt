@@ -2,6 +2,7 @@ package com.kit.wallet.data.remote
 
 import com.squareup.moshi.Json
 import com.squareup.moshi.JsonClass
+import java.nio.charset.StandardCharsets
 import java.util.Base64
 
 /**
@@ -137,19 +138,64 @@ data class MessagingConversationListDto(
     val items: List<MessagingConversationDto?>? = null,
 )
 
+/**
+ * Creates a direct or group conversation.
+ *
+ * The two are one request because the server treats them as one resource, but they are not
+ * interchangeable: a direct conversation is keyed by its pair and carries no title, while a
+ * group is titled, membership-mutable and role-bearing. [title] is required for a group and
+ * rejected for a direct chat, matching the server rule rather than trusting it.
+ */
 @JsonClass(generateAdapter = false)
-data class CreateDirectMessagingConversationRequest(
+data class CreateMessagingConversationRequest(
     @Json(name = "member_ids") val memberIds: List<String>,
     val type: String = DIRECT_CONVERSATION_TYPE,
+    val title: String? = null,
 ) {
     init {
-        require(type == DIRECT_CONVERSATION_TYPE) {
-            "This Android wire operation creates direct conversations only"
+        require(type == DIRECT_CONVERSATION_TYPE || type == GROUP_CONVERSATION_TYPE) {
+            "This Android wire operation creates direct and group conversations only"
         }
-        require(memberIds.size == 1) {
-            "A direct conversation requires exactly one other user"
+        require(memberIds.distinct().size == memberIds.size) {
+            "A conversation cannot contain duplicate members"
         }
-        requireCanonicalMessagingUuid(memberIds.single(), "direct conversation member ID")
+        memberIds.forEach { requireCanonicalMessagingUuid(it, "conversation member ID") }
+
+        if (type == DIRECT_CONVERSATION_TYPE) {
+            require(memberIds.size == 1) {
+                "A direct conversation requires exactly one other user"
+            }
+            require(title == null) {
+                "A direct conversation cannot carry a server-visible title"
+            }
+        } else {
+            // The creator is a member too, so the wire list is one short of the group size.
+            require(memberIds.size in 1..(MAX_GROUP_MEMBERS - 1)) {
+                "A group requires 1 to ${MAX_GROUP_MEMBERS - 1} other members"
+            }
+            require(title != null && isValidMessagingGroupTitle(title)) {
+                "A group requires a title of at most $MAX_GROUP_TITLE_LENGTH Unicode scalars " +
+                    "and $MAX_GROUP_TITLE_UTF8_BYTES UTF-8 bytes"
+            }
+        }
+    }
+}
+
+@JsonClass(generateAdapter = false)
+data class AddMessagingConversationMemberRequest(
+    @Json(name = "user_id") val userId: String,
+    val role: String = MEMBER_CONVERSATION_ROLE,
+) {
+    init {
+        requireCanonicalMessagingUuid(userId, "conversation member ID")
+        require(role in ASSIGNABLE_CONVERSATION_ROLES) { "Invalid conversation member role" }
+    }
+}
+
+@JsonClass(generateAdapter = false)
+data class UpdateMessagingConversationMemberRequest(val role: String) {
+    init {
+        require(role in ASSIGNABLE_CONVERSATION_ROLES) { "Invalid conversation member role" }
     }
 }
 
@@ -169,6 +215,15 @@ data class MessagingDeviceRosterEntryDto(
     @Json(name = "rotated_at") val rotatedAt: String? = null,
     @Json(name = "identity_key_changed_at") val identityKeyChangedAt: String? = null,
     @Json(name = "bundle_version_changed_at") val bundleVersionChangedAt: String? = null,
+    val client: MessagingDeviceClientDto? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class MessagingDeviceClientDto(
+    val platform: String? = null,
+    val version: String? = null,
+    val build: Int? = null,
+    val capabilities: Map<String, Boolean?>? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -301,11 +356,14 @@ data class SendEncryptedMessageRequest(
         // Mirrors the server contract: encrypted text carries no attachment metadata, while an
         // encrypted_attachment message must carry at least one row. Key material never appears
         // here; it rides end-to-end inside the per-device envelopes.
-        require(kind == ENCRYPTED_MESSAGE_KIND || kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND) {
+        require(kind in SECURE_MESSAGE_KINDS) {
             "Unsupported secure-message kind"
         }
         require((kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND) == attachments.isNotEmpty()) {
             "Encrypted attachment metadata must accompany exactly the encrypted_attachment kind"
+        }
+        require(kind != ENCRYPTED_REACTION_MESSAGE_KIND || replyToMessageId != null) {
+            "An encrypted reaction requires a reply target"
         }
         require(attachments.size <= MAX_SECURE_MESSAGE_ATTACHMENTS) {
             "An encrypted message supports at most $MAX_SECURE_MESSAGE_ATTACHMENTS attachments"
@@ -428,6 +486,8 @@ data class MessagingSyncEventDataDto(
     @Json(name = "revoked_at") val revokedAt: String? = null,
     @Json(name = "device_id") val deviceId: String? = null,
     @Json(name = "user_id") val userId: String? = null,
+    /** Present on `membership.*`: the subject's role after the change, never the actor's. */
+    val role: String? = null,
     @Json(name = "enrollment_epoch") val enrollmentEpoch: Long? = null,
     @Json(name = "signal_device_id") val signalDeviceId: Int? = null,
     @Json(name = "registration_id") val registrationId: Int? = null,
@@ -574,8 +634,47 @@ data class MessagingAttachmentUploadDto(
 
 const val SECURE_MESSAGING_PROTOCOL_VERSION = "v2"
 const val DIRECT_CONVERSATION_TYPE = "direct"
+const val GROUP_CONVERSATION_TYPE = "group"
+const val OWNER_CONVERSATION_ROLE = "owner"
+const val ADMIN_CONVERSATION_ROLE = "admin"
+const val MEMBER_CONVERSATION_ROLE = "member"
+
+/**
+ * The roles this client will ever ask the server to assign.
+ *
+ * `moderator` is a server-side channel role with no meaning in a group, so it is recognised
+ * when read back but never sent.
+ */
+val ASSIGNABLE_CONVERSATION_ROLES: Set<String> = setOf(
+    OWNER_CONVERSATION_ROLE,
+    ADMIN_CONVERSATION_ROLE,
+    MEMBER_CONVERSATION_ROLE,
+)
+
+/**
+ * The group member ceiling, mirroring `messaging.maximum_group_members` on the server.
+ *
+ * Fan-out is pairwise Signal — one ciphertext per recipient *device* — so a group of M
+ * members with D devices each costs M*D envelopes in a single request. 32 * 3 = 96 fits both
+ * the 100-device roster cap and the 99-envelope request cap, so a member enrolling a third
+ * device can never turn a sendable group into an unsendable one. The client enforces it so a
+ * group that cannot work is refused before a participant picker lets someone build it.
+ */
+const val MAX_GROUP_MEMBERS = 32
+const val MAX_GROUP_TITLE_LENGTH = 64
+const val MAX_GROUP_TITLE_UTF8_BYTES = 120
 const val ENCRYPTED_MESSAGE_KIND = "encrypted"
 const val ENCRYPTED_ATTACHMENT_MESSAGE_KIND = "encrypted_attachment"
+const val ENCRYPTED_REACTION_MESSAGE_KIND = "encrypted_reaction"
+val SECURE_MESSAGE_KINDS: Set<String> = setOf(
+    ENCRYPTED_MESSAGE_KIND,
+    ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+    ENCRYPTED_REACTION_MESSAGE_KIND,
+)
+const val MESSAGING_GROUPS_FEATURE = "messaging_groups"
+const val MESSAGING_REACTIONS_FEATURE = "messaging_reactions_e2ee_v1"
+const val MESSAGING_GROUPS_DEVICE_CAPABILITY = "messaging_groups_v1"
+const val MESSAGING_REACTIONS_DEVICE_CAPABILITY = "messaging_reactions_e2ee_v1"
 const val MAX_DELIVERY_ACKNOWLEDGEMENT_BATCH = 100
 const val MAX_SECURE_MESSAGE_RECIPIENT_DEVICES = 99
 const val MAX_SECURE_MESSAGE_ATTACHMENTS = 20
@@ -591,6 +690,53 @@ val SECURE_MESSAGING_ROSTER_REVISION = Regex("^v1:sha256:[a-f0-9]{64}$")
 
 private val CANONICAL_MESSAGING_UUID =
     Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+fun isValidMessagingGroupTitle(value: String): Boolean =
+    value.isNotBlank() &&
+        value.trim() == value &&
+        value.hasWellFormedUnicodeScalars() &&
+        value.codePointCount(0, value.length) <= MAX_GROUP_TITLE_LENGTH &&
+        value.toByteArray(StandardCharsets.UTF_8).size <= MAX_GROUP_TITLE_UTF8_BYTES &&
+        '\u0000' !in value
+
+fun truncateMessagingGroupTitle(value: String): String {
+    val result = StringBuilder()
+    var index = 0
+    var scalars = 0
+    var bytes = 0
+    while (index < value.length && scalars < MAX_GROUP_TITLE_LENGTH) {
+        if (value[index].isSurrogate() &&
+            (index + 1 >= value.length || !Character.isSurrogatePair(value[index], value[index + 1]))
+        ) {
+            break
+        }
+        val codePoint = value.codePointAt(index)
+        val token = String(Character.toChars(codePoint))
+        val tokenBytes = token.toByteArray(StandardCharsets.UTF_8).size
+        if (bytes + tokenBytes > MAX_GROUP_TITLE_UTF8_BYTES) break
+        result.append(token)
+        index += Character.charCount(codePoint)
+        scalars++
+        bytes += tokenBytes
+    }
+    return result.toString()
+}
+
+private fun String.hasWellFormedUnicodeScalars(): Boolean {
+    var index = 0
+    while (index < length) {
+        val character = this[index]
+        when {
+            Character.isHighSurrogate(character) -> {
+                if (index + 1 >= length || !Character.isLowSurrogate(this[index + 1])) return false
+                index += 2
+            }
+            Character.isLowSurrogate(character) -> return false
+            else -> index++
+        }
+    }
+    return true
+}
 
 private fun requireCanonicalMessagingUuid(value: String, field: String) {
     require(CANONICAL_MESSAGING_UUID.matches(value)) { "Invalid $field" }

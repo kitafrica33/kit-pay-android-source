@@ -79,7 +79,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
@@ -92,8 +91,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import coil.compose.AsyncImage
 import com.kit.wallet.ui.components.KitAvatar
+import com.kit.wallet.ui.components.KitAvatarPhoto
 import com.kit.wallet.ui.components.initialsOf
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.theme.KitGreen100
@@ -782,14 +781,7 @@ private fun ColumnScope.VoiceCallBody(state: ActiveCallUiState) {
                         fontWeight = FontWeight.SemiBold,
                         color = KitGreen700,
                     )
-                    if (!state.avatarUrl.isNullOrBlank()) {
-                        AsyncImage(
-                            model = state.avatarUrl,
-                            contentDescription = null,
-                            modifier = Modifier.size(132.dp).clip(CircleShape),
-                            contentScale = ContentScale.Crop,
-                        )
-                    }
+                    KitAvatarPhoto(avatarUrl = state.avatarUrl, size = 132.dp)
                 }
             }
         }
@@ -898,11 +890,13 @@ private fun GroupVideoGrid(
                                 modifier = Modifier.fillMaxSize(),
                             )
                         } else {
-                            Text(
-                                initialsOf(participant.name),
-                                fontSize = 34.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = Color.White,
+                            // A camera that is off should show the person, not a monogram standing
+                            // in for one. The photo is the same cached copy the chat list drew, so
+                            // this costs no download at the moment a call is being carried.
+                            KitAvatar(
+                                name = participant.name,
+                                size = 96.dp,
+                                avatarUrl = participant.avatarUrl,
                             )
                         }
                         Text(

@@ -58,6 +58,8 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.kit.wallet.data.repository.KycVerificationState
+import com.kit.wallet.data.repository.kycVerificationStateOf
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.remote.KitFeature
 import com.kit.wallet.navigation.AppCapabilities
@@ -278,7 +280,7 @@ private fun HomeContent(
                 )
             }
 
-            if (shouldPromptForIdentityVerification(profile.kycLabel)) {
+            identityPromptFor(profile.kycLabel)?.let { prompt ->
                 item {
                     Surface(
                         shape = MaterialTheme.shapes.large,
@@ -300,12 +302,12 @@ private fun HomeContent(
                             )
                             Column(Modifier.padding(start = 12.dp).weight(1f)) {
                                 Text(
-                                    "Verify your identity",
+                                    prompt.title,
                                     style = MaterialTheme.typography.titleMedium,
                                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                                 )
                                 Text(
-                                    "Continue securely with Didit to access regulated Kit Pay services.",
+                                    prompt.detail,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                                 )
@@ -365,7 +367,7 @@ private fun HomeContent(
                                     .clickable { onFavorite(contact) }
                                     .padding(6.dp),
                             ) {
-                                KitAvatar(contact.name, size = 52.dp)
+                                KitAvatar(contact.name, size = 52.dp, avatarUrl = contact.avatarUrl)
                                 Spacer(Modifier.height(6.dp))
                                 Text(
                                     contact.name.substringBefore(" "),
@@ -401,8 +403,36 @@ private fun HomeContent(
     }
 }
 
+/** What the home card should say about identity, or null when it should not be there at all. */
+internal data class IdentityPrompt(val title: String, val detail: String)
+
+/**
+ * The identity card, phrased for the state the account is actually in.
+ *
+ * A check that is already with a reviewer is reported as such rather than as an invitation to
+ * start another one: being told to "verify your identity" while a submitted check sits in review
+ * is what led people to submit again, and again. An unreadable status shows nothing, because the
+ * only honest thing to say about it is nothing.
+ */
+internal fun identityPromptFor(status: String): IdentityPrompt? =
+    when (kycVerificationStateOf(status)) {
+        KycVerificationState.VERIFIED, KycVerificationState.UNKNOWN -> null
+        KycVerificationState.IN_REVIEW -> IdentityPrompt(
+            title = "Verification in review",
+            detail = "We're checking what you sent. Tap for the latest.",
+        )
+        KycVerificationState.ACTION_NEEDED -> IdentityPrompt(
+            title = "Finish verifying your identity",
+            detail = "The last check couldn't be completed. Tap to try again.",
+        )
+        KycVerificationState.NOT_STARTED -> IdentityPrompt(
+            title = "Verify your identity",
+            detail = "Continue securely with Didit to access regulated Kit Pay services.",
+        )
+    }
+
 internal fun shouldPromptForIdentityVerification(status: String): Boolean =
-    status.trim().lowercase() !in setOf("verified", "approved", "kyc verified")
+    identityPromptFor(status) != null
 
 @Composable
 private fun BalanceCard(

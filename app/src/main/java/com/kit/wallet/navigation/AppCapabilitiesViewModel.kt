@@ -6,6 +6,8 @@ import com.kit.wallet.data.messaging.SecureMessagingContract
 import com.kit.wallet.data.notifications.PushMessagingTransport
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.KitWalletApi
+import com.kit.wallet.data.realtime.KitNetworkEvent
+import com.kit.wallet.data.realtime.KitNetworkSource
 import com.kit.wallet.data.remote.KitFeature
 import com.kit.wallet.data.repository.ChatRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -25,6 +27,17 @@ data class AppCapabilities(
     val features: Map<String, Boolean> = emptyMap(),
     val loaded: Boolean = false,
     val loadFailed: Boolean = false,
+    /**
+     * The last answer the server actually gave, kept across a *transport* failure only.
+     *
+     * There is a real difference between "the server says messaging is off for you" and "we could
+     * not ask" — and the app used to treat them identically, so losing the network took the
+     * Messages tab off the bottom bar and bounced anyone reading a chat back to Home. Discovery
+     * stays fail-closed for everything that acts ([enabled]); this exists so the surfaces that
+     * merely *show* what is already on the device can keep showing it. Cleared at a session
+     * boundary, where another account's view must never survive.
+     */
+    val retainedFeatures: Map<String, Boolean> = emptyMap(),
     val secureMessagingClientReady: Boolean = false,
     val messagingProtocolReady: Boolean = false,
     val messagingProtocolVersion: String? = null,
@@ -40,15 +53,29 @@ data class AppCapabilities(
     fun allEnabled(vararg required: String): Boolean = required.all(::enabled)
 
     /**
+     * Whether a feature was enabled the last time the server answered — which, when discovery is
+     * currently failing, is the most truthful thing this device knows.
+     *
+     * For read-only surfaces only: a tab, a list of what is already stored locally, a route the
+     * user is standing on. Anything that transacts, creates or transmits must use [enabled],
+     * which stays fail-closed. Once a refresh succeeds this collapses back to [enabled] exactly,
+     * so a feature the server has genuinely turned off disappears on the next successful poll.
+     */
+    fun lastKnownEnabled(feature: String): Boolean =
+        enabled(feature) || (loadFailed && retainedFeatures[feature] == true)
+
+    /**
      * Whether the user should be able to discover the messaging surface. The entry remains
      * visible when the backend advertises messaging even if this build cannot safely exchange
-     * messages yet; the Chats screen then explains the end-to-end-encryption requirement.
+     * messages yet; the Chats screen then explains the end-to-end-encryption requirement — and
+     * it survives an offline capability refresh, because the conversations behind it are stored
+     * on this device and remain readable with no server at all.
      */
     val messagingEntryVisible: Boolean
-        get() = enabled(KitFeature.MESSAGING)
+        get() = lastKnownEnabled(KitFeature.MESSAGING)
 
     val messagingServerCompatible: Boolean
-        get() = messagingEntryVisible &&
+        get() = enabled(KitFeature.MESSAGING) &&
             SecureMessagingContract.matchesServerAdvertisement(
                 ready = messagingProtocolReady,
                 version = messagingProtocolVersion,
@@ -97,12 +124,19 @@ data class AppCapabilities(
             return allEnabled(KitFeature.WALLETS, KitFeature.INTERNAL_TRANSFERS)
         }
         return when (route) {
-            // The top-level screen is safe to expose because its unavailable state never reads or
-            // sends plaintext. Conversation creation and content remain closed until E2EE is ready.
-            Dest.CHATS -> messagingEntryVisible
-            Dest.CONVERSATION, Dest.CONTACTS -> messagingUsable
+            // Reading is not exchanging. A conversation's transcript, its title and its member
+            // list all come out of this device's own encrypted store, so the routes that only
+            // display them stay open with no session and no network — the composer inside gates
+            // itself. Being pulled out of a chat you are reading because a key revalidation blipped
+            // is a bug, not a safety property.
+            Dest.CHATS, Dest.CONVERSATION, Dest.GROUP_PROFILE -> messagingEntryVisible
+            // These three do exchange: starting a conversation, picking someone to start it with,
+            // and changing who is in a group are all server-authenticated actions that need a
+            // ready end-to-end session before they can be honoured.
+            Dest.CONTACTS, Dest.NEW_GROUP, Dest.GROUP_ADD -> messagingUsable
+            // Including an in-progress call: a failed capability poll must never hang one up.
             Dest.CALLS, Dest.CALL_CONTACTS, Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL ->
-                enabled(KitFeature.CALLS)
+                lastKnownEnabled(KitFeature.CALLS)
             Dest.BILLS, Dest.BILL_PAY -> billPaymentsUsable
             Dest.AIRTIME -> airtimeUsable
             Dest.BANK -> bankTransfersUsable
@@ -127,6 +161,7 @@ class AppCapabilitiesViewModel @Inject constructor(
     private val apiCalls: ApiCallExecutor,
     chatRepository: ChatRepository,
     pushMessagingTransport: PushMessagingTransport,
+    networkSource: KitNetworkSource,
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(
         AppCapabilities(
@@ -152,6 +187,19 @@ class AppCapabilitiesViewModel @Inject constructor(
                 }
             }
         }
+        viewModelScope.launch {
+            // A failed poll otherwise sits fail-closed for up to five minutes after the network
+            // has already come back — which is precisely the window a user spends walking out of
+            // a lift and wondering why half the app is missing. A new default network is new
+            // information, so retry against it at once. Only when the previous attempt actually
+            // failed: a working session does not need re-asking on every Wi-Fi handover.
+            networkSource.events.collect { event ->
+                if (event == KitNetworkEvent.Available && mutableState.value.loadFailed) {
+                    startRefresh(cancelInFlight = true, invalidateSnapshot = false)
+                }
+            }
+        }
+        networkSource.start()
         refresh()
     }
 
@@ -196,6 +244,7 @@ class AppCapabilitiesViewModel @Inject constructor(
             mutableState.update {
                 it.copy(
                     features = emptyMap(),
+                    retainedFeatures = emptyMap(),
                     loaded = false,
                     loadFailed = false,
                     messagingProtocolReady = false,
@@ -218,6 +267,7 @@ class AppCapabilitiesViewModel @Inject constructor(
                 mutableState.update {
                     it.copy(
                         features = features,
+                        retainedFeatures = features,
                         loaded = true,
                         loadFailed = false,
                         messagingProtocolReady = messagingProtocol?.ready == true,
@@ -233,7 +283,9 @@ class AppCapabilitiesViewModel @Inject constructor(
             } catch (_: Exception) {
                 if (generation != refreshGeneration) return@launch
                 // Capability discovery is fail-closed: unavailable services stay hidden until
-                // a later successful refresh.
+                // a later successful refresh. `retainedFeatures` is deliberately left alone —
+                // it is not consulted by `enabled`, only by the display-only surfaces that would
+                // otherwise blank out the user's own locally stored chats and call history.
                 mutableState.update {
                     it.copy(
                         features = emptyMap(),

@@ -2,8 +2,8 @@
 
 Audit snapshot: 2026-07-22  
 Application ID: `com.kit.wallet`  
-Version name: `0.2.22`  
-Version code: `34`  
+Version name: `0.2.25`  
+Version code: `36`  
 Distribution clearance: `true`  
 Distribution review disposition: `CLEARED`  
 Distribution review record type: `APP_WIDE_INTERNAL_DISTRIBUTION_CLEARANCE_APPROVAL`  
@@ -30,9 +30,9 @@ Applicable terms retrieval date: `2026-07-20`
 Applicable terms URL: `https://developer.android.com/studio/terms`  
 Applicable terms SHA-256: `8bd88dc1144a7d12818687d680d6a9f9e8a2f1ee62c43a8e21f5c6a75f6977cd`  
 Decision document: `docs/google-fcm-agpl-clearance-decision-app-wide.md`  
-Decision document SHA-256: `58a26382838bd26e4a80378bfe6dd7cb8466a88abcf64db85f5bf12e6017904e`  
-Reviewed runtime inventory SHA-256: `b367304e080f083c067571c2fbbbd062f92a1a0cb9d3ccca21a16485c5b0ec49`  
-Reviewed runtime graph manifest SHA-256: `08643aebc10c171d79602a7bb6cb698872943cb6a0b6da45e78ea1ae3cba9676`  
+Decision document SHA-256: `72b01195cc7366bbf2bfedfc0bb382046e23048841703c7af8e18b4586b478b3`  
+Reviewed runtime inventory SHA-256: `5c3a5b03b1e620bec8daf4a7b40089661cbbb4fdbd92d288810e50a3b284b0f2`  
+Reviewed runtime graph manifest SHA-256: `9c0c81142cf5bf27ca93e0f5c7569fc56419c7df21fa41e2b82688f41eef2f03`  
 Distribution conditions recorded: `7`  
 Re-review triggers recorded: `9`  
 Unresolved issue IDs: `none`
@@ -41,14 +41,14 @@ This is the release-runtime licence inventory, not legal advice or a publication
 
 ## Scope and method
 
-Gradle's `releaseRuntimeClasspath` identifies 209 Maven components: 38 direct and 171 transitive. Those components resolve to 172 AAR/JAR artifact archives. The release AAB must reproduce this inventory in `BUNDLE-METADATA/com.android.tools.build.libraries/dependencies.pb` before clearance can change. `com.android.tools:desugar_jdk_libs:2.1.5` is reviewed separately because Android's build tools rewrite its code into the application DEX from the `coreLibraryDesugaring` configuration.
+Gradle's `releaseRuntimeClasspath` identifies 211 Maven components: 39 direct and 172 transitive. Those components resolve to 174 AAR/JAR artifact archives. The release AAB must reproduce this inventory in `BUNDLE-METADATA/com.android.tools.build.libraries/dependencies.pb` before clearance can change. `com.android.tools:desugar_jdk_libs:2.1.5` is reviewed separately because Android's build tools rewrite its code into the application DEX from the `coreLibraryDesugaring` configuration.
 
-Licence evidence was checked from exact resolved POMs, artifact contents and, where POM/archive evidence was incomplete, version-pinned upstream sources. The normalized 209-component result is:
+Licence evidence was checked from exact resolved POMs, artifact contents and, where POM/archive evidence was incomplete, version-pinned upstream sources. The normalized 211-component result is:
 
 | Evidence category | Components |
 | --- | ---: |
 | Apache-2.0 | 196 |
-| Android SDK License | 6 |
+| Android SDK License | 8 |
 | BSD-3-Clause | 3 |
 | AGPL-3.0-only | 2 |
 | MIT | 2 |
@@ -88,8 +88,8 @@ The recorded re-review triggers are:
 8. A major application-architecture change affecting third-party linking, licensing, privacy, or distribution.
 9. A change to the approved Android application ID or release-signing identity.
 
-The release gates compare the resolved six Google/Firebase AARs and POMs byte-for-byte
-with the reviewed hashes, bind the complete 209-component runtime inventory, preserve
+The release gates compare the resolved eight Google/Firebase AARs and POMs byte-for-byte
+with the reviewed hashes, bind the complete 211-component runtime inventory, preserve
 the required notices, and verify the attested Gradle, CycloneDX and final-AAB dependency
 graphs before distribution. The graph-manifest digest is derived release evidence, not
 additional reviewer identity or a replacement legal opinion. A material trigger
@@ -321,6 +321,8 @@ The “declared evidence” column reports metadata/evidence, not a compatibilit
 | `com.google.android.datatransport:transport-api:3.1.0` | transitive | `Apache-2.0` |
 | `com.google.android.datatransport:transport-backend-cct:3.1.9` | transitive | `Apache-2.0` |
 | `com.google.android.datatransport:transport-runtime:3.1.9` | transitive | `Apache-2.0` |
+| `com.google.android.gms:play-services-auth-base:18.0.4` | transitive | `LicenseRef-Android-SDK-License` |
+| `com.google.android.gms:play-services-auth:20.7.0` | direct | `LicenseRef-Android-SDK-License` |
 | `com.google.android.gms:play-services-base:18.1.0` | transitive | `LicenseRef-Android-SDK-License` |
 | `com.google.android.gms:play-services-basement:18.3.0` | transitive | `LicenseRef-Android-SDK-License` |
 | `com.google.android.gms:play-services-cloud-messaging:17.2.0` | transitive | `LicenseRef-Android-SDK-License` |

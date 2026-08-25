@@ -42,6 +42,7 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.repository.KycStatus
+import com.kit.wallet.data.repository.KycVerificationState
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.StatusChip
 import com.kit.wallet.ui.theme.KitTheme
@@ -134,17 +135,37 @@ fun KycScreen(
                 Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
 
+            // An account that has already proven its identity is never asked to prove it again.
+            // Whatever is outstanding after that belongs to this device, and is described as
+            // such, so the two can never be mistaken for one another.
+            val current = status
+            val accountVerified = current?.accountState == KycVerificationState.VERIFIED
+            if (accountVerified) {
+                Text(
+                    "Your identity is verified. Your wallet limits will update automatically.",
+                    color = KitTheme.colors.success,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+
+            val outstanding = current?.deviceState
+            if (accountVerified && current?.deviceCheckRequired == true) {
+                Text(
+                    "This device still needs to confirm it's you before it can move money. " +
+                        "Your verified identity stays as it is.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
             when {
-                status?.status in setOf("approved", "verified") -> {
-                    Text(
-                        "Your identity is verified. Your wallet limits will update automatically.",
-                        color = KitTheme.colors.success,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
-                status?.verificationUrl != null -> {
+                current == null || (accountVerified && !current.deviceCheckRequired) -> Unit
+                // A live provider session outranks a status word: the server only publishes the
+                // link while it is genuinely resumable, so finishing it is always better than
+                // starting a second one.
+                current.resumable -> {
                     KitGreenButton(
-                        text = "Continue with Didit",
+                        text = if (accountVerified) "Confirm this device" else "Continue with Didit",
                         loading = busy,
                         enabled = !busy,
                         onClick = viewModel::continueVerification,
@@ -158,13 +179,38 @@ fun KycScreen(
                         )
                     }
                 }
-                status?.status in setOf("pending", "in_review", "submitted") -> {
+                outstanding == KycVerificationState.IN_REVIEW -> {
                     Text(
-                        "Your verification is being reviewed. Pull down or tap refresh after Didit completes.",
+                        "Your check is with our reviewers. There is nothing more to send — this " +
+                            "page updates on its own, and you can tap refresh any time.",
                         color = MaterialTheme.colorScheme.primary,
+                    )
+                    reviewReason(current.decisionCode)?.let {
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                // A word this build does not know is a gap in the app, not a verdict on the user.
+                // Starting a verification off the back of one is precisely the mistake that had
+                // verified people queueing up for a check they had already passed.
+                outstanding == KycVerificationState.UNKNOWN -> {
+                    Text(
+                        "We're checking your verification status. Tap refresh if this doesn't " +
+                            "settle in a moment.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 else -> {
+                    if (outstanding == KycVerificationState.ACTION_NEEDED) {
+                        Text(
+                            "The last check couldn't be completed. You can try again below.",
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
                     Row(verticalAlignment = Alignment.Top) {
                         Checkbox(checked = consented, onCheckedChange = { consented = it })
                         Text(
@@ -175,7 +221,11 @@ fun KycScreen(
                         )
                     }
                     KitGreenButton(
-                        text = "Start secure verification",
+                        text = when {
+                            accountVerified -> "Confirm this device"
+                            outstanding == KycVerificationState.ACTION_NEEDED -> "Try verification again"
+                            else -> "Start secure verification"
+                        },
                         loading = busy,
                         enabled = consented && !busy,
                         onClick = { viewModel.startVerification(consented) },
@@ -187,10 +237,49 @@ fun KycScreen(
     }
 }
 
+/**
+ * Plain-English reasons for the decision codes a reviewer's queue can produce.
+ *
+ * Anything unrecognised returns null rather than being shown raw: an internal code tells the user
+ * nothing and reads as a fault they caused.
+ */
+internal fun reviewReason(decisionCode: String?): String? = when (decisionCode?.uppercase()) {
+    "DIDIT_IDENTITY_NAME_REVIEW_REQUIRED" ->
+        "The name on your document needs a manual check against your Kit Pay profile."
+    // Deliberately unspecific, and it must stay that way. This one code covers a document image a
+    // reviewer has to look at *and* a document already registered to another Kit Pay account, and
+    // the server keeps it generic for that second case: telling somebody holding a document that
+    // is not theirs that it is "already registered" confirms precisely what they were testing for.
+    "DIDIT_IDENTITY_DOCUMENT_REVIEW_REQUIRED" ->
+        "Your document needs a manual check by our team. Nothing more is needed from you."
+    "DIDIT_SCREENING_IDENTITY_REVIEW_REQUIRED" ->
+        "Your details need a manual check against our compliance records."
+    else -> null
+}
+
+/**
+ * The one-line verdict at the top of the screen, phrased from the *account's* standing.
+ *
+ * A device check that is still outstanding is described below this card, not here, so the card
+ * never contradicts a verification the user has already passed.
+ */
+internal fun verificationSummaryLabel(status: KycStatus?): String = when {
+    status == null -> "Checking…"
+    status.accountState == KycVerificationState.VERIFIED && status.deviceCheckRequired ->
+        "Verified • confirming this device"
+    else -> when (status.accountState) {
+        KycVerificationState.VERIFIED -> "Verified"
+        KycVerificationState.IN_REVIEW -> "In review"
+        KycVerificationState.ACTION_NEEDED -> "Needs another try"
+        KycVerificationState.NOT_STARTED -> "Not started"
+        KycVerificationState.UNKNOWN -> "Checking…"
+    }
+}
+
 @Composable
 private fun VerificationSummary(status: KycStatus?) {
-    val value = status?.status ?: "loading"
-    val approved = value in setOf("approved", "verified")
+    val value = verificationSummaryLabel(status)
+    val approved = status?.accountState == KycVerificationState.VERIFIED
     Surface(
         shape = MaterialTheme.shapes.large,
         color = if (approved) KitTheme.colors.successContainer
@@ -204,11 +293,8 @@ private fun VerificationSummary(status: KycStatus?) {
                 tint = if (approved) KitTheme.colors.success else MaterialTheme.colorScheme.primary,
             )
             Column(Modifier.padding(start = 12.dp).weight(1f)) {
-                Text("KYC status", style = MaterialTheme.typography.labelMedium)
-                Text(
-                    value.replace('_', ' ').replaceFirstChar(Char::uppercase),
-                    style = MaterialTheme.typography.titleMedium,
-                )
+                Text("Identity", style = MaterialTheme.typography.labelMedium)
+                Text(value, style = MaterialTheme.typography.titleMedium)
             }
             if (status?.provider == "didit") {
                 StatusChip(

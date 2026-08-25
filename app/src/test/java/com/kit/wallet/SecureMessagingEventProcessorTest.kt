@@ -15,6 +15,7 @@ import com.kit.wallet.data.messaging.RealSecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.SecureMessagingActivationCapability
 import com.kit.wallet.data.messaging.SecureMessagingActivationCoordinator
+import com.kit.wallet.data.messaging.ConversationRosterStore
 import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
 import com.kit.wallet.data.messaging.SecureMessagingCommittedResult
 import com.kit.wallet.data.messaging.SecureMessagingCompanionStateIntent
@@ -169,6 +170,8 @@ class SecureMessagingEventProcessorTest {
         val stateStore = TestSecureMessagingStateStore()
         val completions = SecureMessagingSyncCompletionSignal()
         val runtime = DefaultSecureMessagingChatRuntime(
+            lifecycle = lifecycle,
+            roster = ConversationRosterStore(stateStore),
             sessions = registry,
             authenticationSessions = MutableTestSessionStore(authenticatedSession()),
             engine = PersistingDecryptionEngine(stateStore),
@@ -203,6 +206,8 @@ class SecureMessagingEventProcessorTest {
         val stateStore = TestSecureMessagingStateStore()
         val projections = projectionStore(stateStore)
         val runtime = DefaultSecureMessagingChatRuntime(
+            lifecycle = lifecycle,
+            roster = ConversationRosterStore(stateStore),
             sessions = registry,
             authenticationSessions = MutableTestSessionStore(authenticatedSession()),
             engine = OutboundCommitTestEngine(
@@ -297,6 +302,8 @@ class SecureMessagingEventProcessorTest {
                 }
             }
             val runtime = DefaultSecureMessagingChatRuntime(
+                lifecycle = lifecycle,
+                roster = ConversationRosterStore(stateStore),
                 sessions = registry,
                 authenticationSessions = authentication,
                 engine = PersistingDecryptionEngine(stateStore),
@@ -370,6 +377,8 @@ class SecureMessagingEventProcessorTest {
             }
         }
         val runtime = DefaultSecureMessagingChatRuntime(
+            lifecycle = lifecycle,
+            roster = ConversationRosterStore(stateStore),
             sessions = registry,
             authenticationSessions = authentication,
             engine = PersistingDecryptionEngine(stateStore),
@@ -1616,7 +1625,7 @@ class SecureMessagingEventProcessorTest {
             val restarted = projectionStore(stateStore)
             assertTrue(restarted.readPage(limit = 10).messages().isEmpty())
             assertNull(
-                restarted.newestUnreadInboundMessageId(CONVERSATION_ID, PEER_USER_ID),
+                restarted.newestUnreadInboundMessageId(CONVERSATION_ID, setOf(PEER_USER_ID)),
             )
             assertTrue(notifications.isEmpty())
             assertEquals(
@@ -2119,6 +2128,8 @@ class SecureMessagingEventProcessorTest {
                 ): CapturedAccountMessageHistory = object : CapturedAccountMessageHistory {
                     override suspend fun archive(projected: SecureMessagingProjectedMessage) = Unit
 
+                    override suspend fun restore(archived: AccountArchivedMessage) = Unit
+
                     override suspend fun readAll(): List<AccountArchivedMessage> {
                         archiveRestored.set(true)
                         return emptyList()
@@ -2267,7 +2278,20 @@ class SecureMessagingEventProcessorTest {
         projections.recordOutboundPending(outbound, Instant.parse(TIMESTAMP))
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
         enqueueRoster(roster)
-        enqueueOutboundReceipt(roster, OUTBOUND_CLIENT_ID)
+        enqueueOutboundReceipt(
+            roster,
+            OUTBOUND_CLIENT_ID,
+            kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+            attachments = listOf(
+                EncryptedAttachmentDto(
+                    id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    storageKey = "0f0e0d0c-0b0a-4a0b-8c0d-0e0f10111213",
+                    mediaType = "image/jpeg",
+                    byteSize = 4_096,
+                    ciphertextSha256 = "ab".repeat(32),
+                ),
+            ),
+        )
 
         processor.recoverPendingOutbox(session)
 
@@ -2437,6 +2461,8 @@ class SecureMessagingEventProcessorTest {
         val registry = SecureMessagingActiveSessionRegistry(lifecycle)
         registry.publish(session, fence)
         val runtime = DefaultSecureMessagingChatRuntime(
+            lifecycle = lifecycle,
+            roster = ConversationRosterStore(stateStore),
             sessions = registry,
             authenticationSessions = MutableTestSessionStore(authenticatedSession()),
             engine = PersistingDecryptionEngine(stateStore),
@@ -2930,6 +2956,8 @@ class SecureMessagingEventProcessorTest {
     private fun enqueueOutboundReceipt(
         roster: MessagingDeviceRosterDto,
         clientMessageId: String,
+        kind: String = ENCRYPTED_MESSAGE_KIND,
+        attachments: List<EncryptedAttachmentDto?> = emptyList(),
     ) {
         val current = roster.devices.orEmpty().filterNotNull()
             .single { it.deviceId == CURRENT_DEVICE_ID }
@@ -2945,10 +2973,10 @@ class SecureMessagingEventProcessorTest {
             senderBundleVersion = current.bundleVersion,
             senderIdentityKeySha256 = current.identityKeySha256,
             rosterRevision = roster.rosterRevision,
-            kind = "encrypted",
+            kind = kind,
             replyToMessageId = null,
             envelope = null,
-            attachments = emptyList(),
+            attachments = attachments,
             reactions = emptyList(),
             sentAt = TIMESTAMP,
             revokedAt = null,
@@ -3869,7 +3897,7 @@ class SecureMessagingEventProcessorTest {
         )
         const val READY_CAPABILITIES = """
             {"ok":true,"data":{"api_version":"v1","currency":{"code":"UGX","scale":"2"},
-            "features":{"messaging":true},"authentication":{},"protocols":{"messaging":{
+            "features":{"messaging":true,"messaging_groups":true,"messaging_reactions_e2ee_v1":true},"authentication":{},"protocols":{"messaging":{
             "ready":true,"version":"v2","suite":"signal-pqxdh-kyber1024-double-ratchet-v2",
             "post_quantum":true}}}}
         """

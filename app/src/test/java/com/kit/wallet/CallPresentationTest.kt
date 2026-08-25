@@ -2,6 +2,7 @@ package com.kit.wallet
 
 import com.kit.wallet.data.repository.initialCallPresentation
 import com.kit.wallet.data.repository.resolveCallPresentation
+import com.kit.wallet.data.repository.resolveRoomParticipant
 import com.kit.wallet.data.repository.resolveRoomParticipantName
 import com.kit.wallet.ui.model.Contact
 import org.junit.Assert.assertEquals
@@ -122,5 +123,29 @@ class CallPresentationTest {
                 contacts = listOf(flora),
             ),
         )
+    }
+
+    @Test
+    fun `a participant on a call carries their photo as well as their name`() {
+        // The grid tile for someone whose camera is off shows their face; it only can if the
+        // participant resolver hands back more than a display name.
+        val resolved = resolveRoomParticipant(
+            identity = "$floraId:server-device-id",
+            serverName = "Flora Registered",
+            contacts = listOf(flora.copy(avatarUrl = "https://pay.kit.africa/media/a1")),
+        )
+        assertEquals("Flora from my contacts", resolved.name)
+        assertEquals("https://pay.kit.africa/media/a1", resolved.avatarUrl)
+    }
+
+    @Test
+    fun `a participant nobody has saved has no photo and no name to borrow`() {
+        val resolved = resolveRoomParticipant(
+            identity = "$floraId:server-device-id",
+            serverName = "Flora Registered",
+            contacts = emptyList(),
+        )
+        assertEquals("Flora Registered", resolved.name)
+        assertNull(resolved.avatarUrl)
     }
 }

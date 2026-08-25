@@ -32,6 +32,13 @@ class MoneyTest {
     }
 
     @Test
+    fun `primary UGX formatting groups amounts and trims only trailing fractional zeros`() {
+        assertEquals("UGX 1,856.84", Money.format(185_684))
+        assertEquals("UGX 1,768.8", Money.format(176_880))
+        assertEquals("UGX 1,000", Money.format(100_000))
+    }
+
+    @Test
     fun `parses money exactly without floating point rounding`() {
         assertEquals(29L, Money.parseMinor("0.29"))
         assertEquals(128_450_000L, Money.parseMinor("1284500"))

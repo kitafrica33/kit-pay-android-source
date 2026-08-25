@@ -59,17 +59,19 @@ Signing certificate.
 
 ## 4. Reviewed runtime baseline
 
-- Reviewed runtime inventory SHA-256: `b367304e080f083c067571c2fbbbd062f92a1a0cb9d3ccca21a16485c5b0ec49`
-- Reviewed runtime graph manifest SHA-256: `08643aebc10c171d79602a7bb6cb698872943cb6a0b6da45e78ea1ae3cba9676`
-- Release runtime components: 209
-- Direct components: 38
-- Transitive components: 171
-- Runtime artifact archives: 172
+- Reviewed runtime inventory SHA-256: `5c3a5b03b1e620bec8daf4a7b40089661cbbb4fdbd92d288810e50a3b284b0f2`
+- Reviewed runtime graph manifest SHA-256: `9c0c81142cf5bf27ca93e0f5c7569fc56419c7df21fa41e2b82688f41eef2f03`
+- Release runtime components: 211
+- Direct components: 39
+- Transitive components: 172
+- Runtime artifact archives: 174
 
 ### Reviewed Google components
 
 | Maven coordinate | AAR SHA-256 | POM SHA-256 |
 | --- | --- | --- |
+| `com.google.android.gms:play-services-auth-base:18.0.4` | `ab524b18725d90a3060da75c41d431d337b6d90f5e9539efeedf215a75deb63f` | `54f0140924ae1e88787fc9a15d1932a5f397f94bd68f0b8be444bf1c812902bb` |
+| `com.google.android.gms:play-services-auth:20.7.0` | `150494d7a052abaaac9bb829a28c8ad26ac3ca59c576c16967bdbe28aaaa4e16` | `ee85c1294da9874c70403b9f63986b9c4af356ddc88de46ef89518acefdb8089` |
 | `com.google.android.gms:play-services-base:18.1.0` | `4eca56ceecd4325a376cd843af56377e2376ce284d0c6f05a5d0a82f4c1bf8cd` | `30df78ba3ead133c2b36784b425a9eeee7f02531907e8aaee4e8922354f732a7` |
 | `com.google.android.gms:play-services-basement:18.3.0` | `6c11ae3eb2dd7f17373f919c4c557a70e4cf891bc0c9b66926a0a6445d654352` | `9cef5dc9a6950ff09a85ff522b476f855eb7ef2373aa4c17339cb114ac5397e2` |
 | `com.google.android.gms:play-services-cloud-messaging:17.2.0` | `27255e7fe9706483816b158db25cf319f6a26a0566feff41597ce8807a350e37` | `65f5833e621368dfb0eb203dcafcf070c5cece5a60ca18842ce7081d440e0419` |

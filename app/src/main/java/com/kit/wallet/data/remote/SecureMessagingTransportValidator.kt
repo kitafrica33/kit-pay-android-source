@@ -40,14 +40,16 @@ object SecureMessagingTransportValidator {
     }
 
     /**
-     * Validates the complete conversation collection and returns only direct conversations.
-     * Other recognized conversation types remain server resources but are not treated as secure
-     * Android chats because the current wire protocol is direct-message only.
+     * Validates the complete conversation collection and returns the encryptable ones.
+     *
+     * Direct chats and groups are both carried by the pairwise wire protocol and both come
+     * back. Communities and channels stay server resources the Android client never opens:
+     * their audiences are unbounded, which pairwise fan-out cannot express.
      */
-    fun validateDirectConversations(
+    fun validateConversations(
         response: MessagingConversationListDto,
         currentUserId: String,
-    ): List<ValidatedDirectConversation> {
+    ): List<ValidatedConversation> {
         requireUuid(currentUserId, "current user ID")
         val nullableItems = required(response.items, "conversation list")
         requireTransport(nullableItems.size <= MAX_CONVERSATIONS, "conversation list is too large")
@@ -74,93 +76,136 @@ object SecureMessagingTransportValidator {
                 )
                 requireTransport(!updatedAt.isBefore(createdAt), "conversation $index chronology")
 
-                if (type != DIRECT_CONVERSATION_TYPE) return@forEachIndexed
-
-                requireTransport(conversation.parentId == null, "direct conversation has a parent")
-                val createdBy = required(
-                    conversation.createdBy,
-                    "direct conversation $index creator",
-                )
-                requireUuid(createdBy, "direct conversation $index creator")
-                val role = required(conversation.role, "direct conversation $index current role")
-                requireTransport(role in MEMBER_ROLES, "direct conversation $index current role")
-
-                val nullableMembers = required(
-                    conversation.members,
-                    "direct conversation $index members",
-                )
-                requireTransport(
-                    nullableMembers.size == DIRECT_MEMBER_COUNT,
-                    "direct conversation must contain exactly two members",
-                )
-                val members = nullableMembers.mapIndexed { memberIndex, nullableMember ->
-                    val member = required(
-                        nullableMember,
-                        "direct conversation $index member $memberIndex",
-                    )
-                    val userId = required(
-                        member.userId,
-                        "direct conversation $index member $memberIndex user ID",
-                    )
-                    requireUuid(
-                        userId,
-                        "direct conversation $index member $memberIndex user ID",
-                    )
-                    val memberRole = required(
-                        member.role,
-                        "direct conversation $index member $memberIndex role",
-                    )
-                    requireTransport(
-                        memberRole in MEMBER_ROLES,
-                        "direct conversation $index member $memberIndex role",
-                    )
-                    val joinedAt = requireTimestamp(
-                        member.joinedAt,
-                        "direct conversation $index member $memberIndex join time",
-                    )
-                    requireTransport(
-                        !joinedAt.isBefore(createdAt),
-                        "direct conversation $index member $memberIndex chronology",
-                    )
-                    ValidatedDirectConversationMember(
-                        userId = userId,
-                        name = member.name?.trim()?.takeIf(String::isNotEmpty),
-                        role = memberRole,
-                        joinedAt = joinedAt,
-                    )
-                }
-                requireTransport(
-                    members.map(ValidatedDirectConversationMember::userId).distinct().size ==
-                        DIRECT_MEMBER_COUNT,
-                    "direct conversation contains duplicate members",
-                )
-                requireTransport(
-                    members.count { it.userId == currentUserId } == 1,
-                    "direct conversation does not contain the current user exactly once",
-                )
-                requireTransport(
-                    members.any { it.userId == createdBy },
-                    "direct conversation creator is not an active member",
-                )
-                val currentMember = members.single { it.userId == currentUserId }
-                requireTransport(
-                    currentMember.role == role,
-                    "direct conversation current role disagrees with membership",
-                )
-                val peer = members.single { it.userId != currentUserId }
+                if (type !in ENCRYPTABLE_CONVERSATION_TYPES) return@forEachIndexed
 
                 add(
-                    ValidatedDirectConversation(
-                        conversationId = id,
-                        peerUserId = peer.userId,
-                        peerName = peer.name,
-                        currentUserRole = role,
+                    validateEncryptableConversation(
+                        conversation = conversation,
+                        index = index,
+                        id = id,
+                        type = type,
                         createdAt = createdAt,
                         updatedAt = updatedAt,
+                        currentUserId = currentUserId,
                     ),
                 )
             }
         }
+    }
+
+    /** Validates one already-typed direct or group conversation body. */
+    fun validateConversation(
+        response: MessagingConversationDto,
+        currentUserId: String,
+    ): ValidatedConversation {
+        requireUuid(currentUserId, "current user ID")
+        val id = required(response.id, "conversation ID")
+        requireUuid(id, "conversation ID")
+        val type = required(response.type, "conversation type")
+        requireTransport(type in ENCRYPTABLE_CONVERSATION_TYPES, "conversation type")
+        val createdAt = requireTimestamp(response.createdAt, "conversation creation time")
+        val updatedAt = requireTimestamp(response.updatedAt, "conversation update time")
+        requireTransport(!updatedAt.isBefore(createdAt), "conversation chronology")
+
+        return validateEncryptableConversation(
+            conversation = response,
+            index = 0,
+            id = id,
+            type = type,
+            createdAt = createdAt,
+            updatedAt = updatedAt,
+            currentUserId = currentUserId,
+        )
+    }
+
+    private fun validateEncryptableConversation(
+        conversation: MessagingConversationDto,
+        index: Int,
+        id: String,
+        type: String,
+        createdAt: Instant,
+        updatedAt: Instant,
+        currentUserId: String,
+    ): ValidatedConversation {
+        val group = type == GROUP_CONVERSATION_TYPE
+        val label = if (group) "group conversation $index" else "direct conversation $index"
+
+        requireTransport(conversation.parentId == null, "$label has a parent")
+        val createdBy = required(conversation.createdBy, "$label creator")
+        requireUuid(createdBy, "$label creator")
+        val role = required(conversation.role, "$label current role")
+        requireTransport(role in MEMBER_ROLES, "$label current role")
+
+        // A title is exactly the disclosure a group makes and a direct chat does not, so the
+        // client holds the server to the same rule in both directions rather than rendering
+        // whatever comes back.
+        val title = conversation.title?.trim()?.takeIf(String::isNotEmpty)
+        if (group) {
+            val groupTitle = required(title, "$label title")
+            requireTransport(
+                isValidMessagingGroupTitle(groupTitle) && conversation.title == groupTitle,
+                "$label title length",
+            )
+        } else {
+            requireTransport(conversation.title == null, "$label carries a title")
+        }
+
+        val nullableMembers = required(conversation.members, "$label members")
+        val memberBounds = if (group) 1..MAX_GROUP_MEMBERS else DIRECT_MEMBER_COUNT..DIRECT_MEMBER_COUNT
+        requireTransport(nullableMembers.size in memberBounds, "$label member count")
+
+        val members = nullableMembers.mapIndexed { memberIndex, nullableMember ->
+            val member = required(nullableMember, "$label member $memberIndex")
+            val userId = required(member.userId, "$label member $memberIndex user ID")
+            requireUuid(userId, "$label member $memberIndex user ID")
+            val memberRole = required(member.role, "$label member $memberIndex role")
+            requireTransport(memberRole in MEMBER_ROLES, "$label member $memberIndex role")
+            val joinedAt = requireTimestamp(
+                member.joinedAt,
+                "$label member $memberIndex join time",
+            )
+            requireTransport(
+                !joinedAt.isBefore(createdAt),
+                "$label member $memberIndex chronology",
+            )
+            ValidatedConversationMember(
+                userId = userId,
+                name = member.name?.trim()?.takeIf(String::isNotEmpty),
+                role = memberRole,
+                joinedAt = joinedAt,
+            )
+        }
+        requireTransport(
+            members.map(ValidatedConversationMember::userId).distinct().size == members.size,
+            "$label contains duplicate members",
+        )
+        requireTransport(
+            members.count { it.userId == currentUserId } == 1,
+            "$label does not contain the current user exactly once",
+        )
+        val currentMember = members.single { it.userId == currentUserId }
+        requireTransport(
+            currentMember.role == role,
+            "$label current role disagrees with membership",
+        )
+
+        // Only a direct chat can promise its creator is still a member: a group's founder may
+        // have handed it over and left, and the group is no less valid for it.
+        if (!group) {
+            requireTransport(members.any { it.userId == createdBy }, "$label creator is not an active member")
+        }
+
+        return ValidatedConversation(
+            conversationId = id,
+            type = type,
+            title = title,
+            createdBy = createdBy,
+            viewerUserId = currentUserId,
+            currentUserRole = role,
+            members = members,
+            createdAt = createdAt,
+            updatedAt = updatedAt,
+        )
     }
 
     fun validateSyncPage(
@@ -346,6 +391,7 @@ object SecureMessagingTransportValidator {
                         message.rosterRevision,
                         "history candidate $index roster revision",
                     ),
+                    expectedKind = required(message.kind, "history candidate $index kind"),
                 )
                 null
             } else {
@@ -388,14 +434,15 @@ object SecureMessagingTransportValidator {
                 "history candidate $index roster revision",
             )
             val kind = required(message.kind, "history candidate $index kind")
-            requireTransport(
-                kind == ENCRYPTED_MESSAGE_KIND || kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
-                "history candidate $index kind",
-            )
+            requireTransport(kind in SECURE_MESSAGE_KINDS, "history candidate $index kind")
             val replyToMessageId = message.replyToMessageId
             replyToMessageId?.let { requireUuid(it, "history candidate $index reply target") }
+            requireTransport(
+                kind != ENCRYPTED_REACTION_MESSAGE_KIND || replyToMessageId != null,
+                "history candidate $index reaction reply target",
+            )
             val sentAt = validatedIncoming?.sentAt
-                ?: requireTimestamp(message.sentAt, "history candidate $index send time")
+                ?: requireMessageTimestamp(message.sentAt, "history candidate $index send time")
             requireTransport(message.revokedAt == null, "history candidate $index is revoked")
             ValidatedMessagingHistoryCandidate(
                 messageId = messageId,
@@ -484,6 +531,7 @@ object SecureMessagingTransportValidator {
         expectedCurrentDeviceId: String,
         expectedCurrentEnrollmentEpoch: Long? = null,
         expectedRosterRevision: String,
+        expectedKind: String = ENCRYPTED_MESSAGE_KIND,
     ): ValidatedOutboundEncryptedMessage {
         requireUuid(expectedConversationId, "expected conversation ID")
         requireUuid(expectedClientMessageId, "expected client message ID")
@@ -501,6 +549,7 @@ object SecureMessagingTransportValidator {
             expectedCurrentDeviceId = expectedCurrentDeviceId,
             expectedCurrentEnrollmentEpoch = expectedCurrentEnrollmentEpoch,
             expectedRosterRevision = expectedRosterRevision,
+            expectedKind = expectedKind,
         )
     }
 
@@ -559,7 +608,7 @@ object SecureMessagingTransportValidator {
             )
             requireUuid(messageId, "delivery acknowledgement item $index message ID")
             requireTransport(seenMessageIds.add(messageId), "delivery acknowledgement contains duplicate IDs")
-            val deliveredAt = requireTimestamp(
+            val deliveredAt = requireMessageTimestamp(
                 item.deliveredToDeviceAt,
                 "delivery acknowledgement item $index time",
             )
@@ -595,7 +644,7 @@ object SecureMessagingTransportValidator {
             "canonical last-read message ID",
         )
         requireUuid(canonicalMessageId, "canonical last-read message ID")
-        val readAt = requireTimestamp(response.readAt, "read-receipt time")
+        val readAt = requireMessageTimestamp(response.readAt, "read-receipt time")
         return ValidatedMessagingReadReceipt(
             conversationId = expectedConversationId,
             userId = expectedCurrentUserId,
@@ -615,7 +664,7 @@ object SecureMessagingTransportValidator {
         requireTransport(type in SYNC_EVENT_TYPES, "messaging sync event type")
         val conversationId = required(event.conversationId, "messaging sync conversation ID")
         requireUuid(conversationId, "messaging sync conversation ID")
-        val occurredAt = requireTimestamp(event.occurredAt, "messaging sync event time")
+        val occurredAt = requireEventTimestamp(event.occurredAt, "messaging sync event time")
 
         return when (type) {
             MESSAGE_CREATED_EVENT -> validateMessageEvent(
@@ -651,7 +700,7 @@ object SecureMessagingTransportValidator {
                     refresh = refresh,
                 )
             }
-            CONVERSATION_CREATED_EVENT -> {
+            CONVERSATION_CREATED_EVENT, CONVERSATION_UPDATED_EVENT -> {
                 requireTransport(event.resourceType == CONVERSATION_RESOURCE, "conversation event resource type")
                 requireTransport(event.resourceId == conversationId, "conversation event resource changed")
                 required(event.data, "conversation event data")
@@ -668,8 +717,23 @@ object SecureMessagingTransportValidator {
                     "membership event resource ID",
                 )
                 val data = required(event.data, "membership event data")
-                requireUuid(required(data.userId, "membership event user ID"), "membership event user ID")
-                ValidatedMessagingSyncEvent.Metadata(eventId, type, conversationId, occurredAt)
+                val memberUserId = required(data.userId, "membership event user ID")
+                requireUuid(memberUserId, "membership event user ID")
+                // The role is what the change *made* the subject, and it is the only other thing
+                // the server sends. It is optional on the wire and bounded here to the roles the
+                // rest of the protocol already knows; an unknown one is a rejected event, not a
+                // rendered one.
+                val memberRole = data.role?.takeIf(String::isNotBlank)?.also {
+                    requireTransport(it in MEMBER_ROLES, "membership event role")
+                }
+                ValidatedMessagingSyncEvent.Metadata(
+                    eventId = eventId,
+                    type = type,
+                    conversationId = conversationId,
+                    occurredAt = occurredAt,
+                    memberUserId = memberUserId,
+                    memberRole = memberRole,
+                )
             }
             else -> rejectTransport("messaging sync event type")
         }
@@ -693,7 +757,7 @@ object SecureMessagingTransportValidator {
             data.deliveryState == PEER_DELIVERY_STATE,
             "message-delivery state",
         )
-        val deliveredAt = requireTimestamp(data.deliveredAt, "message-delivery time")
+        val deliveredAt = requireMessageTimestamp(data.deliveredAt, "message-delivery time")
         requireTransport(!occurredAt.isBefore(deliveredAt), "message-delivery event chronology")
         return ValidatedMessagingSyncEvent.DeliveryReceipt(
             eventId = eventId,
@@ -727,7 +791,7 @@ object SecureMessagingTransportValidator {
             "read-receipt last-read message ID",
         )
         requireUuid(lastReadMessageId, "read-receipt last-read message ID")
-        val readAt = requireTimestamp(data.readAt, "read-receipt time")
+        val readAt = requireMessageTimestamp(data.readAt, "read-receipt time")
         requireTransport(!occurredAt.isBefore(readAt), "read-receipt event chronology")
         return ValidatedMessagingSyncEvent.ReadReceipt(
             eventId = eventId,
@@ -770,6 +834,7 @@ object SecureMessagingTransportValidator {
                 expectedCurrentDeviceId = currentDeviceId,
                 expectedCurrentEnrollmentEpoch = currentEnrollmentEpoch,
                 expectedRosterRevision = required(data.rosterRevision, "outbound roster revision"),
+                expectedKind = required(data.kind, "outbound message kind"),
             )
             requireTransport(event.resourceId == outbound.messageId, "message event resource changed")
             requireTransport(!occurredAt.isBefore(outbound.sentAt), "message event predates its message")
@@ -804,6 +869,7 @@ object SecureMessagingTransportValidator {
         expectedCurrentDeviceId: String,
         expectedCurrentEnrollmentEpoch: Long? = null,
         expectedRosterRevision: String,
+        expectedKind: String,
     ): ValidatedOutboundEncryptedMessage {
         val messageId = required(message.id, "outbound message ID")
         requireUuid(messageId, "outbound message ID")
@@ -835,10 +901,15 @@ object SecureMessagingTransportValidator {
             "outbound roster revision",
         )
         requireTransport(
-            message.kind == ENCRYPTED_MESSAGE_KIND || message.kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+            expectedKind in SECURE_MESSAGE_KINDS && message.kind == expectedKind,
             "outbound message kind",
         )
         message.replyToMessageId?.let { requireUuid(it, "outbound reply target") }
+        requireTransport(
+            message.kind != ENCRYPTED_REACTION_MESSAGE_KIND ||
+                message.replyToMessageId != null,
+            "outbound reaction reply target",
+        )
         // Attachment metadata rows accompany exactly the encrypted_attachment kind; the media
         // descriptor with its key material still travels only inside the per-device ciphertext.
         requireTransport(
@@ -850,7 +921,7 @@ object SecureMessagingTransportValidator {
             required(message.reactions, "outbound reactions").isEmpty(),
             "v2 outbound text messages cannot contain reactions",
         )
-        val sentAt = requireTimestamp(message.sentAt, "outbound send time")
+        val sentAt = requireMessageTimestamp(message.sentAt, "outbound send time")
         requireTransport(message.revokedAt == null, "outbound message is revoked")
         // The backend intentionally excludes the sending device from fan-out. Accepting an
         // envelope here would confuse untrusted echoed bytes with a recipient delivery.
@@ -918,6 +989,26 @@ object SecureMessagingTransportValidator {
         }
     }
 
+    private fun requireMessageTimestamp(value: String?, field: String): Instant {
+        val timestamp = required(value, field)
+        requireTransport(MESSAGE_TIMESTAMP.matches(timestamp), field)
+        return try {
+            Instant.parse(timestamp)
+        } catch (_: RuntimeException) {
+            rejectTransport(field)
+        }
+    }
+
+    private fun requireEventTimestamp(value: String?, field: String): Instant {
+        val timestamp = required(value, field)
+        requireTransport(MESSAGE_TIMESTAMP.matches(timestamp), field)
+        return try {
+            Instant.parse(timestamp)
+        } catch (_: RuntimeException) {
+            rejectTransport(field)
+        }
+    }
+
     private fun requireSignalDeviceId(value: Int?, field: String) {
         requireTransport(value != null && value in 1..127, field)
     }
@@ -948,6 +1039,7 @@ object SecureMessagingTransportValidator {
     private const val MESSAGE_DELIVERY_UPDATED_EVENT = "message.delivery.updated"
     private const val READ_RECEIPT_UPDATED_EVENT = "read_receipt.updated"
     private const val CONVERSATION_CREATED_EVENT = "conversation.created"
+    private const val CONVERSATION_UPDATED_EVENT = "conversation.updated"
     private const val MESSAGE_RESOURCE = "message"
     private const val MESSAGE_DELIVERY_RESOURCE = "message_delivery"
     private const val READ_RECEIPT_RESOURCE = "read_receipt"
@@ -961,7 +1053,13 @@ object SecureMessagingTransportValidator {
     private val CURSOR = Regex("^[A-Za-z0-9_-]+$")
     private val HISTORY_CURSOR = Regex("^[A-Za-z0-9_.-]+$")
     private val UTC_TIMESTAMP = Regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+    private val MESSAGE_TIMESTAMP =
+        Regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{6})?Z$")
     private val CONVERSATION_TYPES = setOf("direct", "group", "community", "channel")
+
+    /** The subset of [CONVERSATION_TYPES] the pairwise wire protocol can actually carry. */
+    private val ENCRYPTABLE_CONVERSATION_TYPES =
+        setOf(DIRECT_CONVERSATION_TYPE, GROUP_CONVERSATION_TYPE)
     private val MEMBER_ROLES = setOf("owner", "admin", "moderator", "member")
     private val MEMBERSHIP_EVENT_TYPES = setOf(
         "membership.added",
@@ -981,24 +1079,49 @@ object SecureMessagingTransportValidator {
         MESSAGE_DELIVERY_UPDATED_EVENT,
         READ_RECEIPT_UPDATED_EVENT,
         CONVERSATION_CREATED_EVENT,
+        CONVERSATION_UPDATED_EVENT,
     ) + MEMBERSHIP_EVENT_TYPES + DEVICE_LIFECYCLE_EVENT_TYPES
 }
 
-data class ValidatedDirectConversationMember(
+data class ValidatedConversationMember(
     val userId: String,
     val name: String?,
     val role: String,
     val joinedAt: Instant,
 )
 
-data class ValidatedDirectConversation(
+data class ValidatedConversation(
     val conversationId: String,
-    val peerUserId: String,
-    val peerName: String?,
+    val type: String,
+    /** Server-visible group name; always null for a direct chat, which discloses nothing. */
+    val title: String?,
+    val createdBy: String,
+    /** The account this conversation was validated for; always present in [members]. */
+    val viewerUserId: String,
     val currentUserRole: String,
+    val members: List<ValidatedConversationMember>,
     val createdAt: Instant,
     val updatedAt: Instant,
-)
+) {
+    val isGroup: Boolean get() = type == GROUP_CONVERSATION_TYPE
+
+    /** Every member but the viewer; a direct chat's single peer, or the rest of the group. */
+    val others: List<ValidatedConversationMember>
+        get() = members.filterNot { it.userId == viewerUserId }
+
+    /**
+     * The other party of a direct chat.
+     *
+     * Null for a group, where "the peer" is not a thing that exists — callers that need an
+     * identity must go through [others] and say which member they mean.
+     */
+    val peerUserId: String? get() = if (isGroup) null else others.singleOrNull()?.userId
+
+    val peerName: String? get() = if (isGroup) null else others.singleOrNull()?.name
+
+    /** The user IDs the roster must cover for this conversation to be encryptable. */
+    fun memberUserIds(): Set<String> = members.mapTo(mutableSetOf(), ValidatedConversationMember::userId)
+}
 
 data class ValidatedMessagingSyncPage(
     val events: List<ValidatedMessagingSyncEvent>,
@@ -1097,6 +1220,13 @@ sealed interface ValidatedMessagingSyncEvent {
         val type: String,
         override val conversationId: String,
         override val occurredAt: Instant,
+        /**
+         * Who the change was *about*, on a `membership.*` event. The server never says who made
+         * it, so neither can anything downstream: a system message names a subject or nobody.
+         */
+        val memberUserId: String? = null,
+        /** The subject's role after a `membership.role_changed`; null on every other event. */
+        val memberRole: String? = null,
     ) : ValidatedMessagingSyncEvent
 }
 

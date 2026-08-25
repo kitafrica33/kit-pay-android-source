@@ -27,6 +27,17 @@
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
+    <!-- Android 11+ hides installed packages by default. Identity verification, the privacy policy
+         and the account-deletion page all open in the user's own browser, so Kit Pay has to be able
+         to see that a browser exists before offering to send them there. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
+
     <application
         android:name=".KitApplication"
         android:allowBackup="false"

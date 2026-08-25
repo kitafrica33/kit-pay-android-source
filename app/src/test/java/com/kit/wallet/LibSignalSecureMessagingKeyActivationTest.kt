@@ -1669,7 +1669,7 @@ class LibSignalSecureMessagingKeyActivationTest {
         )
         const val READY_CAPABILITIES = """
             {"ok":true,"data":{"api_version":"v1","currency":{"code":"UGX","scale":"2"},
-            "features":{"messaging":true},"authentication":{},"protocols":{"messaging":{
+            "features":{"messaging":true,"messaging_groups":true,"messaging_reactions_e2ee_v1":true},"authentication":{},"protocols":{"messaging":{
             "ready":true,"version":"v2","suite":"signal-pqxdh-kyber1024-double-ratchet-v2",
             "post_quantum":true}}}}
         """

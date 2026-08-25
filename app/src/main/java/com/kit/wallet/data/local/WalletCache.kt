@@ -1,6 +1,7 @@
 package com.kit.wallet.data.local
 
 import androidx.room.withTransaction
+import com.kit.wallet.data.media.ProfileAvatarByteStore
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.flow.Flow
@@ -36,6 +37,9 @@ class RoomWalletCache @Inject constructor(
     private val transactionDao: WalletTransactionDao,
     private val syncStateDao: SyncStateDao,
     private val conversationPrefsDao: ConversationPrefsDao? = null,
+    private val profilePhotoDao: ProfilePhotoDao? = null,
+    private val profileAvatarBytes: ProfileAvatarByteStore? = null,
+    private val beneficiaryContactDao: BeneficiaryContactDao? = null,
 ) : WalletCache {
     override val ownerScope: Flow<String?> = syncStateDao.observe(AUTHENTICATED_CACHE_OWNER_KEY)
 
@@ -118,6 +122,16 @@ class RoomWalletCache @Inject constructor(
         walletDao.clear()
         profileDao.clear()
         conversationPrefsDao?.clear()
+        // Signing out, or another account claiming this device, takes the faces with it. Who a
+        // person's contacts are is theirs, and a photo left behind would say so to whoever holds
+        // the phone next. Both halves go: the rows that address the photos, and the bytes.
+        profilePhotoDao?.clear()
+        // Which of this account's payout destinations belong to which of its contacts is just as
+        // much theirs, and says as much about them, as the faces do.
+        beneficiaryContactDao?.clear()
+        // A file that will not delete must not roll back the row erasure — leaving the rows behind
+        // would be the worse of the two failures by far.
+        runCatching { profileAvatarBytes?.clear() }
     }
 
     private suspend fun requireOwner(ownerScopeId: String) {

@@ -6,6 +6,8 @@ import android.content.pm.PackageManager
 import android.provider.ContactsContract
 import androidx.core.content.ContextCompat
 import com.kit.wallet.data.mapper.toBankInstitution
+import com.kit.wallet.data.contacts.ContactDiscoveryAuthorization
+import com.kit.wallet.data.contacts.ContactDiscoveryConsent
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.mapper.DecimalMoney
 import com.kit.wallet.data.local.WalletCache
@@ -27,6 +29,7 @@ import com.kit.wallet.data.remote.StartCallRequest
 import com.kit.wallet.data.remote.EndCallRequest
 import com.kit.wallet.data.remote.ProviderProductDto
 import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.ui.model.BillProvider
 import com.kit.wallet.ui.model.Beneficiary
@@ -141,31 +144,8 @@ internal fun validateContactSync(
     }
 }
 
-/** Canonical Uganda-local/E.164 identity that never merges foreign numbers by suffix. */
-internal fun normalizedContactPhone(rawPhone: String?): String? {
-    val raw = rawPhone?.trim().orEmpty()
-    if (raw.isEmpty() || raw.toByteArray(Charsets.UTF_8).size > 64) return null
-    val compact = StringBuilder(raw.length)
-    for ((index, character) in raw.withIndex()) {
-        when {
-            character in '0'..'9' -> compact.append(character)
-            character == '+' && index == 0 -> Unit
-            character.isSupportedPhoneSeparator() -> Unit
-            else -> return null
-        }
-    }
-    val digits = compact.toString()
-    val international = when {
-        raw.startsWith('+') -> digits
-        digits.startsWith("00") -> digits.drop(2)
-        digits.startsWith("256") -> digits
-        digits.startsWith('0') -> "256${digits.drop(1)}"
-        digits.length == 9 -> "256$digits"
-        else -> return null
-    }
-    if (international.length !in 8..15 || international.startsWith('0')) return null
-    return "+$international"
-}
+/** Compatibility name retained for contact-sync callers and tests. */
+internal fun normalizedContactPhone(rawPhone: String?): String? = canonicalContactPhone(rawPhone)
 
 private fun sanitizeDeviceContactPhone(rawPhone: String?): String? {
     val raw = rawPhone?.trim().orEmpty()
@@ -178,14 +158,6 @@ private fun sanitizeDeviceContactPhone(rawPhone: String?): String? {
     if (digits.length !in MIN_CONTACT_PHONE_DIGITS..MAX_CONTACT_PHONE_DIGITS) return null
     if (digits.all { it == '0' }) return null
     return sanitized
-}
-
-private fun Char.isSupportedPhoneSeparator(): Boolean = when (this) {
-    ' ', '\t', '\u00a0', '\u202f',
-    '-', '\u2010', '\u2011', '\u2012', '\u2013', '\u2212',
-    '(', ')', '.',
-    -> true
-    else -> false
 }
 
 private fun sanitizeDeviceContactName(rawName: String?, fallback: String): String {
@@ -202,38 +174,71 @@ class RemoteContactRepository @Inject constructor(
     @ApplicationContext private val context: Context,
     private val api: KitWalletApi,
     private val apiCalls: ApiCallExecutor,
-    sessions: SessionStore,
+    private val sessions: SessionStore,
     @ApplicationScope scope: CoroutineScope,
+    private val profilePhotos: ProfilePhotoDirectory? = null,
+    private val discovery: ContactDiscoveryConsent? = null,
 ) : ContactRepository {
     private val mutableContacts = MutableStateFlow<List<Contact>>(emptyList())
     override val contacts: StateFlow<List<Contact>> = mutableContacts.asStateFlow()
 
     init {
         scope.launch {
-            sessions.session.map { it?.sessionId }.distinctUntilChanged().collectLatest { sessionId ->
-                if (sessionId == null) mutableContacts.value = emptyList()
+            sessions.session.map { it?.fence() }.distinctUntilChanged().collectLatest { fence ->
+                if (fence == null) mutableContacts.value = emptyList()
                 else runCatching { refresh() }
             }
         }
     }
 
     override suspend fun refresh() {
-        // READ_CONTACTS is granted only after the in-app disclosure and Android permission flow.
-        // Once granted, keep the server contact graph current on login and contacts-screen entry
-        // so a newly saved Kit member is not left as a permanently local, invite-only row.
-        if (hasContactPermission()) {
-            syncDeviceContacts()
+        val active = sessions.current() ?: run {
+            mutableContacts.value = emptyList()
+            return
+        }
+        val fence = active.fence()
+        val authorization = discovery?.authorizationFor(fence)
+        // Two separate answers are needed before an address book leaves this phone: the Android
+        // permission, and the person's own standing choice to be findable from other people's
+        // contacts. With both, keep the server contact graph current on login and contacts-screen
+        // entry so a newly saved Kit member is not left as a permanently local, invite-only row.
+        // With only the permission, the address book is still read — names on this screen come
+        // from it — but nothing is uploaded.
+        if (contactDiscoveryUploadAllowed(hasContactPermission(), authorization)) {
+            syncDeviceContacts(fence, requireNotNull(authorization))
             return
         }
         val deviceNames = deviceContactNames()
-        val registered = loadAllContacts()
+        val registered = loadAllContacts(fence)
             .map { it.toUiModel(deviceNames) }
-        mutableContacts.value = withLocalOnlyDeviceContacts(registered, deviceNames)
+        publish(fence, registered, deviceNames)
+    }
+
+    /**
+     * Publishes a freshly loaded address book, and reconciles the remembered photos against it.
+     *
+     * The contact list carries `avatar_url` for every Kit member this account knows, which makes it
+     * the whole story: a member listed without one has taken theirs down, and the remembered row
+     * goes with it rather than resurrecting a face its owner removed. Screens that have no contact
+     * list to consult — a chat list on a cold start, a search result — read the directory instead.
+     */
+    private suspend fun publish(
+        fence: SessionFence,
+        registered: List<Contact>,
+        deviceNames: Map<String, String>,
+    ) {
+        val seen = registered.asSequence()
+            .filter { it.isKitUser && it.id.isNotBlank() }
+            .associate { it.id to it.avatarUrl }
+        sessions.withCurrentSession(fence) {
+            profilePhotos?.learn(fence, seen, complete = true)
+            mutableContacts.value = withLocalOnlyDeviceContacts(registered, deviceNames)
+        }
     }
 
     override suspend fun resolveForMessaging(contact: Contact): Contact? {
         if (contact.isKitUser) return contact
-        if (hasContactPermission()) syncDeviceContacts() else refresh()
+        refresh()
         val key = contactNumberKey(contact.phone)
         return mutableContacts.value.singleOrNull { candidate ->
             candidate.isKitUser && contactNumberKey(candidate.phone) == key
@@ -317,14 +322,29 @@ class RemoteContactRepository @Inject constructor(
                     receivingWalletId = null,
                     registeredName = result.title,
                     savedInDevice = false,
+                    // Search results carry no photo of their own, but a member who is already in
+                    // this account's address book has one on the device: show it rather than
+                    // showing the same person as initials here and as a face one screen over.
+                    avatarUrl = profilePhotos?.photoFor(result.id),
                 )
             }
     }
 
     override suspend fun syncDeviceContacts() {
-        check(
-            hasContactPermission(),
-        ) { "Contacts permission is required before synchronization" }
+        val active = requireNotNull(sessions.current()) {
+            "Sign in again before synchronizing contacts"
+        }
+        val fence = active.fence()
+        val authorization = discovery?.authorizationFor(fence)
+            ?: error("Contact discovery consent is unavailable or turned off")
+        syncDeviceContacts(fence, authorization)
+    }
+
+    private suspend fun syncDeviceContacts(
+        fence: SessionFence,
+        authorization: ContactDiscoveryAuthorization,
+    ) {
+        requireUploadAuthorized(authorization)
 
         val projection = arrayOf(
             ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
@@ -354,15 +374,22 @@ class RemoteContactRepository @Inject constructor(
             }
             sanitizeDeviceContactsForSync(candidates)
         }.orEmpty()
+        requireUploadAuthorized(authorization)
         val deviceNames = localContacts.associate { contactNumberKey(it.phone) to it.name }
-        val registered = synchronizeContacts(localContacts)
+        val registered = synchronizeContacts(localContacts, fence, authorization)
             .map { it.toUiModel(deviceNames) }
-        mutableContacts.value = withLocalOnlyDeviceContacts(registered, deviceNames)
+        requireUploadAuthorized(authorization)
+        publish(fence, registered, deviceNames)
     }
 
-    private suspend fun synchronizeContacts(localContacts: List<DeviceContactDto>): List<ContactDto> {
+    private suspend fun synchronizeContacts(
+        localContacts: List<DeviceContactDto>,
+        fence: SessionFence,
+        authorization: ContactDiscoveryAuthorization,
+    ): List<ContactDto> {
         val clientSyncId = UUID.randomUUID().toString().lowercase()
         val opened = try {
+            requireUploadAuthorized(authorization)
             apiCalls.execute {
                 api.startContactSync(
                     BeginContactSyncRequest(clientSyncId, localContacts.size, "full"),
@@ -373,13 +400,21 @@ class RemoteContactRepository @Inject constructor(
             check(localContacts.size <= LEGACY_CONTACT_SYNC_LIMIT) {
                 "This Kit Pay service cannot safely sync more than $LEGACY_CONTACT_SYNC_LIMIT contacts yet"
             }
-            return apiCalls.execute { api.syncContacts(ContactSyncRequest(localContacts)) }.items.orEmpty()
+            requireUploadAuthorized(authorization)
+            val legacy = apiCalls.execute {
+                api.syncContacts(ContactSyncRequest(localContacts))
+            }.items.orEmpty()
+            requireUploadAuthorized(authorization)
+            return legacy
         }
+        requireUploadAuthorized(authorization)
         validateContactSync(opened, clientSyncId, localContacts.size, expectedStatus = "open")
         localContacts.chunked(opened.chunkSize).forEachIndexed { index, chunk ->
+            requireUploadAuthorized(authorization)
             val uploaded = apiCalls.execute {
                 api.uploadContactSyncChunk(opened.id, index, ContactSyncRequest(chunk))
             }
+            requireUploadAuthorized(authorization)
             validateContactSync(uploaded.sync, clientSyncId, localContacts.size, "open")
             check(uploaded.chunk.index == index && uploaded.chunk.inputCount == chunk.size) {
                 "The contact sync server returned an invalid chunk receipt"
@@ -388,20 +423,27 @@ class RemoteContactRepository @Inject constructor(
                 "The contact sync server returned an invalid accepted count"
             }
         }
+        requireUploadAuthorized(authorization)
         val finalized = apiCalls.execute { api.finalizeContactSync(opened.id) }.sync
+        requireUploadAuthorized(authorization)
         validateContactSync(finalized, clientSyncId, localContacts.size, "finalized")
         check(finalized.storedContactCount != null && finalized.missingChunkIndexes.isEmpty()) {
             "The contact sync server did not finalize the complete address book"
         }
-        return loadAllContacts()
+        return loadAllContacts(fence, authorization)
     }
 
-    private suspend fun loadAllContacts(): List<ContactDto> {
+    private suspend fun loadAllContacts(
+        fence: SessionFence,
+        authorization: ContactDiscoveryAuthorization? = null,
+    ): List<ContactDto> {
         val contacts = ArrayList<ContactDto>()
         val seenCursors = mutableSetOf<String>()
         var cursor: String? = null
         repeat(MAX_CONTACT_PAGES) {
+            requireCurrent(fence, authorization)
             val response = apiCalls.execute { api.contacts(cursor, CONTACT_PAGE_LIMIT) }
+            requireCurrent(fence, authorization)
             val items = response.items.orEmpty()
             check(items.size <= CONTACT_PAGE_LIMIT && contacts.size + items.size <= MAX_CONTACTS) {
                 "The contact service returned too many contacts"
@@ -476,7 +518,32 @@ class RemoteContactRepository @Inject constructor(
     private fun hasContactPermission(): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) ==
             PackageManager.PERMISSION_GRANTED
+
+    private fun requireUploadAuthorized(authorization: ContactDiscoveryAuthorization) {
+        check(
+            contactDiscoveryUploadAllowed(
+                permissionGranted = hasContactPermission(),
+                authorization = authorization.takeIf { discovery?.isAuthorized(it) == true },
+            ),
+        ) { "Contact permission or account-scoped upload consent changed" }
+    }
+
+    private fun requireCurrent(
+        fence: SessionFence,
+        authorization: ContactDiscoveryAuthorization?,
+    ) {
+        check(sessions.current()?.fence() == fence) {
+            "The authenticated contact session changed"
+        }
+        if (authorization != null) requireUploadAuthorized(authorization)
+    }
 }
+
+/** Missing consent and revoked Android permission are both a closed upload gate. */
+internal fun contactDiscoveryUploadAllowed(
+    permissionGranted: Boolean,
+    authorization: ContactDiscoveryAuthorization?,
+): Boolean = permissionGranted && authorization != null
 
 @Singleton
 class ProviderCatalogRepository @Inject constructor(
@@ -789,6 +856,10 @@ class RemoteBankingRepository @Inject constructor(
                 verified = beneficiary.status == "active",
                 kind = beneficiary.kind,
                 bankId = beneficiary.bank.id,
+                // A bank account number is nothing a phone's address book can be matched against,
+                // so the server saying who owns it is the only identity this row can ever carry.
+                kitUserId = beneficiary.kitUser?.id?.trim()?.takeIf(String::isNotEmpty),
+                avatarUrl = beneficiary.kitUser?.avatarUrl?.trim()?.takeIf(String::isNotEmpty),
             )
         }
         val beneficiaryNames = beneficiaries.associate { it.id to it.label }
@@ -998,7 +1069,10 @@ class RemoteBankingRepository @Inject constructor(
         }
     }
 
-    override suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String) {
+    override suspend fun submitOperation(
+        quote: FinancialOperationQuote,
+        paymentPin: String,
+    ): String {
         val operation = requireNotNull(BankOperationKind.fromApiType(quote.operationType)) {
             "The bank quote is invalid"
         }
@@ -1016,7 +1090,7 @@ class RemoteBankingRepository @Inject constructor(
             paymentPin,
         )
         val key = "android-bank-operation-${java.util.UUID.randomUUID()}"
-        if (quote.quoteId != null) {
+        val created = if (quote.quoteId != null) {
             val request = CreateQuotedBankingOperationRequest(quote.quoteId)
             apiCalls.execute {
                 if (operation == BankOperationKind.WITHDRAWAL) {
@@ -1040,6 +1114,7 @@ class RemoteBankingRepository @Inject constructor(
             }
         }
         refresh()
+        return created.id
     }
 
     private fun formatBankingTime(value: String): String = runCatching {

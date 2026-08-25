@@ -9,6 +9,8 @@ import com.kit.wallet.data.repository.BankingRepository
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.CommunicationPrivacyRepository
+import com.kit.wallet.data.repository.AbuseReportAttemptStore
+import com.kit.wallet.data.repository.AbuseReportingRepository
 import com.kit.wallet.data.repository.EncryptedChatRepository
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.OfflineUserRepository
@@ -17,6 +19,8 @@ import com.kit.wallet.data.repository.OfflineWalletSyncRepository
 import com.kit.wallet.data.repository.ProviderCatalogRepository
 import com.kit.wallet.data.repository.RemoteCallRepository
 import com.kit.wallet.data.repository.RemoteCommunicationPrivacyRepository
+import com.kit.wallet.data.repository.RemoteAbuseReportingRepository
+import com.kit.wallet.data.repository.SharedPreferencesAbuseReportAttemptStore
 import com.kit.wallet.data.repository.RemoteContactRepository
 import com.kit.wallet.data.repository.RemoteBankingRepository
 import com.kit.wallet.data.repository.MobileMoneyRepository
@@ -128,6 +132,18 @@ abstract class RepositoryBindingsModule {
     abstract fun bindCommunicationPrivacyRepository(
         implementation: RemoteCommunicationPrivacyRepository,
     ): CommunicationPrivacyRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindAbuseReportingRepository(
+        implementation: RemoteAbuseReportingRepository,
+    ): AbuseReportingRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindAbuseReportAttemptStore(
+        implementation: SharedPreferencesAbuseReportAttemptStore,
+    ): AbuseReportAttemptStore
 
     @Binds
     @Singleton

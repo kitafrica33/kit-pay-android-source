@@ -3,6 +3,16 @@
   "review_scope": "GOOGLE_ANDROID_SDK_AGPL_COMPATIBILITY",
   "artifacts": [
     {
+      "coordinate": "com.google.android.gms:play-services-auth-base:18.0.4",
+      "aar_sha256": "ab524b18725d90a3060da75c41d431d337b6d90f5e9539efeedf215a75deb63f",
+      "pom_sha256": "54f0140924ae1e88787fc9a15d1932a5f397f94bd68f0b8be444bf1c812902bb"
+    },
+    {
+      "coordinate": "com.google.android.gms:play-services-auth:20.7.0",
+      "aar_sha256": "150494d7a052abaaac9bb829a28c8ad26ac3ca59c576c16967bdbe28aaaa4e16",
+      "pom_sha256": "ee85c1294da9874c70403b9f63986b9c4af356ddc88de46ef89518acefdb8089"
+    },
+    {
       "coordinate": "com.google.android.gms:play-services-base:18.1.0",
       "aar_sha256": "4eca56ceecd4325a376cd843af56377e2376ce284d0c6f05a5d0a82f4c1bf8cd",
       "pom_sha256": "30df78ba3ead133c2b36784b425a9eeee7f02531907e8aaee4e8922354f732a7"

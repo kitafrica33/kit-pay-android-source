@@ -2,12 +2,16 @@ package com.kit.wallet
 
 import com.kit.wallet.data.local.ProfileDao
 import com.kit.wallet.data.local.ProfileEntity
+import com.kit.wallet.data.local.ProfilePhotoDao
+import com.kit.wallet.data.local.ProfilePhotoEntity
 import com.kit.wallet.data.local.WalletCache
 import com.kit.wallet.data.local.WalletEntity
 import com.kit.wallet.data.local.WalletTransactionEntity
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.KitWalletApi
+import com.kit.wallet.data.remote.UpdateProfileRequestAdapter
 import com.kit.wallet.data.repository.OfflineUserRepository
+import com.kit.wallet.data.repository.ProfilePhotoDirectory
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
 import com.squareup.moshi.Moshi
@@ -15,29 +19,49 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class OfflineUserRepositoryTest {
     private lateinit var server: MockWebServer
     private lateinit var api: KitWalletApi
     private lateinit var apiCalls: ApiCallExecutor
 
+    /** On the API's own host, because anything else is refused by `isTrustedProfileAvatarUrl`. */
+    private val avatarUrl =
+        "https://${BuildConfig.KIT_WALLET_BASE_URL.toHttpUrl().host}/profile/user-1/avatar/one"
+
+    private val profileWithAvatarJson = """
+        {"ok":true,"data":{"id":"user-1","name":"Amina Yusuf","phone":"+256700000200","tag":"amina","kyc_status":"not_started","email_verified":null,"phone_verified":null,"mfa_enabled":null,"payment_pin_set":null,"profile_setup_required":false,"avatar_url":"$avatarUrl"},"meta":{"request_id":"request-profile-avatar"}}
+    """.trimIndent()
+
     @Before
     fun setUp() {
         server = MockWebServer().apply { start() }
-        val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+        // Assembled the way `StorageModule` assembles it, custom adapter first: the reflective
+        // factory would otherwise claim `UpdateProfileRequest` and drop the null that clears a
+        // username, and the test would be exercising a serializer the app does not use.
+        val moshi = Moshi.Builder()
+            .add(UpdateProfileRequestAdapter())
+            .add(KotlinJsonAdapterFactory())
+            .build()
         apiCalls = ApiCallExecutor(moshi)
         api = Retrofit.Builder()
             .baseUrl(server.url("/"))
@@ -97,7 +121,106 @@ class OfflineUserRepositoryTest {
         assertEquals("PATCH", request.method)
     }
 
-    private fun kotlinx.coroutines.test.TestScope.repository(profiles: FakeProfileDao) =
+    @Test
+    fun `a verified account can drop its username and setup stays complete`() = runTest {
+        server.enqueue(jsonResponse(VERIFIED_WITHOUT_USERNAME_JSON))
+        val profiles = FakeProfileDao()
+        profiles.value.value = verifiedProfileEntity(tag = "amina")
+        val repository = repository(profiles)
+        runCurrent()
+
+        repository.updateProfile("", "")
+
+        // An explicit null, not an omitted field: omission means "leave my username alone" and
+        // would leave the user staring at a switch that did nothing.
+        assertEquals("""{"tag":null}""", server.takeRequest().body.readUtf8())
+        assertEquals("", repository.profile.value.tag)
+        assertEquals("Amina Yusuf", repository.profile.value.legalName)
+        assertEquals("Amina Yusuf", repository.profile.value.displayIdentityName)
+        // The wait for the cache to catch up has to settle on an empty tag rather than hang on it.
+        assertEquals(false, repository.profile.value.profileSetupRequired)
+    }
+
+    @Test
+    fun `an account that still needs a username never asks the server to drop it`() = runTest {
+        server.enqueue(jsonResponse(COMPLETED_PROFILE_JSON))
+        val profiles = FakeProfileDao()
+        val repository = repository(profiles)
+        runCurrent()
+
+        repository.updateProfile("Amina Yusuf", "amina")
+
+        assertEquals(
+            """{"name":"Amina Yusuf","tag":"amina"}""",
+            server.takeRequest().body.readUtf8(),
+        )
+    }
+
+    @Test
+    fun `the signed-in account's own photo is indexed like everyone else's`() = runTest {
+        // Screens that draw a face by user id — a group's participant list, an @tag search result —
+        // read one shared directory. Their own row was the one nobody was writing, which is why the
+        // person the app knows best appeared to themselves as initials.
+        server.enqueue(jsonResponse(profileWithAvatarJson))
+        val profiles = FakeProfileDao()
+        val photos = ProfilePhotoDirectory(FakeOwnPhotoDao(), FakeSessionStore(), backgroundScope)
+        val repository = repository(profiles, photos)
+
+        repository.refreshProfile()
+        runCurrent()
+
+        assertEquals(avatarUrl, photos.photoFor("user-1"))
+    }
+
+    @Test
+    fun `a photo stored by an earlier build is indexed without waiting for the network`() = runTest {
+        // Read from the cached row rather than from the response, so an account whose profile was
+        // saved before this indexing existed is picked up on the next cold start — offline too.
+        val profiles = FakeProfileDao()
+        profiles.value.value = ProfileEntity(
+            userId = "user-1",
+            name = "Amina Yusuf",
+            phone = "+256700000200",
+            tag = "amina",
+            kycLabel = "Not started",
+            email = null,
+            emailVerified = false,
+            profileSetupRequired = false,
+            avatarUrl = avatarUrl,
+            updatedAtEpochMillis = 1L,
+        )
+        val photos = ProfilePhotoDirectory(FakeOwnPhotoDao(), FakeSessionStore(), backgroundScope)
+
+        repository(profiles, photos)
+        runCurrent()
+
+        assertEquals(avatarUrl, photos.photoFor("user-1"))
+    }
+
+    @Test
+    fun `taking your own photo down takes the indexed row with it`() = runTest {
+        // A profile is the whole story about its own photo, so a profile that comes back without
+        // one is a removal — not a gap to keep the old face in.
+        server.enqueue(jsonResponse(profileWithAvatarJson))
+        server.enqueue(jsonResponse(COMPLETED_PROFILE_JSON))
+        val profiles = FakeProfileDao()
+        val photos = ProfilePhotoDirectory(FakeOwnPhotoDao(), FakeSessionStore(), backgroundScope)
+        val repository = repository(profiles, photos)
+
+        repository.refreshProfile()
+        runCurrent()
+        assertEquals(avatarUrl, photos.photoFor("user-1"))
+
+        repository.refreshProfile()
+        runCurrent()
+
+        assertNull(photos.photoFor("user-1"))
+    }
+
+    private fun kotlinx.coroutines.test.TestScope.repository(
+        profiles: FakeProfileDao,
+        photos: ProfilePhotoDirectory? = null,
+    ) =
         OfflineUserRepository(
             profileDao = profiles,
             cache = FakeWalletCache(profiles),
@@ -106,7 +229,23 @@ class OfflineUserRepositoryTest {
             apiCalls = apiCalls,
             clock = Clock.fixed(Instant.parse("2026-07-18T12:00:00Z"), ZoneOffset.UTC),
             scope = backgroundScope,
+            profilePhotos = photos,
         )
+
+    /** A verified account whose legal name came from its identity document, not from a form. */
+    private fun verifiedProfileEntity(tag: String) = ProfileEntity(
+        userId = "user-1",
+        name = "Amina Yusuf",
+        phone = "+256700000200",
+        tag = tag,
+        kycLabel = "KYC verified",
+        email = null,
+        emailVerified = false,
+        profileSetupRequired = false,
+        legalName = "Amina Yusuf",
+        usernameRequired = false,
+        updatedAtEpochMillis = 1L,
+    )
 
     private fun jsonResponse(body: String) = MockResponse()
         .setResponseCode(200)
@@ -119,6 +258,26 @@ class OfflineUserRepositoryTest {
             value
         override suspend fun upsert(profile: ProfileEntity) { value.value = profile }
         override suspend fun clear() { value.value = null }
+    }
+
+    /** Local because `ProfilePhotoDirectoryTest`'s equivalent is private to that file. */
+    private class FakeOwnPhotoDao : ProfilePhotoDao {
+        private val rows = MutableStateFlow(emptyMap<Pair<String, String>, ProfilePhotoEntity>())
+
+        override fun observeForOwner(ownerScopeId: String): Flow<List<ProfilePhotoEntity>> =
+            rows.map { stored -> stored.values.filter { it.ownerScopeId == ownerScopeId } }
+
+        override suspend fun put(photos: List<ProfilePhotoEntity>) {
+            rows.value = rows.value + photos.associateBy { it.ownerScopeId to it.userId }
+        }
+
+        override suspend fun forget(ownerScopeId: String, userIds: List<String>) {
+            rows.value = rows.value - userIds.mapTo(mutableSetOf()) { ownerScopeId to it }
+        }
+
+        override suspend fun clear() {
+            rows.value = emptyMap()
+        }
     }
 
     private class FakeSessionStore : SessionStore {
@@ -230,6 +389,11 @@ class OfflineUserRepositoryTest {
 
         val COMPLETED_PROFILE_JSON = """
             {"ok":true,"data":{"id":"user-1","name":"Amina Yusuf","phone":"+256700000200","tag":"amina","kyc_status":"not_started","email_verified":null,"phone_verified":null,"mfa_enabled":null,"payment_pin_set":null,"profile_setup_required":false},"meta":{"request_id":"request-profile"}}
+        """.trimIndent()
+
+        /** As the API answers once the username is gone: a null tag, and `name` falling back. */
+        val VERIFIED_WITHOUT_USERNAME_JSON = """
+            {"ok":true,"data":{"id":"user-1","name":"Amina Yusuf","legal_name":"Amina Yusuf","legal_name_verified_at":"2026-08-25T09:00:00Z","username_required":false,"phone":"+256700000200","tag":null,"kyc_status":"approved","email_verified":null,"phone_verified":null,"mfa_enabled":null,"payment_pin_set":null,"profile_setup_required":false},"meta":{"request_id":"request-profile-no-username"}}
         """.trimIndent()
     }
 }

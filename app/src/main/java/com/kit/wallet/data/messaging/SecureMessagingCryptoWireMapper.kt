@@ -1,6 +1,7 @@
 package com.kit.wallet.data.messaging
 
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
+import com.kit.wallet.data.remote.ENCRYPTED_REACTION_MESSAGE_KIND
 import com.kit.wallet.data.remote.EncryptedDeviceEnvelopeRequest
 import com.kit.wallet.data.remote.MessagingOneTimePrekeyRequest
 import com.kit.wallet.data.remote.MessagingPqPrekeyRequest
@@ -447,12 +448,14 @@ object SecureMessagingCryptoWireMapper {
 
     fun encryption(
         committed: SecureMessagingCommittedResult.Encrypted,
+        messageKind: String = ENCRYPTED_MESSAGE_KIND,
     ): SecureMessagingEncryptedSend {
         val committedFanout = requireDurablyCommittedFanout(committed)
         return encryptedSend(
             fanout = committedFanout.fanout,
             plan = committedFanout.plan,
             provenance = committedFanout.provenance,
+            messageKind = messageKind,
         )
     }
 
@@ -500,13 +503,19 @@ object SecureMessagingCryptoWireMapper {
             envelopes = envelopes,
             replyToMessageId = durable.replyToMessageId,
         )
-        return encryptedSend(fanout, planSnapshot, planSnapshot.provenance)
+        val messageKind = if (KitReactionMessage.parse(durable.authenticatedText) != null) {
+            ENCRYPTED_REACTION_MESSAGE_KIND
+        } else {
+            ENCRYPTED_MESSAGE_KIND
+        }
+        return encryptedSend(fanout, planSnapshot, planSnapshot.provenance, messageKind)
     }
 
     private fun encryptedSend(
         fanout: SecureMessagingPreparedFanout,
         plan: SecureMessagingEncryptionPlanSnapshot,
         provenance: SecureMessagingActivationProvenance,
+        messageKind: String,
     ): SecureMessagingEncryptedSend {
         check(provenance.isSameActivation(plan.provenance)) {
             "Committed fanout and encryption plan belong to different activations"
@@ -533,7 +542,7 @@ object SecureMessagingCryptoWireMapper {
         val request = SendEncryptedMessageRequest(
             clientMessageId = fanout.clientMessageId,
             rosterRevision = fanout.rosterRevision,
-            kind = ENCRYPTED_MESSAGE_KIND,
+            kind = messageKind,
             replyToMessageId = fanout.replyToMessageId,
             envelopes = envelopes.map { envelope ->
                 val ciphertext = envelope.ciphertext.copyBytes()

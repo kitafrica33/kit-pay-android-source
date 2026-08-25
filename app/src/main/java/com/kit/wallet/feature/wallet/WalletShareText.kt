@@ -6,7 +6,9 @@ import com.kit.wallet.ui.model.UserProfile
 import com.kit.wallet.ui.model.formatKitTag
 
 internal fun receiveDetailsShareText(profile: UserProfile): String {
-    val name = profile.name.trim().ifBlank { "this Kit Pay user" }
+    // The verified name where there is one: this text is an instruction to send someone money,
+    // and the name in it should be the name their account is actually known by.
+    val name = profile.displayIdentityName.trim().ifBlank { "this Kit Pay user" }
     val identifiers = listOf(formatKitTag(profile.tag), profile.phone.trim())
         .filter(String::isNotBlank)
         .joinToString(" or ")

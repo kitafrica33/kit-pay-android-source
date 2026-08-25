@@ -21,7 +21,7 @@ import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.IncomingCallDetails
 import com.kit.wallet.data.repository.initialCallPresentation
 import com.kit.wallet.data.repository.resolveCallPresentation
-import com.kit.wallet.data.repository.resolveRoomParticipantName
+import com.kit.wallet.data.repository.resolveRoomParticipant
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.ui.model.Contact
 import com.twilio.audioswitch.AudioDevice
@@ -76,6 +76,8 @@ data class RemoteCallParticipant(
     val speaking: Boolean = false,
     /** Stable backend/LiveKit fallback used if a saved contact is renamed or removed. */
     val serverName: String? = name,
+    /** This participant's profile photo, when they are someone the viewer has saved. */
+    val avatarUrl: String? = null,
 )
 
 /** A second call ringing in while this call is connected (call-waiting). */
@@ -185,13 +187,12 @@ internal fun refreshActiveCallContactPresentation(
         waiting
     }
     val refreshedParticipants = state.remoteParticipants.map { participant ->
-        participant.copy(
-            name = resolveRoomParticipantName(
-                identity = participant.id,
-                serverName = participant.serverName,
-                contacts = contacts,
-            ),
+        val presentation = resolveRoomParticipant(
+            identity = participant.id,
+            serverName = participant.serverName,
+            contacts = contacts,
         )
+        participant.copy(name = presentation.name, avatarUrl = presentation.avatarUrl)
     }
     val refreshedState = state.copy(
         name = activePresentation?.name ?: state.name,
@@ -724,16 +725,18 @@ class ActiveCallViewModel @Inject constructor(
                 .asSequence()
                 .mapNotNull { (_, track) -> track as? VideoTrack }
                 .firstOrNull()
+            val presentation = resolveRoomParticipant(
+                identity = identity,
+                serverName = participant.name,
+                contacts = contacts.contacts.value,
+            )
             RemoteCallParticipant(
                 id = identity ?: participant.hashCode().toString(),
-                name = resolveRoomParticipantName(
-                    identity = identity,
-                    serverName = participant.name,
-                    contacts = contacts.contacts.value,
-                ),
+                name = presentation.name,
                 videoTrack = video,
                 speaking = participant.isSpeaking,
                 serverName = participant.name,
+                avatarUrl = presentation.avatarUrl,
             )
         }
         val showsVideo = mutableState.value.cameraEnabled ||

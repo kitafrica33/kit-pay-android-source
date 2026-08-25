@@ -378,6 +378,13 @@ val firebaseClientConfigSha256 = if (firebaseValues.isNotEmpty()) {
     ""
 }
 
+// Google Drive backup has nothing to configure here. Google withdrew custom-URI-scheme redirects
+// for Android OAuth client types, so authorization now goes through Play Services, which
+// identifies the app by its package name and signing certificate rather than by a client ID
+// compiled into the APK. Every build therefore has working Drive backup as long as the
+// certificate that signs it is registered against an OAuth client in the Google Cloud project;
+// `fastlane/scripts/sign-play-artifacts.sh` is what enforces that.
+
 val gitMetadataAvailable = rootDir.resolve(".git").exists()
 val publicSourceProvenanceFile = rootDir.resolve("SOURCE_PROVENANCE.json")
 
@@ -392,8 +399,8 @@ android {
         applicationId = kitPayApplicationId
         minSdk = 26
         targetSdk = 36
-        versionCode = 34
-        versionName = "0.2.22"
+        versionCode = 36
+        versionName = "0.2.25"
 
         if (kitPaySideloadAbi != null) {
             ndk { abiFilters += kitPaySideloadAbi }
@@ -419,7 +426,6 @@ android {
         buildConfigField("String", "FIREBASE_SENDER_ID", quotedBuildValue(firebaseValues["senderId"].orEmpty()))
         buildConfigField("String", "FIREBASE_APPLICATION_ID", quotedBuildValue(firebaseValues["applicationId"].orEmpty()))
         buildConfigField("String", "FIREBASE_API_KEY", quotedBuildValue(firebaseValues["apiKey"].orEmpty()))
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }
@@ -620,6 +626,15 @@ dependencies {
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.messaging) {
         exclude(group = "com.google.firebase", module = "firebase-measurement-connector")
+    }
+    // Drive backup only. Google stopped supporting browser redirects for Android OAuth clients, so
+    // the Authorization API is now the only way an Android app can be granted a Drive scope. The
+    // sign-in credential is the app's own signing certificate, which is why nothing about this
+    // dependency is configured at build time. The unused sign-in halves of the artifact are dropped
+    // rather than carried: Kit Pay asks Google for a scope, never for an identity.
+    implementation(libs.play.services.auth) {
+        exclude(group = "com.google.android.gms", module = "play-services-auth-api-phone")
+        exclude(group = "com.google.android.gms", module = "play-services-fido")
     }
     implementation(libs.livekit.android)
     implementation(libs.libsignal.android)

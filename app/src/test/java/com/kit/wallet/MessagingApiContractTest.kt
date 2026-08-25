@@ -3,7 +3,7 @@ package com.kit.wallet
 import com.kit.wallet.data.remote.AcknowledgeMessageDeliveryRequest
 import com.kit.wallet.data.remote.ConsumeMessagingKeyBundlesRequest
 import com.kit.wallet.data.remote.ConsumedMessagingKeyBundlesDto
-import com.kit.wallet.data.remote.CreateDirectMessagingConversationRequest
+import com.kit.wallet.data.remote.CreateMessagingConversationRequest
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
 import com.kit.wallet.data.remote.EncryptedDeviceEnvelopeRequest
 import com.kit.wallet.data.remote.MarkMessagingConversationReadRequest
@@ -68,8 +68,8 @@ class MessagingApiContractTest {
         api.messagingConversations()
         assertRequest("GET", "/api/kit-wallet/v1/messaging/conversations")
 
-        api.createDirectMessagingConversation(
-            CreateDirectMessagingConversationRequest(memberIds = listOf(OTHER_USER_ID)),
+        api.createMessagingConversation(
+            CreateMessagingConversationRequest(memberIds = listOf(OTHER_USER_ID)),
         )
         val conversation = assertRequest("POST", "/api/kit-wallet/v1/messaging/conversations")
         assertTrue(conversation.contains("\"type\":\"direct\""))
@@ -226,7 +226,7 @@ class MessagingApiContractTest {
             )
         }
         assertThrows(IllegalArgumentException::class.java) {
-            CreateDirectMessagingConversationRequest(
+            CreateMessagingConversationRequest(
                 memberIds = listOf(OTHER_USER_ID, "44444444-4444-4444-8444-444444444444"),
             )
         }

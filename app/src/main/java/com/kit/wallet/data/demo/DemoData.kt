@@ -8,6 +8,7 @@ import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
+import com.kit.wallet.ui.model.MessageReaction
 import com.kit.wallet.ui.model.MessageKind
 import com.kit.wallet.ui.model.Transaction
 import com.kit.wallet.ui.model.TxStatus
@@ -63,10 +64,19 @@ object DemoData {
     val conversation = listOf(
         Message("m1", "Reached home yet?", "1:58 PM", fromMe = false),
         Message("m2", "Yes, just got in. Traffic was crazy on Jinja Road 😅", "2:00 PM", fromMe = true, state = DeliveryState.READ),
-        Message("m3", "Btw lunch was 50k, split is 25k 🍜", "2:02 PM", fromMe = false, reactions = listOf("👍")),
+        Message(
+            "m3",
+            "Btw lunch was 50k, split is 25k 🍜",
+            "2:02 PM",
+            fromMe = false,
+            reactions = listOf(MessageReaction("👍", listOf("You"), fromMe = true)),
+        ),
         Message("m4", "Sending now", "2:03 PM", fromMe = true, state = DeliveryState.READ, replyToText = "Btw lunch was 50k, split is 25k 🍜"),
         Message("m5", "Payment", "2:04 PM", fromMe = true, kind = MessageKind.PAYMENT, amountMinor = -2_500_000, state = DeliveryState.READ),
-        Message("m6", "Received! Webale nyo 🎉", "2:05 PM", fromMe = false, reactions = listOf("❤️", "🎉")),
+        Message("m6", "Received! Webale nyo 🎉", "2:05 PM", fromMe = false, reactions = listOf(
+            MessageReaction("❤️", listOf("You", "Aisha"), fromMe = true),
+            MessageReaction("🎉", listOf("Aisha"), fromMe = false),
+        )),
         Message("m7", "Voice note", "2:08 PM", fromMe = false, kind = MessageKind.VOICE_NOTE, durationSec = 42),
         Message("m8", "Anytime! Same time next week?", "2:14 PM", fromMe = true, state = DeliveryState.DELIVERED),
     )

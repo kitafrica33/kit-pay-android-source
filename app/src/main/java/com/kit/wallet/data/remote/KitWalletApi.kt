@@ -1,5 +1,6 @@
 package com.kit.wallet.data.remote
 
+import com.kit.wallet.data.session.SessionFence
 import retrofit2.http.Body
 import retrofit2.http.DELETE
 import retrofit2.http.GET
@@ -9,6 +10,7 @@ import retrofit2.http.PATCH
 import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
+import retrofit2.http.Tag
 import okhttp3.RequestBody
 
 interface KitWalletApi {
@@ -113,6 +115,13 @@ interface KitWalletApi {
     suspend fun unblockCommunicationUser(
         @Path("userId") userId: String,
     ): ApiEnvelope<CommunicationBlockDto>
+
+    @POST("api/kit-wallet/v1/communications/reports")
+    suspend fun submitAbuseReport(
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Body request: CreateAbuseReportRequestDto,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<AbuseReportReceiptDto>
 
     @POST("api/kit-wallet/v1/profile/email")
     suspend fun requestProfileEmail(
@@ -293,6 +302,7 @@ interface KitWalletApi {
     suspend fun createPaymentRequest(
         @Header("Idempotency-Key") idempotencyKey: String,
         @Body request: CreatePaymentRequestDto,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<PaymentRequestDto>
 
     @GET("api/kit-wallet/v1/payments/requests")

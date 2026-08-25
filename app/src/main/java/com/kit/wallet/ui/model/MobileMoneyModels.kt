@@ -22,6 +22,13 @@ data class MobileMoneyAccount(
     val currencyCode: String,
     val currencyScale: Int,
     val status: String,
+    /** The Kit Pay account this number belongs to, when the server says it belongs to one. */
+    val kitUserId: String? = null,
+    /**
+     * The photo to draw over this row's glyph; null leaves the glyph alone. Resolved by
+     * [BeneficiaryIdentity], which will not guess.
+     */
+    val avatarUrl: String? = null,
 ) {
     val isOwnAccount: Boolean get() = kind == "own"
 }

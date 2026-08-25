@@ -3,6 +3,8 @@ package com.kit.wallet.data.notifications
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.KitReactionAction
+import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotification
 import java.time.Instant
@@ -52,6 +54,29 @@ class SecureMessageNotificationPresentationTest {
 
         assertEquals("📷 Photo", presentation.preview)
         assertFalse(presentation.preview.contains("private-material"))
+    }
+
+    @Test
+    fun `reaction descriptor is summarized rather than surfaced raw`() {
+        // Reactions are suppressed before the shade; this is the second line of defence.
+        val descriptor = KitReactionMessage(
+            targetMessageId = MESSAGE_ID,
+            emoji = "👍",
+            action = KitReactionAction.ADD,
+        )
+        val presentation = presentation(text = descriptor.encode())
+
+        assertEquals("Reacted to your message 👍", presentation.preview)
+        assertFalse(presentation.preview.contains(MESSAGE_ID))
+        assertFalse(presentation.preview.contains(KitReactionMessage.PREFIX))
+    }
+
+    @Test
+    fun `malformed reaction descriptor fails closed`() {
+        val presentation = presentation(text = "${KitReactionMessage.PREFIX}v=9&mid=$MESSAGE_ID")
+
+        assertEquals("Reacted to your message", presentation.preview)
+        assertFalse(presentation.preview.contains(MESSAGE_ID))
     }
 
     @Test

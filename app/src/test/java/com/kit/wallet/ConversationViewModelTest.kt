@@ -10,6 +10,8 @@ import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.SecureMessagingStateNotReadyException
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.realtime.KitConversationSignals
+import com.kit.wallet.data.realtime.KitTypingSignals
 import com.kit.wallet.feature.chat.ConversationComposerState
 import com.kit.wallet.feature.chat.ConversationViewModel
 import com.kit.wallet.feature.chat.MessageSoundPlayer
@@ -43,6 +45,7 @@ import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -195,6 +198,26 @@ class ConversationViewModelTest {
         assertEquals("", submitted.clearIfUnchanged(submitted).text)
     }
 
+    @Test
+    fun `a second tap on send cannot resend the same composer content`() {
+        val typed = ConversationComposerState().edited("hello")
+
+        val firstTap = checkNotNull(typed.submitted())
+        assertEquals("hello", firstTap.text)
+        // The double tap: the composer still holds its text because nothing has committed yet.
+        assertNull(firstTap.submitted())
+
+        // A commit clears it, and the cleared composer has nothing to send either.
+        assertNull(firstTap.clearIfUnchanged(firstTap).submitted())
+
+        // Retyping the same words is a new message and must go through.
+        val retyped = firstTap.edited("hello")
+        assertEquals("hello", checkNotNull(retyped.submitted()).text)
+
+        // So is tapping again after an attempt that failed before it was durably committed.
+        assertEquals("hello", checkNotNull(firstTap.releasedForRetry().submitted()).text)
+    }
+
     private fun connectivityFailure() = KitWalletApiException(
         code = "NETWORK_UNAVAILABLE",
         message = "failed to reach private-host.test",
@@ -322,23 +345,64 @@ class ConversationViewModelTest {
     }
 
     @Test
-    fun `foreground sync runs every two seconds and stops immediately when hidden`() = runTest {
+    fun `a live socket catches up once on entry and then never polls`() = runTest {
         val repository = FakeChatRepository()
-        val viewModel = viewModel(repository)
+        val realtime = RecordingConversationSignals()
+        val viewModel = viewModel(repository, realtime = realtime)
 
         viewModel.setConversationVisible(true)
         runCurrent()
         assertEquals(1, repository.syncRequests)
+        assertEquals(listOf(CHAT_ID), realtime.observed)
 
-        advanceTimeBy(2_000)
+        // A `null` interval is the coordinator saying it is carrying this conversation
+        // itself. Polling on top of a live socket is the duplicated work this feature
+        // exists to remove, so two minutes of it must cost nothing.
+        advanceTimeBy(120_000)
         runCurrent()
-        assertEquals(2, repository.syncRequests)
+        assertEquals(1, repository.syncRequests)
 
         viewModel.setConversationVisible(false)
-        advanceTimeBy(4_000)
-        runCurrent()
-        assertEquals(2, repository.syncRequests)
+        assertEquals(listOf(CHAT_ID), realtime.released)
     }
+
+    @Test
+    fun `with no socket the conversation polls on the advertised interval and stops when hidden`() =
+        runTest {
+            val repository = FakeChatRepository()
+            val realtime = RecordingConversationSignals().apply { syncInterval.value = 10_000L }
+            val viewModel = viewModel(repository, realtime = realtime)
+
+            viewModel.setConversationVisible(true)
+            runCurrent()
+            assertEquals(1, repository.syncRequests)
+
+            advanceTimeBy(9_999)
+            runCurrent()
+            assertEquals(1, repository.syncRequests)
+            advanceTimeBy(1)
+            runCurrent()
+            assertEquals(2, repository.syncRequests)
+
+            // The socket came back mid-wait. `collectLatest` has to cancel the pending
+            // delay rather than let one more sync fire behind the nudges.
+            realtime.syncInterval.value = null
+            runCurrent()
+            advanceTimeBy(30_000)
+            runCurrent()
+            assertEquals(2, repository.syncRequests)
+
+            realtime.syncInterval.value = 10_000L
+            runCurrent()
+            advanceTimeBy(10_000)
+            runCurrent()
+            assertEquals(3, repository.syncRequests)
+
+            viewModel.setConversationVisible(false)
+            advanceTimeBy(30_000)
+            runCurrent()
+            assertEquals(3, repository.syncRequests)
+        }
 
     @Test
     fun `visible conversation marks only unread inbound projection once`() = runTest {
@@ -388,7 +452,10 @@ class ConversationViewModelTest {
         assertEquals(1, repository.readRequests)
         assertEquals(DeliveryState.DELIVERED, repository.messages.value.single().state)
 
-        advanceTimeBy(1_999)
+        // The 45-second idle timer, not a message poll. Delivery rides the socket now;
+        // this timer survives it because a receipt whose POST failed without changing
+        // local state has no other retry path, and neither does a transfer that expires.
+        advanceTimeBy(44_999)
         runCurrent()
         assertEquals(1, repository.readRequests)
         advanceTimeBy(1)
@@ -396,7 +463,7 @@ class ConversationViewModelTest {
         assertEquals(2, repository.readRequests)
         assertEquals(DeliveryState.READ, repository.messages.value.single().state)
 
-        advanceTimeBy(4_000)
+        advanceTimeBy(90_000)
         runCurrent()
         assertEquals(2, repository.readRequests)
         viewModel.setConversationVisible(false)
@@ -860,7 +927,7 @@ class ConversationViewModelTest {
 
         viewModel.setConversationVisible(true)
         runCurrent()
-        advanceTimeBy(2_000)
+        advanceTimeBy(10_000)
         runCurrent()
 
         val posted = checkNotNull(KitPaymentMessage.parse(repository.sent.single().second))
@@ -1012,11 +1079,16 @@ class ConversationViewModelTest {
     private fun viewModel(
         repository: ChatRepository,
         wallet: WalletRepository = FakeWalletRepository(),
+        realtime: KitConversationSignals = InertConversationSignals,
+        typingSignaller: KitTypingSignals = RecordingTypingSignals(),
     ) = ConversationViewModel(
         chatRepo = repository,
         walletRepo = wallet,
+        walletSync = NoOpTestWalletSync,
         callRepo = FakeCallRepository(),
         messageSounds = NoOpMessageSoundPlayer,
+        realtime = realtime,
+        typingSignaller = typingSignaller,
         savedStateHandle = SavedStateHandle(mapOf("chatId" to CHAT_ID)),
     )
 

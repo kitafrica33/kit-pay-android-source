@@ -4,13 +4,17 @@ import com.kit.wallet.ui.model.Beneficiary
 import com.kit.wallet.ui.model.BillProvider
 import com.kit.wallet.ui.model.BankInstitution
 import com.kit.wallet.ui.model.CallEntry
+import com.kit.wallet.ui.model.ChatMember
+import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Message
+import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.model.Transaction
 import com.kit.wallet.ui.model.TransferClaim
 import com.kit.wallet.ui.model.UserProfile
 import java.time.Instant
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import com.kit.wallet.data.session.SessionFence
 
@@ -56,6 +60,13 @@ interface UserRepository {
 
     suspend fun refreshProfile()
 
+    /**
+     * Saves the *chosen* half of the identity. Neither argument is the legal name, which only
+     * identity verification can set and which no request may overwrite.
+     *
+     * A blank [tag] means "no username". That is only accepted once a verified legal name exists;
+     * otherwise it is a validation error long before it reaches here.
+     */
     suspend fun updateProfile(name: String, tag: String)
 
     /** Uploads a JPEG profile photo through the moderated media pipeline and attaches it. */
@@ -67,12 +78,27 @@ interface UserRepository {
     suspend fun verifyEmailAttachment(challengeId: String, code: String)
 }
 
+/** The currency and minor-unit scale of the wallet money is moving out of. */
+data class WalletCurrency(
+    val code: String = Money.SYMBOL,
+    val scale: Int = Money.SCALE,
+)
+
 interface WalletRepository {
     /** Authenticated public account ID used to bind wallet objects to a direct conversation. */
     val currentAccountId: String?
         get() = null
 
     val balanceMinor: StateFlow<Long>
+
+    /**
+     * The selected wallet's currency, for amounts the app composes itself rather than reads off a
+     * quote — a shortfall, for one. Defaults to the display currency so a repository that has no
+     * wallet to speak for still answers something formattable.
+     */
+    val walletCurrency: StateFlow<WalletCurrency>
+        get() = MutableStateFlow(WalletCurrency())
+
     val transactions: StateFlow<List<Transaction>>
     val beneficiaries: StateFlow<List<Beneficiary>>
 
@@ -101,12 +127,28 @@ interface WalletRepository {
     /** Records an outgoing payment request (no balance change). */
     suspend fun request(from: Contact, amountMinor: Long, note: String?)
 
-    /** Creates an idempotent, non-debit payment request addressed to a chat peer. */
+    /**
+     * Creates an idempotent, non-debit payment request addressed to a chat peer.
+     *
+     * [idempotencyKey] lets a caller that can retry — a scheduled request, whose dispatch may run
+     * again after failing to share the card — name the request it is retrying, so the server
+     * returns the same one instead of minting a second ask. A null key means a fresh request.
+     */
     suspend fun createChatPaymentRequest(
         peerUserId: String,
         amountMinor: Long,
         note: String?,
+        idempotencyKey: String? = null,
     ): ChatPaymentRequest = error("Payment requests are unavailable")
+
+    /** Scheduled-send boundary that cannot be redirected into a replacement login. */
+    suspend fun createChatPaymentRequestForOwner(
+        owner: SessionFence,
+        peerUserId: String,
+        amountMinor: Long,
+        note: String?,
+        idempotencyKey: String,
+    ): ChatPaymentRequest = error("Owner-pinned payment requests are unavailable")
 
     /** Pays a payment request received in chat; a PIN step-up authorizes the debit. */
     suspend fun payChatPaymentRequest(
@@ -209,6 +251,19 @@ interface ContactRepository {
 interface ChatRepository {
     /** Reacts to the current authentication epoch's READY secure-messaging session. */
     val readiness: StateFlow<Boolean>
+
+    /**
+     * Whether [chats] and [conversation] reflect this device's own encrypted store.
+     *
+     * True long before [readiness] and independent of the network: it means the local database has
+     * been read and what is on screen is real. [readiness] additionally means a message may be
+     * sent. Screens render on this one and gate send actions on the other, which is why a chat
+     * list, its previews and its transcripts survive a cold start, an offline launch and a failed
+     * or still-running secure-session setup.
+     */
+    val localHistoryReady: StateFlow<Boolean>
+        get() = readiness
+
     val chats: StateFlow<List<ChatPreview>>
     fun chat(chatId: String): ChatPreview?
     fun conversation(chatId: String): StateFlow<List<Message>>
@@ -231,12 +286,27 @@ interface ChatRepository {
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
     )
 
+    /** Scheduled-send boundary that captures one exact encrypted activation before sending. */
+    suspend fun sendMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        text: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit = {},
+    ): Unit = error("Owner-pinned secure messaging is unavailable")
+
     /** Sends a canonical descriptor produced by a payment flow, never by a text composer. */
     suspend fun sendPaymentEvent(
         chatId: String,
         descriptor: String,
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
     ) = sendMessage(chatId, descriptor, onDurablyCommitted)
+
+    suspend fun sendPaymentEventForOwner(
+        owner: SessionFence,
+        chatId: String,
+        descriptor: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit = {},
+    ): Unit = error("Owner-pinned secure messaging is unavailable")
 
     suspend fun retryMessage(chatId: String, clientMessageId: String, text: String) {
         error("This chat repository does not support explicit secure-message retries")
@@ -262,6 +332,53 @@ interface ChatRepository {
     /** Downloads and decrypts the media referenced by a message's authenticated descriptor. */
     suspend fun openImageMessage(chatId: String, mediaDescriptor: String): ByteArray {
         error("This chat repository does not support secure media messages")
+    }
+
+    /**
+     * Adds [emoji] to [messageId], or takes it off again when this account already reacted with
+     * it. The reaction travels end-to-end encrypted inside the conversation, so the server never
+     * learns which message was reacted to or with what.
+     */
+    suspend fun toggleReaction(chatId: String, messageId: String, emoji: String) {
+        error("This chat repository does not support message reactions")
+    }
+
+    /**
+     * Creates a group named [title] with [contacts] plus this account, returning its chat ID.
+     *
+     * The title is the one thing a group discloses to the server — everything inside it (messages,
+     * media, payments, reactions) stays end-to-end encrypted exactly as a direct chat does.
+     */
+    suspend fun createGroupConversation(title: String, contacts: List<Contact>): String {
+        error("This chat repository does not support group conversations")
+    }
+
+    /**
+     * Who is in [chatId] right now, the role each of them holds, and who is presently watching.
+     *
+     * A flow rather than a snapshot because the presence half of it changes without the roster
+     * changing — the participant list has to light up and go dark the same way a chat header does.
+     */
+    fun groupMembers(chatId: String): StateFlow<List<ChatMember>> = MutableStateFlow(emptyList())
+
+    /** Adds one Kit Pay contact to a group this account may manage. */
+    suspend fun addGroupMember(chatId: String, contact: Contact) {
+        error("This chat repository does not support group conversations")
+    }
+
+    /** Promotes or demotes a member. Only an owner may change an owner's or admin's role. */
+    suspend fun setGroupMemberRole(chatId: String, userId: String, role: ChatMemberRole) {
+        error("This chat repository does not support group conversations")
+    }
+
+    /** Removes another member from a group this account may manage. */
+    suspend fun removeGroupMember(chatId: String, userId: String) {
+        error("This chat repository does not support group conversations")
+    }
+
+    /** Leaves the group and drops it locally. An owner must hand it over first. */
+    suspend fun leaveGroupConversation(chatId: String) {
+        error("This chat repository does not support group conversations")
     }
 
     /** Best-effort encrypted composer draft for [chatId]; null when none is stored. */
@@ -382,7 +499,13 @@ interface BankingRepository {
         amountMinor: Long,
         feeMode: String = "sender_absorbs",
     ): FinancialOperationQuote
-    suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String)
+    /**
+     * Submits an approved quote and returns the banking operation it created.
+     *
+     * See [MobileMoneyRepository.submitOperation] for why the id matters: a top-up covering a
+     * payment has to be able to watch its own operation rather than the newest one in the list.
+     */
+    suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String): String
 }
 
 class FinancialOperationQuote internal constructor(

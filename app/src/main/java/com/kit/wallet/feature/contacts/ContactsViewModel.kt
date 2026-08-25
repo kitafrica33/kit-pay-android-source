@@ -2,6 +2,7 @@ package com.kit.wallet.feature.contacts
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.contacts.ContactDiscoveryConsent
 import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
@@ -20,6 +21,7 @@ import kotlinx.coroutines.launch
 class ContactsViewModel @Inject constructor(
     private val contactRepo: ContactRepository,
     private val chatRepo: ChatRepository,
+    private val discovery: ContactDiscoveryConsent? = null,
 ) : ViewModel() {
     val contacts = contactRepo.contacts
 
@@ -49,7 +51,18 @@ class ContactsViewModel @Inject constructor(
 
     fun refresh() = run { launchSync(deviceContacts = false) }
 
-    fun syncDeviceContacts() = run { launchSync(deviceContacts = true) }
+    /**
+     * Agreeing to the contacts disclosure is the moment consent is given, so it is the moment it
+     * is recorded — the Android permission on its own never stands in for it again.
+     */
+    fun syncDeviceContacts() = run {
+        if (discovery?.setShareDeviceContacts(true) != true) {
+            mutableError.value =
+                "Contact sync stays off until a signed-in account can record your choice."
+            return@run
+        }
+        launchSync(deviceContacts = true)
+    }
 
     fun clearError() {
         mutableError.value = null
@@ -94,7 +107,10 @@ class ContactsViewModel @Inject constructor(
     fun openDirectConversation(contact: Contact, onOpened: (String) -> Unit) {
         if (mutableOpeningContactId.value != null) return
         if (!chatRepo.readiness.value) {
-            mutableError.value = "Secure messaging is not ready on this device yet."
+            // Point-of-action, and phrased as a wait rather than a fault: starting a *new*
+            // conversation is a server-authenticated action, so unlike reading existing chats it
+            // genuinely cannot proceed yet. It retries itself; there is nothing for the user to fix.
+            mutableError.value = "Still preparing secure messaging. Try again in a moment."
             return
         }
         viewModelScope.launch {

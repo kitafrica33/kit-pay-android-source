@@ -125,7 +125,9 @@ internal fun ReceiveContent(
             )
             Spacer(Modifier.height(20.dp))
             Text(
-                profile.name.ifBlank { "Kit Pay user" },
+                // Verified name first: whoever is being shown this screen is deciding whether to
+                // pay the person in front of them.
+                profile.displayIdentityName.ifBlank { "Kit Pay user" },
                 style = MaterialTheme.typography.headlineSmall,
             )
             Text(

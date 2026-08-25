@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "google_cloud_project": "kit-pay-africa",
+  "application_id": "com.kit.wallet",
+  "approved_scopes": [
+    "https://www.googleapis.com/auth/drive.appdata"
+  ],
+  "registered_certificates": [
+    {
+      "role": "play_app_signing",
+      "description": "Google's generated Play App Signing key. Every install delivered by Play carries this certificate, so this is the fingerprint almost all users authorize with.",
+      "sha1": "1D:3B:29:C7:8F:6F:71:57:46:B6:FD:DA:D1:4F:B9:1B:BD:FE:E9:56",
+      "sha256": "AA:E4:24:7B:E9:86:8F:CF:5E:AA:3F:9B:AF:E6:21:82:3F:61:86:60:A4:A4:62:5A:68:7C:20:AE:FD:FB:73:FF",
+      "signs_release_artifacts": false
+    },
+    {
+      "role": "upload",
+      "description": "The dedicated Kit Pay upload certificate. It signs the AAB Play accepts and the arm64 sideload APK users install directly, so direct installs authorize with this fingerprint.",
+      "sha1": "24:1E:D3:34:14:FA:CF:7A:80:4F:E4:F3:6C:33:0C:08:01:17:04:2B",
+      "sha256": "CA:DF:18:E8:5B:F9:32:81:52:F3:48:1A:E0:1E:DB:52:CA:0F:77:4C:F3:65:CF:A9:D9:9F:D1:1B:B6:60:08:75",
+      "signs_release_artifacts": true
+    }
+  ]
+}

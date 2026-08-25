@@ -5,7 +5,17 @@ import com.kit.wallet.data.remote.AcknowledgeMessageDeliveryRequest
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.ApiEnvelope
 import com.kit.wallet.data.remote.ConsumeMessagingKeyBundlesRequest
-import com.kit.wallet.data.remote.CreateDirectMessagingConversationRequest
+import com.kit.wallet.data.remote.AddMessagingConversationMemberRequest
+import com.kit.wallet.data.remote.CreateMessagingConversationRequest
+import com.kit.wallet.data.remote.GROUP_CONVERSATION_TYPE
+import com.kit.wallet.data.remote.MEMBER_CONVERSATION_ROLE
+import com.kit.wallet.data.remote.MESSAGING_GROUPS_DEVICE_CAPABILITY
+import com.kit.wallet.data.remote.MESSAGING_GROUPS_FEATURE
+import com.kit.wallet.data.remote.MESSAGING_REACTIONS_DEVICE_CAPABILITY
+import com.kit.wallet.data.remote.MESSAGING_REACTIONS_FEATURE
+import com.kit.wallet.data.remote.MessagingConversationDto
+import com.kit.wallet.data.remote.UpdateMessagingConversationMemberRequest
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
 import com.kit.wallet.data.remote.EncryptedAttachmentRequest
 import com.kit.wallet.data.remote.KitFeature
@@ -22,7 +32,7 @@ import com.kit.wallet.data.remote.SecureMessagingWireApi
 import com.kit.wallet.data.remote.SecureMessagingTransportValidator
 import com.kit.wallet.data.remote.SecureMessagingWireValidationException
 import com.kit.wallet.data.remote.SecureMessagingWireValidator
-import com.kit.wallet.data.remote.ValidatedDirectConversation
+import com.kit.wallet.data.remote.ValidatedConversation
 import com.kit.wallet.data.remote.ValidatedMessageDeliveryAcknowledgement
 import com.kit.wallet.data.remote.ValidatedMessagingDeviceRoster
 import com.kit.wallet.data.remote.ValidatedMessagingHistoryBackfillPage
@@ -74,14 +84,47 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         private val fence: SecureMessagingSessionFence,
         private val activation: SecureMessagingActivationCapability,
         private val context: SecureMessagingRemoteContext,
+        private val groupMessagingEnabled: Boolean = false,
+        private val reactionMessagingEnabled: Boolean = false,
     ) {
-        class DirectConversation internal constructor(
+        /**
+         * Opaque authority for one exact, server-validated conversation.
+         *
+         * Direct chats and groups share this handle because every operation below is
+         * membership-driven: the roster names the devices, and nothing downstream needs to
+         * know whether there are two people in the room or thirty-two. [peerUserId] is the
+         * one thing that differs, and it is null precisely when it is meaningless.
+         */
+        class SecureConversation internal constructor(
             private val owner: Session,
             internal val issuanceIdentity: Any,
             val conversationId: String,
-            val peerUserId: String,
+            val type: String,
+            val title: String?,
+            val peerUserId: String?,
             val peerName: String?,
             val currentUserRole: String,
+            val members: List<ConversationMember>,
+        ) {
+            val isGroup: Boolean get() = type == GROUP_CONVERSATION_TYPE
+
+            /** True when [userId] is an active member, and so a legitimate actor here. */
+            fun contains(userId: String): Boolean =
+                members.any { it.userId.equals(userId, ignoreCase = true) }
+
+            /** Members other than [viewerUserId] — for a direct chat, exactly the peer. */
+            fun otherMemberUserIds(viewerUserId: String): Set<String> = members
+                .asSequence()
+                .map(ConversationMember::userId)
+                .filterNot { it.equals(viewerUserId, ignoreCase = true) }
+                .toSet()
+        }
+
+        /** One active member of a [SecureConversation], as the server last reported it. */
+        data class ConversationMember(
+            val userId: String,
+            val name: String?,
+            val role: String,
         )
 
         /** Opaque authority for one exact, server-validated device roster. */
@@ -199,6 +242,10 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             conversationId: String,
             occurredAt: Instant,
             val type: String,
+            /** The subject of a `membership.*` change; null on every other metadata event. */
+            val memberUserId: String? = null,
+            /** The subject's role after a `membership.role_changed`, if the server sent one. */
+            val memberRole: String? = null,
         ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt)
 
         class SyncBatch internal constructor(
@@ -309,7 +356,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
 
         private data class IssuedConversation(
             val identity: Any,
-            val validated: ValidatedDirectConversation,
+            val validated: ValidatedConversation,
         )
 
         private data class IssuedRoster(
@@ -389,7 +436,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         )
 
         private val issuanceLock = Any()
-        private val issuedConversations = WeakHashMap<DirectConversation, IssuedConversation>()
+        private val issuedConversations = WeakHashMap<SecureConversation, IssuedConversation>()
         private val issuedRosters = WeakHashMap<AuthoritativeRoster, IssuedRoster>()
         private val issuedPlans = WeakHashMap<SecureMessagingEncryptionPlan, IssuedPlan>()
         private val issuedHistoryPages = WeakHashMap<HistoryBackfillPage, IssuedHistoryPage>()
@@ -581,16 +628,16 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             )
         }
 
-        suspend fun directConversations(): List<DirectConversation> {
+        suspend fun conversations(expectedOwner: SessionFence? = null): List<SecureConversation> {
             val response = owner.fencedSessionCall(
                 this,
                 issuanceIdentity,
                 lifecycle,
                 fence,
             ) {
-                messagingConversations()
+                messagingConversations(expectedOwner)
             }
-            return SecureMessagingTransportValidator.validateDirectConversations(
+            return SecureMessagingTransportValidator.validateConversations(
                 response,
                 context.currentUserId,
             ).map(::issueConversation)
@@ -598,7 +645,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
 
         suspend fun createDirectConversation(
             peerUserId: String,
-        ): DirectConversation {
+        ): SecureConversation {
             requireUuid(peerUserId, "direct-message peer user ID")
             require(peerUserId != context.currentUserId) {
                 "A direct conversation requires another user"
@@ -610,28 +657,165 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 fence,
                 readyRequired = true,
             ) {
-                createDirectMessagingConversation(
-                    CreateDirectMessagingConversationRequest(listOf(peerUserId)),
+                createMessagingConversation(
+                    CreateMessagingConversationRequest(listOf(peerUserId)),
                 )
             }
-            val validated = SecureMessagingTransportValidator.validateDirectConversations(
-                MessagingConversationListDto(listOf(created)),
+            val validated = SecureMessagingTransportValidator.validateConversation(
+                created,
                 context.currentUserId,
-            ).single()
+            )
             check(validated.peerUserId == peerUserId) {
                 "The server created a direct conversation with another peer"
             }
             return issueConversation(validated)
         }
 
+        suspend fun createGroupConversation(
+            title: String,
+            memberUserIds: List<String>,
+        ): SecureConversation {
+            require(groupMessagingEnabled) { "Group messaging is not enabled" }
+            val members = memberUserIds.distinct()
+            require(members.size == memberUserIds.size) { "A group cannot list a member twice" }
+            require(members.none { it == context.currentUserId }) {
+                "The group creator is added by the server, not by the client"
+            }
+            members.forEach { requireUuid(it, "group member user ID") }
+            val trimmedTitle = title.trim()
+            val created = owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                createMessagingConversation(
+                    CreateMessagingConversationRequest(
+                        memberIds = members,
+                        type = GROUP_CONVERSATION_TYPE,
+                        title = trimmedTitle,
+                    ),
+                )
+            }
+            val validated = SecureMessagingTransportValidator.validateConversation(
+                created,
+                context.currentUserId,
+            )
+            check(validated.isGroup) { "The server created a conversation of another type" }
+            // Every requested member must actually be in it. A group silently created with a
+            // subset would encrypt to fewer people than the creator picked, and they would
+            // have no way to see that from the composer.
+            check(validated.memberUserIds().containsAll(members)) {
+                "The server created a group without every requested member"
+            }
+            return issueConversation(validated)
+        }
+
+        suspend fun addGroupMember(
+            conversation: SecureConversation,
+            userId: String,
+            role: String = MEMBER_CONVERSATION_ROLE,
+        ): SecureConversation {
+            require(groupMessagingEnabled) { "Group messaging is not enabled" }
+            return mutateMembership(conversation, userId) { conversationId ->
+                addMessagingConversationMember(
+                    conversationId,
+                    AddMessagingConversationMemberRequest(userId = userId, role = role),
+                )
+            }
+        }
+
+        suspend fun setGroupMemberRole(
+            conversation: SecureConversation,
+            userId: String,
+            role: String,
+        ): SecureConversation {
+            require(groupMessagingEnabled) { "Group messaging is not enabled" }
+            return mutateMembership(conversation, userId) { conversationId ->
+                updateMessagingConversationMember(
+                    conversationId,
+                    userId,
+                    UpdateMessagingConversationMemberRequest(role),
+                )
+            }
+        }
+
+        suspend fun removeGroupMember(
+            conversation: SecureConversation,
+            userId: String,
+        ): SecureConversation {
+            require(userId != context.currentUserId) {
+                "Removing yourself is leaving; use leaveGroup"
+            }
+            return mutateMembership(conversation, userId) { conversationId ->
+                removeMessagingConversationMember(conversationId, userId)
+            }
+        }
+
+        /**
+         * Leaves [conversation], returning nothing.
+         *
+         * The server answers with the conversation as it now stands, which no longer contains
+         * this account — so unlike every other membership change there is no handle to reissue
+         * and nothing left to validate a viewer against. The caller drops the chat locally.
+         */
+        suspend fun leaveGroup(conversation: SecureConversation) {
+            val validatedConversation = requireConversation(conversation)
+            require(validatedConversation.isGroup) { "A direct conversation cannot be left" }
+            owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                removeMessagingConversationMember(
+                    validatedConversation.conversationId,
+                    context.currentUserId,
+                )
+            }
+            synchronized(issuanceLock) { issuedConversations.remove(conversation) }
+        }
+
+        private suspend fun mutateMembership(
+            conversation: SecureConversation,
+            userId: String,
+            call: suspend SecureMessagingWireApi.(String) -> ApiEnvelope<MessagingConversationDto>,
+        ): SecureConversation {
+            val validatedConversation = requireConversation(conversation)
+            require(validatedConversation.isGroup) {
+                "Direct conversation membership cannot be changed"
+            }
+            requireUuid(userId, "group member user ID")
+            val response = owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                call(validatedConversation.conversationId)
+            }
+            val validated = SecureMessagingTransportValidator.validateConversation(
+                response,
+                context.currentUserId,
+            )
+            check(validated.conversationId == validatedConversation.conversationId) {
+                "The server returned another conversation"
+            }
+            return issueConversation(validated)
+        }
+
         suspend fun roster(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
+            expectedOwner: SessionFence? = null,
         ): AuthoritativeRoster {
             val validatedConversation = requireConversation(conversation)
             val conversationId = validatedConversation.conversationId
             requireUuid(conversationId, "conversation ID")
             val response = owner.fencedSessionCall(this, issuanceIdentity, lifecycle, fence) {
-                messagingDeviceRoster(conversationId)
+                messagingDeviceRoster(conversationId, expectedOwner)
             }
             return issueRoster(
                 conversation = conversation,
@@ -640,10 +824,8 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                     expectedConversationId = conversationId,
                     currentDeviceId = context.currentDeviceId,
                     currentUserId = context.currentUserId,
-                    expectedMemberUserIds = setOf(
-                        context.currentUserId,
-                        validatedConversation.peerUserId,
-                    ),
+                    expectedMemberUserIds = validatedConversation.memberUserIds(),
+                    groupMembership = validatedConversation.isGroup,
                 ),
                 use = RosterUse.CURRENT_OUTBOUND,
             )
@@ -654,7 +836,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
          * roster snapshots predate enrollment epochs and are deliberately rejected by this path.
          */
         fun historyBackfillTargets(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             roster: AuthoritativeRoster,
         ): List<HistoryBackfillTarget> {
             val issued = requireRoster(roster, conversation)
@@ -680,7 +862,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
 
         /** Retrieves the immutable roster that authenticated an older offline envelope. */
         suspend fun historicalRoster(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             rosterRevision: String,
         ): AuthoritativeRoster {
             val validatedConversation = requireConversation(conversation)
@@ -697,10 +879,8 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 expectedConversationId = conversationId,
                 currentDeviceId = context.currentDeviceId,
                 currentUserId = context.currentUserId,
-                expectedMemberUserIds = setOf(
-                    context.currentUserId,
-                    validatedConversation.peerUserId,
-                ),
+                expectedMemberUserIds = validatedConversation.memberUserIds(),
+                groupMembership = validatedConversation.isGroup,
             )
             check(validated.rosterRevision == rosterRevision) {
                 "Historical roster response changed the requested revision"
@@ -713,10 +893,11 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
 
         suspend fun consumeKeyBundles(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             roster: AuthoritativeRoster,
             plan: SecureMessagingEncryptionPlan,
             deviceIds: Set<String>,
+            expectedOwner: SessionFence? = null,
         ): SecureMessagingSessionEstablishmentRequest {
             val validatedConversation = requireConversation(conversation)
             val issuedRoster = requireRoster(roster, conversation)
@@ -734,13 +915,19 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 "Too many missing recipient sessions"
             }
             targetIds.forEach { requireUuid(it, "missing recipient device ID") }
-            val expectedMembers = setOf(context.currentUserId, validatedConversation.peerUserId)
+            val expectedMembers = validatedConversation.memberUserIds()
             val issuedPlan = SecureMessagingCryptoWireMapper.requireEncryptionPlan(plan)
             check(issuedPlan.conversationId == conversationId) {
                 "Encryption plan belongs to another conversation"
             }
-            check(issuedPlan.memberUserIds() == expectedMembers) {
-                "Encryption plan belongs to another direct membership"
+            // The plan is built from the roster, which for a group may cover fewer users
+            // than the group has. Containment is therefore the strongest true statement:
+            // the plan may not reach anybody outside the conversation.
+            check(expectedMembers.containsAll(issuedPlan.memberUserIds())) {
+                "Encryption plan reaches a user outside this conversation"
+            }
+            check(context.currentUserId in issuedPlan.memberUserIds()) {
+                "Encryption plan omits the current account"
             }
             SecureMessagingWireValidator.requireKeyBundleTargets(
                 roster = issuedRoster.validated,
@@ -749,12 +936,14 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 currentUserId = context.currentUserId,
                 expectedMemberUserIds = expectedMembers,
                 requestedDeviceIds = targetIds,
+                groupMembership = validatedConversation.isGroup,
             )
             val sortedIds = targetIds.sorted()
             val response = owner.fencedSessionCall(this, issuanceIdentity, lifecycle, fence) {
                 consumeMessagingKeyBundles(
                     conversationId,
                     ConsumeMessagingKeyBundlesRequest(sortedIds),
+                    expectedOwner,
                 )
             }
             val validatedClaims = SecureMessagingWireValidator.validateConsumedKeyBundles(
@@ -765,6 +954,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 currentDeviceId = context.currentDeviceId,
                 currentUserId = context.currentUserId,
                 expectedMemberUserIds = expectedMembers,
+                groupMembership = validatedConversation.isGroup,
             )
             return SecureMessagingCryptoWireMapper.sessionEstablishment(
                 validatedClaims,
@@ -774,7 +964,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
 
         fun encryptionPlan(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             roster: AuthoritativeRoster,
         ): SecureMessagingEncryptionPlan {
             val validatedConversation = requireConversation(conversation)
@@ -782,11 +972,45 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             check(issuedRoster.use == RosterUse.CURRENT_OUTBOUND) {
                 "Historical rosters cannot authorize outbound encryption"
             }
+            if (validatedConversation.isGroup) {
+                require(groupMessagingEnabled) { "Group messaging is not enabled" }
+                requireRosterCapability(
+                    validatedConversation,
+                    issuedRoster.validated,
+                    MESSAGING_GROUPS_DEVICE_CAPABILITY,
+                )
+            }
             return issuePlan(conversation, roster, validatedConversation, issuedRoster, true)
         }
 
+        fun requireReactionCapability(
+            conversation: SecureConversation,
+            roster: AuthoritativeRoster,
+        ) {
+            require(reactionMessagingEnabled) { "Encrypted reactions are not enabled" }
+            requireRosterCapability(
+                requireConversation(conversation),
+                requireRoster(roster, conversation).validated,
+                MESSAGING_REACTIONS_DEVICE_CAPABILITY,
+            )
+        }
+
+        private fun requireRosterCapability(
+            conversation: ValidatedConversation,
+            roster: ValidatedMessagingDeviceRoster,
+            capability: String,
+        ) {
+            check(roster.memberUserIds() == conversation.memberUserIds()) {
+                "The capability roster does not cover every conversation member"
+            }
+            check(roster.devices().all { device ->
+                device.deviceId == context.currentDeviceId ||
+                    device.supportsClientCapability(capability)
+            }) { "A conversation device does not support $capability" }
+        }
+
         suspend fun historyBackfillCandidates(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             roster: AuthoritativeRoster,
             targetDeviceId: String,
             targetEnrollmentEpoch: Long,
@@ -836,7 +1060,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
 
         fun historyBackfillEncryptionPlan(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             roster: AuthoritativeRoster,
             page: HistoryBackfillPage,
         ): SecureMessagingEncryptionPlan {
@@ -868,7 +1092,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
 
         suspend fun storeHistoryEnvelope(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             roster: AuthoritativeRoster,
             page: HistoryBackfillPage,
             candidate: HistoryBackfillCandidate,
@@ -945,7 +1169,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
 
         /** Issues a receive-only plan; historical rosters can never authorize an outbound send. */
         fun decryptionPlan(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             roster: AuthoritativeRoster,
         ): SecureMessagingEncryptionPlan {
             val validatedConversation = requireConversation(conversation)
@@ -954,9 +1178,9 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
 
         private fun issuePlan(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             roster: AuthoritativeRoster,
-            validatedConversation: ValidatedDirectConversation,
+            validatedConversation: ValidatedConversation,
             issuedRoster: IssuedRoster,
             outboundAllowed: Boolean,
         ): SecureMessagingEncryptionPlan {
@@ -964,10 +1188,25 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 check(validatedRoster.conversationId == validatedConversation.conversationId) {
                     "Authoritative roster belongs to another conversation"
                 }
-                check(
-                    validatedRoster.memberUserIds() ==
-                        setOf(context.currentUserId, validatedConversation.peerUserId),
-                ) { "Authoritative roster belongs to another direct membership" }
+                val rosterMembers = validatedRoster.memberUserIds()
+                val conversationMembers = validatedConversation.memberUserIds()
+                check(conversationMembers.containsAll(rosterMembers)) {
+                    "Authoritative roster names a user outside this conversation"
+                }
+                if (validatedConversation.isGroup) {
+                    // A group roster is allowed to be *narrower* than the membership: a member
+                    // who has not enrolled a messaging device contributes no devices, and the
+                    // group must still work for everyone who has. What is never allowed is a
+                    // roster naming somebody the conversation does not contain — that is the
+                    // direction that would leak a message to a stranger, so it stays checked.
+                    check(rosterMembers.contains(context.currentUserId)) {
+                        "Authoritative roster omits the current account"
+                    }
+                } else {
+                    check(rosterMembers == conversationMembers) {
+                        "Authoritative roster belongs to another direct membership"
+                    }
+                }
             }
             val plan = SecureMessagingCryptoWireMapper.encryptionPlan(
                 issuedRoster.validated,
@@ -1048,9 +1287,10 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
 
         suspend fun send(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             encryptedSend: SecureMessagingEncryptedSend,
             attachments: List<EncryptedAttachmentRequest>,
+            expectedOwner: SessionFence? = null,
         ): OutboundReceipt {
             val validatedConversation = requireConversation(conversation)
             val conversationId = validatedConversation.conversationId
@@ -1073,8 +1313,8 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 "Encrypted send command belongs to another authenticated device"
             }
             check(
-                send.memberUserIds() == setOf(context.currentUserId, validatedConversation.peerUserId),
-            ) { "Encrypted send command belongs to another direct membership" }
+                send.memberUserIds() == validatedConversation.memberUserIds(),
+            ) { "Encrypted send command belongs to another conversation membership" }
             // The committed fanout stays byte-identical; attachment metadata only decorates the
             // wire request. The data-class initializer re-validates the kind/metadata pairing.
             val request = if (attachments.isEmpty()) {
@@ -1092,7 +1332,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 fence,
                 readyRequired = true,
             ) {
-                sendEncryptedMessage(conversationId, request)
+                sendEncryptedMessage(conversationId, request, expectedOwner)
             }
             return issueOutboundReceipt(
                 SecureMessagingTransportValidator.validateOutboundSendResponse(
@@ -1103,6 +1343,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                     expectedCurrentDeviceId = context.currentDeviceId,
                     expectedCurrentEnrollmentEpoch = reconciledEnrollmentEpochOrNull(),
                     expectedRosterRevision = request.rosterRevision,
+                    expectedKind = request.kind,
                 ),
             )
         }
@@ -1188,7 +1429,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
 
         suspend fun markConversationRead(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             messageId: String,
         ): ReadReceipt {
             val validatedConversation = requireConversation(conversation)
@@ -1466,15 +1707,20 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
 
         private fun requireUuid(value: String, field: String) = owner.requireUuid(value, field)
 
-        private fun issueConversation(validated: ValidatedDirectConversation): DirectConversation {
+        private fun issueConversation(validated: ValidatedConversation): SecureConversation {
             val identity = Any()
-            val handle = DirectConversation(
+            val handle = SecureConversation(
                 owner = this,
                 issuanceIdentity = identity,
                 conversationId = validated.conversationId,
+                type = validated.type,
+                title = validated.title,
                 peerUserId = validated.peerUserId,
                 peerName = validated.peerName,
                 currentUserRole = validated.currentUserRole,
+                members = validated.members.map {
+                    ConversationMember(userId = it.userId, name = it.name, role = it.role)
+                },
             )
             synchronized(issuanceLock) {
                 issuedConversations[handle] = IssuedConversation(identity, validated)
@@ -1482,7 +1728,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             return handle
         }
 
-        private fun requireConversation(handle: DirectConversation): ValidatedDirectConversation {
+        private fun requireConversation(handle: SecureConversation): ValidatedConversation {
             lifecycle.assertCurrent(activation)
             return synchronized(issuanceLock) {
                 val issued = issuedConversations[handle]
@@ -1495,7 +1741,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
 
         private fun issueHistoryPage(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             roster: AuthoritativeRoster,
             validated: ValidatedMessagingHistoryBackfillPage,
         ): HistoryBackfillPage {
@@ -1549,7 +1795,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
 
         private fun requireHistoryPage(
             page: HistoryBackfillPage,
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             roster: AuthoritativeRoster,
         ): IssuedHistoryPage {
             lifecycle.assertCurrent(activation)
@@ -1596,7 +1842,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         )
 
         private fun issueRoster(
-            conversation: DirectConversation,
+            conversation: SecureConversation,
             validated: ValidatedMessagingDeviceRoster,
             use: RosterUse,
         ): AuthoritativeRoster {
@@ -1620,7 +1866,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
 
         private fun requireRoster(
             handle: AuthoritativeRoster,
-            conversation: DirectConversation? = null,
+            conversation: SecureConversation? = null,
         ): IssuedRoster {
             lifecycle.assertCurrent(activation)
             return synchronized(issuanceLock) {
@@ -1646,7 +1892,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         private fun requirePlan(
             plan: SecureMessagingEncryptionPlan,
             roster: AuthoritativeRoster,
-            conversation: DirectConversation? = null,
+            conversation: SecureConversation? = null,
             outboundRequired: Boolean,
         ) {
             lifecycle.assertCurrent(activation)
@@ -1899,6 +2145,8 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 conversationId = validated.conversationId,
                 occurredAt = validated.occurredAt,
                 type = validated.type,
+                memberUserId = validated.memberUserId,
+                memberRole = validated.memberRole,
             )
         }
 
@@ -2101,6 +2349,9 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             fence = fence,
             activation = lifecycle.activationCapability(fence),
             context = SecureMessagingRemoteContext(profile.id, device.id),
+            groupMessagingEnabled = capabilities.features?.get(MESSAGING_GROUPS_FEATURE) == true,
+            reactionMessagingEnabled =
+                capabilities.features?.get(MESSAGING_REACTIONS_FEATURE) == true,
         )
         issuedSessions[session] = issuanceIdentity
         return session

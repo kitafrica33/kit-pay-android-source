@@ -6,29 +6,45 @@ import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.messaging.KitChatMediaLimits
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.messaging.MessagingRichMediaCapability
+import com.kit.wallet.data.messaging.ScheduledSend
+import com.kit.wallet.data.messaging.ScheduledSendDispatcher
+import com.kit.wallet.data.messaging.ScheduledSendKind
+import com.kit.wallet.data.messaging.ScheduledSendState
+import com.kit.wallet.data.messaging.ScheduledSendStore
+import com.kit.wallet.data.realtime.KitConversationSignals
+import com.kit.wallet.data.realtime.KitTypingSignals
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
 import com.kit.wallet.data.remote.isKitConnectivityError
+import com.kit.wallet.data.remote.isKitInsufficientFundsError
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatPaymentRequest
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.WalletRepository
+import com.kit.wallet.data.repository.WalletSyncRepository
+import com.kit.wallet.data.repository.WalletSyncResult
 import com.kit.wallet.data.repository.canonicalTransferClaimReason
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.model.ChatPreview
+import com.kit.wallet.ui.model.ChatMember
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
 import com.kit.wallet.ui.model.PaymentEventKind
+import com.kit.wallet.ui.model.TopUp
+import com.kit.wallet.ui.model.TopUpRequirement
 import com.kit.wallet.ui.model.TransferClaim
 import com.kit.wallet.ui.model.TransferClaimStatus
 import dagger.hilt.android.lifecycle.HiltViewModel
+import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import kotlin.coroutines.coroutineContext
@@ -52,6 +68,18 @@ import kotlinx.coroutines.withContext
 
 /** Process-wide receive gate: navigation must not overlap bounded download/decrypt buffer sets. */
 private val secureMediaOpenMutex = Mutex()
+
+/**
+ * Marks a thread entry as belonging to the send-later queue rather than to the encrypted store.
+ *
+ * A scheduled entry has no message id — it has never been encrypted for anyone — so the queue's own
+ * id is namespaced here instead. The prefix contains a character the projection's ids cannot, so a
+ * real message can never be mistaken for a scheduled one.
+ */
+internal const val SCHEDULED_MESSAGE_ID_PREFIX = "scheduled:"
+
+/** Canonical lowercase UUID, which is the identity form [ScheduledSend] accepts. */
+private fun newScheduledSendId(): String = UUID.randomUUID().toString()
 
 internal data class ConversationSoundDecision(
     val playReceived: Boolean = false,
@@ -110,7 +138,11 @@ class ChatsViewModel @Inject constructor(
     private val chatRepo: ChatRepository,
     contactRepo: ContactRepository,
 ) : ViewModel() {
+    /** Whether a message can be sent right now. Never a reason to withhold the list. */
     val messagingAvailable = chatRepo.readiness
+
+    /** Whether what is on screen came from the local encrypted store. */
+    val historyAvailable = chatRepo.localHistoryReady
     val chats = chatRepo.chats
 
     /** Kit contacts for the global-search Contacts section, like the iOS search sheet. */
@@ -162,13 +194,19 @@ class ChatsViewModel @Inject constructor(
 }
 
 @HiltViewModel
-class ConversationViewModel @Inject constructor(
+class ConversationViewModel @Inject internal constructor(
     private val chatRepo: ChatRepository,
     private val walletRepo: WalletRepository,
+    private val walletSync: WalletSyncRepository,
     private val callRepo: CallRepository,
     private val messageSounds: MessageSoundPlayer,
+    private val realtime: KitConversationSignals,
+    private val typingSignaller: KitTypingSignals,
     savedStateHandle: SavedStateHandle,
     internal val richMediaCapability: MessagingRichMediaCapability? = null,
+    private val scheduledSends: ScheduledSendStore? = null,
+    private val scheduledDispatcher: ScheduledSendDispatcher? = null,
+    private val clock: Clock = Clock.systemUTC(),
 ) : ViewModel() {
 
     /** Current authenticated public ID; used only to bind server claims to this direct chat. */
@@ -179,10 +217,14 @@ class ConversationViewModel @Inject constructor(
         ?.trim()
         .orEmpty()
 
+    /** Exact login that owns every send-later action initiated by this conversation instance. */
+    private val scheduledOwner = scheduledSends?.currentOwnerFence()
+
     private val callTimeFormatter =
         DateTimeFormatter.ofPattern("HH:mm").withZone(ZoneId.systemDefault())
 
     val messagingAvailable = chatRepo.readiness
+    val historyAvailable = chatRepo.localHistoryReady
     val chat: StateFlow<ChatPreview?> = chatRepo.chats
         .map { chats -> chats.singleOrNull { it.id == chatId } }
         .stateIn(
@@ -191,19 +233,77 @@ class ConversationViewModel @Inject constructor(
             chatId.takeIf(String::isNotBlank)?.let(chatRepo::chat),
         )
 
+    /** Authenticated roster used to bind group-message reporting to the message's real sender. */
+    val groupMembers: StateFlow<List<ChatMember>> = if (chatId.isBlank()) {
+        MutableStateFlow<List<ChatMember>>(emptyList()).asStateFlow()
+    } else {
+        chatRepo.groupMembers(chatId)
+    }
+
     /** Raw encrypted messages for this conversation, before call-log entries are interleaved. */
     private val conversationMessages: StateFlow<List<Message>> = chatId.takeIf(String::isNotBlank)
         ?.let(chatRepo::conversation)
         ?: MutableStateFlow<List<Message>>(emptyList()).asStateFlow()
 
+    /** Whether this build can hold a message back until a time the user picks. */
+    val schedulingAvailable: Boolean =
+        scheduledSends != null && scheduledDispatcher != null && scheduledOwner != null
+
+    /** This conversation's send-later queue, soonest first. Empty when scheduling is unavailable. */
+    private val scheduledForChat: StateFlow<List<ScheduledSend>> =
+        if (chatId.isBlank() || scheduledSends == null || scheduledOwner == null) {
+            MutableStateFlow<List<ScheduledSend>>(emptyList()).asStateFlow()
+        } else {
+            scheduledSends.items
+                .map { items ->
+                    items.takeIf { scheduledSends.isCurrentOwner(scheduledOwner) }
+                        ?.filter { it.conversationId == chatId }
+                        .orEmpty()
+                }
+                .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+        }
+
     /** Messages plus this conversation's call-log entries, ordered together like a WhatsApp thread. */
     val messages: StateFlow<List<Message>> = if (chatId.isBlank()) {
         MutableStateFlow<List<Message>>(emptyList()).asStateFlow()
     } else {
-        combine(conversationMessages, callRepo.calls, chat) { msgs, calls, currentChat ->
-            mergeCallLog(msgs, calls, currentChat)
+        combine(
+            conversationMessages,
+            callRepo.calls,
+            chat,
+            scheduledForChat,
+        ) { msgs, calls, currentChat, scheduled ->
+            // Scheduled entries always sit at the foot of the thread, whatever hour they are due:
+            // they are what is still to come, and putting them in date order among things that have
+            // already happened would read as history that somehow has not happened yet.
+            mergeCallLog(msgs, calls, currentChat) + scheduled.map(::toScheduledMessage)
         }.stateIn(viewModelScope, SharingStarted.Eagerly, conversationMessages.value)
     }
+
+    /**
+     * One queued intent as the thread renders it.
+     *
+     * A scheduled payment request shows the money it will ask for, but carries no reference id —
+     * there is no server-side request yet, and there must not be one until the send actually runs.
+     */
+    private fun toScheduledMessage(item: ScheduledSend): Message = Message(
+        id = SCHEDULED_MESSAGE_ID_PREFIX + item.id,
+        text = if (item.kind == ScheduledSendKind.TEXT) item.text else "",
+        time = callTimeFormatter.format(Instant.ofEpochMilli(item.scheduledAtEpochMillis)),
+        fromMe = true,
+        state = when (item.state) {
+            ScheduledSendState.UNCONFIRMED -> DeliveryState.UNCONFIRMED
+            ScheduledSendState.WAITING, ScheduledSendState.SENDING -> DeliveryState.SCHEDULED
+        },
+        kind = when (item.kind) {
+            ScheduledSendKind.TEXT -> MessageKind.TEXT
+            ScheduledSendKind.PAYMENT_REQUEST -> MessageKind.PAYMENT_REQUEST
+        },
+        amountMinor = item.amountMinor,
+        paymentNote = item.note,
+        sortEpochMillis = item.scheduledAtEpochMillis,
+        scheduledAtEpochMillis = item.scheduledAtEpochMillis,
+    )
 
     private fun mergeCallLog(
         messages: List<Message>,
@@ -244,6 +344,10 @@ class ConversationViewModel @Inject constructor(
     private val mutableSending = MutableStateFlow(false)
     val sending = mutableSending.asStateFlow()
 
+    /** An in-chat request the authoritative wallet says cannot currently be covered. */
+    private val mutableTopUpRequired = MutableStateFlow<TopUpRequirement?>(null)
+    val topUpRequired = mutableTopUpRequired.asStateFlow()
+
     private val mutableRetryingMessageId = MutableStateFlow<String?>(null)
     val retryingMessageId = mutableRetryingMessageId.asStateFlow()
 
@@ -260,6 +364,7 @@ class ConversationViewModel @Inject constructor(
 
     private val mutableConversationVisible = MutableStateFlow(false)
     private var foregroundSyncJob: Job? = null
+    private var idleTimerJob: Job? = null
 
     /**
      * Live state of the held Kit → Kit transfers this account is a party to, keyed by claim id.
@@ -282,6 +387,12 @@ class ConversationViewModel @Inject constructor(
             viewModelScope.launch {
                 mutableRestoredDraft.value =
                     runCatching { chatRepo.composerDraft(chatId) }.getOrNull()
+            }
+            scheduledSends?.let { queue ->
+                // Idempotent: the repository already re-reads the queue on every messaging
+                // activation. This is what makes the thread show its scheduled entries even when
+                // the conversation is opened before that has happened.
+                viewModelScope.launch { runCatching { queue.load() } }
             }
             viewModelScope.launch {
                 combine(
@@ -319,46 +430,124 @@ class ConversationViewModel @Inject constructor(
         }
     }
 
-    /** Starts one cancellable, sequential sync loop only while this conversation is visible. */
+    /**
+     * Binds this conversation to the realtime transport while it is on screen, and runs the two
+     * cadences that survive the socket.
+     *
+     * Message delivery is no longer polled. While the socket is `Live` the server nudges and the
+     * sync engine pulls, so [foregroundSyncJob] sits idle on a `null` interval; when the socket is
+     * down it falls back to the coordinator's ladder. The 45-second [idleTimerJob] is separate and
+     * unconditional, because the loop this replaced was the *only* retry path for a read receipt
+     * whose POST failed without changing local state, and for held transfers that settle or expire
+     * with no push behind either.
+     */
     fun setConversationVisible(visible: Boolean) {
         mutableConversationVisible.value = visible
-        if (!visible || chatId.isBlank()) {
+        if (chatId.isBlank()) return
+        if (!visible) {
+            realtime.stopObservingConversation(chatId)
+            typingSignaller.onConversationClosed(chatId)
             foregroundSyncJob?.cancel()
             foregroundSyncJob = null
+            idleTimerJob?.cancel()
+            idleTimerJob = null
             return
         }
+        // Presence and typing for this conversation, for exactly as long as it is looked at.
+        realtime.observeConversation(chatId)
         // Refresh the call log so recent calls appear inline in the conversation.
         viewModelScope.launch { runCatching { callRepo.refresh() } }
         viewModelScope.launch { refreshTransferClaims() }
-        if (foregroundSyncJob?.isActive == true) return
-        foregroundSyncJob = viewModelScope.launch {
-            var firstIteration = true
+        dispatchScheduledDue()
+        if (foregroundSyncJob?.isActive != true) {
+            foregroundSyncJob = viewModelScope.launch { runForegroundSync() }
+        }
+        if (idleTimerJob?.isActive != true) {
+            idleTimerJob = viewModelScope.launch { runIdleRefresh() }
+        }
+    }
+
+    /**
+     * One catch-up on entry, then whatever cadence the transport says it cannot cover itself.
+     *
+     * `null` means the socket is carrying this conversation and there is nothing periodic to do;
+     * `collectLatest` cancels the waiting loop the moment that becomes true, and starts a fresh one
+     * on the new interval when it stops being true.
+     */
+    private suspend fun runForegroundSync() {
+        synchronizeOnce()
+        realtime.foregroundSyncIntervalMillis.collectLatest { intervalMillis ->
+            if (intervalMillis == null) return@collectLatest
             while (true) {
-                if (messagingAvailable.value) {
-                    try {
-                        chatRepo.synchronizeConversation(chatId)
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        // FCM and WorkManager remain recovery paths. A visible conversation makes
-                        // another bounded foreground attempt on the next cadence.
-                    }
-                }
-                // Projection changes attempt immediately through the collector above. If that
-                // POST fails without changing local state, retry it on the next foreground tick.
-                if (!firstIteration) attemptMarkConversationRead()
-                // Held transfers settle from the other side, and expire with nobody acting at
-                // all. There is no push for either, so an open conversation re-reads them on
-                // the same cadence it re-reads messages.
-                if (!firstIteration) refreshTransferClaims()
-                firstIteration = false
-                delay(FOREGROUND_SYNC_INTERVAL_MILLIS)
+                delay(intervalMillis)
+                synchronizeOnce()
             }
         }
     }
 
+    private suspend fun synchronizeOnce() {
+        if (!messagingAvailable.value) return
+        try {
+            chatRepo.synchronizeConversation(chatId)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // FCM, WorkManager and the next realtime nudge all remain recovery paths.
+        }
+    }
+
+    private suspend fun runIdleRefresh() {
+        while (true) {
+            delay(IDLE_REFRESH_INTERVAL_MILLIS)
+            // Projection changes attempt the receipt immediately through the collector in `init`.
+            // If that POST failed without changing local state, this is what tries it again.
+            attemptMarkConversationRead()
+            // Held transfers settle from the other side, and expire with nobody acting at all.
+            // There is no push for either.
+            refreshTransferClaims()
+            // A scheduled send whose minute passes while the chat is open should go out then, not
+            // whenever the system next feels like running a worker.
+            dispatchScheduledDue()
+        }
+    }
+
+    /** Every composer keystroke. The debounce, throttle and stop-on-switch all live downstream. */
+    fun onComposerChanged(text: String) {
+        if (chatId.isBlank()) return
+        typingSignaller.onComposerChanged(chatId, text)
+    }
+
     fun clearError() {
         mutableError.value = null
+    }
+
+    fun clearTopUpRequired() {
+        mutableTopUpRequired.value = null
+    }
+
+    /** Uses the authenticated request descriptor and current wallet row for the preflight offer. */
+    fun shortfallForPaymentRequest(message: Message): TopUpRequirement? =
+        shortfallForPaymentRequest(message, refreshed = null)
+
+    private fun shortfallForPaymentRequest(
+        message: Message,
+        refreshed: WalletSyncResult?,
+    ): TopUpRequirement? {
+        if (message.fromMe) return null
+        val descriptor = message.mediaDescriptor?.let(KitPaymentMessage::parse)
+            ?.takeIf { it.isRequest }
+            ?: return null
+        val currencyCode = refreshed?.selectedCurrencyCode ?: walletRepo.walletCurrency.value.code
+        val currencyScale = refreshed?.selectedCurrencyScale ?: walletRepo.walletCurrency.value.scale
+        if (!descriptor.currencyCode.equals(currencyCode, ignoreCase = true) ||
+            descriptor.currencyScale != currencyScale
+        ) return null
+        return TopUp.requirementFor(
+            requiredMinor = descriptor.amountMinor,
+            balanceMinor = refreshed?.selectedAvailableBalanceMinor ?: walletRepo.balanceMinor.value,
+            currencyCode = descriptor.currencyCode,
+            currencyScale = descriptor.currencyScale,
+        )
     }
 
     fun reportMediaSelectionError(message: String) {
@@ -388,7 +577,7 @@ class ConversationViewModel @Inject constructor(
             throw cancelled
         } catch (_: Exception) {
             // Durable unread state is the retry signal. A projection/readiness emission or the
-            // two-second visible-conversation cadence will try the receipt again.
+            // 45-second idle timer will try the receipt again.
         }
     }
 
@@ -396,8 +585,11 @@ class ConversationViewModel @Inject constructor(
         val selectedChat = chat.value ?: return
         val normalized = text.trim()
         if (!messagingAvailable.value || normalized.isBlank()) return
-        if (!KitPaymentMessage.allowsUserAuthoredText(normalized)) {
-            mutableError.value = "Messages cannot start with Kit Pay's reserved payment prefix"
+        if (
+            !KitPaymentMessage.allowsUserAuthoredText(normalized) ||
+            KitReactionMessage.beginsWithReservedPrefix(normalized)
+        ) {
+            mutableError.value = "Messages cannot start with one of Kit Pay's reserved prefixes"
             return
         }
         viewModelScope.launch {
@@ -405,6 +597,9 @@ class ConversationViewModel @Inject constructor(
             fun releaseComposer() {
                 if (composerReleased.compareAndSet(false, true)) {
                     onSent()
+                    // Durably committed, and this runs before the network POST: the peer must never
+                    // see "typing…" still attached to a message that has already reached them.
+                    typingSignaller.onMessageCommitted(selectedChat.id)
                     // The message is durably owned by the outbox; its draft copy is obsolete.
                     viewModelScope.launch { chatRepo.clearComposerDraft(selectedChat.id) }
                 }
@@ -435,6 +630,230 @@ class ConversationViewModel @Inject constructor(
                     } else {
                         error.message ?: "Secure messaging is temporarily unavailable"
                     }
+                }
+            }
+        }
+    }
+
+    /**
+     * Holds [text] back until [atEpochMillis] instead of sending it now.
+     *
+     * Nothing is encrypted here. A scheduled message is stored as an intent and becomes ciphertext
+     * once, at the moment it is actually sent, so it goes out under the roster that is current then
+     * rather than the one that happened to exist when it was written.
+     */
+    fun scheduleSend(text: String, atEpochMillis: Long, onScheduled: () -> Unit = {}) {
+        val queue = scheduledSends ?: return
+        val owner = scheduledOwner ?: return
+        val selectedChat = chat.value ?: return
+        val normalized = text.trim()
+        if (normalized.isBlank()) return
+        if (
+            !KitPaymentMessage.allowsUserAuthoredText(normalized) ||
+            KitReactionMessage.beginsWithReservedPrefix(normalized)
+        ) {
+            mutableError.value = "Messages cannot start with one of Kit Pay's reserved prefixes"
+            return
+        }
+        if (normalized.length > ScheduledSend.MAX_TEXT_LENGTH) {
+            mutableError.value = "That message is too long to schedule"
+            return
+        }
+        val now = clock.millis()
+        ScheduledSend.schedulingError(atEpochMillis, now)?.let { problem ->
+            mutableError.value = problem
+            return
+        }
+        viewModelScope.launch {
+            try {
+                queue.putForOwner(
+                    owner,
+                    ScheduledSend(
+                        id = newScheduledSendId(),
+                        conversationId = selectedChat.id,
+                        kind = ScheduledSendKind.TEXT,
+                        scheduledAtEpochMillis = atEpochMillis,
+                        createdAtEpochMillis = now,
+                        text = normalized,
+                    ),
+                )
+                onScheduled()
+                // The composer's copy has been taken over by the queue; leaving the draft behind
+                // would restore the same text on the next visit, next to the scheduled bubble.
+                runCatching { chatRepo.clearComposerDraft(selectedChat.id) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "That message could not be scheduled"
+            }
+        }
+    }
+
+    /**
+     * Queues a payment request for [atEpochMillis] without creating anything on the server yet.
+     *
+     * A request that does not exist until it is sent cannot be paid, declined or chased early, and
+     * cannot leave a stranded ask behind if the user cancels the schedule.
+     */
+    fun schedulePaymentRequest(
+        amountMinor: Long,
+        note: String?,
+        atEpochMillis: Long,
+        onScheduled: () -> Unit = {},
+    ) {
+        val queue = scheduledSends ?: return
+        val owner = scheduledOwner ?: return
+        val selectedChat = chat.value ?: return
+        if (amountMinor <= 0) {
+            mutableError.value = "Enter an amount to request"
+            return
+        }
+        if (selectedChat.peerUserId == null) {
+            mutableError.value = "This conversation is not linked to a Kit Pay account"
+            return
+        }
+        val now = clock.millis()
+        ScheduledSend.schedulingError(atEpochMillis, now)?.let { problem ->
+            mutableError.value = problem
+            return
+        }
+        viewModelScope.launch {
+            try {
+                queue.putForOwner(
+                    owner,
+                    ScheduledSend(
+                        id = newScheduledSendId(),
+                        conversationId = selectedChat.id,
+                        kind = ScheduledSendKind.PAYMENT_REQUEST,
+                        scheduledAtEpochMillis = atEpochMillis,
+                        createdAtEpochMillis = now,
+                        amountMinor = amountMinor,
+                        note = note?.trim()?.takeIf(String::isNotBlank),
+                    ),
+                )
+                onScheduled()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "That request could not be scheduled"
+            }
+        }
+    }
+
+    /** Sends a scheduled entry immediately, ahead of the time it was given. */
+    fun sendScheduledNow(message: Message) {
+        val dispatcher = scheduledDispatcher ?: return
+        val owner = scheduledOwner ?: return
+        val id = scheduledSendIdOf(message) ?: return
+        viewModelScope.launch {
+            try {
+                dispatcher.sendNowForOwner(owner, id)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (!error.isKitConnectivityError()) {
+                    mutableError.value = error.message ?: "That message could not be sent"
+                }
+            }
+        }
+    }
+
+    /** Moves a scheduled entry to a new time, keeping its identity and its place in the queue. */
+    fun rescheduleSend(message: Message, atEpochMillis: Long) {
+        val queue = scheduledSends ?: return
+        val owner = scheduledOwner ?: return
+        val id = scheduledSendIdOf(message) ?: return
+        ScheduledSend.schedulingError(atEpochMillis, clock.millis())?.let { problem ->
+            mutableError.value = problem
+            return
+        }
+        viewModelScope.launch {
+            val current = queue.itemsForOwner(owner).firstOrNull { it.id == id } ?: return@launch
+            // A live claim means a dispatch is sending this right now. Moving its time would not
+            // recall it, so the schedule is left alone rather than made to look as if it had.
+            if (current.state == ScheduledSendState.SENDING) {
+                mutableError.value = "That message is being sent right now"
+                return@launch
+            }
+            try {
+                queue.compareAndSetForOwner(
+                    owner,
+                    current,
+                    current.copy(
+                        scheduledAtEpochMillis = atEpochMillis,
+                        attempts = 0,
+                        lastAttemptAtEpochMillis = 0,
+                    ),
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "That schedule could not be changed"
+            }
+        }
+    }
+
+    /** Discards a scheduled entry. Nothing has been sent, so nothing is recalled. */
+    fun cancelScheduledSend(message: Message) {
+        val queue = scheduledSends ?: return
+        val owner = scheduledOwner ?: return
+        val id = scheduledSendIdOf(message) ?: return
+        viewModelScope.launch {
+            val current = queue.itemsForOwner(owner).firstOrNull { it.id == id } ?: return@launch
+            if (current.state == ScheduledSendState.SENDING) {
+                mutableError.value = "That message is being sent right now"
+                return@launch
+            }
+            try {
+                if (!queue.removeIfUnchangedForOwner(owner, current)) {
+                    mutableError.value = "That message changed before it could be cancelled"
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "That schedule could not be cancelled"
+            }
+        }
+    }
+
+    /**
+     * Sends anything already overdue, right now, while the app is in front of the user.
+     *
+     * The background wake is what makes scheduling work at all; this is what makes it prompt. A
+     * device that was asleep, offline or force-stopped at the chosen minute catches up the moment
+     * somebody opens the conversation rather than waiting for the system to run the worker.
+     */
+    private fun dispatchScheduledDue() {
+        val dispatcher = scheduledDispatcher ?: return
+        val owner = scheduledOwner ?: return
+        viewModelScope.launch {
+            runCatching { dispatcher.dispatchDueForOwner(owner) }
+        }
+    }
+
+    /** The queue id behind a scheduled bubble, or null when this is an ordinary message. */
+    private fun scheduledSendIdOf(message: Message): String? = message.id
+        .takeIf { it.startsWith(SCHEDULED_MESSAGE_ID_PREFIX) }
+        ?.removePrefix(SCHEDULED_MESSAGE_ID_PREFIX)
+
+    /**
+     * Adds [emoji] to a message, or takes it back off when this account already reacted with it.
+     *
+     * The repository publishes the outgoing reaction to the projection before the network round
+     * trip, so the chip appears immediately and the durable outbox owns delivery from there. A
+     * failure that is only connectivity therefore stays silent: the reaction is already queued.
+     */
+    fun toggleReaction(messageId: String, emoji: String) {
+        val selectedChat = chat.value ?: return
+        if (!messagingAvailable.value) return
+        viewModelScope.launch {
+            try {
+                chatRepo.toggleReaction(selectedChat.id, messageId, emoji)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (!error.isKitConnectivityError()) {
+                    mutableError.value = error.message ?: "That reaction could not be sent"
                 }
             }
         }
@@ -567,8 +986,28 @@ class ConversationViewModel @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                mutableError.value = error.message
-                    ?: "The payment could not be completed"
+                if (error.isKitInsufficientFundsError()) {
+                    try {
+                        // The request payment raced a balance change. Re-read the server-owned
+                        // wallet before deciding how much the common top-up flow should collect.
+                        val refreshed = walletSync.refresh()
+                        val shortfall = shortfallForPaymentRequest(message, refreshed)
+                        if (shortfall != null) {
+                            mutableTopUpRequired.value = shortfall
+                        } else {
+                            mutableError.value = error.message
+                                ?: "The payment could not be completed"
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (refreshFailure: Exception) {
+                        mutableError.value = refreshFailure.message
+                            ?: "Your wallet balance could not be refreshed"
+                    }
+                } else {
+                    mutableError.value = error.message
+                        ?: "The payment could not be completed"
+                }
             } finally {
                 mutableSending.value = false
             }
@@ -1036,7 +1475,10 @@ class ConversationViewModel @Inject constructor(
     }
 
     private companion object {
-        const val FOREGROUND_SYNC_INTERVAL_MILLIS = 2_000L
+        // Read receipts and held-transfer state, neither of which has a push behind it. Deliberately
+        // not a message-sync cadence: messages arrive by nudge, or by the coordinator's fallback
+        // ladder when the socket cannot carry them.
+        const val IDLE_REFRESH_INTERVAL_MILLIS = 45_000L
         const val MAX_MEDIA_CACHE_ENTRIES = 4
         const val MAX_MEDIA_CACHE_BYTES = 24 * 1024 * 1024
     }

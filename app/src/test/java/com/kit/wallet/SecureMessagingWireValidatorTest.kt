@@ -4,6 +4,7 @@ import com.kit.wallet.data.remote.ConsumedMessagingKeyBundleDto
 import com.kit.wallet.data.remote.ConsumedMessagingKeyBundlesDto
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
+import com.kit.wallet.data.remote.ENCRYPTED_REACTION_MESSAGE_KIND
 import com.kit.wallet.data.remote.EncryptedAttachmentDto
 import com.kit.wallet.data.remote.EncryptedAttachmentRequest
 import com.kit.wallet.data.remote.EncryptedMessageDto
@@ -294,6 +295,45 @@ class SecureMessagingWireValidatorTest {
     }
 
     @Test
+    fun `message timestamps accept legacy seconds and canonical six digit precision only`() {
+        val precise = "2026-07-19T12:02:00.123456Z"
+        val validated = SecureMessagingWireValidator.validateIncomingEncryptedMessage(
+            incomingMessage().copy(sentAt = precise),
+            CONVERSATION_ID,
+            CURRENT_DEVICE_ID,
+        )
+        assertEquals(Instant.parse(precise), validated.sentAt)
+
+        val eventTime = "2026-07-19T12:02:00.234567Z"
+        val event = incomingEvent().let { original ->
+            original.copy(
+                data = original.data?.copy(sentAt = precise),
+                occurredAt = eventTime,
+            )
+        }
+        val eventMessage = SecureMessagingWireValidator.validateIncomingEncryptedMessageEvent(
+            event,
+            CONVERSATION_ID,
+            CURRENT_DEVICE_ID,
+        )
+        assertEquals(Instant.parse(precise), eventMessage.sentAt)
+
+        listOf(
+            "2026-07-19T12:02:00.1Z",
+            "2026-07-19T12:02:00.123Z",
+            "2026-07-19T12:02:00.1234567Z",
+        ).forEach { malformed ->
+            assertRejected {
+                SecureMessagingWireValidator.validateIncomingEncryptedMessage(
+                    incomingMessage().copy(sentAt = malformed),
+                    CONVERSATION_ID,
+                    CURRENT_DEVICE_ID,
+                )
+            }
+        }
+    }
+
+    @Test
     fun `incoming attachment metadata is validated and preserved for plaintext binding`() {
         val attachment = EncryptedAttachmentDto(
             id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -330,6 +370,29 @@ class SecureMessagingWireValidatorTest {
                 message.copy(
                     attachments = listOf(attachment.copy(storageKey = "not-a-storage-key")),
                 ),
+                CONVERSATION_ID,
+                CURRENT_DEVICE_ID,
+            )
+        }
+    }
+
+    @Test
+    fun `incoming encrypted reaction requires and preserves its target`() {
+        val reaction = incomingMessage().copy(
+            kind = ENCRYPTED_REACTION_MESSAGE_KIND,
+            replyToMessageId = THIRD_MESSAGE_ID,
+        )
+
+        val validated = SecureMessagingWireValidator.validateIncomingEncryptedMessage(
+            reaction,
+            CONVERSATION_ID,
+            CURRENT_DEVICE_ID,
+        )
+        assertEquals(ENCRYPTED_REACTION_MESSAGE_KIND, validated.kind)
+        assertEquals(THIRD_MESSAGE_ID, validated.replyToMessageId)
+        assertRejected {
+            SecureMessagingWireValidator.validateIncomingEncryptedMessage(
+                reaction.copy(replyToMessageId = null),
                 CONVERSATION_ID,
                 CURRENT_DEVICE_ID,
             )

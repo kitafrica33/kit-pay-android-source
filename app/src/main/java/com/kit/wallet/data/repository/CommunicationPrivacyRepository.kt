@@ -14,6 +14,8 @@ data class CommunicationPreferences(
     val phoneDiscoverable: Boolean,
     val directMessageRequestsEnabled: Boolean,
     val incomingCallsEnabled: Boolean,
+    /** Whether peers may see this account as online, and as typing, inside a conversation. */
+    val messagingPresenceVisible: Boolean,
     val updatedAt: String?,
 ) {
     companion object {
@@ -22,6 +24,9 @@ data class CommunicationPreferences(
             phoneDiscoverable = false,
             directMessageRequestsEnabled = false,
             incomingCallsEnabled = false,
+            // The pre-load placeholder, not a server value: show the private state until the
+            // server has actually told us otherwise.
+            messagingPresenceVisible = false,
             updatedAt = null,
         )
     }
@@ -31,12 +36,14 @@ data class CommunicationPreferenceChanges(
     val phoneDiscoverable: Boolean? = null,
     val directMessageRequestsEnabled: Boolean? = null,
     val incomingCallsEnabled: Boolean? = null,
+    val messagingPresenceVisible: Boolean? = null,
 ) {
     init {
         require(
             phoneDiscoverable != null ||
                 directMessageRequestsEnabled != null ||
-                incomingCallsEnabled != null,
+                incomingCallsEnabled != null ||
+                messagingPresenceVisible != null,
         ) { "At least one communication preference must change" }
     }
 }
@@ -81,6 +88,7 @@ class RemoteCommunicationPrivacyRepository @Inject constructor(
                     phoneDiscoverable = changes.phoneDiscoverable,
                     directMessageRequestsEnabled = changes.directMessageRequestsEnabled,
                     incomingCallsEnabled = changes.incomingCallsEnabled,
+                    messagingPresenceVisible = changes.messagingPresenceVisible,
                 ),
             )
         }.toDomain()
@@ -137,6 +145,10 @@ class RemoteCommunicationPrivacyRepository @Inject constructor(
             phoneDiscoverable = phoneDiscoverable == true,
             directMessageRequestsEnabled = directMessageRequestsEnabled == true,
             incomingCallsEnabled = incomingCallsEnabled == true,
+            // `!= false`, not `== true`: this flag's server default is `true`, and a server that
+            // omits it has no presence to share in the first place. Reading a missing value as
+            // "hidden" would show a privacy guarantee nothing is enforcing.
+            messagingPresenceVisible = messagingPresenceVisible != false,
             updatedAt = updatedAt,
         )
     }

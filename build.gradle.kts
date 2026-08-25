@@ -93,8 +93,8 @@ fun parseReviewedGoogleRuntimeArtifacts(value: Any?, source: String): List<Revie
         }
         ReviewedGoogleRuntimeArtifact(coordinate, aarSha256, pomSha256)
     }
-    check(artifacts.size == 6 && artifacts.map { it.coordinate }.toSet().size == 6) {
-        "$source must identify exactly six unique reviewed Google/Firebase artifacts."
+    check(artifacts.size == 8 && artifacts.map { it.coordinate }.toSet().size == 8) {
+        "$source must identify exactly eight unique reviewed Google/Firebase artifacts."
     }
     return artifacts
 }
@@ -432,7 +432,7 @@ val verifyReviewedGoogleRuntimeArtifacts = tasks.register("verifyReviewedGoogleR
         val recordedDirectCoordinates = recordedRuntimeRelationships
             .filterValues { it == "direct" }
             .keys
-        check(recordedRuntimeCoordinates.size == 209 &&
+        check(recordedRuntimeCoordinates.size == 211 &&
             selectedRuntimeCoordinates == recordedRuntimeCoordinates
         ) {
             "releaseRuntimeClasspath differs from the complete reviewed runtime inventory. " +
@@ -469,7 +469,7 @@ val verifyReviewedGoogleRuntimeArtifacts = tasks.register("verifyReviewedGoogleR
             }
             .toSet()
         check(selectedReviewedCoordinates == expectedCoordinates) {
-            "releaseRuntimeClasspath differs from the six reviewed Google/Firebase coordinates. " +
+            "releaseRuntimeClasspath differs from the eight reviewed Google/Firebase coordinates. " +
                 "Expected: ${expectedCoordinates.sorted()}; selected: " +
                 "${selectedReviewedCoordinates.sorted()}."
         }
@@ -700,9 +700,7 @@ val verifySecureMessagingDependencyGate = tasks.register("verifySecureMessagingD
  */
 val prohibitedFirebasePhoneModules = setOf(
     "androidx.credentials:credentials-play-services-auth",
-    "com.google.android.gms:play-services-auth",
     "com.google.android.gms:play-services-auth-api-phone",
-    "com.google.android.gms:play-services-auth-base",
     "com.google.android.gms:play-services-fido",
     "com.google.android.libraries.identity.googleid:googleid",
     "com.google.android.play:core-common",
@@ -711,6 +709,45 @@ val prohibitedFirebasePhoneModules = setOf(
     "com.google.firebase:firebase-appcheck-interop",
     "com.google.firebase:firebase-auth",
     "com.google.firebase:firebase-auth-interop",
+)
+
+/*
+ * `play-services-auth` used to sit in the list above, and the reasoning that put it there still
+ * holds for most of what the artifact contains — Google Sign-In and One Tap are exactly the second
+ * phone-identity authority the policy exists to keep out.
+ *
+ * It is admitted now for one capability that lives in the same artifact and nowhere else: the
+ * Authorization API, which is the only supported way an Android app can be granted a Google Drive
+ * scope. Google withdrew custom-URI-scheme redirects for Android OAuth clients, so the browser flow
+ * Kit Pay would otherwise have used is answered with `invalid_request` at the authorization
+ * endpoint.
+ *
+ * Admitting the coordinate on its own would trade a build-time tripwire for nothing, so the ban is
+ * narrowed rather than lifted:
+ *
+ *  - only these exact versions resolve, and only these two modules; the SMS-retriever module
+ *    (`play-services-auth-api-phone`) and `play-services-fido` stay prohibited above and are
+ *    excluded at the declaration site;
+ *  - `verifyLocalSmsAuthPolicy` allows only the three Authorization API imports in app sources, so
+ *    the sign-in half of the artifact cannot be reached even though it is now on the classpath.
+ *
+ * The guarantee the policy actually makes — that Kit's server OTP is the only phone-identity
+ * authority in the app — is therefore enforced against source, which is stronger than enforcing it
+ * against a coordinate.
+ */
+val driveAuthorizationModules = mapOf(
+    "com.google.android.gms:play-services-auth" to "20.7.0",
+    "com.google.android.gms:play-services-auth-base" to "18.0.4",
+)
+
+/**
+ * The whole of `com.google.android.gms.auth` that Kit Pay may import. Everything else in that
+ * package tree is an identity authority.
+ */
+val approvedGoogleAuthImports = setOf(
+    "com.google.android.gms.auth.api.identity.AuthorizationRequest",
+    "com.google.android.gms.auth.api.identity.AuthorizationResult",
+    "com.google.android.gms.auth.api.identity.Identity",
 )
 val localSmsPolicyFiles = files(
     "app/build.gradle.kts",
@@ -721,14 +758,47 @@ val localSmsPolicyFiles = files(
     "app/src/main/java/com/kit/wallet/data/remote/KitWalletApi.kt",
     "app/src/main/java/com/kit/wallet/feature/auth/AuthViewModel.kt",
 )
+/** Every app source, because an identity API may be imported from anywhere, not just the auth layer. */
+val appSourceFiles = fileTree("app/src") {
+    include("**/*.kt", "**/*.java")
+}
 val verifyLocalSmsAuthPolicy = tasks.register("verifyLocalSmsAuthPolicy") {
     group = "verification"
     description = "Enforces local server-OTP phone auth and excludes dormant Firebase Auth."
     inputs.files(localSmsPolicyFiles)
         .withPropertyName("localSmsPolicyFiles")
         .withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(appSourceFiles)
+        .withPropertyName("appSourceFiles")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    val approvedImports = approvedGoogleAuthImports
 
     doLast {
+        // play-services-auth is on the classpath for the Drive Authorization API and for nothing
+        // else. Google Sign-In, One Tap and the credential-saving APIs all live in the same
+        // artifact, so the boundary that keeps Kit's server OTP the only phone-identity authority
+        // is drawn here, at the import, rather than at the coordinate.
+        appSourceFiles.files.forEach { source ->
+            source.useLines { lines ->
+                lines.forEach { line ->
+                    val imported = line.trim()
+                        .removePrefix("import ")
+                        .takeIf { line.trimStart().startsWith("import ") }
+                        ?.removeSuffix(";")
+                        ?.trim()
+                        ?: return@forEach
+                    if (imported.startsWith("com.google.android.gms.auth.") &&
+                        imported !in approvedImports
+                    ) {
+                        throw GradleException(
+                            "${source.invariantSeparatorsPath} imports $imported. The " +
+                                "server-OTP phone-auth policy allows only the Drive " +
+                                "Authorization API: ${approvedImports.sorted().joinToString()}.",
+                        )
+                    }
+                }
+            }
+        }
         check(!file("app/src/main/java/com/kit/wallet/data/auth/FirebasePhoneAuthClient.kt").exists()) {
             "FirebasePhoneAuthClient must remain absent; production phone sign-in uses server OTP."
         }
@@ -758,6 +828,84 @@ val verifyLocalSmsAuthPolicy = tasks.register("verifyLocalSmsAuthPolicy") {
             api.contains("api/kit-wallet/v1/auth/otp/verify")
         ) {
             "The local SMS request/verify API contract is missing."
+        }
+    }
+}
+
+/*
+ * Google grants the Drive scope to a signing certificate, not to a secret in the binary, so nothing
+ * about Drive backup can be configured at build time and nothing about it can be caught by a
+ * compiler. Two things can still silently break it between here and a user's phone:
+ *
+ *  - the app asking for a scope Google was never told to expect, which is refused at consent; and
+ *  - a release signed by a certificate that has no Android OAuth client, which fails on the device
+ *    with an error the user cannot act on and which no emulator build would reveal.
+ *
+ * The first is enforced here against source. The second is enforced at signing time, in
+ * fastlane/scripts/sign-play-artifacts.sh, because Play App Signing means Gradle never sees a
+ * certificate at all. Both read the same record, so the app and the registration cannot drift.
+ */
+val driveAuthorizationRecord = file("gradle/drive-authorization.json")
+val driveAuthorizationSource =
+    file("app/src/main/java/com/kit/wallet/data/backup/DriveAuthorization.kt")
+val verifyDriveAuthorizationPolicy = tasks.register("verifyDriveAuthorizationPolicy") {
+    group = "verification"
+    description = "Binds the requested Google Drive scope to the registered authorization record."
+    inputs.file(driveAuthorizationRecord)
+        .withPropertyName("driveAuthorizationRecord")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.files(appSourceFiles)
+        .withPropertyName("appSourceFiles")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    val record = driveAuthorizationRecord
+    val authorizationSource = driveAuthorizationSource
+    val sources = appSourceFiles
+
+    doLast {
+        @Suppress("UNCHECKED_CAST")
+        val document = groovy.json.JsonSlurper().parse(record) as Map<String, Any?>
+        check(document["schema_version"] == 1 && document["application_id"] == "com.kit.wallet") {
+            "${record.name} must identify schema 1 for com.kit.wallet."
+        }
+        val approvedScopes = (document["approved_scopes"] as List<*>).map { it as String }.toSet()
+        check(approvedScopes == setOf("https://www.googleapis.com/auth/drive.appdata")) {
+            "Kit Pay is cleared for the Drive app-folder scope alone. Widening it is a material " +
+                "change to the reviewed architecture, not a configuration edit."
+        }
+        val certificates = (document["registered_certificates"] as List<*>)
+            .map {
+                @Suppress("UNCHECKED_CAST")
+                it as Map<String, Any?>
+            }
+        check(certificates.size >= 2 && certificates.all { entry ->
+            (entry["sha1"] as? String)?.matches(Regex("([0-9A-F]{2}:){19}[0-9A-F]{2}")) == true
+        }) {
+            "${record.name} must record an uppercase colon-separated SHA-1 for the Play " +
+                "app-signing and upload certificates; those are the fingerprints Google matches " +
+                "an authorization request against."
+        }
+
+        // Every Google scope the app can ask for is a string literal, so the whole surface is
+        // greppable. Anything beyond the cleared one — an identity, profile or wider Drive scope —
+        // fails here rather than at a consent screen on a user's phone.
+        val scopeLiteral = Regex("\"(https://www[.]googleapis[.]com/auth/[^\"]+)\"")
+        sources.files.forEach { source ->
+            scopeLiteral.findAll(source.readText()).forEach { match ->
+                val scope = match.groupValues[1]
+                check(scope in approvedScopes) {
+                    "${source.invariantSeparatorsPath} requests $scope. Only " +
+                        "${approvedScopes.joinToString()} is registered and cleared."
+                }
+            }
+        }
+        val authorization = authorizationSource.readText()
+        check(approvedScopes.all { authorization.contains("\"$it\"") }) {
+            "${authorizationSource.name} must request the registered Drive scope; a build that " +
+                "asks for nothing cannot back up."
+        }
+        check(authorization.contains("getAuthorizationClient")) {
+            "Drive access must go through the Play Services Authorization API. Google no longer " +
+                "grants Android OAuth clients through a browser redirect."
         }
     }
 }
@@ -794,6 +942,15 @@ subprojects {
                     "$requestedCoordinate is prohibited by the local server-OTP phone-auth policy.",
                 )
             }
+            driveAuthorizationModules[requestedCoordinate]?.let { approvedVersion ->
+                if (requested.version != approvedVersion) {
+                    throw GradleException(
+                        "$requestedCoordinate:${requested.version} is not approved. The " +
+                            "server-OTP phone-auth policy admits this module only at " +
+                            "$approvedVersion, for the Drive Authorization API.",
+                    )
+                }
+            }
             if (isSignalFamilyModule(requested.group, requested.name)) {
                 val coordinate = "${requested.group}:${requested.name}"
                 val approvedVersion = approvedSignalModules[coordinate]
@@ -829,6 +986,7 @@ subprojects {
         dependsOn(
             verifySecureMessagingDependencyGate,
             verifyLocalSmsAuthPolicy,
+            verifyDriveAuthorizationPolicy,
             verifyVendoredLiveKit,
         )
     }

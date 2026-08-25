@@ -108,6 +108,23 @@ class SecureMessagingCryptoWireMapperTest {
         assertTrue(request.envelopes.all { it.envelopeType == "signal-prekey-v2" })
         assertTrue(request.envelopes.all { it.ciphertext == "AQID" })
 
+        val reactionFanout = SecureMessagingPreparedFanout(
+            conversationId = SECURE_CONVERSATION_ID,
+            clientMessageId = MESSAGE_ID,
+            rosterRevision = roster.rosterRevision,
+            recipients = recipients,
+            envelopes = fanout.envelopes,
+            replyToMessageId = REPLY_MESSAGE_ID,
+        )
+        val reactionRequest = SecureMessagingCryptoWireMapper.requireEncryptedSend(
+            SecureMessagingCryptoWireMapper.encryption(
+                commitEncryptedFanoutForTest(reactionFanout, plan, activation),
+                messageKind = com.kit.wallet.data.remote.ENCRYPTED_REACTION_MESSAGE_KIND,
+            ),
+        ).request()
+        assertEquals("encrypted_reaction", reactionRequest.kind)
+        assertEquals(REPLY_MESSAGE_ID, reactionRequest.replyToMessageId)
+
         @Suppress("UNCHECKED_CAST")
         (request.envelopes as MutableList<EncryptedDeviceEnvelopeRequest>).clear()
         assertEquals(3, issued.request().envelopes.size)

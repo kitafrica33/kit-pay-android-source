@@ -35,10 +35,27 @@ object Money {
         val absolute = BigInteger.valueOf(amountMinor).abs()
         val units = absolute.divide(BigInteger.valueOf(100))
         val cents = absolute.mod(BigInteger.valueOf(100)).toInt()
-        val grouped = units.toString().reversed().chunked(3).joinToString(",").reversed()
-        val body = if (cents == 0) grouped else "$grouped.%02d".format(cents)
+        val grouped = groupUnits(units.toString())
+        val fraction = when {
+            cents == 0 -> ""
+            cents % 10 == 0 -> (cents / 10).toString()
+            cents < 10 -> "0$cents"
+            else -> cents.toString()
+        }
+        val body = if (fraction.isEmpty()) grouped else "$grouped.$fraction"
         return if (withSymbol) "$sign$SYMBOL $body" else "$sign$body"
     }
+
+    /**
+     * Thousands separators for a run of whole units, and the single place the app decides what
+     * grouping looks like.
+     *
+     * Every amount the user reads — a balance, a receipt, a chat payment, a half-typed keypad
+     * entry — comes through here, so none of them can drift apart into a differently punctuated
+     * house style.
+     */
+    fun groupUnits(units: String): String =
+        units.reversed().chunked(3).joinToString(",").reversed()
 
     /**
      * Groups a half-typed amount for display without changing what was typed: only the digits
@@ -51,7 +68,7 @@ object Money {
         val units = if (point < 0) text else text.substring(0, point)
         val rest = if (point < 0) "" else text.substring(point)
         if (!units.all(Char::isDigit)) return text
-        return units.reversed().chunked(3).joinToString(",").reversed() + rest
+        return groupUnits(units) + rest
     }
 
     fun format(
@@ -72,7 +89,7 @@ object Money {
         // card and the wallet balance never disagree about how UGX 120,000 is written.
         val units = amount.substringBefore('.')
         val fraction = amount.substringAfter('.', "")
-        val grouped = units.reversed().chunked(3).joinToString(",").reversed()
+        val grouped = groupUnits(units)
         val body = if (fraction.isEmpty()) grouped else "$grouped.$fraction"
         return "$sign${currencyCode.uppercase()} $body"
     }

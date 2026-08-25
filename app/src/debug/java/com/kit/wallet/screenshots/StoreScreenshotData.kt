@@ -22,6 +22,12 @@ import com.kit.wallet.ui.model.UserProfile
  * Fictional conversation and wallet data used only to render the Play Store listing screenshots.
  * It lives in the debug source set, so it is never compiled into a distributable build. Every
  * name, number and amount here is invented; no real account or person is depicted.
+ *
+ * Every value here must be something the shipped build can actually produce. Message reactions,
+ * presence dots, typing indicators and group conversations are all deliberately absent: the v2
+ * wire validator rejects reactions outright, and the repository never populates `online`,
+ * `typing` or `isGroup`. A screenshot showing any of them would advertise a feature that does
+ * not exist.
  */
 internal object StoreScreenshotData {
 
@@ -29,6 +35,11 @@ internal object StoreScreenshotData {
     const val PEER_GRACE = "acct-grace"
     const val PEER_BRIAN = "acct-brian"
     const val PEER_DENG = "acct-deng"
+    private const val PEER_SARAH = "acct-sarah"
+    private const val PEER_FATUMA = "acct-fatuma"
+    private const val PEER_LYDIA = "acct-lydia"
+    private const val PEER_PETER = "acct-peter"
+    private const val PEER_HALIMA = "acct-halima"
 
     private const val HELD_CLAIM_ID = "6f1c9d20-3a44-4c6b-9f52-2c7e18b0aa31"
     private const val REVERSED_CLAIM_ID = "b23a7e58-9c11-4d0a-8fe6-51d4a6c73b90"
@@ -62,22 +73,33 @@ internal object StoreScreenshotData {
         Transaction("t10", "Centenary Bank ..18", "Deposit", 200_000_000, "8:15 AM", "Mon, 18 Aug", TxType.BANK_IN, TxStatus.COMPLETED, "KIT-0C28K5"),
     )
 
+    /**
+     * Chat list rows. Only fields the production projection can actually produce are set:
+     * `EncryptedChatRepository` never sets `online`, `typing` or `isGroup` — there is no presence
+     * source and no group conversation — while `unread`, `pinned`, `muted`, `lastFromMe` and
+     * `lastState` are all real. `lastMessage` holds exactly what the projection stores: raw text,
+     * a `KitChatMediaKind.previewLabel` ("Photo", "Voice note", "Video", "Document") or a payment
+     * preview label. The "Read · " / "Delivered · " prefix is drawn by `ChatsScreen`, so it must
+     * not be baked in here.
+     */
     val chats = listOf(
-        ChatPreview("ch1", "Grace Nakato", "Sent you UGX 25,000", "2:14 PM", peerUserId = PEER_GRACE, unread = 2, online = true, pinned = true),
-        ChatPreview("ch2", "Apartment 4B", "Deng: I've sent my share", "1:48 PM", unread = 5, isGroup = true, pinned = true),
-        ChatPreview("ch3", "Brian Okello", "Received, webale!", "12:30 PM", peerUserId = PEER_BRIAN, lastFromMe = true, lastState = DeliveryState.READ, online = true),
-        ChatPreview("ch4", "Fatuma Ali", "Voice note - 0:42", "11:05 AM", unread = 1),
-        ChatPreview("ch5", "Weekend Hikers", "Lydia: Sipi or Mabira?", "Yesterday", isGroup = true, muted = true),
-        ChatPreview("ch6", "Peter Ssemwanga", "You: Photo", "Yesterday", lastFromMe = true, lastState = DeliveryState.DELIVERED),
-        ChatPreview("ch7", "Halima Noor", "Kale, see you at 6", "Sunday"),
-        ChatPreview("ch8", "Deng Majok", "You: Requested UGX 250,000", "Sunday", peerUserId = PEER_DENG, lastFromMe = true, lastState = DeliveryState.DELIVERED),
+        ChatPreview("ch1", "Grace Nakato", "💸 Payment", "2:14 PM", peerUserId = PEER_GRACE, unread = 2, pinned = true),
+        ChatPreview("ch2", "Sarah Nabirye", "I've sent my share for the water bill", "1:48 PM", peerUserId = PEER_SARAH, unread = 5, pinned = true),
+        ChatPreview("ch3", "Brian Okello", "Perfect", "12:30 PM", peerUserId = PEER_BRIAN, lastFromMe = true, lastState = DeliveryState.READ),
+        ChatPreview("ch4", "Fatuma Ali", "Voice note", "11:05 AM", peerUserId = PEER_FATUMA, unread = 1),
+        ChatPreview("ch5", "Lydia Achieng", "Sipi or Mabira this weekend?", "Yesterday", peerUserId = PEER_LYDIA, muted = true),
+        ChatPreview("ch6", "Peter Ssemwanga", "Photo", "Yesterday", peerUserId = PEER_PETER, lastFromMe = true, lastState = DeliveryState.DELIVERED),
+        ChatPreview("ch7", "Halima Noor", "Kale, see you at 6", "Sunday", peerUserId = PEER_HALIMA),
+        ChatPreview("ch8", "Deng Majok", "💰 Payment request", "Sunday", peerUserId = PEER_DENG, lastFromMe = true, lastState = DeliveryState.DELIVERED),
     )
 
     val calls = listOf(
         CallEntry("cl1", "Grace Nakato", "Today, 1:20 PM", CallDirection.OUTGOING, video = true),
         CallEntry("cl2", "Brian Okello", "Today, 11:47 AM", CallDirection.INCOMING),
         CallEntry("cl3", "Deng Majok", "Today, 9:15 AM", CallDirection.MISSED),
-        CallEntry("cl4", "Apartment 4B", "Yesterday, 8:02 PM", CallDirection.OUTGOING, video = true),
+        // A multi-party call: `resolveCallPresentation` joins the resolved contact names with
+        // commas. There is no group-call name, because there are no group conversations.
+        CallEntry("cl4", "Grace Nakato, Deng Majok", "Yesterday, 8:02 PM", CallDirection.OUTGOING, video = true),
         CallEntry("cl5", "Fatuma Ali", "Yesterday, 4:31 PM", CallDirection.INCOMING),
         CallEntry("cl6", "Halima Noor", "Sunday, 7:44 PM", CallDirection.MISSED, video = true),
         CallEntry("cl7", "Peter Ssemwanga", "Sunday, 10:12 AM", CallDirection.OUTGOING),
@@ -115,7 +137,7 @@ internal object StoreScreenshotData {
     val incomingTransferConversation = listOf(
         Message("m1", "Reached home yet?", "1:58 PM", fromMe = false),
         Message("m2", "Yes, just got in. Traffic was mad on Jinja Road", "2:00 PM", fromMe = true, state = DeliveryState.READ),
-        Message("m3", "Lunch came to 50k, so your half is 25k", "2:02 PM", fromMe = false, reactions = listOf("👍")),
+        Message("m3", "Lunch came to 50k, so your half is 25k", "2:02 PM", fromMe = false),
         Message("m4", "Sending it over now", "2:03 PM", fromMe = false),
         Message(
             id = "m5",
@@ -213,7 +235,7 @@ internal object StoreScreenshotData {
             paymentCurrencyCode = "UGX",
             paymentCurrencyScale = 2,
         ),
-        Message("p4", "Landed, thank you", "4:34 PM", fromMe = false, reactions = listOf("🙏")),
+        Message("p4", "Landed, thank you", "4:34 PM", fromMe = false),
         Message("p5", "I'll book him for 7am then", "4:35 PM", fromMe = false),
         Message("p6", "Perfect", "4:36 PM", fromMe = true, state = DeliveryState.DELIVERED),
     )
@@ -259,7 +281,40 @@ internal object StoreScreenshotData {
             paymentCurrencyCode = "UGX",
             paymentCurrencyScale = 2,
         ),
-        Message("q5", "Got it, thank you", "10:07 AM", fromMe = false, reactions = listOf("🎉")),
+        Message("q5", "Got it, thank you 🎉", "10:07 AM", fromMe = false),
         Message("q6", "Voice note", "10:12 AM", fromMe = false, kind = MessageKind.VOICE_NOTE, durationSec = 42),
     )
+
+    val mediaChat = chats[5]
+
+    /**
+     * Screenshot: photos, a voice note and a document in one thread. Three consecutive photos
+     * from the same sender group into the featured-plus-pair grid, which is what the app draws.
+     */
+    val mediaConversation = listOf(
+        Message("n3", "", "3:16 PM", fromMe = true, state = DeliveryState.READ, kind = MessageKind.IMAGE, mediaType = "image/jpeg"),
+        Message("n4", "", "3:16 PM", fromMe = true, state = DeliveryState.READ, kind = MessageKind.IMAGE, mediaType = "image/jpeg"),
+        Message("n5", "", "3:16 PM", fromMe = true, state = DeliveryState.READ, kind = MessageKind.IMAGE, mediaType = "image/jpeg"),
+        Message("n6", "That ridge view is unreal", "3:18 PM", fromMe = false),
+        Message("n7", "Voice note", "3:19 PM", fromMe = false, kind = MessageKind.VOICE_NOTE, durationSec = 23),
+        Message(
+            id = "n8",
+            text = "Site visit notes.pdf",
+            time = "3:21 PM",
+            fromMe = true,
+            state = DeliveryState.DELIVERED,
+            kind = MessageKind.DOCUMENT,
+            mediaType = "application/pdf",
+            mediaPlaintextBytes = 1_248_000,
+        ),
+    )
+
+    /** Decrypted payloads for [mediaConversation], keyed the way the conversation keys them. */
+    val mediaBytes: Map<String, ByteArray> by lazy {
+        mapOf(
+            "n3" to StoreScreenshotImages.lakeSunset,
+            "n4" to StoreScreenshotImages.greenHills,
+            "n5" to StoreScreenshotImages.cityDusk,
+        )
+    }
 }

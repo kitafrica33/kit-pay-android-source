@@ -60,8 +60,13 @@ class RemoteKycRepository @Inject constructor(
     }
 
     private fun KycStatusDto.toUiModel() = KycStatus(
-        status = status.lowercase(),
+        // Trimmed as well as lowered: a status is compared against a fixed vocabulary, and a
+        // stray space is not a reason to tell someone their identity is unverified.
+        status = status.trim().lowercase(),
+        accountStatus = accountStatus?.trim()?.lowercase()?.takeIf(String::isNotEmpty),
+        deviceCheckRequired = deviceVerification?.required == true,
         caseReference = case?.reference,
+        caseStatus = case?.status?.trim()?.lowercase()?.takeIf(String::isNotEmpty),
         decisionCode = case?.decisionCode,
         provider = providerSession?.provider,
         providerStatus = providerSession?.status,

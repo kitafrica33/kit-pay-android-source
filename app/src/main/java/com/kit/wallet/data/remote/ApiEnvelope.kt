@@ -1,5 +1,6 @@
 package com.kit.wallet.data.remote
 
+import com.kit.wallet.data.session.SessionInvalidatedException
 import com.squareup.moshi.Json
 import com.squareup.moshi.JsonClass
 import com.squareup.moshi.Moshi
@@ -89,6 +90,29 @@ fun Throwable?.isKitConnectivityError(): Boolean {
     return false
 }
 
+/** The server's code for a payment the wallet cannot afford. */
+const val KIT_INSUFFICIENT_FUNDS_CODE = "INSUFFICIENT_FUNDS"
+
+/**
+ * Whether a failure is the server refusing a payment for want of funds.
+ *
+ * Matched on the code rather than the HTTP status, because 409 also carries currency mismatches
+ * and restricted wallets, and offering to top up in answer to either of those would be nonsense.
+ * Walks the cause chain for the same reason [isKitConnectivityError] does: a repository may wrap
+ * the boundary failure before a screen ever sees it.
+ */
+fun Throwable?.isKitInsufficientFundsError(): Boolean {
+    var current = this
+    while (current != null) {
+        if (
+            current is KitWalletApiException &&
+            current.code == KIT_INSUFFICIENT_FUNDS_CODE
+        ) return true
+        current = current.cause
+    }
+    return false
+}
+
 @JsonClass(generateAdapter = false)
 internal data class ApiFailureEnvelope(
     val ok: Boolean? = null,
@@ -131,6 +155,7 @@ class ApiCallExecutor @Inject constructor(
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (transport: IOException) {
+        if (transport is SessionFenceMismatchIOException) throw SessionInvalidatedException()
         // The request never reached the server (offline, DNS, TLS, timeout). Replace the raw cause
         // — which typically embeds the host name or IP address — with one clean, address-free
         // message so no screen can ever display connection internals to the user.

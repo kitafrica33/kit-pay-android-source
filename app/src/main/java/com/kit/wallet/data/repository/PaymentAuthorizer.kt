@@ -34,15 +34,28 @@ class PaymentAuthorizer @Inject constructor(
         }
         val methods = challenge.methods.orEmpty()
         val session = sessions?.current()
-        if (paymentPin.isEmpty() && "biometric_signature" in methods && session?.accountId != null &&
-            biometricApprovals?.availableFor(session.accountId) == true
-        ) {
-            val signature = biometricApprovals.sign(
-                session.accountId,
+        if (paymentPin.isEmpty()) {
+            check("biometric_signature" in methods) {
+                "Biometric approval is not available for this payment. Use your wallet PIN."
+            }
+            val activeSession = checkNotNull(session) {
+                "Biometric approval is no longer available. Use your wallet PIN."
+            }
+            val accountId = checkNotNull(activeSession.accountId) {
+                "Biometric approval is no longer available. Use your wallet PIN."
+            }
+            val approver = checkNotNull(biometricApprovals) {
+                "Biometric approval is no longer available. Use your wallet PIN."
+            }
+            check(approver.availableFor(accountId)) {
+                "Biometric approval is no longer available. Use your wallet PIN."
+            }
+            val signature = approver.sign(
+                accountId,
                 challenge.signingPayload,
                 biometricReason,
             )
-            check(sessions.current()?.fence() == session.fence()) {
+            check(sessions?.current()?.fence() == activeSession.fence()) {
                 "The signed-in account changed during approval"
             }
             return apiCalls.execute {

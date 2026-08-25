@@ -1,16 +1,20 @@
 package com.kit.wallet.data.remote
 
+import com.kit.wallet.data.session.SessionFence
 import okhttp3.MultipartBody
 import okhttp3.ResponseBody
 import retrofit2.http.Body
+import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.Multipart
+import retrofit2.http.PATCH
 import retrofit2.http.POST
 import retrofit2.http.PUT
 import retrofit2.http.Part
 import retrofit2.http.Path
 import retrofit2.http.Query
 import retrofit2.http.Streaming
+import retrofit2.http.Tag
 
 /**
  * Raw secure-messaging routes. Production callers must go through
@@ -26,16 +30,39 @@ internal interface SecureMessagingWireApi {
     ): ApiEnvelope<MessagingKeyStatusDto>
 
     @GET("api/kit-wallet/v1/messaging/conversations")
-    suspend fun messagingConversations(): ApiEnvelope<MessagingConversationListDto>
+    suspend fun messagingConversations(
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<MessagingConversationListDto>
 
     @POST("api/kit-wallet/v1/messaging/conversations")
-    suspend fun createDirectMessagingConversation(
-        @Body request: CreateDirectMessagingConversationRequest,
+    suspend fun createMessagingConversation(
+        @Body request: CreateMessagingConversationRequest,
+    ): ApiEnvelope<MessagingConversationDto>
+
+    @POST("api/kit-wallet/v1/messaging/conversations/{conversation}/members")
+    suspend fun addMessagingConversationMember(
+        @Path("conversation") conversationId: String,
+        @Body request: AddMessagingConversationMemberRequest,
+    ): ApiEnvelope<MessagingConversationDto>
+
+    @PATCH("api/kit-wallet/v1/messaging/conversations/{conversation}/members/{user}")
+    suspend fun updateMessagingConversationMember(
+        @Path("conversation") conversationId: String,
+        @Path("user") userId: String,
+        @Body request: UpdateMessagingConversationMemberRequest,
+    ): ApiEnvelope<MessagingConversationDto>
+
+    /** Removes a member, or leaves the group when the target is the current account. */
+    @DELETE("api/kit-wallet/v1/messaging/conversations/{conversation}/members/{user}")
+    suspend fun removeMessagingConversationMember(
+        @Path("conversation") conversationId: String,
+        @Path("user") userId: String,
     ): ApiEnvelope<MessagingConversationDto>
 
     @GET("api/kit-wallet/v1/messaging/conversations/{conversation}/device-roster")
     suspend fun messagingDeviceRoster(
         @Path("conversation") conversationId: String,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<MessagingDeviceRosterDto>
 
     @GET(
@@ -51,12 +78,14 @@ internal interface SecureMessagingWireApi {
     suspend fun consumeMessagingKeyBundles(
         @Path("conversation") conversationId: String,
         @Body request: ConsumeMessagingKeyBundlesRequest = ConsumeMessagingKeyBundlesRequest(),
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<ConsumedMessagingKeyBundlesDto>
 
     @POST("api/kit-wallet/v1/messaging/conversations/{conversation}/messages")
     suspend fun sendEncryptedMessage(
         @Path("conversation") conversationId: String,
         @Body request: SendEncryptedMessageRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<EncryptedMessageDto>
 
     @GET(

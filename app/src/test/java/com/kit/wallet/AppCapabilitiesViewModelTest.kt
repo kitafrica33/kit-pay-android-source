@@ -9,6 +9,8 @@ import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.MessagingProtocolDto
 import com.kit.wallet.data.remote.ProtocolsDto
 import com.kit.wallet.data.notifications.PushMessagingTransport
+import com.kit.wallet.data.realtime.KitNetworkEvent
+import com.kit.wallet.data.realtime.KitNetworkSource
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.navigation.AppCapabilitiesViewModel
 import com.kit.wallet.ui.model.ChatPreview
@@ -22,7 +24,9 @@ import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.coroutines.resume
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
@@ -60,6 +64,7 @@ class AppCapabilitiesViewModelTest {
             ),
             chatRepository = FakeChatRepository(),
             pushMessagingTransport = FakePushMessagingTransport,
+            networkSource = FakeNetworkSource(),
         )
 
         assertEquals(1, api.calls)
@@ -108,6 +113,7 @@ class AppCapabilitiesViewModelTest {
             ),
             chatRepository = chatRepository,
             pushMessagingTransport = FakePushMessagingTransport,
+            networkSource = FakeNetworkSource(),
         )
 
         assertEquals(1, api.calls)
@@ -133,6 +139,7 @@ class AppCapabilitiesViewModelTest {
                 ),
                 chatRepository = FakeChatRepository(),
                 pushMessagingTransport = FakePushMessagingTransport,
+                networkSource = FakeNetworkSource(),
             )
             assertEquals(1, api.calls)
 
@@ -240,6 +247,18 @@ class AppCapabilitiesViewModelTest {
             text: String,
             onDurablyCommitted: (clientMessageId: String) -> Unit,
         ) = error("Not used")
+    }
+
+    private class FakeNetworkSource : KitNetworkSource {
+        val changes = MutableSharedFlow<KitNetworkEvent>(extraBufferCapacity = 8)
+        var started: Boolean = false
+            private set
+
+        override val events: SharedFlow<KitNetworkEvent> = changes
+
+        override fun start() {
+            started = true
+        }
     }
 
     private object FakePushMessagingTransport : PushMessagingTransport {

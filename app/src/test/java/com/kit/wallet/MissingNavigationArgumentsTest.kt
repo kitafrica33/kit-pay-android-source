@@ -49,6 +49,7 @@ class MissingNavigationArgumentsTest {
         val viewModel = BillPayViewModel(
             billsRepo = bills,
             wallet = UnusedWalletRepository,
+            walletSync = NoOpTestWalletSync,
             savedStateHandle = SavedStateHandle(),
         )
 
@@ -64,6 +65,7 @@ class MissingNavigationArgumentsTest {
         val viewModel = BillPayViewModel(
             billsRepo = bills,
             wallet = UnusedWalletRepository,
+            walletSync = NoOpTestWalletSync,
             savedStateHandle = SavedStateHandle(mapOf("providerId" to "missing")),
         )
 
@@ -75,18 +77,27 @@ class MissingNavigationArgumentsTest {
     @Test
     fun `missing conversation route fails closed without asking repository for null identity`() {
         val chats = FakeChatRepository()
+        val realtime = RecordingConversationSignals()
 
         val viewModel = ConversationViewModel(
             chatRepo = chats,
             walletRepo = UnusedWalletRepository,
+            walletSync = NoOpTestWalletSync,
             callRepo = UnusedCallRepository,
             messageSounds = UnusedMessageSoundPlayer,
+            realtime = realtime,
+            typingSignaller = RecordingTypingSignals(),
             savedStateHandle = SavedStateHandle(),
         )
 
         assertNull(viewModel.chat.value)
         assertTrue(viewModel.messages.value.isEmpty())
         assertEquals(0, chats.chatLookups)
+
+        // A route with no conversation must not reach the socket either: subscribing
+        // to a presence channel we cannot name is how a screen would ask the server
+        // to authorize "null".
+        assertTrue(realtime.observed.isEmpty())
     }
 
     private class FakeBillsRepository : BillsRepository {

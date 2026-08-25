@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Sync
@@ -75,6 +76,8 @@ fun ContactsScreen(
     onContact: (String) -> Unit = {},
     onVoiceCall: (String) -> Unit = {},
     onVideoCall: (String) -> Unit = {},
+    /** Null where a group makes no sense — the call picker, and any preview of this screen. */
+    onNewGroup: (() -> Unit)? = null,
     viewModel: ContactsViewModel = hiltViewModel(),
 ) {
     val contacts by viewModel.contacts.collectAsStateWithLifecycle()
@@ -190,6 +193,7 @@ fun ContactsScreen(
         onContact = { contact -> viewModel.openDirectConversation(contact, onContact) },
         onVoiceCall = onVoiceCall,
         onVideoCall = onVideoCall,
+        onNewGroup = onNewGroup,
         onSync = requestSync,
         onManageContact = onManageContact,
         onInvite = onInvite,
@@ -275,6 +279,7 @@ private fun ContactsContent(
     onContact: (Contact) -> Unit,
     onVoiceCall: (String) -> Unit,
     onVideoCall: (String) -> Unit,
+    onNewGroup: (() -> Unit)? = null,
     onSync: () -> Unit,
     onManageContact: (Contact) -> Unit,
     onInvite: (Contact) -> Unit = {},
@@ -320,6 +325,11 @@ private fun ContactsContent(
                     singleLine = true,
                     shape = MaterialTheme.shapes.extraLarge,
                 )
+            }
+            // The group builder sits above the sync row and only on the chat picker: a call
+            // picker's group is an invite mid-call, not a conversation.
+            if (onNewGroup != null && purpose == ContactPickerPurpose.CHAT) {
+                item { ActionRow(Icons.Rounded.Groups, "New group", onNewGroup) }
             }
             item {
                 ActionRow(

@@ -8,6 +8,7 @@ import android.widget.VideoView
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
@@ -29,11 +30,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Report
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -45,6 +48,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
@@ -53,6 +57,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
@@ -61,12 +67,28 @@ import androidx.core.content.FileProvider
 import com.kit.wallet.data.messaging.chatMediaFileExtension
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
+import com.kit.wallet.ui.model.MessageReaction
+import com.kit.wallet.ui.model.acceptsReactions
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /** Media kinds the connected gallery can page through. */
 internal val GALLERY_MEDIA_KINDS = setOf(MessageKind.IMAGE, MessageKind.VIDEO)
+
+/** Resolves and reports exactly the visible gallery page, including pages hidden behind a +N tile. */
+internal fun reportCurrentGalleryMessage(
+    mediaMessages: List<Message>,
+    currentPage: Int,
+    reportableMessageIds: Set<String>,
+    onReportMessage: (Message) -> Unit,
+): Boolean {
+    val current = mediaMessages.getOrNull(currentPage)
+        ?.takeIf { it.id in reportableMessageIds }
+        ?: return false
+    onReportMessage(current)
+    return true
+}
 
 /**
  * WhatsApp-style connected full-screen gallery over the conversation's media messages:
@@ -85,6 +107,10 @@ internal fun ConversationMediaGallery(
     onLoad: (Message) -> Unit,
     onRetry: (Message) -> Unit,
     onDismiss: () -> Unit,
+    reactionsEnabled: Boolean = false,
+    onToggleReaction: (Message, String) -> Unit = { _, _ -> },
+    reportableMessageIds: Set<String> = emptySet(),
+    onReportMessage: (Message) -> Unit = {},
 ) {
     if (mediaMessages.isEmpty()) {
         onDismiss()
@@ -95,6 +121,14 @@ internal fun ConversationMediaGallery(
         .coerceAtLeast(0)
     val pagerState = rememberPagerState(initialPage = initialPage) { mediaMessages.size }
     var actionNotice by remember { mutableStateOf<String?>(null) }
+    var paletteOpen by remember { mutableStateOf(false) }
+    var pickerOpen by remember { mutableStateOf(false) }
+    var reactorsOpen by remember { mutableStateOf(false) }
+    // A palette or a reactor list left open over the next photo would read as belonging to it.
+    LaunchedEffect(pagerState.currentPage) {
+        paletteOpen = false
+        reactorsOpen = false
+    }
 
     // Load the visible page and its neighbours so swiping stays smooth.
     LaunchedEffect(pagerState.currentPage, mediaMessages.size) {
@@ -174,6 +208,24 @@ internal fun ConversationMediaGallery(
                 }
                 val current = mediaMessages.getOrNull(pagerState.currentPage)
                 val currentBytes = current?.let { mediaBytes[it.id] }
+                if (current != null && current.id in reportableMessageIds) {
+                    IconButton(
+                        onClick = {
+                            reportCurrentGalleryMessage(
+                                mediaMessages = mediaMessages,
+                                currentPage = pagerState.currentPage,
+                                reportableMessageIds = reportableMessageIds,
+                                onReportMessage = onReportMessage,
+                            )
+                        },
+                    ) {
+                        Icon(
+                            Icons.Rounded.Report,
+                            contentDescription = "Report this message",
+                            tint = Color.White,
+                        )
+                    }
+                }
                 IconButton(
                     enabled = currentBytes != null,
                     onClick = {
@@ -219,6 +271,94 @@ internal fun ConversationMediaGallery(
                 }
             }
 
+            // The same reactions the bubble carries, on the item currently on screen: opening a
+            // photo full-screen is where a reaction is most often wanted, and leaving the gallery
+            // to find the bubble again is the long way round.
+            val reacting = mediaMessages.getOrNull(pagerState.currentPage)
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 12.dp, vertical = 12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                val ownEmoji = reacting?.reactions.orEmpty()
+                    .filter(MessageReaction::fromMe)
+                    .map(MessageReaction::emoji)
+                    .toSet()
+                if (paletteOpen && reacting != null) {
+                    Surface(
+                        shape = CircleShape,
+                        shadowElevation = 6.dp,
+                        modifier = Modifier.padding(bottom = 10.dp),
+                    ) {
+                        QuickReactionPalette(
+                            selected = ownEmoji,
+                            onPick = { emoji ->
+                                onToggleReaction(reacting, emoji)
+                                paletteOpen = false
+                            },
+                            onMore = {
+                                paletteOpen = false
+                                pickerOpen = true
+                            },
+                        )
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.weight(1f)) {
+                        MessageReactionChips(
+                            reactions = reacting?.reactions.orEmpty(),
+                            onToggle = { emoji ->
+                                reacting?.let { onToggleReaction(it, emoji) }
+                            },
+                            onShowReactors = { reactorsOpen = true },
+                        )
+                    }
+                    // A send still on its way has no stable ID to pin a reaction to, exactly as in
+                    // the transcript, so the affordance is absent rather than inert.
+                    if (reacting != null && reactionsEnabled && reacting.acceptsReactions) {
+                        Box(
+                            Modifier
+                                .size(44.dp)
+                                .background(Color.White.copy(alpha = 0.16f), CircleShape)
+                                .clip(CircleShape)
+                                .clickable { paletteOpen = !paletteOpen }
+                                .semantics {
+                                    contentDescription = if (reacting.kind == MessageKind.VIDEO) {
+                                        "React to this video"
+                                    } else {
+                                        "React to this photo"
+                                    }
+                                },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text("🙂", style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
+                }
+            }
+
+            if (pickerOpen && reacting != null) {
+                ReactionPickerDialog(
+                    selected = reacting.reactions.filter(MessageReaction::fromMe)
+                        .map(MessageReaction::emoji)
+                        .toSet(),
+                    onPick = { emoji ->
+                        onToggleReaction(reacting, emoji)
+                        pickerOpen = false
+                    },
+                    onDismiss = { pickerOpen = false },
+                )
+            }
+            val reactors = reacting?.reactions.orEmpty()
+            // Removing the last reaction while the list is open closes it rather than leaving an
+            // empty sheet naming nobody.
+            if (reactorsOpen && reactors.isNotEmpty()) {
+                ReactionReactorsDialog(reactors) { reactorsOpen = false }
+            }
+
             actionNotice?.let { notice ->
                 Text(
                     notice,
@@ -227,7 +367,8 @@ internal fun ConversationMediaGallery(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .navigationBarsPadding()
-                        .padding(bottom = 24.dp)
+                        // Clears the reaction row rather than landing on top of it.
+                        .padding(bottom = 84.dp)
                         .background(Color.Black.copy(alpha = 0.6f), CircleShape)
                         .padding(horizontal = 16.dp, vertical = 8.dp),
                 )

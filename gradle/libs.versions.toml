@@ -28,6 +28,10 @@ androidxHilt = "1.2.0"
 coroutines = "1.10.2"
 moshi = "1.15.2"
 firebaseBom = "34.1.0"
+# Pinned low deliberately: 20.7.0 is the release that introduced the Authorization API, and every
+# transitive it asks for is already at or below what the reviewed graph resolves. A newer line
+# would drag play-services-base/basement/tasks upward and rebind the attestation chain for nothing.
+playServicesAuth = "20.7.0"
 livekit = "2.27.0-kitpay.1"
 libsignal = "0.97.4"
 desugarJdkLibs = "2.1.5"
@@ -78,6 +82,7 @@ moshi-kotlin = { group = "com.squareup.moshi", name = "moshi-kotlin", version.re
 work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "workManager" }
 firebase-bom = { group = "com.google.firebase", name = "firebase-bom", version.ref = "firebaseBom" }
 firebase-messaging = { group = "com.google.firebase", name = "firebase-messaging" }
+play-services-auth = { group = "com.google.android.gms", name = "play-services-auth", version.ref = "playServicesAuth" }
 livekit-android = { group = "africa.kit.livekit", name = "livekit-android", version.ref = "livekit" }
 libsignal-android = { module = "org.signal:libsignal-android", version.ref = "libsignal" }
 libsignal-client = { module = "org.signal:libsignal-client", version.ref = "libsignal" }

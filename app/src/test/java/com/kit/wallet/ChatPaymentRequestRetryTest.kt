@@ -99,8 +99,11 @@ class ChatPaymentRequestRetryTest {
     ) = ConversationViewModel(
         chatRepo = chats,
         walletRepo = wallet,
+        walletSync = NoOpTestWalletSync,
         callRepo = NoCallsRepository,
         messageSounds = SilentMessageSoundPlayer,
+        realtime = InertConversationSignals,
+        typingSignaller = RecordingTypingSignals(),
         savedStateHandle = SavedStateHandle(mapOf("chatId" to CHAT_ID)),
     )
 
@@ -151,6 +154,7 @@ class ChatPaymentRequestRetryTest {
             peerUserId: String,
             amountMinor: Long,
             note: String?,
+            idempotencyKey: String?,
         ): ChatPaymentRequest {
             check(peerUserId == PEER_USER_ID)
             val created = ChatPaymentRequest(

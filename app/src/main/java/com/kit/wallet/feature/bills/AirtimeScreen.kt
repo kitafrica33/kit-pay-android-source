@@ -37,13 +37,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.repository.FinancialOperationQuote
+import com.kit.wallet.feature.auth.PaymentApproval
+import com.kit.wallet.feature.auth.rememberBiometricApprovalAvailable
+import com.kit.wallet.feature.funding.TopUpSheet
+import com.kit.wallet.feature.funding.TopUpViewModel
+import com.kit.wallet.ui.components.GroupedAmountTransformation
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.KitOutlinedButton
 import com.kit.wallet.ui.model.BillProvider
@@ -61,11 +65,19 @@ fun AirtimeScreen(
     onBack: () -> Unit,
     onDone: () -> Unit,
     viewModel: AirtimeViewModel = hiltViewModel(),
+    topUp: TopUpViewModel = hiltViewModel(),
 ) {
     val products by viewModel.products.collectAsStateWithLifecycle()
     val buying by viewModel.buying.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
     val quote by viewModel.quote.collectAsStateWithLifecycle()
+    val refusedForFunds by viewModel.topUpRequired.collectAsStateWithLifecycle()
+    val topUpRequirement by topUp.requirement.collectAsStateWithLifecycle()
+    LaunchedEffect(refusedForFunds) {
+        val shortfall = refusedForFunds ?: return@LaunchedEffect
+        topUp.start(shortfall)
+        viewModel.clearTopUpRequired()
+    }
     AirtimeContent(
         products = products,
         ownPhone = viewModel.ownPhone,
@@ -77,7 +89,15 @@ fun AirtimeScreen(
         onQuoteInvalidated = viewModel::invalidateQuote,
         onReview = viewModel::review,
         onBuy = { pin -> viewModel.buy(pin, onDone) },
+        biometricsAvailable = rememberBiometricApprovalAvailable(),
     )
+    if (topUpRequirement != null) {
+        TopUpSheet(
+            viewModel = topUp,
+            onDismiss = topUp::dismiss,
+            onFunded = topUp::dismiss,
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -93,13 +113,13 @@ internal fun AirtimeContent(
     onQuoteInvalidated: () -> Unit,
     onReview: (String, String, Long) -> Unit,
     onBuy: (String) -> Unit,
+    biometricsAvailable: Boolean = false,
 ) {
     var productId by rememberSaveable(products) {
         mutableStateOf(products.firstOrNull()?.id.orEmpty())
     }
     var phone by rememberSaveable { mutableStateOf(ownPhone) }
     var amount by rememberSaveable { mutableStateOf("") }
-    var paymentPin by rememberSaveable { mutableStateOf("") }
     val amountMinor = Money.parseMinor(amount) ?: 0L
     // Only a quote for exactly these details may be approved; edits require a fresh review.
     val reviewedQuote = quote?.takeIf {
@@ -186,7 +206,7 @@ internal fun AirtimeContent(
                     FilterChip(
                         selected = amount == quickAmount.toString(),
                         onClick = { amount = quickAmount.toString() },
-                        label = { Text(quickAmount.toString()) },
+                        label = { Text(Money.groupUnits(quickAmount.toString())) },
                     )
                 }
             }
@@ -196,53 +216,45 @@ internal fun AirtimeContent(
                 onValueChange = { value -> amount = value.filter(Char::isDigit) },
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("Amount (${Money.SYMBOL})") },
+                visualTransformation = GroupedAmountTransformation,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 singleLine = true,
                 shape = MaterialTheme.shapes.medium,
             )
-            if (reviewedQuote != null) {
+            if (reviewedQuote == null) {
+                if (error != null) {
+                    Text(
+                        error,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+                Spacer(Modifier.height(24.dp))
+                KitGreenButton(
+                    text = "Review amount and fees",
+                    loading = buying,
+                    onClick = { onReview(productId, phone, amountMinor) },
+                    enabled = productId.isNotBlank() && phone.length >= 9 && amountMinor > 0,
+                )
+            } else {
+                val total = Money.format(
+                    reviewedQuote.customerDebitMinor,
+                    reviewedQuote.currencyCode,
+                    reviewedQuote.currencyScale,
+                )
                 Spacer(Modifier.height(16.dp))
                 ProviderQuoteSummary(reviewedQuote)
-                Spacer(Modifier.height(12.dp))
-                OutlinedTextField(
-                    value = paymentPin,
-                    onValueChange = { paymentPin = it.filter(Char::isDigit).take(4) },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Wallet PIN (optional with biometrics)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
-                    isError = error != null,
-                    shape = MaterialTheme.shapes.medium,
+                Spacer(Modifier.height(24.dp))
+                PaymentApproval(
+                    actionLabel = "Buy airtime • $total",
+                    biometricsAvailable = biometricsAvailable,
+                    busy = buying,
+                    error = error,
+                    onApprove = onBuy,
+                    pinSubtitle = "Authorizes $total of airtime for $phone.",
                 )
             }
-            if (error != null) {
-                Text(
-                    error,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 8.dp),
-                )
-            }
-            Spacer(Modifier.height(24.dp))
-            KitGreenButton(
-                text = if (reviewedQuote == null) {
-                    "Review amount and fees"
-                } else {
-                    "Buy airtime • ${Money.format(
-                        reviewedQuote.customerDebitMinor,
-                        reviewedQuote.currencyCode,
-                        reviewedQuote.currencyScale,
-                    )}"
-                },
-                loading = buying,
-                onClick = {
-                    if (reviewedQuote == null) onReview(productId, phone, amountMinor)
-                    else onBuy(paymentPin)
-                },
-                enabled = productId.isNotBlank() && phone.length >= 9 && amountMinor > 0 &&
-                    (reviewedQuote == null || paymentPin.isEmpty() || paymentPin.length == 4),
-            )
             Spacer(Modifier.height(24.dp))
         }
     }

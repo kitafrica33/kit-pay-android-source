@@ -8,11 +8,21 @@ import com.kit.wallet.data.messaging.KitChatMediaKind
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.ConversationRosterStore
+import com.kit.wallet.data.messaging.ConversationSystemEvent
+import com.kit.wallet.data.messaging.ConversationSystemEventStore
+import com.kit.wallet.data.messaging.MEMBERSHIP_ADDED_EVENT
+import com.kit.wallet.data.messaging.MEMBERSHIP_REMOVED_EVENT
+import com.kit.wallet.data.messaging.MEMBERSHIP_ROLE_CHANGED_EVENT
+import com.kit.wallet.data.messaging.KitReactionAction
+import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionRecord
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
 import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
+import com.kit.wallet.data.messaging.ScheduledSendStore
+import com.kit.wallet.data.messaging.SecureMessagingActivationCapability
 import com.kit.wallet.data.messaging.SecureMessagingActiveSession
 import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
 import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
@@ -23,8 +33,10 @@ import com.kit.wallet.data.messaging.SecureMessagingCryptoWireMapper
 import com.kit.wallet.data.messaging.SecureMessagingEncryptionPlan
 import com.kit.wallet.data.messaging.SecureMessagingEncryptionRequest
 import com.kit.wallet.data.messaging.SecureMessagingEncryptedSend
+import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
 import com.kit.wallet.data.messaging.SecureMessagingMissingSessionSet
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
+import com.kit.wallet.data.messaging.SecureMessagingProjectionPage
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingSyncCompletionSignal
@@ -33,16 +45,29 @@ import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.isRecoverableSecureMessagingStateLoss
 import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
 import com.kit.wallet.data.messaging.requireDurablyCommittedSessions
+import com.kit.wallet.data.realtime.KitPresenceRegistry
+import com.kit.wallet.data.realtime.KitTypingRegistry
+import com.kit.wallet.data.remote.ADMIN_CONVERSATION_ROLE
+import com.kit.wallet.data.remote.GROUP_CONVERSATION_TYPE
+import com.kit.wallet.data.remote.ENCRYPTED_REACTION_MESSAGE_KIND
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.remote.MEMBER_CONVERSATION_ROLE
+import com.kit.wallet.data.remote.OWNER_CONVERSATION_ROLE
+import com.kit.wallet.data.remote.isValidMessagingGroupTitle
 import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.di.ApplicationScope
+import com.kit.wallet.ui.model.ChatMember
+import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
+import com.kit.wallet.ui.model.MessageReaction
 import com.kit.wallet.ui.model.PaymentEventKind
+import com.kit.wallet.ui.model.acceptsReactions
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import java.io.IOException
 import java.time.Clock
@@ -85,11 +110,49 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-internal data class AuthenticatedDirectConversation(
-    val id: String,
-    val peerUserId: String,
-    val peerName: String?,
+internal data class AuthenticatedConversationMember(
+    val userId: String,
+    val name: String?,
+    val role: String,
 )
+
+/**
+ * A conversation this account is a proven, server-validated member of.
+ *
+ * Direct chats and groups share the type because everything downstream of here — projection
+ * routing, unread counts, drafts, reactions — is keyed by conversation, not by peer. The
+ * differences are narrow and explicit: a group has a [title] and more than one other member,
+ * a direct chat has [peerUserId] and cannot be renamed or left.
+ */
+internal data class AuthenticatedConversation(
+    val id: String,
+    val type: String,
+    val title: String?,
+    val viewerUserId: String,
+    val currentUserRole: String,
+    val members: List<AuthenticatedConversationMember>,
+) {
+    val isGroup: Boolean get() = type == GROUP_CONVERSATION_TYPE
+
+    val others: List<AuthenticatedConversationMember>
+        get() = members.filterNot { it.userId == viewerUserId }
+
+    val peerUserId: String? get() = if (isGroup) null else others.singleOrNull()?.userId
+
+    val peerName: String? get() = if (isGroup) null else others.singleOrNull()?.name
+
+    fun memberNamed(userId: String): AuthenticatedConversationMember? =
+        members.firstOrNull { it.userId.equals(userId, ignoreCase = true) }
+
+    /** True when [userId] may post here — i.e. is still an active member. */
+    fun contains(userId: String): Boolean = memberNamed(userId) != null
+
+    val canManageMembers: Boolean
+        get() = isGroup && currentUserRole in MANAGING_CONVERSATION_ROLES
+}
+
+private val MANAGING_CONVERSATION_ROLES =
+    setOf(OWNER_CONVERSATION_ROLE, ADMIN_CONVERSATION_ROLE)
 
 internal enum class AuthenticatedTextDeliveryState {
     RECEIVED,
@@ -155,12 +218,124 @@ internal val authenticatedProjectionOrder = Comparator<AuthenticatedProjectedTex
     }
 }
 
+/** Display name used when an authenticated conversation carries no usable peer name. */
+internal const val DEFAULT_PEER_NAME = "Kit Pay contact"
+
+/** Display name used when a group's server-visible title is missing or unusable. */
+internal const val DEFAULT_GROUP_NAME = "Kit Pay group"
+
+/** How this account is named in its own reaction list. */
+internal const val SELF_REACTOR_NAME = "You"
+
+/** How this account is named in a group's participant list. */
+internal const val SELF_MEMBER_NAME = SELF_REACTOR_NAME
+
+/**
+ * Maps a server role onto what the UI may offer.
+ *
+ * Anything unrecognised reads as a plain member: a role this build has never heard of must not
+ * be mistaken for elevated rights just because the server invented it after we shipped.
+ */
+internal fun String.toChatMemberRole(): ChatMemberRole = when (this) {
+    OWNER_CONVERSATION_ROLE -> ChatMemberRole.OWNER
+    ADMIN_CONVERSATION_ROLE -> ChatMemberRole.ADMIN
+    else -> ChatMemberRole.MEMBER
+}
+
+internal fun ChatMemberRole.toConversationRole(): String = when (this) {
+    ChatMemberRole.OWNER -> OWNER_CONVERSATION_ROLE
+    ChatMemberRole.ADMIN -> ADMIN_CONVERSATION_ROLE
+    ChatMemberRole.MEMBER -> MEMBER_CONVERSATION_ROLE
+}
+
+/**
+ * Collapses one conversation's reaction descriptors onto the messages they point at.
+ *
+ * [ordered] must already be in [authenticatedProjectionOrder], because that order is what decides
+ * a reaction's fate: the last applicable descriptor a reactor authored for a message wins, so an
+ * `add` replaces that user's previous emoji and a `remove` clears only the emoji it names. That
+ * makes the fold idempotent and convergent — replaying the same log, in whole or in part, on any
+ * device yields the same result, so duplicates and out-of-order delivery need no separate handling.
+ *
+ * A reaction is attributed only to the authenticated Signal sender of its carrying message; the
+ * descriptor itself names no reactor, so a peer cannot react on somebody else's behalf. [nameOf]
+ * turns that authenticated sender ID into a display name, which is what makes a group's who-reacted
+ * list name the right person rather than collapsing everyone onto a single peer.
+ */
+internal fun foldAuthenticatedReactions(
+    ordered: List<AuthenticatedProjectedText>,
+    nameOf: (senderUserId: String) -> String,
+): Map<String, List<MessageReaction>> {
+    val targets = ordered.mapTo(mutableSetOf(), AuthenticatedProjectedText::messageId)
+    data class StandingReaction(val emoji: String, val order: Int)
+    // target -> reactor -> the user's one current reaction on that message.
+    val state = linkedMapOf<String, LinkedHashMap<String, StandingReaction>>()
+    var nextOrder = 0
+    ordered.forEach { projected ->
+        val reaction = KitReactionMessage.parse(projected.text) ?: return@forEach
+        // A permanent local failure never reached the server or another device. Suppressing its
+        // event bubble while still folding it would show a reaction only on this installation
+        // and make the next tap send a nonsensical REMOVE for an ADD nobody received.
+        if (projected.deliveryState == AuthenticatedTextDeliveryState.PERMANENT_FAILURE) {
+            return@forEach
+        }
+        // A reaction whose target never authenticated on this device has nothing to annotate.
+        if (reaction.targetMessageId !in targets) return@forEach
+        val reactor = if (projected.fromCurrentUser) {
+            SELF_REACTOR_NAME
+        } else {
+            projected.senderUserId
+        }
+        val reactors = state.getOrPut(reaction.targetMessageId) { linkedMapOf() }
+        when (reaction.action) {
+            KitReactionAction.ADD -> {
+                if (reactors[reactor]?.emoji != reaction.emoji) {
+                    reactors[reactor] = StandingReaction(reaction.emoji, nextOrder++)
+                }
+            }
+            KitReactionAction.REMOVE -> {
+                if (reactors[reactor]?.emoji == reaction.emoji) reactors.remove(reactor)
+            }
+        }
+    }
+    val byTarget = linkedMapOf<String, MutableList<MessageReaction>>()
+    state.forEach { (targetMessageId, reactors) ->
+        reactors.entries.groupBy { it.value.emoji }.forEach { (emoji, entries) ->
+            val standing = entries.sortedBy { it.value.order }.map { it.key }
+            val fromMe = SELF_REACTOR_NAME in standing
+            byTarget.getOrPut(targetMessageId) { mutableListOf() } += MessageReaction(
+                emoji = emoji,
+                reactorNames = standing.sortedBy { if (it == SELF_REACTOR_NAME) 0 else 1 }
+                    .map { if (it == SELF_REACTOR_NAME) SELF_REACTOR_NAME else nameOf(it) },
+                fromMe = fromMe,
+            )
+        }
+    }
+    // Most-reacted first; ties keep the order the emoji first appeared in the conversation, which
+    // [state] preserves, so the chip row does not reshuffle as counts change.
+    return byTarget.mapValues { (_, reactions) ->
+        reactions.sortedWith(compareByDescending(MessageReaction::count).thenBy(MessageReaction::emoji))
+    }
+}
+
 /** Testable repository-facing surface; the production implementation retains opaque handles. */
 internal interface SecureMessagingChatRuntime {
     val activeSession: StateFlow<SecureMessagingChatSession?>
     val projectionChanges: StateFlow<Long>
     val baselineRetrySessions: Flow<SecureMessagingChatSession>
         get() = emptyFlow()
+
+    /**
+     * The authority to read this device's own encrypted history, published from the first moment
+     * an activation exists rather than when message exchange becomes possible.
+     *
+     * [activeSession] is the exchange authority and is deliberately withheld until the transport,
+     * key and roster steps have all completed over the network. This is the display authority for
+     * the same activation, and it is what lets the chat list, transcripts and previews be drawn
+     * from the local encrypted store while those steps are still running — or failing.
+     */
+    val localHistoryActivations: StateFlow<SecureMessagingActivationCapability?>
+        get() = MutableStateFlow(null)
 
     fun isCurrent(session: SecureMessagingChatSession): Boolean = activeSession.value === session
 
@@ -173,15 +348,72 @@ internal interface SecureMessagingChatRuntime {
     /** Routes only proved key loss or migration-fenced unreadable state through local recovery. */
     suspend fun recoverPermanentlyUnavailableState(error: Throwable): Boolean = false
 
-    suspend fun directConversations(
+    /**
+     * Forgets that the current session's archive has already been projected.
+     *
+     * Restoring a backup writes into the encrypted archive behind the projection's back, so unless
+     * the projection is told to read it again the restored history stays invisible until the next
+     * cold start — which reads to the user as a restore that did nothing.
+     */
+    suspend fun invalidateArchivedHistoryProjection() = Unit
+
+    suspend fun conversations(
         session: SecureMessagingChatSession,
         forceRefresh: Boolean = false,
-    ): List<AuthenticatedDirectConversation>
+    ): List<AuthenticatedConversation>
+
+    /**
+     * The conversations this device has already authenticated, read from local encrypted state.
+     *
+     * Display only. Every send, key agreement and membership change continues to run against the
+     * live authenticated handles, so a cached entry can name a chat but can never authorize one.
+     */
+    suspend fun cachedConversations(
+        activation: SecureMessagingActivationCapability,
+    ): List<AuthenticatedConversation> = emptyList()
+
+    /** One page of local transcript, readable before the activation is ready to exchange. */
+    suspend fun localProjectionPage(
+        activation: SecureMessagingActivationCapability,
+        afterRecordKey: String?,
+        limit: Int,
+    ): AuthenticatedProjectionPage = AuthenticatedProjectionPage(emptyList(), null)
 
     suspend fun createDirectConversation(
         session: SecureMessagingChatSession,
         peerUserId: String,
-    ): AuthenticatedDirectConversation
+    ): AuthenticatedConversation
+
+    suspend fun createGroupConversation(
+        session: SecureMessagingChatSession,
+        title: String,
+        memberUserIds: List<String>,
+    ): AuthenticatedConversation = error("This runtime does not support group conversations")
+
+    suspend fun addGroupMember(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        userId: String,
+        role: String = MEMBER_CONVERSATION_ROLE,
+    ): AuthenticatedConversation = error("This runtime does not support group conversations")
+
+    suspend fun setGroupMemberRole(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        userId: String,
+        role: String,
+    ): AuthenticatedConversation = error("This runtime does not support group conversations")
+
+    suspend fun removeGroupMember(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        userId: String,
+    ): AuthenticatedConversation = error("This runtime does not support group conversations")
+
+    suspend fun leaveGroupConversation(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+    ): Unit = error("This runtime does not support group conversations")
 
     suspend fun projectionPage(
         session: SecureMessagingChatSession,
@@ -204,7 +436,9 @@ internal interface SecureMessagingChatRuntime {
         conversationId: String,
         text: String,
         retryClientMessageId: String? = null,
+        replyToMessageId: String? = null,
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
+        expectedOwner: SessionFence? = null,
     )
 
     /** Encrypts, uploads and sends one image as an end-to-end encrypted media message. */
@@ -234,10 +468,15 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     private val syncEngine: SecureMessagingSyncEngine,
     @param:ApplicationScope private val scope: CoroutineScope,
     private val clock: Clock,
+    private val lifecycle: SecureMessagingLifecycleGuard,
+    private val roster: ConversationRosterStore,
     private val syncScheduler: SecureMessagingSyncScheduler? = null,
     private val syncCompletions: SecureMessagingSyncCompletionSignal =
         SecureMessagingSyncCompletionSignal(),
 ) : SecureMessagingChatRuntime {
+    override val localHistoryActivations: StateFlow<SecureMessagingActivationCapability?> =
+        lifecycle.localReadActivation
+
     override val activeSession: StateFlow<SecureMessagingChatSession?> = sessions.activeSession
         .map { active ->
             active?.let {
@@ -265,7 +504,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     private var conversationsLoaded = false
     private var archiveRestoredOwner: SecureMessagingActiveSession? = null
     private var conversationHandles =
-        emptyMap<String, RemoteSecureMessagingTransport.Session.DirectConversation>()
+        emptyMap<String, RemoteSecureMessagingTransport.Session.SecureConversation>()
 
     private data class RetryCandidate(
         val durable: LibSignalCompanionRecord,
@@ -396,10 +635,14 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             }
         }
 
-    override suspend fun directConversations(
+    override suspend fun invalidateArchivedHistoryProjection() {
+        archiveRestoreMutex.withLock { archiveRestoredOwner = null }
+    }
+
+    override suspend fun conversations(
         session: SecureMessagingChatSession,
         forceRefresh: Boolean,
-    ): List<AuthenticatedDirectConversation> {
+    ): List<AuthenticatedConversation> {
         val active = requireCurrent(session)
         val loaded = loadConversations(active, forceRefresh)
         archiveRestoreMutex.withLock {
@@ -424,31 +667,140 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 }
             }
         }
-        return loaded.values.map { it.toAuthenticated() }
+        val authenticated = loaded.values.map { it.toAuthenticated(active.binding.userId) }
+        // Write through so the next cold start can name these chats before it can reach the
+        // server. Best-effort: a failed cache write must never fail a successful roster load.
+        try {
+            roster.replace(active.activation, authenticated)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // The list is already correct in memory for this activation; the next load retries.
+        }
+        return authenticated
     }
+
+    override suspend fun cachedConversations(
+        activation: SecureMessagingActivationCapability,
+    ): List<AuthenticatedConversation> = roster.read(activation)
+
+    override suspend fun localProjectionPage(
+        activation: SecureMessagingActivationCapability,
+        afterRecordKey: String?,
+        limit: Int,
+    ): AuthenticatedProjectionPage = projections.readLocalPage(
+        activation = activation,
+        afterRecordKey = afterRecordKey,
+        limit = limit,
+    ).toAuthenticated(activation.binding.userId)
 
     override suspend fun createDirectConversation(
         session: SecureMessagingChatSession,
         peerUserId: String,
-    ): AuthenticatedDirectConversation {
+    ): AuthenticatedConversation {
         val active = requireCurrent(session)
         loadConversations(active, forceRefresh = false).values
-            .singleOrNull { it.peerUserId == peerUserId }
-            ?.let { return it.toAuthenticated() }
+            .singleOrNull { !it.isGroup && it.peerUserId == peerUserId }
+            ?.let { return it.toAuthenticated(active.binding.userId) }
 
         val created = active.transport.createDirectConversation(peerUserId)
         check(sessions.currentOrNull() === active) {
             "Secure messaging session changed while creating a conversation"
         }
+        return adoptConversation(active, created, expectNew = true)
+    }
+
+    override suspend fun createGroupConversation(
+        session: SecureMessagingChatSession,
+        title: String,
+        memberUserIds: List<String>,
+    ): AuthenticatedConversation {
+        val active = requireCurrent(session)
+        // Deliberately not deduplicated against an existing group: unlike a direct chat, the
+        // same people may hold any number of groups, and silently reopening an old one would
+        // put a new message in front of the wrong audience.
+        val created = active.transport.createGroupConversation(title, memberUserIds)
+        check(sessions.currentOrNull() === active) {
+            "Secure messaging session changed while creating a group"
+        }
+        return adoptConversation(active, created, expectNew = true)
+    }
+
+    override suspend fun addGroupMember(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        userId: String,
+        role: String,
+    ): AuthenticatedConversation = mutateGroup(session, conversationId) { active, conversation ->
+        active.transport.addGroupMember(conversation, userId, role)
+    }
+
+    override suspend fun setGroupMemberRole(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        userId: String,
+        role: String,
+    ): AuthenticatedConversation = mutateGroup(session, conversationId) { active, conversation ->
+        active.transport.setGroupMemberRole(conversation, userId, role)
+    }
+
+    override suspend fun removeGroupMember(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        userId: String,
+    ): AuthenticatedConversation = mutateGroup(session, conversationId) { active, conversation ->
+        active.transport.removeGroupMember(conversation, userId)
+    }
+
+    override suspend fun leaveGroupConversation(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+    ) {
+        val active = requireCurrent(session)
+        val conversation = requireConversation(active, conversationId)
+        active.transport.leaveGroup(conversation)
+        check(sessions.currentOrNull() === active) {
+            "Secure messaging session changed while leaving a group"
+        }
         conversationMutex.withLock {
             prepareOwner(active)
-            check(conversationHandles[created.conversationId] == null) {
-                "The server created a duplicate direct conversation identifier"
+            conversationHandles = conversationHandles - conversationId
+        }
+    }
+
+    private suspend fun mutateGroup(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        mutate: suspend (
+            SecureMessagingActiveSession,
+            RemoteSecureMessagingTransport.Session.SecureConversation,
+        ) -> RemoteSecureMessagingTransport.Session.SecureConversation,
+    ): AuthenticatedConversation {
+        val active = requireCurrent(session)
+        val conversation = requireConversation(active, conversationId)
+        val updated = mutate(active, conversation)
+        check(sessions.currentOrNull() === active) {
+            "Secure messaging session changed while changing group membership"
+        }
+        return adoptConversation(active, updated, expectNew = false)
+    }
+
+    /** Replaces the cached handle for a conversation the server just returned. */
+    private suspend fun adoptConversation(
+        active: SecureMessagingActiveSession,
+        conversation: RemoteSecureMessagingTransport.Session.SecureConversation,
+        expectNew: Boolean,
+    ): AuthenticatedConversation {
+        conversationMutex.withLock {
+            prepareOwner(active)
+            check(!expectNew || conversationHandles[conversation.conversationId] == null) {
+                "The server created a duplicate conversation identifier"
             }
-            conversationHandles = conversationHandles + (created.conversationId to created)
+            conversationHandles =
+                conversationHandles + (conversation.conversationId to conversation)
             conversationsLoaded = true
         }
-        return created.toAuthenticated()
+        return conversation.toAuthenticated(active.binding.userId)
     }
 
     override suspend fun projectionPage(
@@ -466,40 +818,47 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         check(sessions.currentOrNull() === active) {
             "Secure messaging session changed while reading encrypted projections"
         }
-        return AuthenticatedProjectionPage(
-            messages = page.messages().map { projected ->
-                val durable = projected.durableRecord
-                val fromCurrentUser = projectionIsFromCurrentUser(
-                    direction = durable.direction,
-                    senderUserId = durable.sender.userId,
-                    currentUserId = active.binding.userId,
-                )
-                AuthenticatedProjectedText(
-                    recordKey = durable.recordKey,
-                    messageId = projected.serverMessageId ?: durable.messageId,
-                    serverMessageId = projected.serverMessageId,
-                    clientMessageId = durable.clientMessageId,
-                    conversationId = durable.conversationId,
-                    senderUserId = durable.sender.userId,
-                    fromCurrentUser = fromCurrentUser,
-                    text = durable.authenticatedText,
-                    sentAt = projected.sentAt,
-                    deliveryState = projected.deliveryState.toAuthenticated(fromCurrentUser),
-                )
-            },
-            nextAfterRecordKey = page.nextAfterRecordKey,
-        )
+        return page.toAuthenticated(active.binding.userId)
     }
+
+    private fun SecureMessagingProjectionPage.toAuthenticated(
+        currentUserId: String,
+    ): AuthenticatedProjectionPage = AuthenticatedProjectionPage(
+        messages = messages().map { projected ->
+            val durable = projected.durableRecord
+            val fromCurrentUser = projectionIsFromCurrentUser(
+                direction = durable.direction,
+                senderUserId = durable.sender.userId,
+                currentUserId = currentUserId,
+            )
+            AuthenticatedProjectedText(
+                recordKey = durable.recordKey,
+                messageId = projected.serverMessageId ?: durable.messageId,
+                serverMessageId = projected.serverMessageId,
+                clientMessageId = durable.clientMessageId,
+                conversationId = durable.conversationId,
+                senderUserId = durable.sender.userId,
+                fromCurrentUser = fromCurrentUser,
+                text = durable.authenticatedText,
+                sentAt = projected.sentAt,
+                deliveryState = projected.deliveryState.toAuthenticated(fromCurrentUser),
+            )
+        },
+        nextAfterRecordKey = nextAfterRecordKey,
+    )
 
     override suspend fun sendText(
         session: SecureMessagingChatSession,
         conversationId: String,
         text: String,
         retryClientMessageId: String?,
+        replyToMessageId: String?,
         onDurablyCommitted: (clientMessageId: String) -> Unit,
+        expectedOwner: SessionFence?,
     ) = sendMutex.withLock {
         val active = requireCurrent(session)
-        val conversation = requireConversation(active, conversationId)
+        expectedOwner?.let { requireAuthenticationOwner(active, it) }
+        val conversation = requireConversation(active, conversationId, expectedOwner)
         retryClientMessageId?.let {
             require(CANONICAL_UUID.matches(it)) { "Invalid secure-message retry ID" }
         }
@@ -535,7 +894,10 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             }
         }
 
-        val roster = active.transport.roster(conversation)
+        val roster = active.transport.roster(conversation, expectedOwner)
+        if (KitReactionMessage.parse(text) != null) {
+            active.transport.requireReactionCapability(conversation, roster)
+        }
         val plan = active.transport.encryptionPlan(conversation, roster)
         val pending = retry?.takeIf {
             it.deliveryState == SecureMessagingProjectionDeliveryState.OUTBOUND_PENDING
@@ -556,7 +918,8 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                     markOutboundRetryRequired(pending)
                 }
             } else {
-                reissuePending(active, conversation, pending, plan)
+                expectedOwner?.let { requireAuthenticationOwner(active, it) }
+                reissuePending(active, conversation, pending, plan, expectedOwner)
                 return@withLock
             }
         }
@@ -574,6 +937,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 missingDeviceIds = missing.addresses().mapTo(mutableSetOf()) {
                     it.serverDeviceId
                 },
+                expectedOwner = expectedOwner,
             )
             active.transport.openCryptoTransaction(engine).also { transaction ->
                 val unresolved = missingSessionsOrAbort(transaction, plan)
@@ -586,12 +950,14 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
 
         // A normal send always receives a fresh ID, even when its text is byte-for-byte identical
         // to a pending message. Only the explicit retry path above may reuse committed fanout.
+        expectedOwner?.let { requireAuthenticationOwner(active, it) }
         val clientMessageId = UUID.randomUUID().toString()
         val encrypted = commitEncryption(
             transaction = encryptionTransaction,
             plan = plan,
             clientMessageId = clientMessageId,
             text = text,
+            replyToMessageId = replyToMessageId,
         )
         val durable = projections.withActivationLease(
             active.activation,
@@ -613,6 +979,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 conversation,
                 encrypted,
                 KitMediaMessage.attachmentsFor(text),
+                expectedOwner,
             )
             projections.withActivationLease(active.activation, readyRequired = true) {
                 markOutboundSent(durable, receipt)
@@ -627,6 +994,17 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 ?.let(error::addSuppressed)
             throw error
         }
+    }
+
+    private fun requireAuthenticationOwner(
+        active: SecureMessagingActiveSession,
+        expected: SessionFence,
+    ) {
+        if (
+            authenticationSessions.current()?.fence() != expected ||
+            active.binding.sessionEpoch != expected.sessionId ||
+            active.binding.userId != expected.accountId
+        ) throw SessionInvalidatedException()
     }
 
     override suspend fun sendImage(
@@ -752,13 +1130,16 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     ) = readMutex.withLock {
         val active = requireCurrent(session)
         val conversation = requireConversation(active, conversationId)
+        // Every other member, so a group marks read against whoever actually spoke. For a direct
+        // chat this is the single peer, which is exactly the previous behaviour.
+        val senderUserIds = conversation.otherMemberUserIds(active.binding.userId)
         val newestUnreadMessageId = projections.withActivationLease(
             active.activation,
             readyRequired = true,
         ) {
             newestUnreadInboundMessageId(
                 conversationId = conversationId,
-                peerUserId = conversation.peerUserId,
+                senderUserIds = senderUserIds,
             )
         } ?: return@withLock
         // Persist the server-visible receipt first. If it fails, the durable unread projection
@@ -770,7 +1151,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         projections.withActivationLease(active.activation, readyRequired = true) {
             markInboundReadThrough(
                 conversationId = conversationId,
-                peerUserId = conversation.peerUserId,
+                senderUserIds = senderUserIds,
                 requestedLastReadMessageId = newestUnreadMessageId,
                 canonicalLastReadMessageId = receipt.lastReadMessageId,
                 canonicalReadAt = receipt.readAt,
@@ -797,19 +1178,23 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     private suspend fun loadConversations(
         active: SecureMessagingActiveSession,
         forceRefresh: Boolean,
-    ): Map<String, RemoteSecureMessagingTransport.Session.DirectConversation> =
+        expectedOwner: SessionFence? = null,
+    ): Map<String, RemoteSecureMessagingTransport.Session.SecureConversation> =
         conversationMutex.withLock {
             prepareOwner(active)
             if (forceRefresh || !conversationsLoaded) {
-                val loaded = active.transport.directConversations()
+                val loaded = active.transport.conversations(expectedOwner)
                 check(sessions.currentOrNull() === active) {
                     "Secure messaging session changed while loading conversations"
                 }
                 val byId = loaded.associateBy { it.conversationId }
                 check(byId.size == loaded.size) {
-                    "The server returned duplicate direct conversation identifiers"
+                    "The server returned duplicate conversation identifiers"
                 }
-                check(loaded.map { it.peerUserId }.distinct().size == loaded.size) {
+                // Only direct chats are unique per peer. Groups deliberately are not: the same
+                // people may hold several, and each is a separate conversation.
+                val directPeers = loaded.filterNot { it.isGroup }.map { it.peerUserId }
+                check(directPeers.distinct().size == directPeers.size) {
                     "The server returned duplicate direct conversation peers"
                 }
                 conversationHandles = byId
@@ -821,10 +1206,11 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     private suspend fun requireConversation(
         active: SecureMessagingActiveSession,
         conversationId: String,
-    ): RemoteSecureMessagingTransport.Session.DirectConversation =
-        loadConversations(active, forceRefresh = false)[conversationId]
-            ?: loadConversations(active, forceRefresh = true)[conversationId]
-            ?: error("The secure direct conversation is no longer available")
+        expectedOwner: SessionFence? = null,
+    ): RemoteSecureMessagingTransport.Session.SecureConversation =
+        loadConversations(active, forceRefresh = false, expectedOwner)[conversationId]
+            ?: loadConversations(active, forceRefresh = true, expectedOwner)[conversationId]
+            ?: error("The secure conversation is no longer available")
 
     private fun prepareOwner(active: SecureMessagingActiveSession) {
         if (conversationOwner !== active) {
@@ -871,15 +1257,17 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
 
     private suspend fun reissuePending(
         active: SecureMessagingActiveSession,
-        conversation: RemoteSecureMessagingTransport.Session.DirectConversation,
+        conversation: RemoteSecureMessagingTransport.Session.SecureConversation,
         durable: LibSignalCompanionRecord,
         plan: SecureMessagingEncryptionPlan,
+        expectedOwner: SessionFence?,
     ) {
         val encrypted = SecureMessagingCryptoWireMapper.retryEncryption(durable, plan)
         val receipt = active.transport.send(
             conversation,
             encrypted,
             KitMediaMessage.attachmentsFor(durable.authenticatedText),
+            expectedOwner,
         )
         projections.withActivationLease(active.activation, readyRequired = true) {
             markOutboundSent(durable, receipt)
@@ -888,11 +1276,12 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
 
     private suspend fun commitMissingSessions(
         active: SecureMessagingActiveSession,
-        conversation: RemoteSecureMessagingTransport.Session.DirectConversation,
+        conversation: RemoteSecureMessagingTransport.Session.SecureConversation,
         roster: RemoteSecureMessagingTransport.Session.AuthoritativeRoster,
         plan: SecureMessagingEncryptionPlan,
         transaction: SecureMessagingCryptoTransaction,
         missingDeviceIds: Set<String>,
+        expectedOwner: SessionFence?,
     ) {
         var committed = false
         try {
@@ -901,6 +1290,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 roster = roster,
                 plan = plan,
                 deviceIds = missingDeviceIds,
+                expectedOwner = expectedOwner,
             )
             transaction.stageSessionEstablishment(request)
             val result = transaction.commit()
@@ -919,12 +1309,14 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         plan: SecureMessagingEncryptionPlan,
         clientMessageId: String,
         text: String,
+        replyToMessageId: String?,
     ): SecureMessagingEncryptedSend {
         var committed = false
         val request = SecureMessagingEncryptionRequest(
             plan = plan,
             clientMessageId = clientMessageId,
             text = text,
+            replyToMessageId = replyToMessageId,
         )
         return try {
             transaction.stageEncryption(request, projections.outboundIntent(clientMessageId))
@@ -933,7 +1325,14 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 "Secure messaging encryption returned the wrong committed operation"
             }
             committed = true
-            SecureMessagingCryptoWireMapper.encryption(result)
+            SecureMessagingCryptoWireMapper.encryption(
+                result,
+                messageKind = if (KitReactionMessage.parse(text) != null) {
+                    ENCRYPTED_REACTION_MESSAGE_KIND
+                } else {
+                    com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
+                },
+            )
         } finally {
             request.close()
             if (!committed) transaction.abort()
@@ -954,12 +1353,18 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         throw error
     }
 
-    private fun RemoteSecureMessagingTransport.Session.DirectConversation.toAuthenticated() =
-        AuthenticatedDirectConversation(
-            id = conversationId,
-            peerUserId = peerUserId,
-            peerName = peerName,
-        )
+    private fun RemoteSecureMessagingTransport.Session.SecureConversation.toAuthenticated(
+        viewerUserId: String,
+    ) = AuthenticatedConversation(
+        id = conversationId,
+        type = type,
+        title = title,
+        viewerUserId = viewerUserId,
+        currentUserRole = currentUserRole,
+        members = members.map {
+            AuthenticatedConversationMember(userId = it.userId, name = it.name, role = it.role)
+        },
+    )
 
     private fun SecureMessagingProjectionDeliveryState.toAuthenticated(
         fromCurrentUser: Boolean,
@@ -1086,6 +1491,12 @@ class EncryptedChatRepository @Inject internal constructor(
     clock: Clock,
     private val composerDrafts: SecureMessagingComposerDraftStore? = null,
     private val conversationPrefs: ConversationPrefsDao? = null,
+    private val systemEvents: ConversationSystemEventStore? = null,
+    private val presence: KitPresenceRegistry? = null,
+    private val typists: KitTypingRegistry? = null,
+    private val profilePhotos: ProfilePhotoDirectory? = null,
+    private val authenticationSessions: SessionStore? = null,
+    private val scheduledSends: ScheduledSendStore? = null,
 ) : ChatRepository {
     // Drafts are a best-effort convenience riding the encrypted messaging state store; they are
     // erased with that state on logout and must never fail or gate any messaging operation.
@@ -1103,8 +1514,16 @@ class EncryptedChatRepository @Inject internal constructor(
     // A message-ready transport is necessary but not sufficient for UI readiness. Keep this gate
     // closed until the new epoch's restored/current projection baseline has been published, so an
     // open conversation cannot mistake restored history for newly arrived messages or payments.
+    //
+    // This is the *exchange* gate and nothing else: it says a message may be sent, not that there
+    // is something to show. What to show is [localHistoryReady], which the local encrypted store
+    // can answer on its own. Conflating the two is what used to blank the entire Messages screen
+    // behind "Secure messaging is not ready" for as long as the network took to answer.
     private val mutableReadiness = MutableStateFlow(false)
     override val readiness: StateFlow<Boolean> = mutableReadiness.asStateFlow()
+
+    private val mutableLocalHistoryReady = MutableStateFlow(false)
+    override val localHistoryReady: StateFlow<Boolean> = mutableLocalHistoryReady.asStateFlow()
 
     // Viewer-local pin/mute decoration happens synchronously at the publication edge so the
     // authenticated projection flow stays byte-derived from the encrypted store while readers
@@ -1114,9 +1533,77 @@ class EncryptedChatRepository @Inject internal constructor(
     private val mutableChats = MutableStateFlow<List<ChatPreview>>(emptyList())
     override val chats: StateFlow<List<ChatPreview>> = mutableChats.asStateFlow()
 
+    // Presence and typing are the one part of a preview that is not derived from the encrypted
+    // store: they are facts about right now, held in RAM by the realtime registries and folded in
+    // at the same publication edge as the viewer-local pin/mute decoration. Both are empty unless a
+    // conversation is currently subscribed, which is only ever the one on screen.
+    private val onlineConversations = MutableStateFlow<Set<String>>(emptySet())
+    private val typingConversations = MutableStateFlow<Set<String>>(emptySet())
+
+    // The whole roster map, not just which conversations have somebody in them: a participant
+    // list needs to know *who* is watching, one dot per row, and a group needs to name whoever is
+    // typing rather than say that somebody, somewhere in it, is.
+    private val presenceRosters = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
+    private val typingRosters = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
+
     private fun publishChats(previews: List<ChatPreview>) {
         rawChats.value = previews
-        mutableChats.value = applyConversationPrefs(previews, prefsSnapshot.value)
+        republishChats()
+    }
+
+    private fun republishChats() {
+        synchronized(publicationLock) {
+            mutableChats.value = applyRealtimeSignals(
+                applyConversationPrefs(rawChats.value, prefsSnapshot.value),
+                online = onlineConversations.value,
+                typing = typingConversations.value,
+                typingNames = typingNames(),
+            )
+        }
+    }
+
+    /**
+     * Names for the people typing in each group, ordered the way its participant list reads.
+     *
+     * Only groups appear here — a direct chat's typist is the person already named at the top of
+     * the screen. A typist this device cannot name is left out rather than guessed at: the bubble
+     * still shows, it simply says "typing…" the way it always has.
+     */
+    private fun typingNames(): Map<String, List<String>> {
+        val rosters = typingRosters.value
+        if (rosters.isEmpty()) return emptyMap()
+        val members = rawMembers.value
+        return rosters.mapValues { (conversationId, typists) ->
+            members[conversationId].orEmpty()
+                .filter { member ->
+                    !member.isSelf && typists.any { it.equals(member.userId, ignoreCase = true) }
+                }
+                .map(ChatMember::name)
+        }.filterValues(List<String>::isNotEmpty)
+    }
+
+    /**
+     * Re-publishes every participant list with the current presence roster folded in.
+     *
+     * The roster is only populated for a conversation this device is subscribed to — the one on
+     * screen — so everybody else's dot is simply off rather than guessed at. Our own row never
+     * lights up: a dot means "somebody else is here", the same rule the chat list follows.
+     */
+    private fun republishMembers() {
+        synchronized(conversationLock) {
+            memberFlows.forEach { (conversationId, flow) ->
+                flow.value = decoratedMembers(conversationId)
+            }
+        }
+    }
+
+    private fun decoratedMembers(conversationId: String): List<ChatMember> {
+        val roster = presenceRosters.value[conversationId].orEmpty()
+        return rawMembers.value[conversationId].orEmpty().map { member ->
+            member.copy(
+                online = !member.isSelf && roster.any { it.equals(member.userId, true) },
+            )
+        }
     }
 
     override suspend fun setChatPinned(chatId: String, pinned: Boolean) {
@@ -1135,13 +1622,27 @@ class EncryptedChatRepository @Inject internal constructor(
     private val publicationLock = Any()
     private val conversationLock = Any()
     private val conversationFlows = mutableMapOf<String, MutableStateFlow<List<Message>>>()
+    private val memberFlows = mutableMapOf<String, MutableStateFlow<List<ChatMember>>>()
+    private val rawMembers = MutableStateFlow<Map<String, List<ChatMember>>>(emptyMap())
     private val refreshMutex = Mutex()
     private val timeFormatter = DateTimeFormatter.ofPattern("HH:mm").withZone(clock.zone)
     private var publishedSession: SecureMessagingChatSession? = null
 
+    /**
+     * The activation whose local history is currently on screen, when no ready session's
+     * publication has replaced it yet. Never a substitute for [publishedSession]: it names what is
+     * displayed, and confers no authority to send.
+     */
+    private var publishedLocalActivation: SecureMessagingActivationCapability? = null
+    private val localHistoryMutex = Mutex()
+
     private data class ProjectionPublication(
         val chats: List<ChatPreview>,
         val messagesByConversation: Map<String, List<Message>>,
+        /** Groups only: a direct chat's "participants" are the two people already on screen. */
+        val membersByConversation: Map<String, List<ChatMember>> = emptyMap(),
+        /** Trusted URLs learned while building this exact authenticated projection. */
+        val learnedProfilePhotos: Map<String, String> = emptyMap(),
     )
 
     init {
@@ -1149,7 +1650,82 @@ class EncryptedChatRepository @Inject internal constructor(
             scope.launch {
                 dao.observeAll().collect { prefs ->
                     prefsSnapshot.value = prefs
-                    mutableChats.value = applyConversationPrefs(rawChats.value, prefs)
+                    republishChats()
+                }
+            }
+        }
+        presence?.let { registry ->
+            scope.launch {
+                registry.presence.collect { rosters ->
+                    // Our own membership is not presence: the dot means "somebody else is here".
+                    val self = registry.selfPublicId
+                    presenceRosters.value = rosters
+                    onlineConversations.value =
+                        rosters.filterValues { members -> members.any { it != self } }.keys
+                    republishChats()
+                    republishMembers()
+                }
+            }
+        }
+        typists?.let { registry ->
+            scope.launch {
+                registry.typing.collect { byConversation ->
+                    val active = byConversation.filterValues(Set<String>::isNotEmpty)
+                    typingRosters.value = active
+                    typingConversations.value = active.keys
+                    republishChats()
+                }
+            }
+        }
+        scheduledSends?.let { queue ->
+            scope.launch {
+                // Send-later items live in the same encrypted state as the transcripts, so they are
+                // readable exactly when an activation is, and they belong to that activation alone.
+                // Re-reading on every change rather than once is what stops one account's scheduled
+                // messages being shown to — or sent by — the next one to sign in on this device.
+                runtime.localHistoryActivations
+                    .distinctUntilChanged { previous, next -> previous === next }
+                    .collectLatest { activation ->
+                        try {
+                            if (activation == null) queue.forget() else queue.reload()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            // An unreadable queue is not something the user can act on here. The
+                            // next activation change re-reads it; nothing else depends on this.
+                        }
+                    }
+            }
+        }
+        scope.launch {
+            // Draws the app from the encrypted store the moment there is an activation to read
+            // it with, which is before the transport, key and roster round trips have run — and
+            // regardless of whether they ever succeed. This is what makes Messages usable on a
+            // cold start, offline, and while secure setup is retrying in the background.
+            //
+            // It yields the screen to the exchange path below as soon as that path publishes:
+            // the ready baseline is authoritative, this is the interim view of the same data.
+            combine(
+                runtime.localHistoryActivations,
+                mutableReadiness,
+                runtime.projectionChanges,
+                contacts.contacts,
+            ) { activation, ready, _, contactList ->
+                Triple(activation, ready, contactList)
+            }.conflate().collect { (activation, ready, contactList) ->
+                localHistoryMutex.withLock {
+                    // Compared by identity rather than waiting for an intervening null: StateFlow
+                    // conflation could otherwise carry one activation's chats into the next.
+                    if (publishedLocalActivation !== activation) discardLocalHistoryPublication()
+                    if (activation == null || ready) return@withLock
+                    try {
+                        publishLocalHistory(activation, contactList)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        // Unreadable local state is not an error the user can act on. Leave the
+                        // screen as it is; the next projection change or activation retries.
+                    }
                 }
             }
         }
@@ -1157,7 +1733,7 @@ class EncryptedChatRepository @Inject internal constructor(
             // Only a REAL activation change (a different identity, or none at all) may cancel
             // in-flight projection work. Signals for the same activation are conflated and
             // served sequentially below, so a long rebuild can never be starved by the
-            // 2-second foreground sync ticks or draft writes — the livelock that used to
+            // foreground sync ticks or draft writes — the livelock that used to
             // blank every chat exactly while the user was typing.
             runtime.activeSession
                 .distinctUntilChanged { previous, next ->
@@ -1201,6 +1777,76 @@ class EncryptedChatRepository @Inject internal constructor(
                     }
                 }
         }
+    }
+
+    /**
+     * Publishes the chat list and transcripts from this device's own encrypted store.
+     *
+     * Everything here is local: the roster comes from [ConversationRosterStore], the messages from
+     * the projection store, both under an activation lease that has never required stage READY.
+     * No network call is made and none is waited for, so this succeeds in flight mode with the
+     * same content the user last had.
+     */
+    private suspend fun publishLocalHistory(
+        activation: SecureMessagingActivationCapability,
+        localContacts: List<Contact>,
+    ) {
+        val conversations = runtime.cachedConversations(activation)
+        val projections = readAllProjectionPages { after, limit ->
+            runtime.localProjectionPage(activation, after, limit)
+        }
+        if (conversations.isEmpty() && projections.isEmpty()) {
+            // Nothing has ever synced on this device. Say so by publishing an empty-but-ready
+            // list rather than leaving the screen in a permanent loading state.
+            synchronized(publicationLock) {
+                if (mutableReadiness.value || publishedSession != null) return
+                publishedLocalActivation = activation
+                mutableLocalHistoryReady.value = true
+            }
+            return
+        }
+        val membershipHistory = try {
+            systemEvents?.load(conversations.map(AuthenticatedConversation::id))
+            systemEvents?.events?.value.orEmpty()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            emptyMap()
+        }
+        val publication = buildPublication(
+            conversations = conversations,
+            projections = projections,
+            localContacts = localContacts,
+            membershipHistory = membershipHistory,
+            strictSenderAuthentication = false,
+        )
+        val committed = synchronized(publicationLock) {
+            // The exchange path may have published while this was being built. Its baseline is
+            // authoritative and must never be replaced by the interim local view.
+            if (mutableReadiness.value || publishedSession != null) {
+                false
+            } else {
+                commitPublicationBodyLocked(publication)
+                publishedLocalActivation = activation
+                mutableLocalHistoryReady.value = true
+                true
+            }
+        }
+        if (committed) rememberPublicationPhotos(activation.binding.sessionEpoch, publication)
+    }
+
+    /** Takes the local view off screen, but never a ready session's publication. */
+    private fun discardLocalHistoryPublication() = synchronized(publicationLock) {
+        if (publishedSession != null) {
+            // A ready session already replaced the interim view. Nothing to take down, and
+            // withdrawing readiness here would be a lie about what is on screen.
+            publishedLocalActivation = null
+            return@synchronized
+        }
+        val owned = publishedLocalActivation != null
+        publishedLocalActivation = null
+        mutableLocalHistoryReady.value = false
+        if (owned) clearPublishedStateLocked(owner = null)
     }
 
     /**
@@ -1387,6 +2033,78 @@ class EncryptedChatRepository @Inject internal constructor(
         return created.id
     }
 
+    override suspend fun createGroupConversation(title: String, contacts: List<Contact>): String {
+        val session = requireReadySession()
+        val trimmedTitle = title.trim()
+        require(trimmedTitle.isNotEmpty()) { "A group needs a name" }
+        require(isValidMessagingGroupTitle(trimmedTitle)) { "That group name is too long" }
+        require(contacts.isNotEmpty()) { "A group needs at least one other person" }
+        require(contacts.all { it.isKitUser }) {
+            "Only contacts who are on Kit Pay can join a group"
+        }
+        val memberUserIds = contacts.map(Contact::id).distinct()
+        require(memberUserIds.size == contacts.size) { "That group lists somebody twice" }
+        val created = runtime.createGroupConversation(session, trimmedTitle, memberUserIds)
+        refresh(session, this.contacts.contacts.value)
+        check(chat(created.id) != null) { "The secure conversation was not added to the projection" }
+        return created.id
+    }
+
+    override fun groupMembers(chatId: String): StateFlow<List<ChatMember>> =
+        synchronized(conversationLock) {
+            memberFlows.getOrPut(chatId) { MutableStateFlow(decoratedMembers(chatId)) }
+                .asStateFlow()
+        }
+
+    override suspend fun addGroupMember(chatId: String, contact: Contact) {
+        require(contact.isKitUser) { "Only contacts who are on Kit Pay can join a group" }
+        mutateGroupMembership(chatId) { session ->
+            runtime.addGroupMember(session, chatId, contact.id)
+        }
+    }
+
+    override suspend fun setGroupMemberRole(chatId: String, userId: String, role: ChatMemberRole) {
+        mutateGroupMembership(chatId) { session ->
+            runtime.setGroupMemberRole(session, chatId, userId, role.toConversationRole())
+        }
+    }
+
+    override suspend fun removeGroupMember(chatId: String, userId: String) {
+        mutateGroupMembership(chatId) { session ->
+            runtime.removeGroupMember(session, chatId, userId)
+        }
+    }
+
+    override suspend fun leaveGroupConversation(chatId: String) {
+        val session = requireReadySession()
+        // A direct chat cannot be left, only deleted, and there is no delete here: leaving one
+        // would take a peer's whole history off this device with no way to ask for it back.
+        check(chat(chatId)?.isGroup == true) { "That conversation is not a group" }
+        runtime.leaveGroupConversation(session, chatId)
+        refresh(session, contacts.contacts.value)
+        // The projection is rebuilt from what the server still says we are in, so a group we have
+        // left simply stops being there. Saying so out loud keeps a stale chat from lingering on
+        // a list that is otherwise only ever appended to.
+        check(chat(chatId) == null) { "The secure conversation was not removed from the projection" }
+    }
+
+    /**
+     * Applies one membership change and re-publishes from the server's answer.
+     *
+     * The projection is never edited in place: the server decides who is in a group, and a local
+     * guess about the outcome would show a member who was actually refused, or hide one who was
+     * not. The refresh is what makes the participant list true.
+     */
+    private suspend fun mutateGroupMembership(
+        chatId: String,
+        mutate: suspend (SecureMessagingChatSession) -> Unit,
+    ) {
+        val session = requireReadySession()
+        check(chat(chatId)?.isGroup == true) { "That conversation is not a group" }
+        mutate(session)
+        refresh(session, contacts.contacts.value)
+    }
+
     override suspend fun sendMessage(
         chatId: String,
         text: String,
@@ -1395,8 +2113,22 @@ class EncryptedChatRepository @Inject internal constructor(
         chatId = chatId,
         text = text,
         retryClientMessageId = null,
-        trustedPaymentEvent = false,
+        authorship = AuthoredContent.USER_TEXT,
         onDurablyCommitted = onDurablyCommitted,
+    )
+
+    override suspend fun sendMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        text: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit,
+    ) = sendValidatedText(
+        chatId = chatId,
+        text = text,
+        retryClientMessageId = null,
+        authorship = AuthoredContent.USER_TEXT,
+        onDurablyCommitted = onDurablyCommitted,
+        expectedOwner = owner,
     )
 
     override suspend fun sendPaymentEvent(
@@ -1407,8 +2139,22 @@ class EncryptedChatRepository @Inject internal constructor(
         chatId = chatId,
         text = descriptor,
         retryClientMessageId = null,
-        trustedPaymentEvent = true,
+        authorship = AuthoredContent.PAYMENT_EVENT,
         onDurablyCommitted = onDurablyCommitted,
+    )
+
+    override suspend fun sendPaymentEventForOwner(
+        owner: SessionFence,
+        chatId: String,
+        descriptor: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit,
+    ) = sendValidatedText(
+        chatId = chatId,
+        text = descriptor,
+        retryClientMessageId = null,
+        authorship = AuthoredContent.PAYMENT_EVENT,
+        onDurablyCommitted = onDurablyCommitted,
+        expectedOwner = owner,
     )
 
     override suspend fun retryMessage(chatId: String, clientMessageId: String, text: String) =
@@ -1416,7 +2162,7 @@ class EncryptedChatRepository @Inject internal constructor(
             chatId = chatId,
             text = text,
             retryClientMessageId = clientMessageId,
-            trustedPaymentEvent = false,
+            authorship = AuthoredContent.USER_TEXT,
         )
 
     override suspend fun retryPaymentEvent(
@@ -1427,26 +2173,62 @@ class EncryptedChatRepository @Inject internal constructor(
         chatId = chatId,
         text = descriptor,
         retryClientMessageId = clientMessageId,
-        trustedPaymentEvent = true,
+        authorship = AuthoredContent.PAYMENT_EVENT,
     )
+
+    override suspend fun toggleReaction(chatId: String, messageId: String, emoji: String) {
+        val current = conversation(chatId).value.firstOrNull { it.id == messageId }
+        // Reacting to a message this device has not authenticated locally would send a descriptor
+        // pointing at nothing the peer can resolve back to a bubble.
+        requireNotNull(current) { "That message is no longer in this conversation" }
+        require(current.acceptsReactions) { "That message cannot be reacted to yet" }
+        require(KitReactionMessage.isAcceptableReaction(emoji)) { "That is not a usable reaction" }
+        val alreadyMine = current.reactions.any { it.emoji == emoji && it.fromMe }
+        val descriptor = KitReactionMessage(
+            targetMessageId = messageId,
+            emoji = emoji,
+            action = if (alreadyMine) KitReactionAction.REMOVE else KitReactionAction.ADD,
+        ).encode()
+        sendValidatedText(
+            chatId = chatId,
+            text = descriptor,
+            retryClientMessageId = null,
+            authorship = AuthoredContent.REACTION,
+        )
+    }
+
+    /** Which caller produced the authenticated text, and therefore which rules validate it. */
+    private enum class AuthoredContent { USER_TEXT, PAYMENT_EVENT, REACTION }
 
     private suspend fun sendValidatedText(
         chatId: String,
         text: String,
         retryClientMessageId: String?,
-        trustedPaymentEvent: Boolean,
+        authorship: AuthoredContent,
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
+        expectedOwner: SessionFence? = null,
     ) {
         val session = requireReadySession()
+        expectedOwner?.let { owner ->
+            if (
+                authenticationSessions?.current()?.fence() != owner ||
+                session.sessionEpoch != owner.sessionId
+            ) throw SessionInvalidatedException()
+        }
         val normalized = text.trim()
         require(normalized.isNotEmpty()) { "Enter a message to send securely" }
-        if (trustedPaymentEvent) {
-            require(KitPaymentMessage.parse(normalized) != null) {
+        when (authorship) {
+            AuthoredContent.PAYMENT_EVENT -> require(KitPaymentMessage.parse(normalized) != null) {
                 "Kit Pay could not validate this payment event"
             }
-        } else {
-            require(KitPaymentMessage.allowsUserAuthoredText(normalized)) {
-                "Messages cannot start with Kit Pay's reserved payment prefix"
+            AuthoredContent.REACTION -> require(KitReactionMessage.parse(normalized) != null) {
+                "Kit Pay could not validate this reaction"
+            }
+            AuthoredContent.USER_TEXT -> require(
+                KitPaymentMessage.allowsUserAuthoredText(normalized) &&
+                    !KitReactionMessage.beginsWithReservedPrefix(normalized),
+            ) {
+                "Messages cannot start with one of Kit Pay's reserved prefixes"
             }
         }
         try {
@@ -1455,7 +2237,13 @@ class EncryptedChatRepository @Inject internal constructor(
                 conversationId = chatId,
                 text = normalized,
                 retryClientMessageId = retryClientMessageId,
+                replyToMessageId = if (authorship == AuthoredContent.REACTION) {
+                    checkNotNull(KitReactionMessage.parse(normalized)).targetMessageId
+                } else {
+                    null
+                },
                 onDurablyCommitted = onDurablyCommitted,
+                expectedOwner = expectedOwner,
             )
         } finally {
             refresh(session, contacts.contacts.value)
@@ -1500,15 +2288,32 @@ class EncryptedChatRepository @Inject internal constructor(
         if (!runtime.isCurrent(session)) return@withLock false
         if (!establishReadiness && !isReadyFor(session)) return@withLock false
 
-        var conversations = runtime.directConversations(session, forceRefresh = false)
+        var conversations = runtime.conversations(session, forceRefresh = false)
         val projections = readAllProjectionPages(session)
         if (projections.any { projected -> conversations.none { it.id == projected.conversationId } }) {
-            conversations = runtime.directConversations(session, forceRefresh = true)
+            conversations = runtime.conversations(session, forceRefresh = true)
+        }
+
+        // Timeline annotations for whatever this refresh is about to publish. Best-effort by
+        // construction: a group whose system-message record cannot be read shows a transcript
+        // without those lines rather than no transcript at all.
+        val membershipHistory = try {
+            systemEvents?.load(conversations.map(AuthenticatedConversation::id))
+            systemEvents?.events?.value.orEmpty()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            emptyMap()
         }
 
         // Authentication and UI mapping may be non-trivial. Build without holding the runtime's
         // active-session lock, then make only the in-memory commit inside its atomic fence.
-        val publication = buildPublication(conversations, projections, localContacts)
+        val publication = buildPublication(
+            conversations = conversations,
+            projections = projections,
+            localContacts = localContacts,
+            membershipHistory = membershipHistory,
+        )
         var committed = false
         val current = runtime.publishIfCurrent(session) {
             synchronized(publicationLock) {
@@ -1524,16 +2329,24 @@ class EncryptedChatRepository @Inject internal constructor(
         // An obsolete refresh simply does not commit: the successor activation's own baseline
         // replaces (or, on identity change, erases) the publication. Eagerly clearing here used
         // to blank the UI whenever the registry retained the session mid-refresh.
-        current && committed
+        (current && committed).also { published ->
+            if (published) rememberPublicationPhotos(session.sessionEpoch, publication)
+        }
     }
 
     private suspend fun readAllProjectionPages(
         session: SecureMessagingChatSession,
+    ): List<AuthenticatedProjectedText> = readAllProjectionPages { after, limit ->
+        runtime.projectionPage(session, after, limit)
+    }
+
+    private suspend fun readAllProjectionPages(
+        readPage: suspend (afterRecordKey: String?, limit: Int) -> AuthenticatedProjectionPage,
     ): List<AuthenticatedProjectedText> {
         val projected = mutableListOf<AuthenticatedProjectedText>()
         var after: String? = null
         repeat(MAX_PROJECTION_PAGES) {
-            val page = runtime.projectionPage(session, after, PROJECTION_PAGE_SIZE)
+            val page = readPage(after, PROJECTION_PAGE_SIZE)
             projected += page.messages
             val next = page.nextAfterRecordKey ?: return projected
             check(after == null || next > after!!) { "Encrypted projection pagination did not advance" }
@@ -1543,33 +2356,105 @@ class EncryptedChatRepository @Inject internal constructor(
     }
 
     private fun buildPublication(
-        conversations: List<AuthenticatedDirectConversation>,
+        conversations: List<AuthenticatedConversation>,
         projections: List<AuthenticatedProjectedText>,
         localContacts: List<Contact>,
+        membershipHistory: Map<String, List<ConversationSystemEvent>> = emptyMap(),
+        strictSenderAuthentication: Boolean = true,
     ): ProjectionPublication {
         val conversationIds = conversations.mapTo(mutableSetOf()) { it.id }
+        val conversationsById = conversations.associateBy(AuthenticatedConversation::id)
+        fun senderIsMember(projected: AuthenticatedProjectedText): Boolean =
+            projected.fromCurrentUser ||
+                conversationsById[projected.conversationId]?.others?.any {
+                    it.userId.equals(projected.senderUserId, ignoreCase = true)
+                } == true
         val authenticated = projections.filter { it.conversationId in conversationIds }
-        val conversationsById = conversations.associateBy(AuthenticatedDirectConversation::id)
-        authenticated.forEach { projected ->
-            if (!projected.fromCurrentUser) {
-                check(
-                    conversationsById[projected.conversationId]?.peerUserId ==
-                        projected.senderUserId,
-                ) { "An authenticated direct-message projection belongs to another peer" }
+            // Membership minus the viewer, not peer identity: a group has many legitimate
+            // senders, but a bubble attributed to somebody else can never carry this account's
+            // own ID. For a direct chat [others] is exactly the peer, so this is the same
+            // fail-closed decision it has always been — a bubble is shown only to a proven member.
+            //
+            // How that decision is enforced differs by source. A freshly loaded server roster and
+            // the projections it accompanies must agree exactly, so disagreement is an integrity
+            // failure and throws. A roster read back from local cache may legitimately predate a
+            // membership change this device has not learned yet, so an unattributable bubble is
+            // dropped instead — the same message is never displayed, but one stale row does not
+            // cost the user every other conversation on the screen.
+            .filter { projected -> strictSenderAuthentication || senderIsMember(projected) }
+        if (strictSenderAuthentication) {
+            authenticated.forEach { projected ->
+                check(senderIsMember(projected)) {
+                    "An authenticated message projection names a sender outside this conversation"
+                }
             }
-        }
-        val messageLists = authenticated.groupBy { it.conversationId }.mapValues { (_, values) ->
-            values.sortedWith(authenticatedProjectionOrder)
-                .map(::toUiMessage)
-        }
-        val projectedByConversation = authenticated.groupBy(AuthenticatedProjectedText::conversationId)
-        val latestByConversation = projectedByConversation.mapValues { (_, messages) ->
-            messages.maxWithOrNull(authenticatedProjectionOrder)
         }
         val savedNames = localContacts.asSequence()
             .filter { it.isKitUser && it.savedInDevice }
             .associate { it.id.lowercase() to it.name.safeChatContactName() }
-        val avatarsByUser = localContacts.asSequence()
+        // The address book wins over the server's name for anyone this device has saved, which is
+        // what makes a group's bubbles and reaction lists read the way the rest of the app does.
+        fun AuthenticatedConversation.displayNameOf(userId: String): String =
+            savedNames[userId.lowercase()]
+                ?: memberNamed(userId)?.name.safeChatContactName()
+                ?: DEFAULT_PEER_NAME
+        // A reaction is carried by an ordinary encrypted message, so it arrives here as a
+        // projection like any other. Fold each conversation's reaction descriptors onto the
+        // messages they point at and drop them from the transcript: they are an annotation on a
+        // bubble, never a bubble, a chat preview or an unread count of their own.
+        val orderedByConversation = authenticated.groupBy(AuthenticatedProjectedText::conversationId)
+            .mapValues { (_, values) -> values.sortedWith(authenticatedProjectionOrder) }
+        // A group that has been joined but not yet spoken in still has a timeline: its membership
+        // lines are the whole of it, so the transcript is keyed by more than what has ciphertext.
+        val timelineConversationIds = orderedByConversation.keys +
+            membershipHistory.keys.filter { conversationsById[it]?.isGroup == true }
+        val messageLists = timelineConversationIds.associateWith { conversationId ->
+            val ordered = orderedByConversation[conversationId].orEmpty()
+            val conversation = conversationsById[conversationId]
+            val reactions = foldAuthenticatedReactions(
+                ordered = ordered,
+                nameOf = { senderUserId ->
+                    conversation?.displayNameOf(senderUserId) ?: DEFAULT_PEER_NAME
+                },
+            )
+            val bubbles = ordered.filterNot { KitReactionMessage.isReactionText(it.text) }
+                .map { projected ->
+                    toUiMessage(
+                        projected = projected,
+                        reactions = reactions[projected.messageId].orEmpty(),
+                        // Only a group needs an author label on the bubble; a direct chat's
+                        // sender is already the person named at the top of the screen.
+                        senderName = conversation
+                            ?.takeIf { it.isGroup && !projected.fromCurrentUser }
+                            ?.displayNameOf(projected.senderUserId),
+                    )
+                }
+            // Membership lines belong to a group's timeline, not to a direct chat, whose
+            // membership cannot change at all.
+            val notices = conversation?.takeIf(AuthenticatedConversation::isGroup)?.let { group ->
+                membershipHistory[conversationId].orEmpty().mapNotNull { event ->
+                    toSystemMessage(
+                        event = event,
+                        isViewer = event.userId.equals(group.viewerUserId, ignoreCase = true),
+                        // A removed member has already left the roster by the time this reads
+                        // it, so the address book is what usually names them. Nothing is
+                        // invented when neither knows: the line names no one instead.
+                        name = savedNames[event.userId.lowercase()]
+                            ?: group.memberNamed(event.userId)?.name.safeChatContactName(),
+                    )
+                }
+            }.orEmpty()
+            // sortedBy is stable, so the authenticated bubbles keep their order exactly and a
+            // notice slots in after anything sent in the same millisecond.
+            if (notices.isEmpty()) bubbles else (bubbles + notices).sortedBy { it.sortEpochMillis }
+        }
+        val projectedByConversation = orderedByConversation.mapValues { (_, ordered) ->
+            ordered.filterNot { KitReactionMessage.isReactionText(it.text) }
+        }
+        val latestByConversation = projectedByConversation.mapValues { (_, messages) ->
+            messages.maxWithOrNull(authenticatedProjectionOrder)
+        }
+        val contactAvatars = localContacts.asSequence()
             .filter { it.isKitUser && it.id.isNotBlank() }
             .mapNotNull { contact ->
                 contact.avatarUrl?.trim()?.takeIf(String::isNotEmpty)?.let {
@@ -1577,17 +2462,26 @@ class EncryptedChatRepository @Inject internal constructor(
                 }
             }
             .toMap()
+        // The remembered photos come first and the freshly loaded contacts overwrite them, so a
+        // chat list drawn before — or entirely without — a contacts fetch still shows faces, and a
+        // photo that has since changed is corrected the moment the network says so.
+        val avatarsByUser = profilePhotos?.currentPhotos().orEmpty() + contactAvatars
+        // A group is named by its server-visible title; a direct chat by whoever is on the other
+        // end, preferring the local address book.
+        fun AuthenticatedConversation.displayName(): String = if (isGroup) {
+            title.safeChatContactName() ?: DEFAULT_GROUP_NAME
+        } else {
+            peerUserId?.let { displayNameOf(it) } ?: DEFAULT_PEER_NAME
+        }
         val chats = conversations.sortedWith(
-            compareByDescending<AuthenticatedDirectConversation> { conversation ->
+            compareByDescending<AuthenticatedConversation> { conversation ->
                 latestByConversation[conversation.id]?.sentAt?.toEpochMilli() ?: Long.MIN_VALUE
-            }.thenBy { it.peerName?.lowercase().orEmpty() }.thenBy { it.id },
+            }.thenBy { it.displayName().lowercase() }.thenBy { it.id },
         ).map { conversation ->
             val last = latestByConversation[conversation.id]
             ChatPreview(
                 id = conversation.id,
-                name = savedNames[conversation.peerUserId.lowercase()]
-                    ?: conversation.peerName.safeChatContactName()
-                    ?: "Kit Pay contact",
+                name = conversation.displayName(),
                 lastMessage = last?.text?.let { text ->
                     KitMediaMessage.parse(text)?.let { media ->
                         val label = KitChatMediaKind.fromMediaType(media.mediaType).previewLabel
@@ -1605,13 +2499,59 @@ class EncryptedChatRepository @Inject internal constructor(
                     !projected.fromCurrentUser &&
                         projected.deliveryState == AuthenticatedTextDeliveryState.RECEIVED
                 },
-                isGroup = false,
+                isGroup = conversation.isGroup,
                 lastFromMe = last?.fromCurrentUser == true,
                 lastState = last?.deliveryState.toUiDeliveryState(),
-                avatarUrl = avatarsByUser[conversation.peerUserId.lowercase()],
+                // A group has no photo to show: the app never uploads one, and borrowing a
+                // member's avatar would misname the chat.
+                avatarUrl = conversation.peerUserId?.let { avatarsByUser[it.lowercase()] },
             )
         }
-        return ProjectionPublication(chats, messageLists)
+        // Participant lists are ordered the way the group reads them: whoever can act on the
+        // group first, then everybody else alphabetically, with this account marked rather than
+        // moved so its own role stays visible where the eye already is.
+        val membersByConversation = conversations.filter(AuthenticatedConversation::isGroup)
+            .associate { conversation ->
+                conversation.id to conversation.members.map { member ->
+                    ChatMember(
+                        userId = member.userId,
+                        name = if (member.userId == conversation.viewerUserId) {
+                            SELF_MEMBER_NAME
+                        } else {
+                            conversation.displayNameOf(member.userId)
+                        },
+                        role = member.role.toChatMemberRole(),
+                        isSelf = member.userId == conversation.viewerUserId,
+                        avatarUrl = avatarsByUser[member.userId.lowercase()],
+                        savedInDevice = savedNames.containsKey(member.userId.lowercase()),
+                    )
+                }.sortedWith(
+                    compareBy<ChatMember> { it.role }
+                        .thenBy { it.name.lowercase() }
+                        .thenBy { it.userId },
+                )
+            }
+        return ProjectionPublication(
+            chats = chats,
+            messagesByConversation = messageLists,
+            membersByConversation = membersByConversation,
+            learnedProfilePhotos = contactAvatars,
+        )
+    }
+
+    /** Writes only after the runtime committed this projection and the login epoch still agrees. */
+    private fun rememberPublicationPhotos(
+        sessionEpoch: String,
+        publication: ProjectionPublication,
+    ) {
+        if (publication.learnedProfilePhotos.isEmpty()) return
+        val current = authenticationSessions?.current() ?: return
+        if (current.sessionId != sessionEpoch) return
+        profilePhotos?.learn(
+            current.fence(),
+            publication.learnedProfilePhotos,
+            complete = false,
+        )
     }
 
     /** Called only while [publicationLock] and the runtime's exact-session fence are held. */
@@ -1619,6 +2559,19 @@ class EncryptedChatRepository @Inject internal constructor(
         session: SecureMessagingChatSession,
         publication: ProjectionPublication,
     ) {
+        commitPublicationBodyLocked(publication)
+        // The exchange path owns the screen from here; the interim local view is superseded
+        // rather than cleared, so nothing blanks between the two.
+        publishedLocalActivation = null
+        publishedSession = session
+        // Publish readiness last: observing true implies this activation's chats/messages were
+        // already committed under the same repository publication lock.
+        mutableReadiness.value = true
+        mutableLocalHistoryReady.value = true
+    }
+
+    /** The observable half of a commit, shared by the local and message-ready publications. */
+    private fun commitPublicationBodyLocked(publication: ProjectionPublication) {
         synchronized(conversationLock) {
             // Replace each conversation atomically: a collector never observes an empty list
             // between commits. Only conversations absent from the new publication are erased
@@ -1634,14 +2587,38 @@ class EncryptedChatRepository @Inject internal constructor(
                     .value = messages
             }
         }
+        rawMembers.value = publication.membersByConversation
+        republishMembers()
         publishChats(publication.chats)
-        publishedSession = session
-        // Publish readiness last: observing true implies this activation's chats/messages were
-        // already committed under the same repository publication lock.
-        mutableReadiness.value = true
     }
 
-    private fun toUiMessage(projected: AuthenticatedProjectedText): Message {
+    /** One membership change as a centred timeline line, or null when there is nothing to say. */
+    private fun toSystemMessage(
+        event: ConversationSystemEvent,
+        isViewer: Boolean,
+        name: String?,
+    ): Message? {
+        val text = conversationSystemMessageText(
+            type = event.type,
+            role = event.role,
+            name = name,
+            isViewer = isViewer,
+        ) ?: return null
+        return Message(
+            id = "system:${event.eventId}",
+            text = text,
+            time = timeFormatter.format(event.occurredAt),
+            fromMe = false,
+            kind = MessageKind.SYSTEM,
+            sortEpochMillis = event.occurredAt.toEpochMilli(),
+        )
+    }
+
+    private fun toUiMessage(
+        projected: AuthenticatedProjectedText,
+        reactions: List<MessageReaction>,
+        senderName: String? = null,
+    ): Message {
         val media = KitMediaMessage.parse(projected.text)
         val mediaKind = media?.let { KitChatMediaKind.fromMediaType(it.mediaType) }
         val payment = if (media == null) KitPaymentMessage.parse(projected.text) else null
@@ -1654,6 +2631,8 @@ class EncryptedChatRepository @Inject internal constructor(
             },
             time = timeFormatter.format(projected.sentAt),
             fromMe = projected.fromCurrentUser,
+            senderUserId = projected.senderUserId,
+            senderName = senderName,
             state = projected.deliveryState.toUiDeliveryState(),
             kind = when {
                 mediaKind == KitChatMediaKind.VOICE -> MessageKind.VOICE_NOTE
@@ -1679,6 +2658,7 @@ class EncryptedChatRepository @Inject internal constructor(
             paymentCurrencyCode = payment?.currencyCode ?: "UGX",
             paymentCurrencyScale = payment?.currencyScale ?: com.kit.wallet.ui.model.Money.SCALE,
             sortEpochMillis = projected.sentAt.toEpochMilli(),
+            reactions = reactions,
         )
     }
 
@@ -1768,10 +2748,17 @@ class EncryptedChatRepository @Inject internal constructor(
     /** Called only while [publicationLock] is held. */
     private fun clearPublishedStateLocked(owner: SecureMessagingChatSession?) {
         mutableReadiness.value = false
+        mutableLocalHistoryReady.value = false
         publishedSession = owner
+        publishedLocalActivation = null
         publishChats(emptyList())
+        rawMembers.value = emptyMap()
+        // Timeline annotations are read back per session like everything else here: a warm
+        // process must never carry one account's group history into another's publication.
+        systemEvents?.forget()
         synchronized(conversationLock) {
             conversationFlows.values.forEach { it.value = emptyList() }
+            memberFlows.values.forEach { it.value = emptyList() }
         }
     }
 
@@ -1783,6 +2770,7 @@ class EncryptedChatRepository @Inject internal constructor(
         const val BASELINE_REFRESH_COOLDOWN_MILLIS = 30_000L
         const val MAX_BASELINE_REFRESH_COOLDOWN_MILLIS = 5 * 60_000L
         const val SIGNED_OUT_CLEAR_GRACE_MILLIS = 15_000L
+
     }
 }
 
@@ -1819,4 +2807,101 @@ internal fun applyConversationPrefs(
         }
     }
     return decorated.sortedByDescending(ChatPreview::pinned)
+}
+
+/**
+ * What a group's timeline says about one membership change.
+ *
+ * Deliberately actor-free. The sync event names the person the change was *about* and nobody
+ * else, so the copy can only ever name them: "Aisha joined this group", never "Brian added
+ * Aisha". Leaving and being removed are the same event on the wire, so they get the same neutral
+ * line rather than a guess that would be a lie half the time. A change this device cannot put a
+ * name to still gets a line — the group did change — but names nobody instead of inventing one.
+ *
+ * Returns null when there is nothing worth saying, which is what keeps an unrecognised event type
+ * or a role change with no role out of the transcript entirely.
+ */
+internal fun conversationSystemMessageText(
+    type: String,
+    role: String?,
+    name: String?,
+    isViewer: Boolean,
+): String? {
+    val subject = when {
+        isViewer -> "You"
+        !name.isNullOrBlank() -> name
+        else -> null
+    }
+    fun line(viewer: String, third: String, unnamed: String): String = when {
+        isViewer -> viewer
+        subject != null -> "$subject $third"
+        else -> unnamed
+    }
+    return when (type) {
+        MEMBERSHIP_ADDED_EVENT -> line(
+            viewer = "You joined this group",
+            third = "joined this group",
+            unnamed = "Someone joined this group",
+        )
+        // "Left" and "was removed" are indistinguishable here, so the line commits to neither.
+        MEMBERSHIP_REMOVED_EVENT -> line(
+            viewer = "You are no longer in this group",
+            third = "is no longer in this group",
+            unnamed = "Someone is no longer in this group",
+        )
+        MEMBERSHIP_ROLE_CHANGED_EVENT -> when (role) {
+            OWNER_CONVERSATION_ROLE -> line(
+                viewer = "You are now an owner of this group",
+                third = "is now an owner of this group",
+                unnamed = "This group has another owner",
+            )
+            ADMIN_CONVERSATION_ROLE -> line(
+                viewer = "You are now an admin",
+                third = "is now an admin",
+                unnamed = "This group has another admin",
+            )
+            MEMBER_CONVERSATION_ROLE -> line(
+                viewer = "You are no longer an admin",
+                third = "is no longer an admin",
+                unnamed = "This group has one fewer admin",
+            )
+            else -> null
+        }
+        else -> null
+    }
+}
+
+/**
+ * Folds the realtime registries' view of "right now" onto an already-ordered preview list.
+ *
+ * Deliberately does not reorder: presence is the most volatile input the list has, and letting it
+ * move rows would make a conversation jump under a finger the moment a peer opened it. It only ever
+ * sets the two boolean decorations, and it clears them when the signal is gone — a conversation
+ * that stops being subscribed goes dark rather than freezing on its last known state.
+ */
+internal fun applyRealtimeSignals(
+    previews: List<ChatPreview>,
+    online: Set<String>,
+    typing: Set<String>,
+    typingNames: Map<String, List<String>> = emptyMap(),
+): List<ChatPreview> {
+    if (online.isEmpty() && typing.isEmpty() &&
+        previews.none { it.online || it.typing || it.typingNames.isNotEmpty() }
+    ) {
+        return previews
+    }
+    return previews.map { preview ->
+        val isOnline = preview.id in online
+        val isTyping = preview.id in typing
+        val names = typingNames[preview.id].orEmpty().takeIf { isTyping }.orEmpty()
+        if (
+            isOnline == preview.online &&
+            isTyping == preview.typing &&
+            names == preview.typingNames
+        ) {
+            preview
+        } else {
+            preview.copy(online = isOnline, typing = isTyping, typingNames = names)
+        }
+    }
 }

@@ -77,8 +77,11 @@ class ConversationDraftLifecycleTest {
     private fun viewModel(chats: ChatRepository) = ConversationViewModel(
         chatRepo = chats,
         walletRepo = UnusedWalletRepository,
+        walletSync = NoOpTestWalletSync,
         callRepo = NoCallsRepository,
         messageSounds = SilentMessageSoundPlayer,
+        realtime = InertConversationSignals,
+        typingSignaller = RecordingTypingSignals(),
         savedStateHandle = SavedStateHandle(mapOf("chatId" to CHAT_ID)),
     )
 

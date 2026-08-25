@@ -73,16 +73,21 @@ import com.kit.wallet.ui.theme.KitWalletTheme
 fun ChatsScreen(
     onChat: (String) -> Unit,
     onNewChat: () -> Unit,
+    /** The group builder: pick who is in it, name it, and it opens as a conversation. */
+    onNewGroup: () -> Unit = {},
     viewModel: ChatsViewModel = hiltViewModel(),
 ) {
     val chats by viewModel.chats.collectAsStateWithLifecycle()
     val messagingAvailable by viewModel.messagingAvailable.collectAsStateWithLifecycle()
+    val historyAvailable by viewModel.historyAvailable.collectAsStateWithLifecycle()
     val contacts by viewModel.searchableContacts.collectAsStateWithLifecycle()
     ChatsContent(
         allChats = chats,
         messagingAvailable = messagingAvailable,
+        historyAvailable = historyAvailable,
         onChat = onChat,
         onNewChat = onNewChat,
+        onNewGroup = onNewGroup,
         onSetPinned = viewModel::setPinned,
         onSetMuted = viewModel::setMuted,
         onMarkRead = viewModel::markRead,
@@ -96,8 +101,11 @@ fun ChatsScreen(
 internal fun ChatsContent(
     allChats: List<ChatPreview>,
     messagingAvailable: Boolean,
+    /** Whether the local encrypted store has been read; the list is real once this is true. */
+    historyAvailable: Boolean = messagingAvailable,
     onChat: (String) -> Unit,
     onNewChat: () -> Unit,
+    onNewGroup: () -> Unit = {},
     onSetPinned: (Collection<String>, Boolean) -> Unit = { _, _ -> },
     onSetMuted: (Collection<String>, Boolean) -> Unit = { _, _ -> },
     onMarkRead: (Collection<String>) -> Unit = {},
@@ -134,6 +142,7 @@ internal fun ChatsContent(
         val f = when (filter) {
             "Unread" -> c.unread > 0
             "Pinned" -> c.pinned
+            "Groups" -> c.isGroup
             else -> true
         }
         q && f
@@ -142,13 +151,27 @@ internal fun ChatsContent(
 
     Scaffold(
         floatingActionButton = {
-            if (messagingAvailable && !selecting) {
+            if (historyAvailable && !selecting) {
+                // Starting a chat is the one thing here that genuinely needs a live session, so
+                // it is the one thing that dims — in place, keeping its position on screen,
+                // rather than vanishing and shifting the layout when the session arrives.
                 FloatingActionButton(
-                    onClick = onNewChat,
-                    containerColor = MaterialTheme.colorScheme.secondary,
-                    contentColor = MaterialTheme.colorScheme.onSecondary,
+                    onClick = { if (messagingAvailable) onNewChat() },
+                    containerColor = MaterialTheme.colorScheme.secondary.copy(
+                        alpha = if (messagingAvailable) 1f else 0.38f,
+                    ),
+                    contentColor = MaterialTheme.colorScheme.onSecondary.copy(
+                        alpha = if (messagingAvailable) 1f else 0.38f,
+                    ),
                 ) {
-                    Icon(Icons.Rounded.AddComment, contentDescription = "New chat")
+                    Icon(
+                        Icons.Rounded.AddComment,
+                        contentDescription = if (messagingAvailable) {
+                            "New chat"
+                        } else {
+                            "New chat, available once secure messaging is ready"
+                        },
+                    )
                 }
             }
         },
@@ -215,7 +238,7 @@ internal fun ChatsContent(
             }
             item {
                 Row(Modifier.padding(horizontal = 20.dp)) {
-                    listOf("All", "Unread", "Pinned").forEach { f ->
+                    listOf("All", "Unread", "Pinned", "Groups").forEach { f ->
                         FilterChip(
                             selected = filter == f,
                             onClick = { filter = f },
@@ -226,41 +249,24 @@ internal fun ChatsContent(
                 }
             }
             if (!messagingAvailable) {
-                item {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 20.dp, vertical = 24.dp),
-                        verticalAlignment = Alignment.Top,
-                    ) {
-                        Icon(
-                            Icons.Rounded.Lock,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary,
-                        )
-                        Column(Modifier.padding(start = 12.dp)) {
-                            Text(
-                                "Secure messaging is not ready",
-                                style = MaterialTheme.typography.titleMedium,
-                            )
-                            Text(
-                                "Keep Kit Pay online while this device finishes secure setup. Message text is never sent without end-to-end encryption.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                }
+                // One quiet line, not a page. The chats below it are already readable; the only
+                // thing still preparing is the ability to send, and it says so where that
+                // matters — in each conversation's composer. It disappears on its own.
+                item { PreparingSecureMessagingNote() }
             }
-            if (messagingAvailable && chats.isEmpty()) {
+            if (historyAvailable && chats.isEmpty()) {
                 item {
                     EmptyChatsState(
                         noChatsAtAll = allChats.isEmpty(),
                         filter = filter,
                         searching = query.isNotBlank(),
                         onNewChat = onNewChat,
+                        onNewGroup = onNewGroup,
                     )
                 }
+            }
+            if (!historyAvailable && allChats.isEmpty()) {
+                item { OpeningChatsPlaceholders() }
             }
             if (searching && contactHits.isNotEmpty()) {
                 item { SearchSectionHeader("Contacts") }
@@ -365,6 +371,88 @@ private fun SearchSectionHeader(title: String) {
     )
 }
 
+/**
+ * One line of status, sized like a caption and never like a page.
+ *
+ * It reports the one thing that is actually still preparing — the ability to *send* — while the
+ * chats underneath it stay readable. It withdraws itself the moment the session reaches ready,
+ * with no dismiss affordance to teach and nothing to retry, because the retry is automatic.
+ */
+@Composable
+private fun PreparingSecureMessagingNote() {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.Rounded.Lock,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(14.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            "Preparing secure messaging…",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/**
+ * Placeholder rows for the first read of the local store.
+ *
+ * Shown only when there is genuinely nothing to draw yet, so a device that has chats sees its
+ * chats and a device that is still opening the store sees the shape of the list rather than an
+ * empty state it would have to take back a moment later.
+ */
+@Composable
+private fun OpeningChatsPlaceholders() {
+    Column(Modifier.fillMaxWidth()) {
+        repeat(6) { index ->
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                PlaceholderBlock(Modifier.size(48.dp), CircleShape)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    // Widths vary a little so the column reads as a list of names rather than a
+                    // loading bar stack.
+                    PlaceholderBlock(
+                        Modifier
+                            .fillMaxWidth(if (index % 2 == 0) 0.42f else 0.55f)
+                            .height(13.dp),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    PlaceholderBlock(
+                        Modifier
+                            .fillMaxWidth(if (index % 3 == 0) 0.78f else 0.64f)
+                            .height(11.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlaceholderBlock(
+    modifier: Modifier = Modifier,
+    shape: androidx.compose.ui.graphics.Shape = MaterialTheme.shapes.small,
+) {
+    Box(
+        modifier.background(
+            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f),
+            shape,
+        ),
+    )
+}
+
 /** Friendly first-run/empty content so the tab never renders as a bare search box. */
 @Composable
 private fun EmptyChatsState(
@@ -372,6 +460,7 @@ private fun EmptyChatsState(
     filter: String,
     searching: Boolean,
     onNewChat: () -> Unit,
+    onNewGroup: () -> Unit = {},
 ) {
     Column(
         Modifier
@@ -394,11 +483,13 @@ private fun EmptyChatsState(
         }
         Spacer(Modifier.height(16.dp))
         Text(
+            // A filter that is on describes the emptiness better than the device's overall state
+            // does: under Groups, "No chats yet" would read as though groups were not a thing.
             when {
-                noChatsAtAll -> "No chats yet"
                 searching -> "No chats found"
                 filter == "Unread" -> "You're all caught up"
                 filter == "Groups" -> "No group chats yet"
+                noChatsAtAll -> "No chats yet"
                 else -> "No chats found"
             },
             style = MaterialTheme.typography.titleMedium,
@@ -407,20 +498,29 @@ private fun EmptyChatsState(
         Spacer(Modifier.height(6.dp))
         Text(
             when {
-                noChatsAtAll ->
-                    "Start an end-to-end encrypted chat with your Kit Pay contacts."
                 searching -> "Try a different name or message."
                 filter == "Unread" -> "New messages will appear here."
-                filter == "Groups" -> "Group conversations will appear here."
+                filter == "Groups" ->
+                    "Start an end-to-end encrypted group with your Kit Pay contacts."
+                noChatsAtAll ->
+                    "Start an end-to-end encrypted chat with your Kit Pay contacts."
                 else -> "Try a different name or message."
             },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
         )
-        if (noChatsAtAll) {
-            Spacer(Modifier.height(12.dp))
-            TextButton(onClick = onNewChat) { Text("Start a chat") }
+        when {
+            // Under the Groups filter the way forward is a group, not another direct chat —
+            // even on a device with no chats at all.
+            filter == "Groups" && !searching -> {
+                Spacer(Modifier.height(12.dp))
+                TextButton(onClick = onNewGroup) { Text("New group") }
+            }
+            noChatsAtAll -> {
+                Spacer(Modifier.height(12.dp))
+                TextButton(onClick = onNewChat) { Text("Start a chat") }
+            }
         }
     }
 }
@@ -534,7 +634,9 @@ private fun ChatRow(
                 }
                 Text(
                     when {
-                        chat.typing -> "typing…"
+                        // A group says who, since its name is on the row above and "typing…"
+                        // under it would not tell anybody which of thirty people it is.
+                        chat.typing -> groupTypingLabel(chat.typingNames) ?: "typing…"
                         chat.lastState == DeliveryState.RETRY_REQUIRED ->
                             "Not sent · ${chat.lastMessage}"
                         chat.lastState == DeliveryState.FAILED ->

@@ -42,11 +42,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.data.demo.DemoData
+import com.kit.wallet.feature.auth.PaymentApproval
+import com.kit.wallet.feature.auth.rememberBiometricApprovalAvailable
+import com.kit.wallet.feature.funding.TopUpSheetContent
+import com.kit.wallet.feature.funding.TopUpViewModel
+import com.kit.wallet.ui.components.GroupedAmountTransformation
+import com.kit.wallet.ui.components.KitAvatarPhoto
 import com.kit.wallet.ui.components.SectionHeader
 import com.kit.wallet.ui.components.StatusChip
 import com.kit.wallet.ui.components.TransactionRow
@@ -67,6 +72,7 @@ import com.kit.wallet.ui.theme.KitWalletTheme
 fun BankScreen(
     onBack: () -> Unit,
     viewModel: BankViewModel = hiltViewModel(),
+    topUp: TopUpViewModel = hiltViewModel(),
 ) {
     val beneficiaries by viewModel.beneficiaries.collectAsStateWithLifecycle()
     val transfers by viewModel.bankTransfers.collectAsStateWithLifecycle()
@@ -74,6 +80,11 @@ fun BankScreen(
     val busy by viewModel.busy.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
     val quote by viewModel.quote.collectAsStateWithLifecycle()
+    val shortOfFunds by viewModel.topUpRequired.collectAsStateWithLifecycle()
+    val topUpRequirement by topUp.requirement.collectAsStateWithLifecycle()
+    val topUpBusy by topUp.busy.collectAsStateWithLifecycle()
+    val operationBusy = busy || (topUpRequirement != null && topUpBusy)
+    val biometricsAvailable = rememberBiometricApprovalAvailable()
     var operation by remember { mutableStateOf<BankOperationKind?>(null) }
     var addingAccount by remember { mutableStateOf(false) }
     val linkableBanks = banks.filter { it.supports(BankCapability.ACCOUNT_VERIFICATION) }
@@ -98,6 +109,12 @@ fun BankScreen(
 
     LaunchedEffect(addingAccount, linkableBanks) {
         if (addingAccount && linkableBanks.isEmpty()) addingAccount = false
+    }
+    // The shortfall is handed to the top-up and then let go of, so the two do not both own it.
+    LaunchedEffect(shortOfFunds) {
+        val shortfall = shortOfFunds ?: return@LaunchedEffect
+        topUp.start(shortfall)
+        viewModel.clearTopUpRequired()
     }
     LaunchedEffect(operation, selectedBeneficiaries) {
         if (operation != null && selectedBeneficiaries.isEmpty()) operation = null
@@ -132,15 +149,38 @@ fun BankScreen(
         BankOperationSheet(
             operation = selected,
             beneficiaries = selectedBeneficiaries,
-            busy = busy,
+            // Once the sheet changes into a top-up, its ViewModel owns whether the enclosing
+            // modal may be dismissed. Using the bank command's idle state here used to allow a
+            // swipe-away in the middle of submitting or polling a deposit.
+            busy = operationBusy,
             error = error,
             quote = quote,
-            onDismiss = { if (!busy) { viewModel.clearQuote(); operation = null } },
+            onDismiss = {
+                if (!operationBusy) {
+                    if (topUpRequirement != null) topUp.dismiss()
+                    viewModel.clearQuote()
+                    operation = null
+                }
+            },
             onQuoteInvalidated = viewModel::clearQuote,
             onReview = { beneficiaryId, amountMinor, feeMode ->
                 viewModel.preview(selected, beneficiaryId, amountMinor, feeMode)
             },
             onSubmit = { pin -> viewModel.submit(pin) { operation = null } },
+            // Shown in place of the payment, inside the sheet that is already open, so the amount
+            // and account behind it survive the detour.
+            topUp = if (topUpRequirement == null) {
+                null
+            } else {
+                {
+                    TopUpSheetContent(
+                        viewModel = topUp,
+                        onDismiss = topUp::dismiss,
+                        onFunded = topUp::dismiss,
+                    )
+                }
+            },
+            biometricsAvailable = biometricsAvailable,
         )
     }
 }
@@ -253,6 +293,9 @@ private fun BankContent(
                             modifier = Modifier.size(20.dp),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        // Laid over the bank glyph rather than replacing it: a row without a
+                        // known face still reads as a bank account, which is what it is.
+                        KitAvatarPhoto(avatarUrl = b.avatarUrl, size = 44.dp)
                     }
                     Spacer(Modifier.width(14.dp))
                     Column(Modifier.weight(1f)) {
@@ -404,12 +447,20 @@ private fun BankOperationSheet(
     onQuoteInvalidated: () -> Unit,
     onReview: (String, Long, String) -> Unit,
     onSubmit: (String) -> Unit,
+    /** Shown instead of the payment while the wallet is being topped up to afford it. */
+    topUp: (@Composable () -> Unit)? = null,
+    /** Whether this device can approve with biometrics; false falls back to the wallet PIN. */
+    biometricsAvailable: Boolean = false,
 ) {
-    var beneficiaryId by remember(beneficiaries) {
-        mutableStateOf(beneficiaries.firstOrNull()?.id.orEmpty())
+    // Corrected only when the chosen account is gone, rather than reset whenever the list changes:
+    // topping up mid-payment links an account, and that must not quietly move the destination.
+    var beneficiaryId by remember { mutableStateOf(beneficiaries.firstOrNull()?.id.orEmpty()) }
+    LaunchedEffect(beneficiaries) {
+        if (beneficiaries.none { it.id == beneficiaryId }) {
+            beneficiaryId = beneficiaries.firstOrNull()?.id.orEmpty()
+        }
     }
     var amount by remember { mutableStateOf("") }
-    var pin by remember { mutableStateOf("") }
     var feeMode by remember(operation) { mutableStateOf("sender_absorbs") }
     val amountMinor = Money.parseMinor(amount) ?: 0L
     val reviewedQuote = quote?.takeIf {
@@ -418,7 +469,8 @@ private fun BankOperationSheet(
     }
     LaunchedEffect(beneficiaryId, amountMinor, feeMode) { onQuoteInvalidated() }
     ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 32.dp)) {
+        if (topUp != null) topUp()
+        else Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 32.dp)) {
             Text(
                 when (operation) {
                     BankOperationKind.DEPOSIT -> "Deposit from bank"
@@ -449,6 +501,7 @@ private fun BankOperationSheet(
                 value = amount,
                 onValueChange = { amount = it.filter { character -> character.isDigit() || character == '.' } },
                 label = { Text("Amount (${Money.SYMBOL})") },
+                visualTransformation = GroupedAmountTransformation,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
@@ -468,30 +521,31 @@ private fun BankOperationSheet(
                     )
                 }
             }
-            if (reviewedQuote != null) {
+            if (reviewedQuote == null) {
+                ErrorText(error)
+                com.kit.wallet.ui.components.KitGreenButton(
+                    text = "Review amount and fees",
+                    loading = busy,
+                    enabled = beneficiaryId.isNotBlank() && amountMinor > 0,
+                    onClick = { onReview(beneficiaryId, amountMinor, feeMode) },
+                )
+            } else {
                 Spacer(Modifier.height(12.dp))
                 QuoteSummary(reviewedQuote)
-                OutlinedTextField(
-                    value = pin,
-                    onValueChange = { pin = it.filter(Char::isDigit).take(4) },
-                    label = { Text("Wallet PIN (optional with biometrics)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
+                Spacer(Modifier.height(12.dp))
+                PaymentApproval(
+                    actionLabel = "Confirm payment",
+                    biometricsAvailable = biometricsAvailable,
+                    busy = busy,
+                    error = error,
+                    onApprove = onSubmit,
+                    pinSubtitle = when (operation) {
+                        BankOperationKind.DEPOSIT -> "Authorizes this deposit from your bank."
+                        BankOperationKind.WITHDRAWAL -> "Authorizes this withdrawal to your bank."
+                        BankOperationKind.TRANSFER -> "Authorizes this bank transfer."
+                    },
                 )
             }
-            ErrorText(error)
-            com.kit.wallet.ui.components.KitGreenButton(
-                text = if (reviewedQuote == null) "Review amount and fees" else "Confirm payment",
-                loading = busy,
-                enabled = beneficiaryId.isNotBlank() && amountMinor > 0 &&
-                    (reviewedQuote == null || pin.isEmpty() || pin.length == 4),
-                onClick = {
-                    if (reviewedQuote == null) onReview(beneficiaryId, amountMinor, feeMode)
-                    else onSubmit(pin)
-                },
-            )
         }
     }
 }

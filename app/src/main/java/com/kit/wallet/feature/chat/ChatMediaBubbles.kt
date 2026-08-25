@@ -4,9 +4,11 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.widget.VideoView
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -27,6 +29,8 @@ import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalContentColor
@@ -49,12 +53,16 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
+import com.kit.wallet.ui.components.kitNameAccent
 import com.kit.wallet.ui.model.Message
+import com.kit.wallet.ui.model.acceptsReactions
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -406,6 +414,10 @@ internal fun SecureDocumentContent(
  * A grouped-photo grid bubble: 2 side-by-side, 3 as one featured tile plus a stacked pair,
  * 4 as a 2x2 grid, and 5+ as 2x2 with a "+N" veil on the last visible tile. Every tile maps
  * to its own message: tap loads it or opens the connected gallery at exactly that photo.
+ *
+ * Reactions follow the same one-tile-one-message rule. A grid has no single bubble to hang chips
+ * off, so each tile carries its own: long-press that tile to react, and its chips sit on it. A
+ * reaction on a photo the "+N" veil hides is not visible until the group is opened.
  */
 @Composable
 internal fun ImageGroupBubble(
@@ -416,6 +428,10 @@ internal fun ImageGroupBubble(
     mediaErrors: Map<String, String>,
     onOpenMedia: (Message) -> Unit,
     onOpenViewer: (Message) -> Unit,
+    reactable: Boolean = false,
+    onToggleReaction: (Message, String) -> Unit = { _, _ -> },
+    reportableMessageIds: Set<String> = emptySet(),
+    onReportMessage: (Message) -> Unit = {},
 ) {
     val visible = messages.take(4)
     val hiddenCount = messages.size - visible.size
@@ -429,6 +445,21 @@ internal fun ImageGroupBubble(
                 .clip(RoundedCornerShape(16.dp)),
             verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(tileSpacing),
         ) {
+            // A grid has no bubble to write a name inside, so the group author sits above the
+            // tiles. Grouping only joins photos from one author, so one label covers the grid.
+            if (!fromMe) {
+                messages.firstOrNull()?.senderName?.takeIf(String::isNotBlank)?.let { author ->
+                    Text(
+                        author,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = kitNameAccent(author),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(start = 2.dp),
+                    )
+                }
+            }
             when (visible.size) {
                 2 -> Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(tileSpacing)) {
                     visible.forEach { message ->
@@ -436,7 +467,8 @@ internal fun ImageGroupBubble(
                             message, mediaBytes[message.id], message.id in mediaLoading,
                             mediaErrors.containsKey(message.id), 0,
                             Modifier.weight(1f).aspectRatio(1f),
-                            onOpenMedia, onOpenViewer,
+                            onOpenMedia, onOpenViewer, reactable, onToggleReaction,
+                            message.id in reportableMessageIds, onReportMessage,
                         )
                     }
                 }
@@ -445,7 +477,8 @@ internal fun ImageGroupBubble(
                         visible[0], mediaBytes[visible[0].id], visible[0].id in mediaLoading,
                         mediaErrors.containsKey(visible[0].id), 0,
                         Modifier.fillMaxWidth().aspectRatio(16f / 9f),
-                        onOpenMedia, onOpenViewer,
+                        onOpenMedia, onOpenViewer, reactable, onToggleReaction,
+                        visible[0].id in reportableMessageIds, onReportMessage,
                     )
                     Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(tileSpacing)) {
                         visible.drop(1).forEach { message ->
@@ -453,7 +486,8 @@ internal fun ImageGroupBubble(
                                 message, mediaBytes[message.id], message.id in mediaLoading,
                                 mediaErrors.containsKey(message.id), 0,
                                 Modifier.weight(1f).aspectRatio(1f),
-                                onOpenMedia, onOpenViewer,
+                                onOpenMedia, onOpenViewer, reactable, onToggleReaction,
+                                message.id in reportableMessageIds, onReportMessage,
                             )
                         }
                     }
@@ -468,7 +502,8 @@ internal fun ImageGroupBubble(
                                 mediaErrors.containsKey(message.id),
                                 if (isLastVisible) hiddenCount else 0,
                                 Modifier.weight(1f).aspectRatio(1f),
-                                onOpenMedia, onOpenViewer,
+                                onOpenMedia, onOpenViewer, reactable, onToggleReaction,
+                                message.id in reportableMessageIds, onReportMessage,
                             )
                         }
                     }
@@ -478,6 +513,7 @@ internal fun ImageGroupBubble(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun GroupImageTile(
     message: Message,
@@ -488,6 +524,10 @@ private fun GroupImageTile(
     modifier: Modifier,
     onOpenMedia: (Message) -> Unit,
     onOpenViewer: (Message) -> Unit,
+    reactable: Boolean = false,
+    onToggleReaction: (Message, String) -> Unit = { _, _ -> },
+    reportable: Boolean = false,
+    onReportMessage: (Message) -> Unit = {},
 ) {
     val thumbnail by produceState<ImageBitmap?>(initialValue = null, message.id, bytes != null) {
         value = bytes?.let { owned ->
@@ -496,13 +536,41 @@ private fun GroupImageTile(
             }
         }
     }
+    val canReact = reactable && message.acceptsReactions
+    var paletteOpen by remember(message.id) { mutableStateOf(false) }
+    var pickerOpen by remember(message.id) { mutableStateOf(false) }
+    var reactorsOpen by remember(message.id) { mutableStateOf(false) }
+    val myReactions = message.reactions.filter { it.fromMe }.mapTo(mutableSetOf()) { it.emoji }
+
+    if (pickerOpen) {
+        ReactionPickerDialog(
+            selected = myReactions,
+            onPick = { emoji ->
+                pickerOpen = false
+                onToggleReaction(message, emoji)
+            },
+            onDismiss = { pickerOpen = false },
+        )
+    }
+    if (reactorsOpen) {
+        ReactionReactorsDialog(
+            reactions = message.reactions,
+            onDismiss = { reactorsOpen = false },
+        )
+    }
     Box(
         modifier
             .clip(RoundedCornerShape(6.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
-            .clickable(enabled = !loading) {
-                if (bytes != null) onOpenViewer(message) else onOpenMedia(message)
-            },
+            .combinedClickable(
+                enabled = !loading,
+                onClick = { if (bytes != null) onOpenViewer(message) else onOpenMedia(message) },
+                onLongClick = if (canReact || reportable) {
+                    { paletteOpen = true }
+                } else {
+                    null
+                },
+            ),
         contentAlignment = Alignment.Center,
     ) {
         thumbnail?.let {
@@ -537,6 +605,40 @@ private fun GroupImageTile(
                     "+$overflowCount",
                     style = MaterialTheme.typography.titleLarge,
                     color = Color.White,
+                )
+            }
+        }
+        // Chips sit on the photo they belong to. A grid is one bubble made of several messages,
+        // so putting them underneath would leave the reader guessing which tile they annotate.
+        MessageReactionChips(
+            reactions = message.reactions,
+            onToggle = { emoji -> onToggleReaction(message, emoji) },
+            onShowReactors = { reactorsOpen = true },
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(4.dp),
+        )
+        DropdownMenu(expanded = paletteOpen, onDismissRequest = { paletteOpen = false }) {
+            if (canReact) {
+                QuickReactionPalette(
+                    selected = myReactions,
+                    onPick = { emoji ->
+                        paletteOpen = false
+                        onToggleReaction(message, emoji)
+                    },
+                    onMore = {
+                        paletteOpen = false
+                        pickerOpen = true
+                    },
+                )
+            }
+            if (reportable) {
+                DropdownMenuItem(
+                    text = { Text("Report message") },
+                    onClick = {
+                        paletteOpen = false
+                        onReportMessage(message)
+                    },
                 )
             }
         }

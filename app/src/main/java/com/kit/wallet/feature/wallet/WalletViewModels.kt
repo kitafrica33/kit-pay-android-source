@@ -5,12 +5,16 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.remote.isKitInsufficientFundsError
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.SentTransfer
 import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.data.repository.WalletRepository
+import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.ui.model.Contact
+import com.kit.wallet.ui.model.TopUp
+import com.kit.wallet.ui.model.TopUpRequirement
 import com.kit.wallet.ui.model.Transaction
 import kotlin.math.abs
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,6 +30,7 @@ import javax.inject.Inject
 @HiltViewModel
 class SendMoneyViewModel @Inject constructor(
     private val wallet: WalletRepository,
+    private val walletSync: WalletSyncRepository,
     private val chats: ChatRepository,
     contactRepo: ContactRepository,
 ) : ViewModel() {
@@ -41,6 +46,39 @@ class SendMoneyViewModel @Inject constructor(
 
     private val _lastSent = MutableStateFlow<Transaction?>(null)
     val lastSent = _lastSent.asStateFlow()
+
+    /**
+     * A shortfall the server itself reported, raised once and then cleared by the screen.
+     *
+     * The amount is checked before the payment is attempted too — see [shortfallFor] — but a
+     * balance can move between the check and the charge, and the server is the one that decides.
+     */
+    private val _topUpRequired = MutableStateFlow<TopUpRequirement?>(null)
+    val topUpRequired = _topUpRequired.asStateFlow()
+
+    /**
+     * How far this wallet falls short of a transfer, or null when it covers it.
+     *
+     * A Kit Pay transfer carries no fee, so the amount being sent is the whole debit — unlike a
+     * mobile money or bank payment, where the quote's customer debit is the figure that matters.
+     */
+    fun shortfallFor(
+        amountMinor: Long,
+        balanceMinor: Long = wallet.balanceMinor.value,
+        currencyCode: String = wallet.walletCurrency.value.code,
+        currencyScale: Int = wallet.walletCurrency.value.scale,
+    ): TopUpRequirement? {
+        return TopUp.requirementFor(
+            requiredMinor = amountMinor,
+            balanceMinor = balanceMinor,
+            currencyCode = currencyCode,
+            currencyScale = currencyScale,
+        )
+    }
+
+    fun clearTopUpRequired() {
+        _topUpRequired.value = null
+    }
 
     fun send(
         recipient: Contact,
@@ -61,7 +99,39 @@ class SendMoneyViewModel @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                _error.value = error.message ?: "The transfer could not be completed"
+                val shortfall = if (error.isKitInsufficientFundsError()) {
+                    // The server, not the cached balance, just established that this wallet is
+                    // short. Re-read it before calculating what to offer; otherwise a stale-high
+                    // cache turns a recoverable refusal into a dead-end error.
+                    try {
+                        val refreshed = walletSync.refresh()
+                        shortfallFor(
+                            amountMinor = amountMinor,
+                            balanceMinor = refreshed.selectedAvailableBalanceMinor
+                                ?: wallet.balanceMinor.value,
+                            currencyCode = refreshed.selectedCurrencyCode
+                                ?: wallet.walletCurrency.value.code,
+                            currencyScale = refreshed.selectedCurrencyScale
+                                ?: wallet.walletCurrency.value.scale,
+                        )
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (refreshFailure: Exception) {
+                        _error.value = refreshFailure.message
+                            ?.takeIf(String::isNotBlank)
+                            ?: "Your wallet balance could not be refreshed"
+                        null
+                    }
+                } else {
+                    null
+                }
+                if (shortfall != null) {
+                    // The top-up says what is wrong and offers the way out of it, so repeating it
+                    // as a red line under the PIN field would only be the same news twice.
+                    _topUpRequired.value = shortfall
+                } else if (_error.value == null) {
+                    _error.value = error.message ?: "The transfer could not be completed"
+                }
             } finally {
                 _sending.value = false
             }

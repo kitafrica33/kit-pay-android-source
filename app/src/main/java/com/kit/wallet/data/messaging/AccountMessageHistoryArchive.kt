@@ -145,6 +145,15 @@ internal class AccountMessageHistoryArchive @Inject constructor(
                 archiveForOwner(owner, projected)
             }
 
+        override suspend fun restore(archived: AccountArchivedMessage) =
+            withCapturedOwner(owner, sessionFence) {
+                // A backup is bytes the user brought back, not authenticated traffic. It goes
+                // through the same immutability rule as live archiving — fill a gap, or advance a
+                // delivery state, never rewrite history that is already here.
+                validateArchivedMessageOwner(archived, owner.ownerAccountId)
+                writeArchivedForOwner(owner, archived)
+            }
+
         override suspend fun readAll(): List<AccountArchivedMessage> =
             withCapturedOwner(owner, sessionFence) {
                 readAllForOwner(owner)
@@ -204,6 +213,13 @@ internal class AccountMessageHistoryArchive @Inject constructor(
         projected: SecureMessagingProjectedMessage,
     ) {
         val archived = projected.toArchived(owner.ownerAccountId) ?: return
+        writeArchivedForOwner(owner, archived)
+    }
+
+    private suspend fun writeArchivedForOwner(
+        owner: AccountMessageArchiveOwner,
+        archived: AccountArchivedMessage,
+    ) {
         val recordKey = archiveMessageRecordKey(archived.serverMessageId)
         repeat(MAX_ARCHIVE_WRITE_ATTEMPTS) { attempt ->
             val existingRecord = records.read(owner, recordKey)
@@ -268,6 +284,10 @@ internal class AccountMessageHistoryArchive @Inject constructor(
 
 internal interface CapturedAccountMessageHistory {
     suspend fun archive(projected: SecureMessagingProjectedMessage)
+
+    /** Merges one message out of a restored backup; existing history always wins a disagreement. */
+    suspend fun restore(archived: AccountArchivedMessage)
+
     suspend fun readAll(): List<AccountArchivedMessage>
     suspend fun readAllAndMaterialize(
         materialize: suspend (List<AccountArchivedMessage>) -> Unit,
@@ -290,6 +310,7 @@ internal object NoOpAccountMessageHistoryAccess : AccountMessageHistoryAccess {
 
 private object NoOpCapturedAccountMessageHistory : CapturedAccountMessageHistory {
     override suspend fun archive(projected: SecureMessagingProjectedMessage) = Unit
+    override suspend fun restore(archived: AccountArchivedMessage) = Unit
     override suspend fun readAll(): List<AccountArchivedMessage> = emptyList()
     override suspend fun readAllAndMaterialize(
         materialize: suspend (List<AccountArchivedMessage>) -> Unit,

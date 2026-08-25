@@ -153,7 +153,38 @@ internal class SecureMessagingAuthBindingResolver @Inject constructor(
         return resolveCurrent(expectedSession.sessionId) { assertCurrent(expectedSession) }
     }
 
+    /**
+     * The authenticated profile and the current server device are both stable for the lifetime of
+     * one authentication epoch, so they are resolved once per epoch instead of on every
+     * [SecureMessagingSyncEngine.synchronize] call. The cache is keyed on the epoch itself and on
+     * the installation identity, which are the only two facts that can invalidate a binding; a
+     * server response can never invalidate it, so a hostile server cannot force a re-resolve.
+     */
     private suspend fun resolveCurrent(
+        sessionEpoch: String,
+        assertOwner: () -> Unit,
+    ): SecureMessagingSessionBinding {
+        reusableBinding(sessionEpoch)?.let { cached ->
+            assertOwner()
+            return cached
+        }
+        // Collapse a concurrent stampede onto one resolve; the loser re-reads the cache.
+        return bindingGate.withLock {
+            reusableBinding(sessionEpoch)?.let { cached ->
+                assertOwner()
+                return@withLock cached
+            }
+            resolveUncached(sessionEpoch, assertOwner).also { cachedBinding = it }
+        }
+    }
+
+    private fun reusableBinding(sessionEpoch: String): SecureMessagingSessionBinding? =
+        cachedBinding?.takeIf { cached ->
+            cached.sessionEpoch == sessionEpoch &&
+                cached.installationId == deviceIdentity.registration().installationId
+        }
+
+    private suspend fun resolveUncached(
         sessionEpoch: String,
         assertOwner: () -> Unit,
     ): SecureMessagingSessionBinding {
@@ -178,6 +209,11 @@ internal class SecureMessagingAuthBindingResolver @Inject constructor(
         }
         return binding
     }
+
+    private val bindingGate = Mutex()
+
+    @Volatile
+    private var cachedBinding: SecureMessagingSessionBinding? = null
 
     fun assertCurrent(binding: SecureMessagingSessionBinding) {
         assertCurrent(binding.sessionEpoch)

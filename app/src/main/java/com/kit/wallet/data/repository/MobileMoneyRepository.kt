@@ -34,5 +34,12 @@ interface MobileMoneyRepository {
         amountMinor: Long,
         feeMode: String = if (action == "collection") "inclusive" else "sender_absorbs",
     ): FinancialOperationQuote
-    suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String)
+    /**
+     * Submits an approved quote and returns the operation it created.
+     *
+     * The id is returned rather than dropped because a caller that is waiting on this money — a
+     * top-up covering a payment the wallet cannot yet afford — has to be able to tell *this*
+     * operation failing from any other one in the list moving.
+     */
+    suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String): String
 }

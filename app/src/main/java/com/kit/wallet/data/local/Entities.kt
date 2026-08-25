@@ -19,6 +19,19 @@ data class ProfileEntity(
     val emailVerified: Boolean,
     val profileSetupRequired: Boolean,
     val avatarUrl: String? = null,
+    /**
+     * The name on the verified identity document, as the server reported it.
+     *
+     * Distinct from [name], which is chosen and can be anything. Nothing on the device writes this
+     * — it arrives with the profile and is cached so that a financial screen opened offline still
+     * knows which name is the verified one. Null means "no verified name", never "not that person".
+     */
+    val legalName: String? = null,
+    /**
+     * Whether this account still has to choose a username. Cached rather than re-derived so the
+     * setup gate offline agrees with the gate the server applied.
+     */
+    val usernameRequired: Boolean = true,
     val updatedAtEpochMillis: Long,
 ) {
     companion object {
@@ -78,6 +91,60 @@ data class ConversationPrefEntity(
     @PrimaryKey val conversationId: String,
     val pinned: Boolean = false,
     val muted: Boolean = false,
+)
+
+/**
+ * Which photo belongs to which person, kept so the answer survives a restart.
+ *
+ * The photos themselves are already stored on the device, but a stored photo is addressed by its
+ * URL and the URL only ever existed in the in-memory contact list — which is empty until a contacts
+ * fetch succeeds. So a cold start with no network drew initials for people whose faces were sitting
+ * on disk the whole time. This table is the missing half: a plain directory of user to photo URL,
+ * written whenever one is learned and read before anything is fetched.
+ *
+ * It is a display convenience and nothing else. No identity, authorisation or payment decision is
+ * taken on it — a row is a URL somebody's picture was last seen at, not a claim about who they are.
+ */
+@Entity(
+    tableName = "profile_photos",
+    primaryKeys = ["ownerScopeId", "userId"],
+    indices = [Index(value = ["ownerScopeId"])],
+)
+data class ProfilePhotoEntity(
+    /** Exact authenticated cache epoch that is allowed to observe this row. */
+    val ownerScopeId: String,
+    /** The peer's public user id, lowercased, as every other Kit-user lookup keys on. */
+    val userId: String,
+    val avatarUrl: String,
+    val updatedAtEpochMillis: Long,
+)
+
+/**
+ * The number a payout destination was saved with, for destinations saved on this device.
+ *
+ * The server returns beneficiaries with their numbers masked, and a mask cannot be matched back to
+ * a person — several real numbers fit one. But at the moment the beneficiary is created this device
+ * has the number the user actually typed, so remembering it is what lets a saved destination show
+ * the right face afterwards, including offline and after a restart.
+ *
+ * Only a device-keyed HMAC of the canonical international number is kept. Neither the number nor a
+ * globally comparable suffix is present in Room. It is a display convenience and nothing else:
+ * no payment is routed or authorised by a row here, and the destination itself remains whatever
+ * the server holds. Rows are also scoped to the exact authenticated cache epoch.
+ */
+@Entity(
+    tableName = "beneficiary_contacts",
+    primaryKeys = ["ownerScopeId", "beneficiaryId"],
+    indices = [Index(value = ["ownerScopeId"])],
+)
+data class BeneficiaryContactEntity(
+    /** Exact authenticated cache epoch that is allowed to observe this row. */
+    val ownerScopeId: String,
+    /** The server's id for the saved destination. */
+    val beneficiaryId: String,
+    /** HMAC-SHA-256 of a full canonical international phone identity. */
+    val phoneIdentity: String,
+    val updatedAtEpochMillis: Long,
 )
 
 /**

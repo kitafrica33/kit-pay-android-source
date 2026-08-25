@@ -28,6 +28,8 @@ import androidx.compose.material.icons.rounded.Block
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.ChatBubbleOutline
+import androidx.compose.material.icons.rounded.CloudSync
+import androidx.compose.material.icons.rounded.Contacts
 import androidx.compose.material.icons.rounded.DeleteForever
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Edit
@@ -35,6 +37,7 @@ import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.PrivacyTip
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Security
+import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -65,6 +68,8 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.net.toUri
+import com.kit.wallet.data.repository.KycVerificationState
+import com.kit.wallet.data.repository.kycVerificationStateOf
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.remote.KitFeature
@@ -87,6 +92,7 @@ fun SettingsScreen(
     capabilities: AppCapabilities,
     onEditProfile: () -> Unit,
     onSecurity: () -> Unit,
+    onChatBackup: () -> Unit,
     onKyc: () -> Unit,
     onLogoutCurrentDevice: () -> Unit,
     logoutBusy: Boolean = false,
@@ -101,6 +107,15 @@ fun SettingsScreen(
     val deletionState by viewModel.deletionState.collectAsStateWithLifecycle()
     val communicationState by communicationViewModel.state.collectAsStateWithLifecycle()
     val communicationContacts by communicationViewModel.contacts.collectAsStateWithLifecycle()
+    val shareDeviceContacts by communicationViewModel.shareDeviceContacts
+        .collectAsStateWithLifecycle()
+    val contactDiscoveryAvailable by communicationViewModel.contactDiscoveryAvailable
+        .collectAsStateWithLifecycle()
+    val contactDiscoveryToggle = rememberContactDiscoveryToggle(
+        consentGranted = shareDeviceContacts,
+        consentAvailable = contactDiscoveryAvailable,
+        onConsentChanged = communicationViewModel::setShareDeviceContacts,
+    )
     var confirmLogout by rememberSaveable { mutableStateOf(false) }
     var showEmailDialog by rememberSaveable { mutableStateOf(false) }
     var showKycUnavailable by rememberSaveable { mutableStateOf(false) }
@@ -294,9 +309,13 @@ fun SettingsScreen(
             }
         },
         onSecurity = onSecurity,
+        onChatBackup = onChatBackup,
         communicationState = communicationState,
         messagingUsable = capabilities.messagingUsable,
         onPhoneDiscoverabilityChanged = communicationViewModel::setPhoneDiscoverable,
+        shareDeviceContacts = contactDiscoveryToggle.checked,
+        shareDeviceContactsEnabled = contactDiscoveryToggle.enabled,
+        onShareDeviceContactsChanged = contactDiscoveryToggle.onCheckedChange,
         onIncomingCallsChanged = communicationViewModel::setIncomingCallsEnabled,
         onDirectMessageRequestsChanged = { enabled ->
             communicationViewModel.setDirectMessageRequestsEnabled(
@@ -304,6 +323,7 @@ fun SettingsScreen(
                 messagingUsable = capabilities.messagingUsable,
             )
         },
+        onMessagingPresenceChanged = communicationViewModel::setMessagingPresenceVisible,
         onRefreshCommunicationPrivacy = communicationViewModel::refresh,
         onBlockedAccounts = {
             showBlockedAccounts = true
@@ -355,11 +375,16 @@ private fun SettingsContent(
     onEditProfile: () -> Unit,
     onEmail: () -> Unit,
     onSecurity: () -> Unit,
+    onChatBackup: () -> Unit,
     communicationState: CommunicationPrivacyUiState,
     messagingUsable: Boolean,
     onPhoneDiscoverabilityChanged: (Boolean) -> Unit,
+    shareDeviceContacts: Boolean,
+    shareDeviceContactsEnabled: Boolean,
+    onShareDeviceContactsChanged: (Boolean) -> Unit,
     onIncomingCallsChanged: (Boolean) -> Unit,
     onDirectMessageRequestsChanged: (Boolean) -> Unit,
+    onMessagingPresenceChanged: (Boolean) -> Unit,
     onRefreshCommunicationPrivacy: () -> Unit,
     onBlockedAccounts: () -> Unit,
     onKyc: () -> Unit,
@@ -399,14 +424,17 @@ private fun SettingsContent(
                     .padding(horizontal = 20.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                KitAvatar(profile.name, size = 76.dp, avatarUrl = profile.avatarUrl)
+                KitAvatar(profile.displayIdentityName, size = 76.dp, avatarUrl = profile.avatarUrl)
                 Spacer(Modifier.width(16.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(profile.name.ifBlank { "Kit Pay user" }, style = MaterialTheme.typography.titleLarge)
                     Text(
-                        listOf(formatKitTag(profile.tag), profile.phone)
-                            .filter(String::isNotBlank)
-                            .joinToString(" • "),
+                        // The verified name leads. A chosen display name is a nickname and is
+                        // named as one below, so the two are never mistaken for each other.
+                        profile.displayIdentityName.ifBlank { "Kit Pay user" },
+                        style = MaterialTheme.typography.titleLarge,
+                    )
+                    Text(
+                        profileIdentitySubtitle(profile),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -436,8 +464,12 @@ private fun SettingsContent(
                 state = communicationState,
                 messagingUsable = messagingUsable,
                 onPhoneDiscoverabilityChanged = onPhoneDiscoverabilityChanged,
+                shareDeviceContacts = shareDeviceContacts,
+                shareDeviceContactsEnabled = shareDeviceContactsEnabled,
+                onShareDeviceContactsChanged = onShareDeviceContactsChanged,
                 onIncomingCallsChanged = onIncomingCallsChanged,
                 onDirectMessageRequestsChanged = onDirectMessageRequestsChanged,
+                onMessagingPresenceChanged = onMessagingPresenceChanged,
                 onRefresh = onRefreshCommunicationPrivacy,
                 onBlockedAccounts = onBlockedAccounts,
             )
@@ -469,6 +501,12 @@ private fun SettingsContent(
                     "Security",
                     "Wallet PIN, authenticator and active sessions",
                     onClick = onSecurity,
+                )
+                SettingsRow(
+                    Icons.Rounded.CloudSync,
+                    "Chats & backup",
+                    "Encrypted backup and restore with Google Drive",
+                    onClick = onChatBackup,
                 )
             }
         }
@@ -517,8 +555,12 @@ private fun CommunicationPrivacySettings(
     state: CommunicationPrivacyUiState,
     messagingUsable: Boolean,
     onPhoneDiscoverabilityChanged: (Boolean) -> Unit,
+    shareDeviceContacts: Boolean,
+    shareDeviceContactsEnabled: Boolean,
+    onShareDeviceContactsChanged: (Boolean) -> Unit,
     onIncomingCallsChanged: (Boolean) -> Unit,
     onDirectMessageRequestsChanged: (Boolean) -> Unit,
+    onMessagingPresenceChanged: (Boolean) -> Unit,
     onRefresh: () -> Unit,
     onBlockedAccounts: () -> Unit,
 ) {
@@ -534,6 +576,32 @@ private fun CommunicationPrivacySettings(
                     checked = state.preferences.phoneDiscoverable,
                     enabled = controlsEnabled,
                     onCheckedChange = if (controlsEnabled) onPhoneDiscoverabilityChanged else null,
+                )
+            },
+            onClick = null,
+        )
+        SettingsRow(
+            icon = Icons.Rounded.Contacts,
+            title = "Find me from contacts",
+            // Says what it actually does, in both directions, including the part that is not
+            // undoable on this phone alone. A privacy switch that quietly leaves an old copy
+            // behind, and does not say so, is worse than no switch.
+            subtitle = if (shareDeviceContacts) {
+                "On. Kit Pay may send your address book so people who have your number saved " +
+                    "can find you. Turn it off to stop sending it."
+            } else {
+                "Off. Your address book stays on this phone. Contacts you already saved are " +
+                    "still shown here."
+            },
+            trailing = {
+                Switch(
+                    checked = shareDeviceContacts,
+                    enabled = shareDeviceContactsEnabled,
+                    onCheckedChange = if (shareDeviceContactsEnabled) {
+                        onShareDeviceContactsChanged
+                    } else {
+                        null
+                    },
                 )
             },
             onClick = null,
@@ -566,6 +634,31 @@ private fun CommunicationPrivacySettings(
                         state.preferences.directMessageRequestsEnabled,
                     enabled = enabled,
                     onCheckedChange = if (enabled) onDirectMessageRequestsChanged else null,
+                )
+            },
+            onClick = null,
+        )
+        SettingsRow(
+            icon = Icons.Rounded.Visibility,
+            title = "Online and typing status",
+            // Both halves, deliberately, and in the tense that matches the switch. Turning this
+            // off is reciprocal, and copy that advertised only the protection would be selling
+            // half of what it does.
+            subtitle = when {
+                !messagingUsable -> "Available once reviewed secure messaging is."
+                state.preferences.messagingPresenceVisible ->
+                    "On. Turn it off and nobody will see when you're online or typing, " +
+                        "and you won't see when they are."
+                else ->
+                    "Off. Nobody sees when you're online or typing, " +
+                        "and you don't see when they are."
+            },
+            trailing = {
+                val enabled = controlsEnabled && messagingUsable
+                Switch(
+                    checked = messagingUsable && state.preferences.messagingPresenceVisible,
+                    enabled = enabled,
+                    onCheckedChange = if (enabled) onMessagingPresenceChanged else null,
                 )
             },
             onClick = null,
@@ -740,6 +833,21 @@ internal fun compactUserId(userId: String): String = when {
     else -> "${userId.take(8)}…${userId.takeLast(4)}"
 }
 
+/**
+ * The line under the account name: the chosen display name when there is one distinct from the
+ * verified legal name, then the username, then the phone number.
+ *
+ * The display name is labelled rather than simply listed. Two names side by side with nothing to
+ * separate them is exactly the confusion this whole distinction exists to prevent.
+ */
+internal fun profileIdentitySubtitle(profile: UserProfile): String = listOfNotNull(
+    profile.name
+        .takeIf { profile.identityVerified && it.isNotBlank() && it != profile.displayIdentityName }
+        ?.let { "Goes by $it" },
+    formatKitTag(profile.tag).takeIf(String::isNotBlank),
+    profile.phone.takeIf(String::isNotBlank),
+).joinToString(" • ")
+
 internal const val KIT_PRIVACY_POLICY_URL = "https://pay.kit.africa/privacy"
 internal const val KIT_ACCOUNT_DELETION_URL = "https://pay.kit.africa/account-deletion"
 
@@ -893,25 +1001,36 @@ internal data class IdentityVerificationPresentation(
 
 internal fun identityVerificationPresentation(rawStatus: String): IdentityVerificationPresentation {
     val status = rawStatus.trim().ifBlank { "KYC not started" }
-    val normalized = status.lowercase()
-    val verified = normalized.contains("verified") &&
-        !normalized.contains("not verified") &&
-        !normalized.contains("unverified")
-    val underReview = normalized.contains("pending") || normalized.contains("review")
-    return when {
-        verified -> IdentityVerificationPresentation(
+    // Read through the same normaliser as every other identity decision. Sniffing for substrings
+    // here is what let this row and the verification screen reach opposite conclusions about the
+    // same account.
+    return when (kycVerificationStateOf(status)) {
+        KycVerificationState.VERIFIED -> IdentityVerificationPresentation(
             title = "Identity verified with Didit",
             subtitle = status,
             status = status,
             verified = true,
         )
-        underReview -> IdentityVerificationPresentation(
+        KycVerificationState.IN_REVIEW -> IdentityVerificationPresentation(
             title = "Didit verification in review",
             subtitle = "$status • Tap to refresh your status",
             status = status,
             verified = false,
         )
-        else -> IdentityVerificationPresentation(
+        KycVerificationState.ACTION_NEEDED -> IdentityVerificationPresentation(
+            title = "Identity verification needs another try",
+            subtitle = "$status • Tap to pick it back up",
+            status = status,
+            verified = false,
+        )
+        // An unreadable status offers a way in without asserting anything about the account.
+        KycVerificationState.UNKNOWN -> IdentityVerificationPresentation(
+            title = "Identity verification",
+            subtitle = "Tap to check your status",
+            status = status,
+            verified = false,
+        )
+        KycVerificationState.NOT_STARTED -> IdentityVerificationPresentation(
             title = "Verify your identity with Didit",
             subtitle = "$status • Tap to start the secure identity check",
             status = status,
@@ -1149,6 +1268,7 @@ private fun SettingsPreview() {
             onEditProfile = {},
             onEmail = {},
             onSecurity = {},
+            onChatBackup = {},
             communicationState = CommunicationPrivacyUiState(
                 loaded = true,
                 loading = false,
@@ -1157,8 +1277,12 @@ private fun SettingsPreview() {
             ),
             messagingUsable = false,
             onPhoneDiscoverabilityChanged = {},
+            shareDeviceContacts = false,
+            shareDeviceContactsEnabled = false,
+            onShareDeviceContactsChanged = {},
             onIncomingCallsChanged = {},
             onDirectMessageRequestsChanged = {},
+            onMessagingPresenceChanged = {},
             onRefreshCommunicationPrivacy = {},
             onBlockedAccounts = {},
             onKyc = {},

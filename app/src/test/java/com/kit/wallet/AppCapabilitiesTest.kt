@@ -36,11 +36,61 @@ class AppCapabilitiesTest {
         assertTrue(serverOnly.routeUsable(Dest.CHATS))
         assertFalse(serverOnly.messagingUsable)
         assertFalse(clientOnly.messagingUsable)
+        // Reading is not exchanging: a transcript and a member list come out of the local
+        // encrypted store, so their routes stay open while the session is still preparing.
+        assertTrue(serverOnly.routeUsable(Dest.CONVERSATION))
+        assertTrue(serverOnly.routeUsable(Dest.GROUP_PROFILE))
+        // Starting or changing one is a server-authenticated action and still is not.
         assertFalse(serverOnly.routeUsable(Dest.CONTACTS))
-        assertFalse(serverOnly.routeUsable(Dest.CONVERSATION))
+        assertFalse(serverOnly.routeUsable(Dest.NEW_GROUP))
+        assertFalse(serverOnly.routeUsable(Dest.GROUP_ADD))
         assertTrue(ready.messagingUsable)
         assertTrue(ready.routeUsable(Dest.CONTACTS))
         assertTrue(ready.routeUsable(Dest.CONVERSATION))
+    }
+
+    @Test
+    fun `a failed refresh keeps local-only surfaces but never re-enables an action`() {
+        val loaded = AppCapabilities(
+            features = mapOf(KitFeature.MESSAGING to true, KitFeature.CALLS to true),
+            retainedFeatures = mapOf(KitFeature.MESSAGING to true, KitFeature.CALLS to true),
+            loaded = true,
+            secureMessagingClientReady = true,
+            messagingProtocolReady = true,
+            messagingProtocolVersion = "v2",
+            messagingProtocolSuite = "signal-pqxdh-kyber1024-double-ratchet-v2",
+            messagingProtocolPostQuantum = true,
+        )
+        // What a transport failure actually leaves behind: features cleared, retained kept.
+        val offline = loaded.copy(
+            features = emptyMap(),
+            loadFailed = true,
+            messagingProtocolReady = false,
+            messagingProtocolVersion = null,
+            messagingProtocolSuite = null,
+            messagingProtocolPostQuantum = null,
+        )
+
+        assertTrue(offline.messagingEntryVisible)
+        assertTrue(offline.routeUsable(Dest.CHATS))
+        assertTrue(offline.routeUsable(Dest.CONVERSATION))
+        assertTrue(offline.routeUsable(Dest.CALLS))
+        assertTrue(offline.routeUsable(Dest.INCOMING_CALL))
+        // Everything that acts stays fail-closed, including messaging itself.
+        assertFalse(offline.enabled(KitFeature.MESSAGING))
+        assertFalse(offline.messagingServerCompatible)
+        assertFalse(offline.messagingUsable)
+        assertFalse(offline.routeUsable(Dest.CONTACTS))
+        assertFalse(offline.routeUsable(Dest.NEW_GROUP))
+
+        // A server that answers "off" is not a failure, and must switch the surface off.
+        val disabled = loaded.copy(
+            features = emptyMap(),
+            retainedFeatures = emptyMap(),
+        )
+        assertFalse(disabled.messagingEntryVisible)
+        assertFalse(disabled.routeUsable(Dest.CHATS))
+        assertFalse(disabled.routeUsable(Dest.CALLS))
     }
 
     @Test
@@ -215,6 +265,7 @@ class AppCapabilitiesTest {
         assertEquals("messaging", KitFeature.MESSAGING)
         assertEquals("calls", KitFeature.CALLS)
         assertEquals("notifications", KitFeature.NOTIFICATIONS)
+        assertEquals("abuse_reporting", KitFeature.ABUSE_REPORTING)
         assertEquals("kyc", KitFeature.KYC)
         assertEquals("email_registration", KitFeature.EMAIL_REGISTRATION)
         assertEquals("email_recovery", KitFeature.EMAIL_RECOVERY)

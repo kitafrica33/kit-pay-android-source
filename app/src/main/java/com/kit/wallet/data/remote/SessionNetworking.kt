@@ -5,9 +5,11 @@ import com.kit.wallet.data.local.WalletCache
 import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
 import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
 import com.kit.wallet.data.session.ProfileSetupState
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
 import com.kit.wallet.data.session.CachedSessionAssurance
+import java.io.IOException
 import java.time.Instant
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -23,12 +25,21 @@ import retrofit2.http.Body
 import retrofit2.http.Header
 import retrofit2.http.POST
 
+/** OkHttp interceptors must signal an intentionally aborted exchange as an [IOException]. */
+internal class SessionFenceMismatchIOException : IOException(
+    "The authenticated session changed before the request reached the network",
+)
+
 @Singleton
 class SessionHeaderInterceptor @Inject constructor(
     private val sessions: SessionStore,
 ) : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
         val session = sessions.current()
+        val expectedOwner = chain.request().tag(SessionFence::class.java)
+        if (expectedOwner != null && session?.fence() != expectedOwner) {
+            throw SessionFenceMismatchIOException()
+        }
         val request = chain.request().newBuilder()
             .header("Accept", "application/json")
             .apply {
@@ -100,7 +111,8 @@ class AuthTokenRefresher @Inject constructor(
         val setupState = if (user == null) {
             current.profileSetupState
         } else if (
-            user.profileSetupRequired == true || requiresProfileSetup(user.name, user.tag)
+            user.profileSetupRequired == true ||
+            requiresProfileSetup(user.name, user.tag, user.legalName)
         ) {
             ProfileSetupState.REQUIRED
         } else {

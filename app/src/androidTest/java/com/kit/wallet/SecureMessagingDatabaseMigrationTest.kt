@@ -199,6 +199,39 @@ class SecureMessagingDatabaseMigrationTest {
         database.close()
     }
 
+    @Test
+    fun migration9To10AddsProfilePhotosWithoutTouchingTheProfile() {
+        helper.createDatabase(MIGRATION_9_10_DATABASE, 9).apply {
+            execSQL(
+                "INSERT INTO profile " +
+                    "(singletonId, userId, name, phone, tag, kycLabel, emailVerified, " +
+                    "profileSetupRequired, updatedAtEpochMillis) " +
+                    "VALUES (1, 'user', 'Amina', '+256700000000', 'amina', 'Verified', 0, 0, 1)",
+            )
+            close()
+        }
+
+        val database = helper.runMigrationsAndValidate(
+            MIGRATION_9_10_DATABASE,
+            10,
+            true,
+            KitWalletDatabase.MIGRATION_9_10,
+        )
+
+        // An upgrade must not cost the signed-in user their cached profile.
+        database.query("SELECT name FROM profile WHERE singletonId = 1").use {
+            assertTrue(it.moveToFirst())
+            assertEquals("Amina", it.getString(0))
+        }
+        // The new table starts empty: photos are learned from the next contact load, never
+        // invented by a migration.
+        database.query("SELECT COUNT(*) FROM profile_photos").use {
+            assertTrue(it.moveToFirst())
+            assertEquals(0L, it.getLong(0))
+        }
+        database.close()
+    }
+
     private fun assertMetadataSchema(database: SupportSQLiteDatabase) {
         val columns = database.query("PRAGMA table_info(secure_messaging_metadata)").use { cursor ->
             buildMap {
@@ -242,5 +275,6 @@ class SecureMessagingDatabaseMigrationTest {
         const val MIGRATION_5_6_EMPTY_DATABASE =
             "secure-messaging-metadata-migration-5-6-empty"
         const val MIGRATION_6_7_DATABASE = "wallet-currency-scale-migration-6-7"
+        const val MIGRATION_9_10_DATABASE = "profile-photos-migration-9-10"
     }
 }

@@ -2,6 +2,8 @@ package com.kit.wallet.data.messaging
 
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
+import com.kit.wallet.data.remote.ENCRYPTED_REACTION_MESSAGE_KIND
+import com.kit.wallet.data.remote.SECURE_MESSAGE_KINDS
 import com.squareup.moshi.JsonReader
 import com.squareup.moshi.JsonWriter
 import java.nio.ByteBuffer
@@ -99,13 +101,14 @@ internal object SecureMessagingHistoryBackfillCodec {
                 durable.replyToMessageId == candidate.replyToMessageId &&
                 projected.sentAt.toEpochMilli() == candidate.sentAt.toEpochMilli(),
         ) { "Retained history projection does not match the server candidate" }
-        val authenticatedKind = if (KitMediaMessage.attachmentsFor(durable.authenticatedText).isEmpty()) {
-            ENCRYPTED_MESSAGE_KIND
-        } else {
-            ENCRYPTED_ATTACHMENT_MESSAGE_KIND
-        }
+        val authenticatedKind = authenticatedMessageKind(durable.authenticatedText)
         check(authenticatedKind == candidate.kind) {
             "Retained history content does not match the server message kind"
+        }
+        KitReactionMessage.parse(durable.authenticatedText)?.let { reaction ->
+            check(reaction.targetMessageId == durable.replyToMessageId) {
+                "Retained reaction content does not match its reply target"
+            }
         }
 
         val buffer = Buffer()
@@ -165,16 +168,17 @@ internal object SecureMessagingHistoryBackfillCodec {
                 decoded.replyToMessageId == envelope.replyToMessageId &&
                 decoded.sentAt == envelope.sentAt,
         ) { "Authenticated history descriptor does not match original server metadata" }
-        val authenticatedKind = if (KitMediaMessage.attachmentsFor(decoded.text).isEmpty()) {
-            ENCRYPTED_MESSAGE_KIND
-        } else {
-            ENCRYPTED_ATTACHMENT_MESSAGE_KIND
-        }
+        val authenticatedKind = authenticatedMessageKind(decoded.text)
         check(authenticatedKind == decoded.kind) {
             "Authenticated history content does not match its message kind"
         }
         check(KitMediaMessage.attachmentsFor(decoded.text) == envelope.attachments) {
             "Authenticated history content does not match its server attachment metadata"
+        }
+        KitReactionMessage.parse(decoded.text)?.let { reaction ->
+            check(reaction.targetMessageId == decoded.replyToMessageId) {
+                "Authenticated history reaction does not match its reply target"
+            }
         }
         return AuthenticatedHistoryValue(
             messageId = decoded.messageId,
@@ -267,7 +271,7 @@ internal object SecureMessagingHistoryBackfillCodec {
         requireRosterRevision(decoded.transferRosterRevision, "history transfer roster revision")
         requireRosterRevision(decoded.originalRosterRevision, "history original roster revision")
         require(decoded.senderSignalDeviceId in 1..127) { "Invalid history Signal device ID" }
-        require(decoded.kind == ENCRYPTED_MESSAGE_KIND || decoded.kind == ENCRYPTED_ATTACHMENT_MESSAGE_KIND) {
+        require(decoded.kind in SECURE_MESSAGE_KINDS) {
             "Invalid history message kind"
         }
         require('\u0000' !in decoded.text && decoded.text.isNotEmpty()) { "Invalid history text" }
@@ -344,6 +348,12 @@ internal object SecureMessagingHistoryBackfillCodec {
         "sent_at",
         "text",
     )
+}
+
+private fun authenticatedMessageKind(text: String): String = when {
+    KitMediaMessage.attachmentsFor(text).isNotEmpty() -> ENCRYPTED_ATTACHMENT_MESSAGE_KIND
+    KitReactionMessage.parse(text) != null -> ENCRYPTED_REACTION_MESSAGE_KIND
+    else -> ENCRYPTED_MESSAGE_KIND
 }
 
 /** Durable, non-secret work item that lets history transfer resume without holding sync back. */

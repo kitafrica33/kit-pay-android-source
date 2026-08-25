@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.data.demo.DemoData
+import com.kit.wallet.ui.components.GroupedAmountTransformation
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.model.Contact
@@ -120,7 +121,7 @@ internal fun RequestMoneyContent(
                             .clickable { selectedId = c.id }
                             .padding(horizontal = 6.dp, vertical = 4.dp),
                     ) {
-                        KitAvatar(c.name, size = 56.dp, online = selected)
+                        KitAvatar(c.name, size = 56.dp, online = selected, avatarUrl = c.avatarUrl)
                         Spacer(Modifier.height(6.dp))
                         Text(
                             c.name.substringBefore(" "),
@@ -160,6 +161,7 @@ internal fun RequestMoneyContent(
                     .padding(horizontal = 24.dp)
                     .testTag("request-amount"),
                 label = { Text("Amount (${Money.SYMBOL})") },
+                visualTransformation = GroupedAmountTransformation,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
                 shape = MaterialTheme.shapes.medium,

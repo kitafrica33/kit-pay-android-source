@@ -7,6 +7,7 @@ import com.kit.wallet.data.repository.BlockedCommunicationUser
 import com.kit.wallet.data.repository.CommunicationPreferenceChanges
 import com.kit.wallet.data.repository.CommunicationPreferences
 import com.kit.wallet.data.repository.CommunicationPrivacyRepository
+import com.kit.wallet.data.contacts.ContactDiscoveryConsent
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.canonicalPublicUserId
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -14,6 +15,7 @@ import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
@@ -21,6 +23,7 @@ internal enum class CommunicationPreferenceField {
     PHONE_DISCOVERABILITY,
     DIRECT_MESSAGE_REQUESTS,
     INCOMING_CALLS,
+    MESSAGING_PRESENCE,
 }
 
 internal data class CommunicationPrivacyUiState(
@@ -39,9 +42,64 @@ internal data class CommunicationPrivacyUiState(
 class CommunicationPrivacyViewModel @Inject constructor(
     private val repository: CommunicationPrivacyRepository,
     contactRepository: ContactRepository,
+    private val discovery: ContactDiscoveryConsent? = null,
 ) : ViewModel() {
     internal val contacts = contactRepository.contacts
     private val contactRepository = contactRepository
+
+    /**
+     * Whether this phone may upload its address book so people can find this account from their
+     * contacts. Device-local and instant: unlike the server-backed flags there is nothing to
+     * negotiate, and switching it off stops the next upload immediately.
+     */
+    internal val shareDeviceContacts: StateFlow<Boolean> =
+        discovery?.shareDeviceContacts ?: MutableStateFlow(false).asStateFlow()
+
+    internal val contactDiscoveryAvailable: StateFlow<Boolean> =
+        discovery?.available ?: MutableStateFlow(false).asStateFlow()
+
+    private var contactDiscoverySyncJob: Job? = null
+
+    fun setShareDeviceContacts(allowed: Boolean) {
+        val consent = discovery
+        if (consent == null) {
+            mutableState.value = mutableState.value.copy(
+                error = "Contact discovery is unavailable until this account is known.",
+            )
+            return
+        }
+        if (!allowed) {
+            val stored = consent.setShareDeviceContacts(false)
+            // Store the closed gate before cancellation. Even if an in-flight HTTP cancellation is
+            // delayed by the network stack, the repository rejects its next chunk/publication.
+            contactDiscoverySyncJob?.cancel()
+            contactDiscoverySyncJob = null
+            if (!stored) {
+                mutableState.value = mutableState.value.copy(
+                    error = "Contact discovery could not be disabled for this account.",
+                )
+            }
+            return
+        }
+        if (!consent.setShareDeviceContacts(true)) {
+            mutableState.value = mutableState.value.copy(
+                error = "Contact discovery stays off until this account can record your choice.",
+            )
+            return
+        }
+        contactDiscoverySyncJob?.cancel()
+        contactDiscoverySyncJob = viewModelScope.launch {
+            try {
+                contactRepository.syncDeviceContacts()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableState.value = mutableState.value.copy(
+                    error = error.privacyMessage("Could not synchronize device contacts"),
+                )
+            }
+        }
+    }
 
     private val mutableState = MutableStateFlow(CommunicationPrivacyUiState())
     internal val state = mutableState.asStateFlow()
@@ -109,6 +167,17 @@ class CommunicationPrivacyViewModel @Inject constructor(
     fun setIncomingCallsEnabled(enabled: Boolean) = updatePreference(
         field = CommunicationPreferenceField.INCOMING_CALLS,
         changes = CommunicationPreferenceChanges(incomingCallsEnabled = enabled),
+    )
+
+    /**
+     * Turning this off is reciprocal by construction: the server leaves an opted-out account off
+     * the conversation's presence channel entirely, so it neither emits presence and typing nor
+     * receives them. The copy in Settings has to say both halves, because the second one is a cost
+     * the user is agreeing to rather than a protection they are gaining.
+     */
+    fun setMessagingPresenceVisible(enabled: Boolean) = updatePreference(
+        field = CommunicationPreferenceField.MESSAGING_PRESENCE,
+        changes = CommunicationPreferenceChanges(messagingPresenceVisible = enabled),
     )
 
     fun setDirectMessageRequestsEnabled(enabled: Boolean, messagingUsable: Boolean) {

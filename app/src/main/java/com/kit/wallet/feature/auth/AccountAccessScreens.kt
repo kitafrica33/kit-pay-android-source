@@ -56,15 +56,16 @@ fun RegisterScreen(
 
     AccountAccessScaffold(
         title = "Create your Kit Pay account",
-        subtitle = "Choose your username / display name and unique @tag, then add an email address you can verify.",
+        subtitle = "Choose a display name and username, then add an email address you can verify. " +
+            "Your legal name comes later, from your ID.",
         onBack = onBack,
         feedback = state,
     ) {
-        AccountTextField(name, { name = it }, "Username / display name")
+        AccountTextField(name, { name = it }, "Display name")
         AccountTextField(
             tag,
             { value -> tag = normalizeProfileTag(value) },
-            "Unique Kit Pay tag (without @)",
+            "Username (without @)",
         )
         AccountTextField(
             email,

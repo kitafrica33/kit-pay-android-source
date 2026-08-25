@@ -47,11 +47,13 @@ import kotlin.math.ceil
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 
 @Singleton
@@ -64,6 +66,7 @@ class OfflineUserRepository @Inject constructor(
     private val clock: Clock,
     @ApplicationScope scope: CoroutineScope,
     private val avatarUploader: ProfileAvatarUploader? = null,
+    private val profilePhotos: ProfilePhotoDirectory? = null,
 ) : UserRepository {
     override val profile: StateFlow<UserProfile> = sessions.session.flatMapLatest { session ->
         if (session == null) {
@@ -89,6 +92,46 @@ class OfflineUserRepository @Inject constructor(
         }
     }.stateIn(scope, SharingStarted.Eagerly, EMPTY_PROFILE)
 
+    init {
+        // The signed-in account is a Kit Pay member like any other, and every screen that draws a
+        // face by user id — a group's participant list, a search result — looks it up in one shared
+        // directory. Their own row was the one nobody wrote, which is why the person the app knows
+        // best appeared to themselves as initials.
+        //
+        // Taken from the cached row rather than from the network response, so it is right on a cold
+        // start and offline, and so a profile stored by an earlier build is indexed too. The profile
+        // is the whole story about its own photo: removing the photo removes the row, rather than
+        // leaving behind a face its owner has taken down.
+        //
+        // Signing out is not a removal and is deliberately not treated as one: the row goes with
+        // the rest of the cache in `RoomWalletCache.clearRows`, so there is nothing to erase here.
+        val directory = profilePhotos
+        if (directory != null) {
+            scope.launch {
+                sessions.session
+                    .flatMapLatest { session ->
+                        if (session == null) {
+                            flowOf(null)
+                        } else {
+                            profileDao.observeForOwner(
+                                session.cacheScopeId,
+                                AUTHENTICATED_CACHE_OWNER_KEY,
+                            ).map { cached -> cached?.let { session.fence() to it } }
+                        }
+                    }
+                    .distinctUntilChanged()
+                    .collect { own ->
+                        val (fence, cached) = own ?: return@collect
+                        directory.learn(
+                            fence,
+                            mapOf(cached.userId to cached.avatarUrl),
+                            complete = true,
+                        )
+                    }
+            }
+        }
+    }
+
     override suspend fun refreshProfile() {
         val session = requireActiveSession()
         val user = apiCalls.execute { api.profile() }
@@ -99,11 +142,21 @@ class OfflineUserRepository @Inject constructor(
 
     override suspend fun updateProfile(name: String, tag: String) {
         val session = requireActiveSession()
+        val current = profile.value
+        val normalizedName = normalizeProfileName(name)
+        val normalizedTag = normalizeProfileTag(tag)
         val user = apiCalls.execute {
             api.updateProfile(
                 UpdateProfileRequest(
-                    name = normalizeProfileName(name),
-                    tag = normalizeProfileTag(tag),
+                    // Blank means "leave it alone", not "erase it". The API has no way to clear a
+                    // display name, and a verified account already falls back to its legal name.
+                    name = normalizedName.takeIf(String::isNotBlank),
+                    tag = normalizedTag.takeIf(String::isNotBlank),
+                    // Sent only when there is a username to drop and the account is allowed to
+                    // drop it, so a required-username account never asks for a rejection.
+                    clearUsername = normalizedTag.isBlank() &&
+                        current.tag.isNotBlank() &&
+                        !current.usernameRequired,
                 ),
             )
         }
@@ -115,6 +168,8 @@ class OfflineUserRepository @Inject constructor(
         persistProfile(session.fence(), updated)
         // Do not return to navigation until the observable cache has caught up. Otherwise the
         // restored-session gate can briefly see the previous true value and reopen setup.
+        // Compared against what the server actually stored, so a dropped username — which comes
+        // back as an empty tag — settles the wait rather than hanging on it.
         profile.first { cached ->
             !cached.profileSetupRequired &&
                 cached.name == updated.name &&
@@ -243,6 +298,13 @@ class OfflineWalletRepository @Inject constructor(
         .map { it?.wallet?.availableBalanceMinor ?: 0L }
         .stateIn(scope, SharingStarted.Eagerly, 0L)
 
+    override val walletCurrency: StateFlow<WalletCurrency> = selectedWallet
+        .map { selected ->
+            selected?.wallet?.let { WalletCurrency(it.currencyCode, it.currencyScale) }
+                ?: WalletCurrency()
+        }
+        .stateIn(scope, SharingStarted.Eagerly, WalletCurrency())
+
     override val transactions: StateFlow<List<Transaction>> = selectedWallet
         .flatMapLatest { selected ->
             if (selected == null) {
@@ -343,20 +405,55 @@ class OfflineWalletRepository @Inject constructor(
         peerUserId: String,
         amountMinor: Long,
         note: String?,
+        idempotencyKey: String?,
+    ): ChatPaymentRequest = createChatPaymentRequestForOwnerOrCurrent(
+        owner = null,
+        peerUserId = peerUserId,
+        amountMinor = amountMinor,
+        note = note,
+        idempotencyKey = idempotencyKey
+            ?: "android-chat-request-${java.util.UUID.randomUUID()}",
+    )
+
+    override suspend fun createChatPaymentRequestForOwner(
+        owner: SessionFence,
+        peerUserId: String,
+        amountMinor: Long,
+        note: String?,
+        idempotencyKey: String,
+    ): ChatPaymentRequest = createChatPaymentRequestForOwnerOrCurrent(
+        owner = owner,
+        peerUserId = peerUserId,
+        amountMinor = amountMinor,
+        note = note,
+        idempotencyKey = idempotencyKey,
+    )
+
+    private suspend fun createChatPaymentRequestForOwnerOrCurrent(
+        owner: SessionFence?,
+        peerUserId: String,
+        amountMinor: Long,
+        note: String?,
+        idempotencyKey: String,
     ): ChatPaymentRequest {
         require(amountMinor > 0) { "Amount must be positive" }
         require(peerUserId.isNotBlank()) { "This conversation has no Kit Pay peer" }
-        val destination = requireSelectedWallet()
+        val destination = if (owner == null) {
+            requireSelectedWallet()
+        } else {
+            requireSelectedWallet(owner)
+        }
         val amount = DecimalMoney.fromMinor(amountMinor, destination.currencyScale)
         val created = apiCalls.execute {
             api.createPaymentRequest(
-                idempotencyKey = "android-chat-request-${java.util.UUID.randomUUID()}",
+                idempotencyKey = idempotencyKey,
                 request = CreatePaymentRequestDto(
                     destinationWalletId = destination.uuid,
                     requestedFromUserId = peerUserId,
                     amount = amount,
                     note = note?.trim()?.takeIf(String::isNotBlank),
                 ),
+                expectedOwner = owner,
             )
         }
         validateCreatedPaymentRequest(
@@ -367,6 +464,7 @@ class OfflineWalletRepository @Inject constructor(
             currencyCode = destination.currencyCode,
             currencyScale = destination.currencyScale,
         )
+        owner?.let { expected -> sessions.withCurrentSession(expected) { } }
         return ChatPaymentRequest(
             id = created.id,
             amountMinor = amountMinor,
@@ -683,12 +781,17 @@ class OfflineWalletRepository @Inject constructor(
 
     private suspend fun requireSelectedWallet(): com.kit.wallet.data.local.WalletEntity {
         val active = requireNotNull(sessions.current()) { "Sign in again to access this wallet" }
-        return sessions.withCurrentSession(active.fence()) { current ->
+        return requireSelectedWallet(active.fence())
+    }
+
+    private suspend fun requireSelectedWallet(
+        owner: SessionFence,
+    ): com.kit.wallet.data.local.WalletEntity =
+        sessions.withCurrentSession(owner) { current ->
             requireNotNull(cache.selectedWallet(current.cacheScopeId)) {
                 "No active wallet is selected"
             }
         }
-    }
 
     private data class OwnedSelectedWallet(
         val ownerScopeId: String,
@@ -703,6 +806,10 @@ data class WalletSyncResult(
     val walletCount: Int,
     val transactionCount: Int,
     val hasMoreTransactions: Boolean,
+    /** Server-backed selected-wallet values, returned directly to avoid Room/StateFlow lag. */
+    val selectedAvailableBalanceMinor: Long? = null,
+    val selectedCurrencyCode: String? = null,
+    val selectedCurrencyScale: Int? = null,
 )
 
 interface WalletSyncRepository {
@@ -747,7 +854,14 @@ class OfflineWalletSyncRepository @Inject constructor(
                 page.page.nextCursor,
             )
         }
-        return WalletSyncResult(wallets.size, transactions.size, page.page.hasMore == true)
+        return WalletSyncResult(
+            walletCount = wallets.size,
+            transactionCount = transactions.size,
+            hasMoreTransactions = page.page.hasMore == true,
+            selectedAvailableBalanceMinor = selected.availableBalanceMinor,
+            selectedCurrencyCode = selected.currencyCode,
+            selectedCurrencyScale = selected.currencyScale,
+        )
     }
 
     override suspend fun clearCachedUserData(ownerScopeId: String?) {
