@@ -96,17 +96,31 @@ internal class KitRealtimeCoordinator @Inject constructor(
 
         data object NetworkLost : Command
 
-        data object SocketOpened : Command
+        data class SocketOpened(val generation: Long) : Command
 
-        data class SocketFrame(val text: String) : Command
+        data class SocketFrame(val generation: Long, val text: String) : Command
 
-        data object SocketGone : Command
+        data class SocketGone(val generation: Long) : Command
 
-        data class Handshake(val socketId: String, val activityTimeoutSeconds: Int) : Command
+        data class Handshake(
+            val generation: Long,
+            val socketId: String,
+            val activityTimeoutSeconds: Int,
+        ) : Command
 
-        data class Authorized(val channel: String, val auth: String, val channelData: String?) : Command
+        data class Authorized(
+            val generation: Long,
+            val channel: String,
+            val auth: String,
+            val channelData: String?,
+        ) : Command
 
-        data class AuthorizationFailed(val channel: String, val status: Int?, val retryAfterMillis: Long?) : Command
+        data class AuthorizationFailed(
+            val generation: Long,
+            val channel: String,
+            val status: Int?,
+            val retryAfterMillis: Long?,
+        ) : Command
 
         data class Advertised(val config: KitRealtimeConfig?) : Command
 
@@ -153,24 +167,35 @@ internal class KitRealtimeCoordinator @Inject constructor(
 
     private var holdOverUntilMillis: Long? = null
     private var started: Boolean = false
+    private var socketGeneration: Long = 0L
+    private var activeSocketGeneration: Long? = null
+
+    /**
+     * Pusher permits one immediate reconnect for 4200-4299. A server repeatedly
+     * issuing the same instruction before a connection stabilises is an outage,
+     * not permission for an unbounded zero-delay loop, so later instructions use
+     * the ordinary capped ladder until new network/session information arrives or
+     * a connection remains Live for a full stability window.
+     */
+    private var immediateReconnectUsed: Boolean = false
 
     private val backoff = KitRealtimeBackoff(clock)
 
-    private val socketListener = object : KitRealtimeTransport.Listener {
+    private fun socketListener(generation: Long) = object : KitRealtimeTransport.Listener {
         override fun onOpen() {
-            commands.trySend(Command.SocketOpened)
+            commands.trySend(Command.SocketOpened(generation))
         }
 
         override fun onFrame(text: String) {
-            commands.trySend(Command.SocketFrame(text))
+            commands.trySend(Command.SocketFrame(generation, text))
         }
 
         override fun onClosed(code: Int, reason: String) {
-            commands.trySend(Command.SocketGone)
+            commands.trySend(Command.SocketGone(generation))
         }
 
         override fun onFailure(error: Throwable) {
-            commands.trySend(Command.SocketGone)
+            commands.trySend(Command.SocketGone(generation))
         }
     }
 
@@ -260,6 +285,7 @@ internal class KitRealtimeCoordinator @Inject constructor(
                     config = null
                     advertisementRequested = false
                     authRetries = 0
+                    immediateReconnectUsed = false
                     backoff.reset()
                     teardown(clean = true)
                     publish(KitRealtimeState.Idle)
@@ -273,6 +299,7 @@ internal class KitRealtimeCoordinator @Inject constructor(
                 // a 60-second ladder after connectivity returns is the single most
                 // visible way this feature can feel broken.
                 backoff.reset()
+                immediateReconnectUsed = false
                 if (connectionState.value is KitRealtimeState.Backoff) publish(KitRealtimeState.Idle)
                 evaluate()
             }
@@ -285,29 +312,41 @@ internal class KitRealtimeCoordinator @Inject constructor(
                 enterBackoff(backoff.delayWithoutSpendingAnAttempt())
             }
 
-            Command.SocketOpened -> {
+            is Command.SocketOpened -> {
+                if (!isCurrentSocket(command.generation)) return
                 lastInboundMillis = clock.elapsedMillis()
                 connectedAtMillis = lastInboundMillis
                 publish(KitRealtimeState.Handshaking)
             }
 
-            is Command.SocketFrame -> onFrame(command.text)
+            is Command.SocketFrame -> {
+                if (!isCurrentSocket(command.generation)) return
+                onFrame(command.generation, command.text)
+            }
 
-            Command.SocketGone -> {
+            is Command.SocketGone -> {
+                if (!isCurrentSocket(command.generation)) return
                 if (connectionState.value is KitRealtimeState.Suspended) return
                 teardown(clean = false)
                 enterBackoff(backoff.nextDelayMillis())
             }
 
-            is Command.Handshake -> onHandshake(command)
+            is Command.Handshake -> {
+                if (!isCurrentSocket(command.generation)) return
+                onHandshake(command)
+            }
 
             is Command.Authorized -> {
+                if (!isCurrentSocket(command.generation)) return
                 transport.send(
                     KitPusherCodec.encodeSubscribe(command.channel, command.auth, command.channelData),
                 )
             }
 
-            is Command.AuthorizationFailed -> onAuthorizationFailed(command)
+            is Command.AuthorizationFailed -> {
+                if (!isCurrentSocket(command.generation)) return
+                onAuthorizationFailed(command)
+            }
 
             is Command.Advertised -> {
                 advertisementRequested = false
@@ -341,8 +380,11 @@ internal class KitRealtimeCoordinator @Inject constructor(
             return
         }
 
+        socketGeneration = Math.incrementExact(socketGeneration)
+        val generation = socketGeneration
+        activeSocketGeneration = generation
         publish(KitRealtimeState.Connecting)
-        transport.open(current.socketUrl, socketListener)
+        transport.open(current.socketUrl, socketListener(generation))
     }
 
     private fun requestAdvertisement() {
@@ -379,6 +421,7 @@ internal class KitRealtimeCoordinator @Inject constructor(
 
     private fun authorize(channel: String, path: String) {
         val socket = socketId ?: return
+        val generation = activeSocketGeneration ?: return
         scope.launch {
             val response = runCatching {
                 authApi.authorizeChannel(path, ChannelAuthRequest(socket, channel))
@@ -386,10 +429,11 @@ internal class KitRealtimeCoordinator @Inject constructor(
 
             val body = response?.body()
             if (response != null && response.isSuccessful && body?.auth != null) {
-                commands.send(Command.Authorized(channel, body.auth, body.channelData))
+                commands.send(Command.Authorized(generation, channel, body.auth, body.channelData))
             } else {
                 commands.send(
                     Command.AuthorizationFailed(
+                        generation = generation,
                         channel = channel,
                         status = response?.code(),
                         retryAfterMillis = response?.retryAfterMillis(),
@@ -484,13 +528,13 @@ internal class KitRealtimeCoordinator @Inject constructor(
         authorize(channel, current.authPath)
     }
 
-    private fun onFrame(text: String) {
+    private fun onFrame(generation: Long, text: String) {
         lastInboundMillis = clock.elapsedMillis()
         val frame = KitPusherCodec.decode(text) ?: return
 
         when (frame) {
             is KitRealtimeFrame.Established ->
-                commands.trySend(Command.Handshake(frame.socketId, frame.activityTimeoutSeconds))
+                commands.trySend(Command.Handshake(generation, frame.socketId, frame.activityTimeoutSeconds))
 
             KitRealtimeFrame.Ping -> transport.send(KitPusherCodec.encodePong())
 
@@ -502,7 +546,12 @@ internal class KitRealtimeCoordinator @Inject constructor(
 
             is KitRealtimeFrame.SubscriptionFailed -> {
                 commands.trySend(
-                    Command.AuthorizationFailed(frame.channel, frame.status, retryAfterMillis = null),
+                    Command.AuthorizationFailed(
+                        generation,
+                        frame.channel,
+                        frame.status,
+                        retryAfterMillis = null,
+                    ),
                 )
             }
 
@@ -581,12 +630,18 @@ internal class KitRealtimeCoordinator @Inject constructor(
                 enterBackoff(backoff.nextDelayMillis(KitRealtimeBackoff.BASE_DELAY_MILLIS))
             }
 
-            // "Reconnect immediately, counter untouched": the server is telling us
-            // it is going away in an orderly fashion, which is not a failure.
+            // Honour the first orderly reconnect instruction immediately. Repeating
+            // it before a stable Live period is a server loop, so it joins the same
+            // bounded ladder as other retryable protocol failures.
             KitRealtimeErrorAction.ReconnectImmediately -> {
                 teardown(clean = true)
-                publish(KitRealtimeState.Idle)
-                evaluate()
+                if (!immediateReconnectUsed) {
+                    immediateReconnectUsed = true
+                    publish(KitRealtimeState.Idle)
+                    evaluate()
+                } else {
+                    enterBackoff(backoff.nextDelayMillis(KitRealtimeBackoff.BASE_DELAY_MILLIS))
+                }
             }
         }
     }
@@ -666,11 +721,16 @@ internal class KitRealtimeCoordinator @Inject constructor(
     }
 
     private fun teardown(clean: Boolean, keepPresence: Boolean = false) {
+        // Invalidate the coordinator generation before touching OkHttp. A callback
+        // already queued by the retiring socket then cannot tear down its successor.
+        activeSocketGeneration = null
         nudgeSink.close()
         typingSignaller.disarm()
         typingRegistry.clear()
 
-        if (connectionState.value is KitRealtimeState.Live) backoff.onLeftLive()
+        if (connectionState.value is KitRealtimeState.Live && backoff.onLeftLive()) {
+            immediateReconnectUsed = false
+        }
 
         if (clean) {
             subscribed.keys.forEach { transport.send(KitPusherCodec.encodeUnsubscribe(it)) }
@@ -693,6 +753,9 @@ internal class KitRealtimeCoordinator @Inject constructor(
         userChannel = null
         pingSentAtMillis = null
     }
+
+    private fun isCurrentSocket(generation: Long): Boolean =
+        activeSocketGeneration == generation
 
     private fun forgetConversation(conversationId: String) {
         presenceRegistry.forget(conversationId)

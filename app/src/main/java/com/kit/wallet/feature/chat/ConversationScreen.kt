@@ -210,7 +210,7 @@ fun ConversationScreen(
         }
     }
     val messages by viewModel.messages.collectAsStateWithLifecycle()
-    val messagingAvailable by viewModel.messagingAvailable.collectAsStateWithLifecycle()
+    val historyAvailable by viewModel.historyAvailable.collectAsStateWithLifecycle()
     val chat by viewModel.chat.collectAsStateWithLifecycle()
     val sending by viewModel.sending.collectAsStateWithLifecycle()
     val retryingMessageId by viewModel.retryingMessageId.collectAsStateWithLifecycle()
@@ -404,7 +404,7 @@ fun ConversationScreen(
             onLoad = viewModel::openMedia,
             onRetry = viewModel::retryMedia,
             onDismiss = { galleryMessageId = null },
-            reactionsEnabled = messagingAvailable,
+            reactionsEnabled = historyAvailable,
             onToggleReaction = { message, emoji ->
                 viewModel.toggleReaction(message.id, emoji)
             },
@@ -447,8 +447,8 @@ fun ConversationScreen(
         onClearError = viewModel::clearError,
         onSend = viewModel::send,
         onRetry = viewModel::retry,
-        reactionsEnabled = messagingAvailable,
-        sendEnabled = messagingAvailable,
+        reactionsEnabled = historyAvailable,
+        sendEnabled = historyAvailable,
         onToggleReaction = { message, emoji ->
             viewModel.toggleReaction(message.id, emoji)
         },
@@ -544,7 +544,7 @@ fun ConversationScreen(
         onRestoredDraftConsumed = viewModel::consumeRestoredDraft,
         onPersistDraft = viewModel::persistDraft,
         onComposerChanged = viewModel::onComposerChanged,
-        schedulingEnabled = viewModel.schedulingAvailable && messagingAvailable,
+        schedulingEnabled = viewModel.schedulingAvailable && historyAvailable,
         onScheduleSend = viewModel::scheduleSend,
         onSchedulePaymentRequest = viewModel::schedulePaymentRequest,
         onSendScheduledNow = viewModel::sendScheduledNow,

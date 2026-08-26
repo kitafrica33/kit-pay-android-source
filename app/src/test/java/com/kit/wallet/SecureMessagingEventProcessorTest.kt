@@ -7,6 +7,8 @@ import com.kit.wallet.data.messaging.FailClosedSecureMessagingCryptoTransaction
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.KitReactionAction
+import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
@@ -67,6 +69,7 @@ import com.kit.wallet.data.messaging.SecureMessagingTextContentBinding
 import com.kit.wallet.data.messaging.encodeSecureMessagingTextContent
 import com.kit.wallet.data.messaging.requireSecureMessagingSyncResumePosition
 import com.kit.wallet.data.repository.DefaultSecureMessagingChatRuntime
+import com.kit.wallet.data.repository.SecureMessagingPendingPredecessorException
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.CursorPageDto
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
@@ -198,7 +201,7 @@ class SecureMessagingEventProcessorTest {
     }
 
     @Test
-    fun `runtime reports exact durable client ID before transport and never before commit`() = runTest {
+    fun `runtime reports and reuses the local outbox client ID across a crash boundary`() = runTest {
         val (transportSession, lifecycle, fence) = openSyncingSession()
         lifecycle.finishActivation(fence)
         val registry = SecureMessagingActiveSessionRegistry(lifecycle)
@@ -246,12 +249,14 @@ class SecureMessagingEventProcessorTest {
         enqueueRoster(roster)
         server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
         val committedClientId = CompletableDeferred<String>()
+        val stableClientId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
         val send = async(start = CoroutineStart.UNDISPATCHED) {
             runtime.sendText(
                 session = active,
                 conversationId = CONVERSATION_ID,
                 text = "operation-owned callback",
                 onDurablyCommitted = { committedClientId.complete(it) },
+                idempotentClientMessageId = stableClientId,
             )
         }
 
@@ -259,11 +264,39 @@ class SecureMessagingEventProcessorTest {
             withTimeout(5_000L) { committedClientId.await() }
         }
         val pending = projections.readPage(limit = 10).messages().single()
-        assertEquals(pending.durableRecord.clientMessageId, callbackId)
+        assertEquals(stableClientId, callbackId)
+        assertEquals(stableClientId, pending.durableRecord.clientMessageId)
         assertEquals(SecureMessagingProjectionDeliveryState.OUTBOUND_PENDING, pending.deliveryState)
         assertFalse(send.isCompleted)
 
         send.cancelAndJoin()
+
+        val requestsBeforeReplay = server.requestCount
+        val replayCallbacks = mutableListOf<String>()
+        runtime.sendText(
+            session = active,
+            conversationId = CONVERSATION_ID,
+            text = "operation-owned callback",
+            onDurablyCommitted = replayCallbacks::add,
+            idempotentClientMessageId = stableClientId,
+        )
+
+        assertEquals(listOf(stableClientId), replayCallbacks)
+        assertEquals(requestsBeforeReplay, server.requestCount)
+        assertEquals(1, projections.readPage(limit = 10).messages().size)
+
+        val successorFailure = runCatching {
+            runtime.sendText(
+                session = active,
+                conversationId = CONVERSATION_ID,
+                text = "must remain behind the pending predecessor",
+                idempotentClientMessageId = SECOND_OUTBOUND_CLIENT_ID,
+            )
+        }.exceptionOrNull()
+
+        assertTrue(successorFailure is SecureMessagingPendingPredecessorException)
+        assertEquals(requestsBeforeReplay, server.requestCount)
+        assertEquals(1, projections.readPage(limit = 10).messages().size)
     }
 
     @Test
@@ -2238,6 +2271,73 @@ class SecureMessagingEventProcessorTest {
         }
 
     @Test
+    fun `process restart recovers pending messages by durable commit order not random uuid`() =
+        runTest {
+            val (session, lifecycle, fence) = openSyncingSession()
+            lifecycle.finishActivation(fence)
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val processor = processor(stateStore, PersistingDecryptionEngine(stateStore), projections)
+            val roster = authoritativeRoster()
+
+            // The older record deliberately has the lexically later UUID. Storage pagination will
+            // return the newer `8...` record first unless recovery restores durable commit order.
+            val older = stateStore.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(
+                    SECOND_OUTBOUND_CLIENT_ID,
+                ),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = SECOND_OUTBOUND_CLIENT_ID,
+                clientMessageId = SECOND_OUTBOUND_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = "older",
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        PEER,
+                        SecureMessagingEnvelopeKind.SESSION,
+                        byteArrayOf(7, 8, 9),
+                    ),
+                ),
+            )
+            val newer = stateStore.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = OUTBOUND_CLIENT_ID,
+                clientMessageId = OUTBOUND_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = "newer",
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        PEER,
+                        SecureMessagingEnvelopeKind.SESSION,
+                        byteArrayOf(10, 11, 12),
+                    ),
+                ),
+            )
+            projections.recordOutboundPending(older, Instant.parse(TIMESTAMP))
+            projections.recordOutboundPending(newer, Instant.parse(TIMESTAMP))
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            enqueueRoster(roster)
+            enqueueOutboundReceipt(roster, SECOND_OUTBOUND_CLIENT_ID)
+            enqueueOutboundReceipt(roster, OUTBOUND_CLIENT_ID)
+
+            processor.recoverPendingOutbox(session)
+
+            server.takeRequest() // conversations
+            server.takeRequest() // roster
+            val firstSend = server.takeRequest().body.readUtf8()
+            val secondSend = server.takeRequest().body.readUtf8()
+            assertTrue(firstSend.contains(SECOND_OUTBOUND_CLIENT_ID))
+            assertTrue(secondSend.contains(OUTBOUND_CLIENT_ID))
+        }
+
+    @Test
     fun `stale media outbox retry preserves authenticated attachment metadata`() = runTest {
         val (session, lifecycle, fence) = openSyncingSession()
         lifecycle.finishActivation(fence)
@@ -2415,6 +2515,87 @@ class SecureMessagingEventProcessorTest {
             projectionStore(stateStore).readPage(limit = 10).messages()
                 .single { it.durableRecord.clientMessageId == OUTBOUND_CLIENT_ID }
                 .deliveryState,
+        )
+    }
+
+    @Test
+    fun `an incompatible pending reaction does not starve later encrypted text`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(stateStore, PersistingDecryptionEngine(stateStore), projections)
+        val roster = authoritativeRoster()
+        val reactionText = KitReactionMessage(
+            targetMessageId = INCOMING_MESSAGE_ID,
+            emoji = "👍",
+            action = KitReactionAction.ADD,
+        ).encode()
+        val reaction = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = OUTBOUND_CLIENT_ID,
+            clientMessageId = OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            replyToMessageId = INCOMING_MESSAGE_ID,
+            text = reactionText,
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(7, 8, 9),
+                ),
+            ),
+        )
+        val laterText = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(
+                SECOND_OUTBOUND_CLIENT_ID,
+            ),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = SECOND_OUTBOUND_CLIENT_ID,
+            clientMessageId = SECOND_OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = "send after unsupported reaction",
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(10, 11, 12),
+                ),
+            ),
+        )
+        projections.recordOutboundPending(reaction, Instant.parse(TIMESTAMP))
+        projections.recordOutboundPending(laterText, Instant.parse(TIMESTAMP))
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        // This fixture deliberately advertises no reaction capability on the peer device.
+        enqueueRoster(roster)
+        enqueueRoster(roster)
+        enqueueOutboundReceipt(roster, SECOND_OUTBOUND_CLIENT_ID)
+
+        processor.recoverPendingOutbox(session)
+
+        repeat(3) { server.takeRequest() }
+        val sent = server.takeRequest()
+        assertEquals(
+            "/api/kit-wallet/v1/messaging/conversations/$CONVERSATION_ID/messages",
+            sent.path,
+        )
+        assertTrue(sent.body.readUtf8().contains(SECOND_OUTBOUND_CLIENT_ID))
+        val projected = projections.readPage(limit = 10).messages()
+            .associateBy { it.durableRecord.clientMessageId }
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_PERMANENT_FAILURE,
+            projected.getValue(OUTBOUND_CLIENT_ID).deliveryState,
+        )
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_SENT,
+            projected.getValue(SECOND_OUTBOUND_CLIENT_ID).deliveryState,
         )
     }
 

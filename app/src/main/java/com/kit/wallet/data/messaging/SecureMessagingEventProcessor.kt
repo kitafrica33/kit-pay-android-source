@@ -239,9 +239,18 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 }
                 val reaction = KitReactionMessage.parse(durable.authenticatedText)
                 val plan = if (reaction != null) {
-                    val roster = session.roster(conversation)
-                    session.requireReactionCapability(conversation, roster)
-                    session.encryptionPlan(conversation, roster)
+                    try {
+                        val roster = session.roster(conversation)
+                        session.requireReactionCapability(conversation, roster)
+                        session.encryptionPlan(conversation, roster)
+                    } catch (_: SecureMessagingConversationCapabilityUnavailableException) {
+                        // This annotation cannot reach the roster and has no standalone retry UI.
+                        // Retire only its ciphertext so it disappears locally and a stale device
+                        // cannot starve later text/media or another conversation's recovery. The
+                        // user can add the reaction again after every device supports it.
+                        session.withProjectionLease { markOutboundPermanentFailure(durable) }
+                        return@forEach
+                    }
                 } else {
                     plans.getOrPut(durable.conversationId) {
                         val roster = session.roster(conversation)
@@ -476,35 +485,45 @@ internal class SecureMessagingEventProcessor @Inject constructor(
 
     private suspend fun pendingOutboundRecords(
         session: RemoteSecureMessagingTransport.Session,
-    ): List<LibSignalCompanionRecord> = session.withProjectionLease {
-        val pending = mutableListOf<LibSignalCompanionRecord>()
-        var after: String? = null
-        repeat(MAX_OUTBOX_PAGES) {
-            val page = readPage(afterRecordKey = after, limit = OUTBOX_PAGE_SIZE)
-            page.messages().forEach { projected ->
-                if (projected.deliveryState ==
-                    SecureMessagingProjectionDeliveryState.OUTBOUND_PENDING
-                ) {
-                    val durable = projected.durableRecord
-                    if (durable.direction != LibSignalCompanionDirection.OUTBOUND) {
-                        throw SecureMessagingCryptographicFailureException(
-                            SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
-                            "Pending projection metadata points at a non-outbound message",
-                        )
+    ): List<LibSignalCompanionRecord> {
+        val pending = session.withProjectionLease {
+            val collected = mutableListOf<SecureMessagingProjectedMessage>()
+            var after: String? = null
+            repeat(MAX_OUTBOX_PAGES) {
+                val page = readPage(afterRecordKey = after, limit = OUTBOX_PAGE_SIZE)
+                page.messages().forEach { projected ->
+                    if (projected.deliveryState ==
+                        SecureMessagingProjectionDeliveryState.OUTBOUND_PENDING
+                    ) {
+                        val durable = projected.durableRecord
+                        if (durable.direction != LibSignalCompanionDirection.OUTBOUND) {
+                            throw SecureMessagingCryptographicFailureException(
+                                SecureMessagingQuarantineReason.REPLAY_OR_ROLLBACK,
+                                "Pending projection metadata points at a non-outbound message",
+                            )
+                        }
+                        collected += projected
                     }
-                    pending += durable
                 }
+                val next = page.nextAfterRecordKey ?: return@withProjectionLease collected
+                check(after == null || next > after!!) {
+                    "Secure-message outbox pagination did not advance"
+                }
+                after = next
             }
-            val next = page.nextAfterRecordKey ?: return@withProjectionLease pending
-            check(after == null || next > after!!) {
-                "Secure-message outbox pagination did not advance"
-            }
-            after = next
+            throw SecureMessagingCryptographicFailureException(
+                SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
+                "Secure-message outbox exceeds the bounded recovery scan",
+            )
         }
-        throw SecureMessagingCryptographicFailureException(
-            SecureMessagingQuarantineReason.STATE_UNAVAILABLE,
-            "Secure-message outbox exceeds the bounded recovery scan",
-        )
+        // Storage pages are keyed by random client UUID. Restore authored order from the immutable
+        // companion commit time; the ID is only a deterministic tie-breaker for legacy same-ms rows.
+        return pending.sortedWith(
+            compareBy<SecureMessagingProjectedMessage>(
+                { it.durableRecord.updatedAtEpochMillis },
+                { it.durableRecord.clientMessageId },
+            ),
+        ).map(SecureMessagingProjectedMessage::durableRecord)
     }
 
     private fun KitWalletApiException.isPermanentAttachmentBindingFailure(): Boolean = when (code) {

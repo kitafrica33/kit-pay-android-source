@@ -59,11 +59,14 @@ internal class KitRealtimeBackoff(
     /**
      * Leaving `Live` for any reason. Clears the counter only if the connection had
      * actually held up; a short-lived one leaves the ladder exactly where it was.
+     * Returns whether this stay crossed the stability threshold.
      */
-    fun onLeftLive() {
-        val since = liveSinceMillis ?: return
+    fun onLeftLive(): Boolean {
+        val since = liveSinceMillis ?: return false
         liveSinceMillis = null
-        if (clock.elapsedMillis() - since >= STABLE_LIVE_MILLIS) attempts = 0
+        val wasStable = clock.elapsedMillis() - since >= STABLE_LIVE_MILLIS
+        if (wasStable) attempts = 0
+        return wasStable
     }
 
     /**

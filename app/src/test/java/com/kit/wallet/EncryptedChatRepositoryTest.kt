@@ -7,12 +7,19 @@ import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.KitReactionAction
 import com.kit.wallet.data.messaging.KitReactionMessage
+import com.kit.wallet.data.messaging.ImmediateMediaSpool
+import com.kit.wallet.data.messaging.ImmediateSendDispatcher
+import com.kit.wallet.data.messaging.ImmediateSendDispatchOutcome
+import com.kit.wallet.data.messaging.ImmediateSendIntent
+import com.kit.wallet.data.messaging.ImmediateSendIntentStore
+import com.kit.wallet.data.messaging.ImmediateSendKind
 import com.kit.wallet.data.messaging.MEMBERSHIP_ADDED_EVENT
 import com.kit.wallet.data.messaging.MEMBERSHIP_REMOVED_EVENT
 import com.kit.wallet.data.messaging.MEMBERSHIP_ROLE_CHANGED_EVENT
 import com.kit.wallet.data.messaging.SecureMessagingActivationCapability
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
+import com.kit.wallet.data.messaging.SecureMessagingConversationCapabilityUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
 import com.kit.wallet.data.realtime.KitPresenceRegistry
 import com.kit.wallet.data.remote.DIRECT_CONVERSATION_TYPE
@@ -28,6 +35,7 @@ import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.EncryptedChatRepository
 import com.kit.wallet.data.repository.SecureMessagingChatSession
 import com.kit.wallet.data.repository.SecureMessagingChatRuntime
+import com.kit.wallet.data.repository.SecureMessagingPendingPredecessorException
 import com.kit.wallet.data.repository.projectionIsFromCurrentUser
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.session.SessionFence
@@ -42,6 +50,7 @@ import java.io.IOException
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
+import java.nio.file.Files
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -959,6 +968,433 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `media bubble appears while encryption is still preparing the durable queue item`() = runTest {
+        val encryptionStarted = CompletableDeferred<Unit>()
+        val releaseEncryption = CompletableDeferred<Unit>()
+        val directory = Files.createTempDirectory("kit-immediate-staging-test").toFile()
+        val bytes = "selected photo bytes".toByteArray()
+        try {
+            val spool = ImmediateMediaSpool(
+                directory = directory,
+                beforeEncryption = {
+                    encryptionStarted.complete(Unit)
+                    releaseEncryption.await()
+                },
+            )
+            val runtime = FakeRuntime().apply {
+                conversations += conversation(CONVERSATION_ONE, "Grace")
+            }
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val queue = ImmediateSendIntentStore(TestSecureMessagingStateStore(), authentication)
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+
+            val send = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                repository.sendImageMessage(
+                    CONVERSATION_ONE,
+                    bytes,
+                    "image/jpeg",
+                    "Receipt",
+                )
+            }
+            encryptionStarted.await()
+            runCurrent()
+
+            val preparing = repository.conversation(CONVERSATION_ONE).value.single()
+            assertEquals(MessageKind.IMAGE, preparing.kind)
+            assertEquals(DeliveryState.SENDING, preparing.state)
+            assertEquals("Receipt", preparing.text)
+            assertTrue(queue.items.value.isEmpty())
+            val openFailure = runCatching {
+                repository.openImageMessage(
+                    CONVERSATION_ONE,
+                    checkNotNull(preparing.mediaDescriptor),
+                )
+            }.exceptionOrNull()
+            assertEquals("This secure attachment is still being prepared", openFailure?.message)
+
+            releaseEncryption.complete(Unit)
+            send.join()
+            runCurrent()
+
+            assertEquals(1, queue.items.value.size)
+            assertEquals(
+                listOf(queue.items.value.single().id),
+                repository.conversation(CONVERSATION_ONE).value.map { it.id },
+            )
+        } finally {
+            releaseEncryption.complete(Unit)
+            bytes.fill(0)
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `local first send survives promotion crash and is committed only once`() = runTest {
+        val disk = TestSecureMessagingStateStore()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val queue = ImmediateSendIntentStore(disk, authentication)
+        val directory = Files.createTempDirectory("kit-immediate-dispatch-test").toFile()
+        try {
+            val spool = ImmediateMediaSpool(directory)
+            val runtime = FakeRuntime().apply {
+                conversations += conversation(CONVERSATION_ONE, "Grace")
+            }
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+
+            repository.sendMessage(CONVERSATION_ONE, "survives the crash")
+            runCurrent()
+            val intent = queue.items.value.single()
+            val owner = checkNotNull(authentication.current()).fence()
+
+            // Model a process dying after libsignal's durable commit but before the local intent
+            // can be tombstoned. The restart must discover the same stable client ID.
+            repository.promoteImmediateSend(owner, intent) {}
+            assertEquals(1, runtime.projected.count { it.clientMessageId == intent.id })
+
+            val restartedQueue = ImmediateSendIntentStore(disk, authentication)
+            restartedQueue.loadForCurrentOwner()
+            val restartedRepository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = restartedQueue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+            val outcome = ImmediateSendDispatcher(
+                restartedQueue,
+                spool,
+                restartedRepository,
+            ).dispatch()
+
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, outcome)
+            assertTrue(restartedQueue.items.value.isEmpty())
+            assertEquals(1, runtime.projected.count { it.clientMessageId == intent.id })
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `immediate dispatcher preserves per chat fifo while another chat continues`() = runTest {
+        var failFirst = true
+        val runtime = FakeRuntime(beforeSend = { text ->
+            if (text == "first" && failFirst) {
+                failFirst = false
+                IOException("offline")
+            } else {
+                null
+            }
+        }).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+            conversations += directConversation(CONVERSATION_TWO, "Emma", USER_THREE)
+        }
+        val disk = TestSecureMessagingStateStore()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val queue = ImmediateSendIntentStore(disk, authentication)
+        val directory = Files.createTempDirectory("kit-immediate-fifo-test").toFile()
+        try {
+            val spool = ImmediateMediaSpool(directory)
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+            queue.enqueue(textIntent(OUTBOX_ID_ONE, CONVERSATION_ONE, "first", 1L))
+            queue.enqueue(textIntent(OUTBOX_ID_TWO, CONVERSATION_ONE, "second", 2L))
+            queue.enqueue(textIntent(OUTBOX_ID_THREE, CONVERSATION_TWO, "other chat", 3L))
+            val dispatcher = ImmediateSendDispatcher(queue, spool, repository)
+
+            assertEquals(ImmediateSendDispatchOutcome.RETRY, dispatcher.dispatch())
+            assertEquals(listOf("first", "other chat"), runtime.sendAttempts.map { it.second })
+            assertEquals(
+                listOf("first", "second"),
+                queue.items.value.map(ImmediateSendIntent::text),
+            )
+
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatcher.dispatch())
+            assertEquals(
+                listOf("first", "other chat", "first", "second"),
+                runtime.sendAttempts.map { it.second },
+            )
+            assertTrue(queue.items.value.isEmpty())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `an incompatible reaction retires without blocking later text`() = runTest {
+        val runtime = FakeRuntime(beforeSend = { text ->
+            if (KitReactionMessage.parse(text) != null) {
+                SecureMessagingConversationCapabilityUnavailableException(
+                    "A conversation device does not support messaging_reactions_e2ee_v1",
+                )
+            } else {
+                null
+            }
+        }).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val disk = TestSecureMessagingStateStore()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val queue = ImmediateSendIntentStore(disk, authentication)
+        val directory = Files.createTempDirectory("kit-immediate-reaction-test").toFile()
+        try {
+            val spool = ImmediateMediaSpool(directory)
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+            val reaction = KitReactionMessage(
+                targetMessageId = TARGET_MESSAGE_ID,
+                emoji = "👍",
+                action = KitReactionAction.ADD,
+            ).encode()
+            queue.enqueue(
+                textIntent(OUTBOX_ID_ONE, CONVERSATION_ONE, reaction, 1L)
+                    .copy(kind = ImmediateSendKind.REACTION),
+            )
+            queue.enqueue(textIntent(OUTBOX_ID_TWO, CONVERSATION_ONE, "still sends", 2L))
+
+            val outcome = ImmediateSendDispatcher(queue, spool, repository).dispatch()
+
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, outcome)
+            assertEquals(listOf(reaction, "still sends"), runtime.sendAttempts.map { it.second })
+            assertTrue(queue.items.value.isEmpty())
+            assertEquals(listOf("still sends"), runtime.projected.map { it.text })
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `a legacy retry-required reaction retires without blocking later text`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val disk = TestSecureMessagingStateStore()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val queue = ImmediateSendIntentStore(disk, authentication)
+        val directory = Files.createTempDirectory("kit-immediate-retired-reaction-test").toFile()
+        try {
+            val spool = ImmediateMediaSpool(directory)
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+            val reaction = KitReactionMessage(
+                targetMessageId = TARGET_MESSAGE_ID,
+                emoji = "👍",
+                action = KitReactionAction.ADD,
+            ).encode()
+            val owner = queue.enqueue(
+                textIntent(OUTBOX_ID_ONE, CONVERSATION_ONE, reaction, 1L)
+                    .copy(kind = ImmediateSendKind.REACTION),
+            )
+            val queuedReaction = queue.items.value.single()
+            assertTrue(queue.markRetryRequiredForOwner(owner, queuedReaction))
+            queue.enqueue(textIntent(OUTBOX_ID_TWO, CONVERSATION_ONE, "still sends", 2L))
+
+            val outcome = ImmediateSendDispatcher(queue, spool, repository).dispatch()
+
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, outcome)
+            assertEquals(listOf("still sends"), runtime.sendAttempts.map { it.second })
+            assertTrue(queue.items.value.isEmpty())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `missing local media retires without blocking later text`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val disk = TestSecureMessagingStateStore()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val queue = ImmediateSendIntentStore(disk, authentication)
+        val directory = Files.createTempDirectory("kit-immediate-missing-media-test").toFile()
+        val plaintext = "media removed before dispatch".toByteArray()
+        try {
+            val spool = ImmediateMediaSpool(directory)
+            val material = spool.stage(OUTBOX_ID_ONE, plaintext)
+            val media = ImmediateSendIntent(
+                id = OUTBOX_ID_ONE,
+                conversationId = CONVERSATION_ONE,
+                kind = ImmediateSendKind.MEDIA,
+                createdAtEpochMillis = 1L,
+                mediaType = "image/jpeg",
+                mediaPlaintextBytes = material.plaintextBytes,
+                mediaCiphertextBytes = material.ciphertextBytes,
+                mediaKeyBase64 = material.keyBase64,
+                mediaSha256Base64 = material.sha256Base64,
+            )
+            spool.discard(media.id)
+            queue.enqueue(media)
+            queue.enqueue(textIntent(OUTBOX_ID_TWO, CONVERSATION_ONE, "still sends", 2L))
+
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+            val outcome = ImmediateSendDispatcher(queue, spool, repository).dispatch()
+
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, outcome)
+            assertEquals(listOf("still sends"), runtime.sendAttempts.map { it.second })
+            assertTrue(queue.items.value.isEmpty())
+        } finally {
+            plaintext.fill(0)
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `a post-commit network failure preserves per-chat fifo while another chat continues`() =
+        runTest {
+            var failFirst = true
+            val runtime = FakeRuntime(afterDurablyCommitted = { text ->
+                if (text == "first" && failFirst) {
+                    failFirst = false
+                    IOException("response lost after durable commit")
+                } else {
+                    null
+                }
+            }).apply {
+                conversations += conversation(CONVERSATION_ONE, "Grace")
+                conversations += directConversation(CONVERSATION_TWO, "Emma", USER_THREE)
+            }
+            val disk = TestSecureMessagingStateStore()
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val queue = ImmediateSendIntentStore(disk, authentication)
+            val directory = Files.createTempDirectory("kit-immediate-post-commit-fifo-test").toFile()
+            try {
+                val spool = ImmediateMediaSpool(directory)
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = queue,
+                    immediateMediaSpool = spool,
+                )
+                runCurrent()
+                queue.enqueue(textIntent(OUTBOX_ID_ONE, CONVERSATION_ONE, "first", 1L))
+                queue.enqueue(textIntent(OUTBOX_ID_TWO, CONVERSATION_ONE, "second", 2L))
+                queue.enqueue(textIntent(OUTBOX_ID_THREE, CONVERSATION_TWO, "other chat", 3L))
+                val dispatcher = ImmediateSendDispatcher(queue, spool, repository)
+
+                assertEquals(ImmediateSendDispatchOutcome.RETRY, dispatcher.dispatch())
+                assertEquals(listOf("first", "other chat"), runtime.sendAttempts.map { it.second })
+                assertEquals(listOf("second"), queue.items.value.map(ImmediateSendIntent::text))
+                assertEquals(
+                    AuthenticatedTextDeliveryState.PENDING,
+                    runtime.projected.single { it.text == "first" }.deliveryState,
+                )
+
+                // Even a direct second dispatch cannot bypass the encrypted predecessor. This is
+                // deliberately enforced below WorkManager's normal sync-before-dispatch ordering.
+                assertEquals(ImmediateSendDispatchOutcome.RETRY, dispatcher.dispatch())
+                assertEquals(listOf("first", "other chat"), runtime.sendAttempts.map { it.second })
+                assertEquals(listOf("second"), queue.items.value.map(ImmediateSendIntent::text))
+
+                // Once synchronization accepts the predecessor, its successor can be promoted.
+                val firstIndex = runtime.projected.indexOfFirst { it.text == "first" }
+                runtime.projected[firstIndex] = runtime.projected[firstIndex].copy(
+                    deliveryState = AuthenticatedTextDeliveryState.SENT,
+                )
+                assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatcher.dispatch())
+                assertEquals(
+                    listOf("first", "other chat", "second"),
+                    runtime.sendAttempts.map { it.second },
+                )
+                assertTrue(queue.items.value.isEmpty())
+            } finally {
+                directory.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `standalone and in chat payment receipts enter the durable queue`() = runTest {
+        val disk = TestSecureMessagingStateStore()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val queue = ImmediateSendIntentStore(disk, authentication)
+        val directory = Files.createTempDirectory("kit-immediate-payment-test").toFile()
+        try {
+            val spool = ImmediateMediaSpool(directory)
+            val runtime = FakeRuntime(epoch = null).apply {
+                cachedConversations += conversation(CONVERSATION_ONE, "Grace")
+            }
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+            )
+            runtime.localHistoryActivations.value = localActivation()
+            runCurrent()
+            val descriptor = KitPaymentMessage(
+                action = KitPaymentAction.TRANSFER,
+                referenceId = PAYMENT_REFERENCE_ID,
+                amountMinor = 500,
+                currencyCode = "UGX",
+                currencyScale = 0,
+                note = "Lunch",
+            ).encode()
+
+            val standaloneChat = repository.openDirectConversation(
+                Contact(USER_ONE, "Grace", "+256700000001", isKitUser = true),
+            )
+            repository.sendPaymentEvent(standaloneChat, descriptor)
+            repository.sendPaymentEvent(CONVERSATION_ONE, descriptor)
+            runCurrent()
+
+            assertEquals(2, queue.items.value.size)
+            assertTrue(queue.items.value.all { it.kind == ImmediateSendKind.PAYMENT_EVENT })
+            assertTrue(queue.items.value.all { it.text == descriptor })
+            assertTrue(runtime.sendAttempts.isEmpty())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `user text cannot impersonate the reserved payment wire`() = runTest {
         val runtime = FakeRuntime().apply {
             conversations += conversation(CONVERSATION_ONE, "Grace")
@@ -1528,6 +1964,8 @@ class EncryptedChatRepositoryTest {
         presence: KitPresenceRegistry? = null,
         systemEvents: ConversationSystemEventStore? = null,
         authenticationSessions: SessionStore? = null,
+        immediateSends: ImmediateSendIntentStore? = null,
+        immediateMediaSpool: ImmediateMediaSpool? = null,
     ) =
         EncryptedChatRepository(
             runtime = runtime,
@@ -1541,6 +1979,8 @@ class EncryptedChatRepositoryTest {
             systemEvents = systemEvents,
             presence = presence,
             authenticationSessions = authenticationSessions,
+            immediateSends = immediateSends,
+            immediateMediaSpool = immediateMediaSpool,
         )
 
     private enum class SendScenario {
@@ -1559,6 +1999,8 @@ class EncryptedChatRepositoryTest {
         private val recoverPermanentBaselineFailure: Boolean = false,
         private val permanentRecoveryError: Exception? = null,
         permanentRecoveryFailures: Int = if (permanentRecoveryError == null) 0 else Int.MAX_VALUE,
+        private val beforeSend: (String) -> Throwable? = { null },
+        private val afterDurablyCommitted: (String) -> Throwable? = { null },
     ) : SecureMessagingChatRuntime {
         private val authorityLock = Any()
         private val initialSession = epoch?.let(::newSession)
@@ -1590,6 +2032,7 @@ class EncryptedChatRepositoryTest {
         val roleChanges = mutableListOf<Pair<String, String>>()
         val left = mutableListOf<String>()
         val sendAttempts = mutableListOf<Triple<String, String, String?>>()
+        val idempotentClientIds = mutableListOf<String?>()
         val expectedOwners = mutableListOf<SessionFence?>()
         val replyTargets = mutableListOf<String?>()
         val pageRequests = mutableListOf<String?>()
@@ -1847,15 +2290,45 @@ class EncryptedChatRepositoryTest {
             replyToMessageId: String?,
             onDurablyCommitted: (clientMessageId: String) -> Unit,
             expectedOwner: SessionFence?,
+            idempotentClientMessageId: String?,
         ) {
             requireCurrent(session)
             expectedOwners += expectedOwner
+            idempotentClientMessageId?.let { stableId ->
+                if (projected.any { it.clientMessageId == stableId }) {
+                    onDurablyCommitted(stableId)
+                    return
+                }
+                if (projected.any {
+                        it.conversationId == conversationId &&
+                            it.deliveryState == AuthenticatedTextDeliveryState.PENDING
+                    }
+                ) {
+                    throw SecureMessagingPendingPredecessorException()
+                }
+            }
             sendAttempts += Triple(conversationId, text, retryClientMessageId)
+            idempotentClientIds += idempotentClientMessageId
             replyTargets += replyToMessageId
+            beforeSend(text)?.let { throw it }
             when (sendScenario) {
                 SendScenario.NORMAL -> {
-                    val committed = recordNormalSend(conversationId, text)
+                    val committed = recordNormalSend(
+                        conversationId,
+                        text,
+                        idempotentClientMessageId,
+                    )
                     onDurablyCommitted(committed.clientMessageId)
+                    afterDurablyCommitted(text)?.let { error ->
+                        val committedIndex = projected.indexOfLast {
+                            it.clientMessageId == committed.clientMessageId
+                        }
+                        projected[committedIndex] = committed.copy(
+                            deliveryState = AuthenticatedTextDeliveryState.PENDING,
+                        )
+                        projectionChanges.value++
+                        throw error
+                    }
                 }
                 SendScenario.LOST_RESPONSE -> retryScenario(
                     conversationId,
@@ -1966,6 +2439,7 @@ class EncryptedChatRepositoryTest {
         private fun recordNormalSend(
             conversationId: String,
             text: String,
+            idempotentClientMessageId: String? = null,
         ): AuthenticatedProjectedText {
             val attempt = sendAttempts.size
             val committed = message(
@@ -1975,6 +2449,7 @@ class EncryptedChatRepositoryTest {
                 fromMe = true,
                 state = AuthenticatedTextDeliveryState.SENT,
                 sentAt = Instant.parse("2026-07-20T12:00:00Z").plusSeconds(attempt.toLong()),
+                clientMessageId = idempotentClientMessageId ?: "out:normal-$attempt",
             )
             projected += committed
             projectionChanges.value++
@@ -1991,6 +2466,11 @@ class EncryptedChatRepositoryTest {
         const val TARGET_MESSAGE_ID = "44444444-4444-4444-8444-444444444444"
         const val GROUP_ONE = "55555555-5555-4555-8555-555555555555"
         const val USER_THREE = "66666666-6666-4666-8666-666666666666"
+        const val CONVERSATION_TWO = "77777777-7777-4777-8777-777777777777"
+        const val OUTBOX_ID_ONE = "80000000-0000-4000-8000-000000000001"
+        const val OUTBOX_ID_TWO = "80000000-0000-4000-8000-000000000002"
+        const val OUTBOX_ID_THREE = "80000000-0000-4000-8000-000000000003"
+        const val PAYMENT_REFERENCE_ID = "90000000-0000-4000-8000-000000000001"
 
         // Equal-timestamp ordering keys chosen so the pending message's client-ID fallback sorts
         // between the two server IDs: LOW_SERVER < PENDING_CLIENT < HIGH_SERVER.
@@ -1999,6 +2479,19 @@ class EncryptedChatRepositoryTest {
         const val HIGH_SERVER_MESSAGE_ID = "server-msg-0999"
 
         fun conversation(id: String, name: String) = directConversation(id, name)
+
+        fun textIntent(
+            id: String,
+            conversationId: String,
+            text: String,
+            createdAtEpochMillis: Long,
+        ) = ImmediateSendIntent(
+            id = id,
+            conversationId = conversationId,
+            kind = ImmediateSendKind.TEXT,
+            createdAtEpochMillis = createdAtEpochMillis,
+            text = text,
+        )
 
         /** A two-member direct chat seen by [USER_TWO], the account under test. */
         fun directConversation(

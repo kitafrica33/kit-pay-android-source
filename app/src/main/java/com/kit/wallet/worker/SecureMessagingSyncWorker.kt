@@ -14,6 +14,8 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
+import com.kit.wallet.data.messaging.ImmediateSendDispatcher
+import com.kit.wallet.data.messaging.ImmediateSendDispatchOutcome
 import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
 import com.kit.wallet.data.messaging.SecureMessagingCryptographicFailureException
 import com.kit.wallet.data.messaging.SecureMessagingProtocolUnavailableException
@@ -29,12 +31,13 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 @HiltWorker
-class SecureMessagingSyncWorker @AssistedInject constructor(
+internal class SecureMessagingSyncWorker @AssistedInject constructor(
     @Assisted appContext: Context,
     @Assisted workerParameters: WorkerParameters,
     private val sessions: SessionStore,
     private val syncEngine: SecureMessagingSyncEngine,
     private val wakeCoalescer: SecureMessagingWakeCoalescer,
+    private val immediateSends: ImmediateSendDispatcher,
 ) : CoroutineWorker(appContext, workerParameters) {
     override suspend fun doWork(): Result {
         // This run now covers every wake observed before it started. A wake arriving from this
@@ -44,7 +47,12 @@ class SecureMessagingSyncWorker @AssistedInject constructor(
 
         return try {
             syncEngine.synchronize()
-            Result.success()
+            when (immediateSends.dispatch()) {
+                ImmediateSendDispatchOutcome.RETRY -> Result.retry()
+                ImmediateSendDispatchOutcome.IDLE,
+                ImmediateSendDispatchOutcome.COMMITTED,
+                -> Result.success()
+            }
         } catch (error: Throwable) {
             debugSecureMessagingWorkerFailure(error)
             when (secureMessagingSyncFailureDisposition(error)) {

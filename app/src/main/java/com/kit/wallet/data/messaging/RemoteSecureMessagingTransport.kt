@@ -60,6 +60,10 @@ internal data class SecureMessagingRemoteContext(
 
 class SecureMessagingProtocolUnavailableException(message: String) : IllegalStateException(message)
 
+/** One conversation roster cannot yet receive a feature this message needs. */
+internal class SecureMessagingConversationCapabilityUnavailableException(message: String) :
+    IllegalStateException(message)
+
 internal enum class ReconciledIdentityStatus { CURRENT, UNENROLLED, MISMATCH }
 
 internal enum class ReconciledIdentityRevalidationPhase { INITIAL_SYNC, READY_SESSION }
@@ -988,7 +992,11 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             conversation: SecureConversation,
             roster: AuthoritativeRoster,
         ) {
-            require(reactionMessagingEnabled) { "Encrypted reactions are not enabled" }
+            if (!reactionMessagingEnabled) {
+                throw SecureMessagingConversationCapabilityUnavailableException(
+                    "Encrypted reactions are not enabled",
+                )
+            }
             requireRosterCapability(
                 requireConversation(conversation),
                 requireRoster(roster, conversation).validated,
@@ -1004,10 +1012,14 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             check(roster.memberUserIds() == conversation.memberUserIds()) {
                 "The capability roster does not cover every conversation member"
             }
-            check(roster.devices().all { device ->
+            if (!roster.devices().all { device ->
                 device.deviceId == context.currentDeviceId ||
                     device.supportsClientCapability(capability)
-            }) { "A conversation device does not support $capability" }
+            }) {
+                throw SecureMessagingConversationCapabilityUnavailableException(
+                    "A conversation device does not support $capability",
+                )
+            }
         }
 
         suspend fun historyBackfillCandidates(

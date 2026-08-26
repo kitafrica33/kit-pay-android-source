@@ -584,7 +584,7 @@ class ConversationViewModel @Inject internal constructor(
     fun send(text: String, onSent: () -> Unit = {}) {
         val selectedChat = chat.value ?: return
         val normalized = text.trim()
-        if (!messagingAvailable.value || normalized.isBlank()) return
+        if (!historyAvailable.value || normalized.isBlank()) return
         if (
             !KitPaymentMessage.allowsUserAuthoredText(normalized) ||
             KitReactionMessage.beginsWithReservedPrefix(normalized)
@@ -845,7 +845,7 @@ class ConversationViewModel @Inject internal constructor(
      */
     fun toggleReaction(messageId: String, emoji: String) {
         val selectedChat = chat.value ?: return
-        if (!messagingAvailable.value) return
+        if (!historyAvailable.value) return
         viewModelScope.launch {
             try {
                 chatRepo.toggleReaction(selectedChat.id, messageId, emoji)
@@ -867,7 +867,7 @@ class ConversationViewModel @Inject internal constructor(
         ) return
         // A media message retries its authenticated descriptor, not its display caption.
         val normalized = (message.mediaDescriptor ?: message.text).trim()
-        if (!messagingAvailable.value || normalized.isBlank() || mutableSending.value) return
+        if (!historyAvailable.value || normalized.isBlank() || mutableSending.value) return
         launchSend(
             selectedChatId = selectedChat.id,
             normalizedText = normalized,
@@ -895,7 +895,7 @@ class ConversationViewModel @Inject internal constructor(
     fun sendPaymentRequest(amountMinor: Long, note: String?, onSent: () -> Unit = {}) {
         val selectedChat = chat.value ?: return
         val peerUserId = selectedChat.peerUserId
-        if (!messagingAvailable.value || mutableSending.value) return
+        if (!historyAvailable.value || mutableSending.value) return
         if (amountMinor <= 0) {
             mutableError.value = "Enter an amount to request"
             return
@@ -963,7 +963,7 @@ class ConversationViewModel @Inject internal constructor(
         val selectedChat = chat.value ?: return
         val descriptor = message.mediaDescriptor?.let(KitPaymentMessage::parse) ?: return
         if (
-            !messagingAvailable.value || mutableSending.value ||
+            !historyAvailable.value || mutableSending.value ||
             message.fromMe || !descriptor.isRequest
         ) return
         viewModelScope.launch {
@@ -1025,7 +1025,7 @@ class ConversationViewModel @Inject internal constructor(
         val selectedChat = chat.value ?: return
         val descriptor = message.mediaDescriptor?.let(KitPaymentMessage::parse) ?: return
         if (
-            !messagingAvailable.value || mutableSending.value ||
+            !historyAvailable.value || mutableSending.value ||
             message.fromMe || !descriptor.isRequest
         ) return
         viewModelScope.launch {
@@ -1052,7 +1052,7 @@ class ConversationViewModel @Inject internal constructor(
         val selectedChat = chat.value ?: return
         val descriptor = message.mediaDescriptor?.let(KitPaymentMessage::parse) ?: return
         if (
-            !messagingAvailable.value || mutableSending.value ||
+            !historyAvailable.value || mutableSending.value ||
             !message.fromMe || !descriptor.isRequest
         ) return
         viewModelScope.launch {
@@ -1273,7 +1273,7 @@ class ConversationViewModel @Inject internal constructor(
      */
     private suspend fun recordExpiredTransfers(claims: List<TransferClaim>) {
         val expired = claims.filter { it.status == TransferClaimStatus.EXPIRED }
-        if (expired.isEmpty() || chatId.isBlank() || !messagingAvailable.value) return
+        if (expired.isEmpty() || chatId.isBlank() || !historyAvailable.value) return
         val projected = conversationMessages.value
         val sentFromHere = projected
             .filter { it.fromMe && it.kind == MessageKind.PAYMENT_TRANSFER }
@@ -1312,7 +1312,7 @@ class ConversationViewModel @Inject internal constructor(
         val selectedChat = chat.value
         if (
             selectedChat == null ||
-            !messagingAvailable.value ||
+            !historyAvailable.value ||
             bytes.isEmpty() ||
             mutableSending.value
         ) {
@@ -1354,7 +1354,7 @@ class ConversationViewModel @Inject internal constructor(
     fun openMedia(message: Message) {
         val selectedChat = chat.value ?: return
         val descriptor = message.mediaDescriptor ?: return
-        if (!messagingAvailable.value) return
+        if (!historyAvailable.value) return
         if (
             mutableMediaBytes.value.containsKey(message.id) ||
             message.id in mutableMediaLoading.value ||

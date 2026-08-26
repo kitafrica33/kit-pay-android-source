@@ -426,6 +426,10 @@ private object SecureMessagingTextContentCodec {
         }
     }
 
+    fun requireStandardText(text: String) {
+        validateText(text, MAX_STANDARD_TEXT_SCALARS)
+    }
+
     fun validateBinding(binding: SecureMessagingTextContentBinding) {
         requireCanonicalUuid(binding.clientMessageId, "content client message ID")
         requireCanonicalUuid(binding.conversationId, "content conversation ID")
@@ -568,6 +572,11 @@ private object SecureMessagingTextContentCodec {
         "reply_to_message_id",
         "text",
     )
+}
+
+/** Applies the exact scalar/NUL policy used by an ordinary encrypted message before queueing it. */
+internal fun requireStandardSecureMessagingText(text: String) {
+    SecureMessagingTextContentCodec.requireStandardText(text)
 }
 
 /** Encodes a recovered original using exactly the ordinary secure-message content profile. */

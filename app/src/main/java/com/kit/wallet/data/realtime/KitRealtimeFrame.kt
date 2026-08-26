@@ -73,7 +73,7 @@ internal enum class KitRealtimeErrorAction {
     /** 4100-4199: retry, but not immediately. */
     Backoff,
 
-    /** 4200+: reconnect at once, and do not spend an attempt on it. */
+    /** 4200-4299: reconnect at once unless repeated before the connection stabilises. */
     ReconnectImmediately,
 }
 
@@ -89,7 +89,7 @@ internal object KitRealtimeErrorPolicy {
         null -> KitRealtimeErrorAction.Backoff
         in 4000..4099 -> KitRealtimeErrorAction.Suspend
         in 4100..4199 -> KitRealtimeErrorAction.Backoff
-        in 4200..Int.MAX_VALUE -> KitRealtimeErrorAction.ReconnectImmediately
+        in 4200..4299 -> KitRealtimeErrorAction.ReconnectImmediately
         else -> KitRealtimeErrorAction.Backoff
     }
 }

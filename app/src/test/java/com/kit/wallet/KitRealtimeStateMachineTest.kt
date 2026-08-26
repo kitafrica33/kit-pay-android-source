@@ -9,6 +9,7 @@ import com.kit.wallet.data.realtime.KitNetworkEvent
 import com.kit.wallet.data.realtime.KitNetworkSource
 import com.kit.wallet.data.realtime.KitPresenceRegistry
 import com.kit.wallet.data.realtime.KitRealtimeAuthApi
+import com.kit.wallet.data.realtime.KitRealtimeBackoff
 import com.kit.wallet.data.realtime.KitRealtimeClock
 import com.kit.wallet.data.realtime.KitRealtimeCoordinator
 import com.kit.wallet.data.realtime.KitRealtimeFallbackPoller
@@ -35,6 +36,7 @@ import com.kit.wallet.data.session.SessionTokens
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.lang.reflect.Proxy
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
@@ -234,6 +236,161 @@ class KitRealtimeStateMachineTest {
         assertEquals(KitRealtimeState.Connecting, world.state)
         assertEquals(SOCKET_URL, world.transport.openedUrl)
         assertEquals(1, world.transport.cleanCloses)
+    }
+
+    @Test
+    fun `a repeated 4200 before stable Live uses bounded backoff`() = stateMachineTest { world ->
+        world.goLive()
+
+        world.frame(protocolError(4200))
+        assertEquals(KitRealtimeState.Connecting, world.state)
+        world.socketOpened()
+        world.handshake()
+        world.subscribed(USER_CHANNEL)
+
+        val before = world.clock.now
+        world.frame(protocolError(4200))
+
+        val state = world.state as KitRealtimeState.Backoff
+        assertTrue(state.retryAtElapsedMillis >= before + 1_000L)
+        assertTrue(state.retryAtElapsedMillis <= before + KitRealtimeBackoff.MAX_DELAY_MILLIS)
+    }
+
+    @Test
+    fun `4299 remains in the reconnect immediately range`() = stateMachineTest { world ->
+        world.goLive()
+        world.transport.openedUrl = null
+
+        world.frame(protocolError(4299))
+
+        assertEquals(KitRealtimeState.Connecting, world.state)
+        assertEquals(SOCKET_URL, world.transport.openedUrl)
+    }
+
+    @Test
+    fun `4300 is outside the reconnect immediately range and backs off`() = stateMachineTest { world ->
+        world.goLive()
+        val before = world.clock.now
+
+        world.frame(protocolError(4300))
+
+        val state = world.state as KitRealtimeState.Backoff
+        assertTrue(state.retryAtElapsedMillis >= before + 1_000L)
+    }
+
+    @Test
+    fun `a protocol error without a code backs off`() = stateMachineTest { world ->
+        world.goLive()
+        val before = world.clock.now
+
+        world.frame("""{"event":"pusher:error","data":"{\"message\":\"nope\"}"}""")
+
+        val state = world.state as KitRealtimeState.Backoff
+        assertTrue(state.retryAtElapsedMillis >= before + 1_000L)
+    }
+
+    @Test
+    fun `sixty seconds of stable Live restores one immediate reconnect`() = stateMachineTest { world ->
+        world.goLive()
+        world.frame(protocolError(4200))
+        world.socketOpened()
+        world.handshake()
+        world.subscribed(USER_CHANNEL)
+
+        world.clock.now += KitRealtimeBackoff.STABLE_LIVE_MILLIS
+        world.transport.openedUrl = null
+        world.frame(protocolError(4200))
+
+        assertEquals(KitRealtimeState.Connecting, world.state)
+        assertEquals(SOCKET_URL, world.transport.openedUrl)
+    }
+
+    @Test
+    fun `network restoration restores one immediate reconnect`() = stateMachineTest { world ->
+        world.goLive()
+        world.frame(protocolError(4200))
+        world.socketOpened()
+        world.handshake()
+        world.subscribed(USER_CHANNEL)
+
+        world.network.emit(KitNetworkEvent.Available)
+        world.settle()
+        world.transport.openedUrl = null
+        world.frame(protocolError(4200))
+
+        assertEquals(KitRealtimeState.Connecting, world.state)
+        assertEquals(SOCKET_URL, world.transport.openedUrl)
+    }
+
+    @Test
+    fun `a session change restores one immediate reconnect`() = stateMachineTest { world ->
+        world.goLive()
+        world.frame(protocolError(4200))
+
+        world.session.signIn(epoch = "scope-2")
+        world.settle()
+        world.socketOpened()
+        world.handshake()
+        world.subscribed(USER_CHANNEL)
+
+        world.transport.openedUrl = null
+        world.frame(protocolError(4200))
+
+        assertEquals(KitRealtimeState.Connecting, world.state)
+        assertEquals(SOCKET_URL, world.transport.openedUrl)
+    }
+
+    @Test
+    fun `a queued close from the retired socket cannot tear down its replacement`() = stateMachineTest { world ->
+        world.goLive()
+        world.transport.openedUrl = null
+
+        world.frameThenSocketFailedBeforeSettle(protocolError(4200))
+
+        assertEquals(KitRealtimeState.Connecting, world.state)
+        assertEquals(SOCKET_URL, world.transport.openedUrl)
+        assertEquals(1, world.transport.cleanCloses)
+        assertEquals(0, world.transport.cancels)
+    }
+
+    @Test
+    fun `a stale successful authorization cannot write to the replacement socket`() = stateMachineTest { world ->
+        val staleAuthorization = world.auth.holdNextChannelAuthorization()
+        world.startSignedInAndForegrounded()
+        world.socketOpened()
+        world.handshake()
+
+        world.frame(protocolError(4200))
+        world.socketOpened()
+        world.handshake()
+        world.subscribed(USER_CHANNEL)
+        val sentBeforeStaleResult = world.transport.sent.size
+
+        world.auth.completeHeldSuccess(staleAuthorization)
+        world.settle()
+
+        assertEquals(KitRealtimeState.Live, world.state)
+        assertEquals(sentBeforeStaleResult, world.transport.sent.size)
+    }
+
+    @Test
+    fun `a stale failed authorization cannot suspend the replacement socket`() = stateMachineTest { world ->
+        val staleAuthorization = world.auth.holdNextChannelAuthorization()
+        world.startSignedInAndForegrounded()
+        world.socketOpened()
+        world.handshake()
+
+        world.frame(protocolError(4200))
+        world.socketOpened()
+        world.handshake()
+        world.subscribed(USER_CHANNEL)
+        val cancelsBeforeStaleResult = world.transport.cancels
+
+        world.auth.completeHeldFailure(staleAuthorization, status = 403)
+        world.settle()
+
+        assertEquals(KitRealtimeState.Live, world.state)
+        assertEquals(cancelsBeforeStaleResult, world.transport.cancels)
     }
 
     @Test
@@ -737,6 +894,11 @@ class KitRealtimeStateMachineTest {
             settle()
         }
 
+        fun frameThenSocketFailedBeforeSettle(text: String) {
+            transport.frameThenFailure(text)
+            settle()
+        }
+
         fun socketFailed() {
             transport.failed()
             settle()
@@ -870,6 +1032,12 @@ class KitRealtimeStateMachineTest {
 
         fun failed() = live().onFailure(IllegalStateException("socket died"))
 
+        fun frameThenFailure(text: String) {
+            val retiring = live()
+            retiring.onFrame(text)
+            retiring.onFailure(IllegalStateException("retiring socket died"))
+        }
+
         fun established(socketId: String = SOCKET_ID) = frame(
             """{"event":"pusher:connection_established",""" +
                 """"data":"{\"socket_id\":\"$socketId\",\"activity_timeout\":$ACTIVITY_TIMEOUT}"}""",
@@ -897,12 +1065,45 @@ class KitRealtimeStateMachineTest {
         /** Conversation id to `state`, in the order they were posted. */
         val typingPosts = mutableListOf<Pair<String, String>>()
 
+        private var nextChannelAuthorization: CompletableDeferred<Response<ChannelAuthDto>>? = null
+
+        fun holdNextChannelAuthorization(): CompletableDeferred<Response<ChannelAuthDto>> {
+            check(nextChannelAuthorization == null)
+            return CompletableDeferred<Response<ChannelAuthDto>>().also {
+                nextChannelAuthorization = it
+            }
+        }
+
+        fun completeHeldSuccess(held: CompletableDeferred<Response<ChannelAuthDto>>) {
+            check(
+                held.complete(
+                    Response.success(
+                        ChannelAuthDto(
+                            auth = "stale:signature",
+                            channelData = """{"user_id":"11111111-1111-4111-8111-111111111111"}""",
+                        ),
+                    ),
+                ),
+            )
+        }
+
+        fun completeHeldFailure(
+            held: CompletableDeferred<Response<ChannelAuthDto>>,
+            status: Int,
+        ) {
+            check(held.complete(errorResponse(status)))
+        }
+
         override suspend fun authorizeChannel(
             path: String,
             body: ChannelAuthRequest,
         ): Response<ChannelAuthDto> {
             channelCalls++
             channelAuthPaths += path
+            nextChannelAuthorization?.let { held ->
+                nextChannelAuthorization = null
+                return held.await()
+            }
             channelAuthStatus?.let { return errorResponse(it) }
             return Response.success(
                 ChannelAuthDto(auth = "key:signature", channelData = """{"user_id":"$SELF"}"""),
