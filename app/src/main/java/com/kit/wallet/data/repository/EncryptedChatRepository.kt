@@ -54,6 +54,7 @@ import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.MEMBER_CONVERSATION_ROLE
 import com.kit.wallet.data.remote.OWNER_CONVERSATION_ROLE
 import com.kit.wallet.data.remote.isValidMessagingGroupTitle
+import com.kit.wallet.data.remote.normalizeMessagingGroupTitle
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionStore
@@ -2035,16 +2036,16 @@ class EncryptedChatRepository @Inject internal constructor(
 
     override suspend fun createGroupConversation(title: String, contacts: List<Contact>): String {
         val session = requireReadySession()
-        val trimmedTitle = title.trim()
-        require(trimmedTitle.isNotEmpty()) { "A group needs a name" }
-        require(isValidMessagingGroupTitle(trimmedTitle)) { "That group name is too long" }
+        val normalizedTitle = normalizeMessagingGroupTitle(title)
+        require(normalizedTitle.isNotEmpty()) { "A group needs a name" }
+        require(isValidMessagingGroupTitle(normalizedTitle)) { "That group name is too long" }
         require(contacts.isNotEmpty()) { "A group needs at least one other person" }
         require(contacts.all { it.isKitUser }) {
             "Only contacts who are on Kit Pay can join a group"
         }
         val memberUserIds = contacts.map(Contact::id).distinct()
         require(memberUserIds.size == contacts.size) { "That group lists somebody twice" }
-        val created = runtime.createGroupConversation(session, trimmedTitle, memberUserIds)
+        val created = runtime.createGroupConversation(session, normalizedTitle, memberUserIds)
         refresh(session, this.contacts.contacts.value)
         check(chat(created.id) != null) { "The secure conversation was not added to the projection" }
         return created.id

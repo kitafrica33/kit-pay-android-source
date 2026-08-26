@@ -1262,7 +1262,10 @@ class EncryptedChatRepositoryTest {
         }
         assertTrue(runtime.createdGroups.isEmpty())
 
-        val created = repository.createGroupConversation("  Weekend savings  ", listOf(aisha))
+        val created = repository.createGroupConversation(
+            "\u00a0\u0085Weekend savings\u3000",
+            listOf(aisha),
+        )
 
         assertEquals(listOf("Weekend savings" to listOf(USER_ONE)), runtime.createdGroups)
         assertEquals(GROUP_ONE, created)

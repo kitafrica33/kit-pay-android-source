@@ -136,14 +136,17 @@ object SecureMessagingTransportValidator {
         val role = required(conversation.role, "$label current role")
         requireTransport(role in MEMBER_ROLES, "$label current role")
 
-        // A title is exactly the disclosure a group makes and a direct chat does not, so the
-        // client holds the server to the same rule in both directions rather than rendering
-        // whatever comes back.
-        val title = conversation.title?.trim()?.takeIf(String::isNotEmpty)
+        // A title is exactly the disclosure a group makes and a direct chat does not. Older
+        // servers may still return otherwise-valid titles with Unicode White_Space at an edge,
+        // so accept that legacy shape but expose only the same canonical title iOS and current
+        // servers use. Bounds and control-character checks still apply to the canonical value.
+        val title = conversation.title
+            ?.let(::normalizeMessagingGroupTitle)
+            ?.takeIf(String::isNotEmpty)
         if (group) {
             val groupTitle = required(title, "$label title")
             requireTransport(
-                isValidMessagingGroupTitle(groupTitle) && conversation.title == groupTitle,
+                isValidMessagingGroupTitle(groupTitle),
                 "$label title length",
             )
         } else {

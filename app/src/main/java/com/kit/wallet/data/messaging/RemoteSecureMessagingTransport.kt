@@ -42,6 +42,7 @@ import com.kit.wallet.data.remote.ValidatedMessagingReadReceipt
 import com.kit.wallet.data.remote.ValidatedMessagingSyncEvent
 import com.kit.wallet.data.remote.ValidatedMessagingSyncPage
 import com.kit.wallet.data.remote.ValidatedOutboundEncryptedMessage
+import com.kit.wallet.data.remote.normalizeMessagingGroupTitle
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.Collections
@@ -682,7 +683,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 "The group creator is added by the server, not by the client"
             }
             members.forEach { requireUuid(it, "group member user ID") }
-            val trimmedTitle = title.trim()
+            val normalizedTitle = normalizeMessagingGroupTitle(title)
             val created = owner.fencedSessionCall(
                 this,
                 issuanceIdentity,
@@ -694,7 +695,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                     CreateMessagingConversationRequest(
                         memberIds = members,
                         type = GROUP_CONVERSATION_TYPE,
-                        title = trimmedTitle,
+                        title = normalizedTitle,
                     ),
                 )
             }

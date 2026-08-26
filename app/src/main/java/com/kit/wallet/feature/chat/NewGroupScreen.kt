@@ -40,8 +40,14 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.remote.MAX_GROUP_MEMBERS
 import com.kit.wallet.data.remote.isValidMessagingGroupTitle
+import com.kit.wallet.data.remote.normalizeMessagingGroupTitle
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.model.Contact
+
+internal fun isMessagingGroupTitleInputError(value: String): Boolean {
+    val normalizedTitle = normalizeMessagingGroupTitle(value)
+    return normalizedTitle.isNotEmpty() && !isValidMessagingGroupTitle(normalizedTitle)
+}
 
 /**
  * The group builder: pick the people, name the group, create it.
@@ -116,7 +122,7 @@ fun NewGroupScreen(
                         )
                     },
                     singleLine = true,
-                    isError = title.isNotBlank() && !isValidMessagingGroupTitle(title.trim()),
+                    isError = isMessagingGroupTitleInputError(title),
                 )
             }
             if (!messagingAvailable) {

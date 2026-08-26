@@ -42,13 +42,13 @@ class GroupViewModelsTest {
     }
 
     @Test
-    fun `a group is created from the chosen people under a trimmed name`() = runTest {
+    fun `a group is created from the chosen people under a Unicode normalized name`() = runTest {
         val chats = FakeChatRepository()
         val viewModel = NewGroupViewModel(chats, FakeContactRepository(directory(3)))
 
         viewModel.toggle(contact(0))
         viewModel.toggle(contact(2))
-        viewModel.setTitle("  Site team  ")
+        viewModel.setTitle("\u0085Site team\u0085")
         var opened: String? = null
         viewModel.create { opened = it }
 
@@ -99,6 +99,64 @@ class GroupViewModelsTest {
 
         assertEquals(30, viewModel.title.value.codePointCount(0, viewModel.title.value.length))
         assertEquals(120, viewModel.title.value.toByteArray(Charsets.UTF_8).size)
+    }
+
+    @Test
+    fun `typing a space then another word preserves the intended group name`() = runTest {
+        val viewModel = NewGroupViewModel(FakeChatRepository(), FakeContactRepository(directory(1)))
+
+        viewModel.setTitle("Weekend ")
+        assertEquals("Weekend ", viewModel.title.value)
+
+        viewModel.setTitle("Weekend trip")
+        assertEquals("Weekend trip", viewModel.title.value)
+    }
+
+    @Test
+    fun `padded exact-bound title stays editable and creates the full canonical core`() = runTest {
+        val chats = FakeChatRepository()
+        val viewModel = NewGroupViewModel(chats, FakeContactRepository(directory(1)))
+        val rawTitle = "\u0085${"a".repeat(MAX_GROUP_TITLE_LENGTH)}\u3000"
+
+        viewModel.toggle(contact(0))
+        viewModel.setTitle(rawTitle)
+        assertEquals(rawTitle, viewModel.title.value)
+
+        viewModel.create { }
+        assertEquals("a".repeat(MAX_GROUP_TITLE_LENGTH), chats.createdTitle)
+    }
+
+    @Test
+    fun `padded over-bound core is truncated without spending its budget on padding`() = runTest {
+        val viewModel = NewGroupViewModel(FakeChatRepository(), FakeContactRepository(directory(1)))
+
+        viewModel.setTitle("\u0085${"é".repeat(61)}\u3000")
+
+        assertEquals("é".repeat(60), viewModel.title.value)
+        assertEquals(60, viewModel.title.value.codePointCount(0, viewModel.title.value.length))
+        assertEquals(120, viewModel.title.value.toByteArray(Charsets.UTF_8).size)
+    }
+
+    @Test
+    fun `Unicode whitespace-only title remains non-creatable`() = runTest {
+        val chats = FakeChatRepository()
+        val viewModel = NewGroupViewModel(chats, FakeContactRepository(directory(1)))
+
+        viewModel.toggle(contact(0))
+        viewModel.setTitle("\u0085\u3000")
+
+        assertFalse(viewModel.canCreate.value)
+        viewModel.create { }
+        assertNull(chats.createdTitle)
+    }
+
+    @Test
+    fun `malformed UTF-16 is removed before it can become creatable`() = runTest {
+        val viewModel = NewGroupViewModel(FakeChatRepository(), FakeContactRepository(directory(1)))
+
+        viewModel.setTitle("Valid\uD800tail")
+
+        assertEquals("Valid", viewModel.title.value)
     }
 
     @Test

@@ -114,6 +114,18 @@ class SecureMessagingTransportValidatorTest {
     }
 
     @Test
+    fun `group validation accepts and canonicalizes legacy Unicode edge padding`() {
+        val validated = SecureMessagingTransportValidator.validateConversations(
+            MessagingConversationListDto(
+                listOf(groupConversation().copy(title = "\u00a0\u0085Weekend savings\u3000")),
+            ),
+            CURRENT_USER_ID,
+        ).single()
+
+        assertEquals("Weekend savings", validated.title)
+    }
+
+    @Test
     fun `malformed groups fail closed`() {
         val valid = groupConversation()
         val members = valid.members.orEmpty()
@@ -123,6 +135,7 @@ class SecureMessagingTransportValidatorTest {
             MessagingConversationListDto(listOf(valid.copy(title = "   "))),
             MessagingConversationListDto(listOf(valid.copy(title = "t".repeat(65)))),
             MessagingConversationListDto(listOf(valid.copy(title = "😀".repeat(31)))),
+            MessagingConversationListDto(listOf(valid.copy(title = "Bad\uD800title"))),
             // The viewer must appear exactly once, with the role the server claims for them.
             MessagingConversationListDto(listOf(valid.copy(members = members.drop(1)))),
             MessagingConversationListDto(

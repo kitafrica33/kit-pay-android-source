@@ -173,7 +173,11 @@ data class CreateMessagingConversationRequest(
             require(memberIds.size in 1..(MAX_GROUP_MEMBERS - 1)) {
                 "A group requires 1 to ${MAX_GROUP_MEMBERS - 1} other members"
             }
-            require(title != null && isValidMessagingGroupTitle(title)) {
+            require(
+                title != null &&
+                    title == normalizeMessagingGroupTitle(title) &&
+                    isValidMessagingGroupTitle(title)
+            ) {
                 "A group requires a title of at most $MAX_GROUP_TITLE_LENGTH Unicode scalars " +
                     "and $MAX_GROUP_TITLE_UTF8_BYTES UTF-8 bytes"
             }
@@ -691,13 +695,40 @@ val SECURE_MESSAGING_ROSTER_REVISION = Regex("^v1:sha256:[a-f0-9]{64}$")
 private val CANONICAL_MESSAGING_UUID =
     Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
-fun isValidMessagingGroupTitle(value: String): Boolean =
-    value.isNotBlank() &&
-        value.trim() == value &&
-        value.hasWellFormedUnicodeScalars() &&
-        value.codePointCount(0, value.length) <= MAX_GROUP_TITLE_LENGTH &&
-        value.toByteArray(StandardCharsets.UTF_8).size <= MAX_GROUP_TITLE_UTF8_BYTES &&
-        '\u0000' !in value
+/**
+ * Trims the exact Unicode White_Space edge set used by iOS and the backend.
+ *
+ * Kotlin's default [String.trim] omits U+0085 NEXT LINE, which made Android send titles the
+ * server normalized differently. Keep this policy explicit so request, response and UI bounds
+ * cannot drift apart again.
+ */
+fun normalizeMessagingGroupTitle(value: String): String {
+    var start = 0
+    var end = value.length
+    while (start < end) {
+        val codePoint = value.codePointAt(start)
+        if (!isMessagingGroupTitleEdgeWhitespace(codePoint)) break
+        start += Character.charCount(codePoint)
+    }
+    while (end > start) {
+        val codePoint = value.codePointBefore(end)
+        if (!isMessagingGroupTitleEdgeWhitespace(codePoint)) break
+        end -= Character.charCount(codePoint)
+    }
+    return if (start == 0 && end == value.length) value else value.substring(start, end)
+}
+
+fun isValidMessagingGroupTitle(value: String): Boolean {
+    val normalized = normalizeMessagingGroupTitle(value)
+    return normalized.isNotEmpty() &&
+        normalized.hasWellFormedUnicodeScalars() &&
+        normalized.codePointCount(0, normalized.length) <= MAX_GROUP_TITLE_LENGTH &&
+        normalized.toByteArray(StandardCharsets.UTF_8).size <= MAX_GROUP_TITLE_UTF8_BYTES &&
+        '\u0000' !in normalized
+}
+
+private fun isMessagingGroupTitleEdgeWhitespace(codePoint: Int): Boolean =
+    codePoint in 0x0009..0x000D || codePoint == 0x0085 || Character.isSpaceChar(codePoint)
 
 fun truncateMessagingGroupTitle(value: String): String {
     val result = StringBuilder()

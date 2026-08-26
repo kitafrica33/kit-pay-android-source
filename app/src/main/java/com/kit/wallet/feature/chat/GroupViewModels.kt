@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.remote.MAX_GROUP_MEMBERS
 import com.kit.wallet.data.remote.isValidMessagingGroupTitle
+import com.kit.wallet.data.remote.normalizeMessagingGroupTitle
 import com.kit.wallet.data.remote.truncateMessagingGroupTitle
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
 import com.kit.wallet.data.remote.isKitConnectivityError
@@ -28,6 +29,19 @@ import kotlinx.coroutines.launch
 
 /** How many other people a group can hold besides this account. */
 internal const val MAX_OTHER_GROUP_MEMBERS = MAX_GROUP_MEMBERS - 1
+
+/**
+ * Preserves in-progress edge whitespace while the title still fits after normalization.
+ *
+ * A controlled text field must not erase a trailing space between keystrokes: doing so can turn
+ * "Weekend " followed by "trip" into "Weekendtrip". If the normalized core exceeds either
+ * server bound, however, truncate that core so edge padding never steals usable capacity.
+ */
+internal fun boundedMessagingGroupTitleInput(value: String): String {
+    val normalizedTitle = normalizeMessagingGroupTitle(value)
+    val boundedTitle = truncateMessagingGroupTitle(normalizedTitle)
+    return if (boundedTitle == normalizedTitle) value else boundedTitle
+}
 
 /**
  * Builds one group: who is in it, what it is called, and the one network call that creates it.
@@ -89,7 +103,8 @@ class NewGroupViewModel @Inject constructor(
 
     val canCreate: StateFlow<Boolean> =
         combine(selected, mutableTitle, mutableCreating) { people, title, creating ->
-            people.isNotEmpty() && isValidMessagingGroupTitle(title.trim()) && !creating
+            val normalizedTitle = normalizeMessagingGroupTitle(title)
+            people.isNotEmpty() && isValidMessagingGroupTitle(normalizedTitle) && !creating
         }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     init {
@@ -103,8 +118,7 @@ class NewGroupViewModel @Inject constructor(
     }
 
     fun setTitle(value: String) {
-        // Trimming is left to the send: a trailing space while typing a second word is not an error.
-        mutableTitle.value = truncateMessagingGroupTitle(value)
+        mutableTitle.value = boundedMessagingGroupTitleInput(value)
     }
 
     fun toggle(contact: Contact) {
@@ -127,7 +141,7 @@ class NewGroupViewModel @Inject constructor(
     fun create(onCreated: (String) -> Unit) {
         if (mutableCreating.value) return
         val members = selected.value
-        val name = mutableTitle.value.trim()
+        val name = normalizeMessagingGroupTitle(mutableTitle.value)
         if (members.isEmpty() || name.isEmpty()) return
         mutableCreating.value = true
         viewModelScope.launch {
