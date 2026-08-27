@@ -274,14 +274,14 @@ class GroupProfileViewModel @Inject constructor(
     }
 
     /** Uploads an already-transcoded JPEG through the moderated pipeline as the group photo. */
-    fun changePhoto(jpegBytes: ByteArray) {
-        mutate("The group photo could not be changed") {
+    fun changePhoto(jpegBytes: ByteArray, onSaved: () -> Unit = {}) {
+        mutate("The group photo could not be changed", onSaved) {
             chatRepo.updateGroupPhoto(chatId, jpegBytes)
         }
     }
 
-    fun removePhoto() {
-        mutate("The group photo could not be removed") {
+    fun removePhoto(onRemoved: () -> Unit = {}) {
+        mutate("The group photo could not be removed", onRemoved) {
             chatRepo.removeGroupPhoto(chatId)
         }
     }

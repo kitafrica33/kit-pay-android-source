@@ -19,12 +19,14 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -40,6 +42,8 @@ import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.repository.GroupPaymentDraftPolicy
 import com.kit.wallet.feature.auth.PaymentApproval
 import com.kit.wallet.ui.model.ChatMember
+import java.math.BigDecimal
+import java.util.UUID
 
 /**
  * What the conversation hands back when a group payment has been filled in and approved.
@@ -56,8 +60,92 @@ internal typealias GroupPaymentSendHandler = (
     customAmounts: Map<String, String>,
     note: String?,
     paymentPin: String,
+    idempotencyKey: String,
     onSent: () -> Unit,
-) -> Unit
+) -> Boolean
+
+/**
+ * One canonical payment intent gets one payment identity and one in-flight submission.
+ *
+ * The ViewModel also fences concurrent money movement, but this first fence lives beside the tap:
+ * it closes the recomposition-sized gap before `sending` reaches the UI. The same idempotency key
+ * survives a retry after a timeout, so a server-confirmed first request cannot become a second
+ * payment merely because its response was lost.
+ */
+internal class GroupPaymentSubmissionLatch(
+    val idempotencyKey: String = "android-group-payment-${UUID.randomUUID()}",
+) {
+    private var inFlight = false
+    private var completed = false
+
+    @Synchronized
+    fun tryBegin(): Boolean {
+        if (inFlight || completed) return false
+        inFlight = true
+        return true
+    }
+
+    @Synchronized
+    fun releaseForRetry() {
+        if (!completed) inFlight = false
+    }
+
+    /** True exactly once, and only for a submission this latch admitted. */
+    @Synchronized
+    fun completeOnce(): Boolean {
+        if (!inFlight || completed) return false
+        inFlight = false
+        completed = true
+        return true
+    }
+}
+
+/**
+ * A collision-safe representation of the request fields the composer controls.
+ *
+ * It deliberately mirrors the body built by [GroupPaymentDraftPolicy]: whitespace and equivalent
+ * decimal spellings do not create a new payment, `everyone` carries no client roster, and custom
+ * payments carry only their selected members. Editing a field that really changes the request
+ * produces a fresh idempotency key; retrying an unchanged request keeps the existing one.
+ */
+internal fun groupPaymentSubmissionIntent(
+    splitMode: GroupPaymentSplitMode,
+    audience: GroupPaymentAudience,
+    selected: List<GroupPaymentDraftPolicy.Member>,
+    totalInput: String,
+    customAmounts: Map<String, String>,
+    note: String?,
+): String = buildString {
+    fun field(value: String?) {
+        val canonical = value.orEmpty()
+        append(canonical.length).append(':').append(canonical)
+    }
+
+    field(splitMode.wire)
+    field(audience.wire)
+    if (audience == GroupPaymentAudience.SELECTED) {
+        selected.forEach { member ->
+            field(member.userId)
+            if (splitMode == GroupPaymentSplitMode.CUSTOM) {
+                field(canonicalComposerAmount(customAmounts[member.userId].orEmpty()))
+            }
+        }
+    }
+    if (splitMode == GroupPaymentSplitMode.EVEN) {
+        field(canonicalComposerAmount(totalInput))
+    }
+    field(
+        note?.trim()
+            ?.takeIf(String::isNotEmpty)
+            ?.take(KitGroupPaymentMessage.MAX_NOTE_LENGTH),
+    )
+}
+
+private fun canonicalComposerAmount(value: String): String {
+    val trimmed = value.trim()
+    return runCatching { BigDecimal(trimmed).stripTrailingZeros().toPlainString() }
+        .getOrDefault(trimmed)
+}
 
 /**
  * Filling in one payment to the group: who is being paid, and how the money is divided between
@@ -95,6 +183,34 @@ internal fun GroupPaymentComposerDialog(
             payable.filter { it.userId in picked }
         }
         chosen.map { GroupPaymentDraftPolicy.Member(userId = it.userId, name = it.name) }
+    }
+    val customAmountSnapshot = customAmounts.toMap()
+    val submissionIntent = remember(
+        splitMode,
+        audience,
+        selected,
+        total,
+        customAmountSnapshot,
+        note,
+    ) {
+        groupPaymentSubmissionIntent(
+            splitMode = splitMode,
+            audience = audience,
+            selected = selected,
+            totalInput = total,
+            customAmounts = customAmountSnapshot,
+            note = note,
+        )
+    }
+    val idempotencyKey = rememberSaveable(submissionIntent) {
+        "android-group-payment-${UUID.randomUUID()}"
+    }
+    val submission = remember(submissionIntent, idempotencyKey) {
+        GroupPaymentSubmissionLatch(idempotencyKey)
+    }
+
+    LaunchedEffect(submission, sending, error) {
+        if (!sending && error != null) submission.releaseForRetry()
     }
 
     AlertDialog(
@@ -235,16 +351,21 @@ internal fun GroupPaymentComposerDialog(
                     // approve at all.
                     enabled = selected.isNotEmpty(),
                     onApprove = { pin ->
-                        onSend(
-                            splitMode,
-                            audience,
-                            selected,
-                            total,
-                            customAmounts.toMap(),
-                            note.trim().ifBlank { null },
-                            pin,
-                            onDismiss,
-                        )
+                        if (submission.tryBegin()) {
+                            val accepted = onSend(
+                                splitMode,
+                                audience,
+                                selected,
+                                total,
+                                customAmounts.toMap(),
+                                note.trim().ifBlank { null },
+                                pin,
+                                submission.idempotencyKey,
+                            ) {
+                                if (submission.completeOnce()) onDismiss()
+                            }
+                            if (!accepted) submission.releaseForRetry()
+                        }
                     },
                     pinSubtitle = "Authorizes this group payment from your wallet.",
                 )

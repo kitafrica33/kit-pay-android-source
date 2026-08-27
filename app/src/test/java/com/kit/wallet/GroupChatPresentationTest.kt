@@ -1,6 +1,7 @@
 package com.kit.wallet
 
 import com.kit.wallet.feature.chat.canLeaveGroup
+import com.kit.wallet.feature.chat.canEditGroupPhoto
 import com.kit.wallet.feature.chat.groupMemberActions
 import com.kit.wallet.feature.chat.groupMemberCountLabel
 import com.kit.wallet.feature.chat.groupTypingLabel
@@ -52,6 +53,15 @@ class GroupChatPresentationTest {
 
         assertFalse(groupMemberActions(viewer, member("brian")).any)
         assertFalse(groupMemberActions(viewer, member("grace", ChatMemberRole.ADMIN)).any)
+        assertFalse(canEditGroupPhoto(viewer))
+    }
+
+    @Test
+    fun `only owners and admins may edit the group photo`() {
+        assertFalse(canEditGroupPhoto(null))
+        assertFalse(canEditGroupPhoto(member("me", ChatMemberRole.MEMBER, isSelf = true)))
+        assertTrue(canEditGroupPhoto(member("me", ChatMemberRole.ADMIN, isSelf = true)))
+        assertTrue(canEditGroupPhoto(member("me", ChatMemberRole.OWNER, isSelf = true)))
     }
 
     @Test

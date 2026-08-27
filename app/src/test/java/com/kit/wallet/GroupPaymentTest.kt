@@ -12,7 +12,9 @@ import com.kit.wallet.data.remote.groupPaymentsAvailable
 import com.kit.wallet.data.repository.GroupPaymentDraftPolicy
 import com.kit.wallet.data.repository.GroupPaymentStepUpPolicy
 import com.kit.wallet.feature.chat.GroupPaymentCopy
+import com.kit.wallet.feature.chat.GroupPaymentSubmissionLatch
 import com.kit.wallet.feature.chat.groupPaymentDescriptor
+import com.kit.wallet.feature.chat.groupPaymentSubmissionIntent
 import com.kit.wallet.feature.chat.projectedGroupPaymentMessages
 import com.kit.wallet.feature.chat.senderNamedMessageIds
 import com.kit.wallet.ui.model.GroupPaymentShareStatus
@@ -36,6 +38,110 @@ import org.junit.Test
  * with members on both platforms has to read one conversation rather than two.
  */
 class GroupPaymentTest {
+    @Test
+    fun `one composer admits one submission and completes only once`() {
+        val latch = GroupPaymentSubmissionLatch("stable-key")
+
+        assertTrue(latch.tryBegin())
+        assertFalse(latch.tryBegin())
+        assertEquals("stable-key", latch.idempotencyKey)
+        assertTrue(latch.completeOnce())
+        assertFalse(latch.completeOnce())
+        assertFalse(latch.tryBegin())
+    }
+
+    @Test
+    fun `a failed attempt retries with the same payment identity`() {
+        val latch = GroupPaymentSubmissionLatch("same-request")
+
+        assertTrue(latch.tryBegin())
+        latch.releaseForRetry()
+
+        assertTrue(latch.tryBegin())
+        assertEquals("same-request", latch.idempotencyKey)
+        assertTrue(latch.completeOnce())
+    }
+
+    @Test
+    fun `equivalent composer text keeps one canonical payment identity`() {
+        val selected = listOf(GroupPaymentDraftPolicy.Member(ama, "Ama"))
+
+        val first = groupPaymentSubmissionIntent(
+            GroupPaymentSplitMode.EVEN,
+            GroupPaymentAudience.SELECTED,
+            selected,
+            "100.00",
+            emptyMap(),
+            "  Lunch  ",
+        )
+        val retry = groupPaymentSubmissionIntent(
+            GroupPaymentSplitMode.EVEN,
+            GroupPaymentAudience.SELECTED,
+            selected,
+            "1E2",
+            emptyMap(),
+            "Lunch",
+        )
+
+        assertEquals(first, retry)
+        assertNotEquals(
+            first,
+            groupPaymentSubmissionIntent(
+                GroupPaymentSplitMode.EVEN,
+                GroupPaymentAudience.SELECTED,
+                selected,
+                "101",
+                emptyMap(),
+                "Lunch",
+            ),
+        )
+    }
+
+    @Test
+    fun `everyone intent ignores a stale local roster but custom amounts remain body bound`() {
+        val amaMember = GroupPaymentDraftPolicy.Member(ama, "Ama")
+        val benMember = GroupPaymentDraftPolicy.Member(ben, "Ben")
+        val everyone = groupPaymentSubmissionIntent(
+            GroupPaymentSplitMode.EVEN,
+            GroupPaymentAudience.ALL,
+            listOf(amaMember),
+            "500",
+            emptyMap(),
+            null,
+        )
+        assertEquals(
+            everyone,
+            groupPaymentSubmissionIntent(
+                GroupPaymentSplitMode.EVEN,
+                GroupPaymentAudience.ALL,
+                listOf(amaMember, benMember),
+                "500",
+                emptyMap(),
+                null,
+            ),
+        )
+
+        val custom = groupPaymentSubmissionIntent(
+            GroupPaymentSplitMode.CUSTOM,
+            GroupPaymentAudience.SELECTED,
+            listOf(amaMember),
+            "ignored",
+            mapOf(ama to "250"),
+            null,
+        )
+        assertNotEquals(
+            custom,
+            groupPaymentSubmissionIntent(
+                GroupPaymentSplitMode.CUSTOM,
+                GroupPaymentAudience.SELECTED,
+                listOf(amaMember),
+                "also ignored",
+                mapOf(ama to "251"),
+                null,
+            ),
+        )
+    }
+
     private val sender = "10000000-0000-4000-8000-000000000001"
     private val ama = "10000000-0000-4000-8000-000000000002"
     private val ben = "10000000-0000-4000-8000-000000000003"

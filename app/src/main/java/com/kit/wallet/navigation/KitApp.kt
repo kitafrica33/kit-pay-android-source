@@ -93,6 +93,7 @@ import com.kit.wallet.feature.chat.ChatsViewModel
 import com.kit.wallet.feature.chat.ConversationScreen
 import com.kit.wallet.feature.chat.GroupAddParticipantsScreen
 import com.kit.wallet.feature.chat.GroupDescriptionScreen
+import com.kit.wallet.feature.chat.GroupPhotoScreen
 import com.kit.wallet.feature.chat.GroupProfileScreen
 import com.kit.wallet.feature.chat.NewGroupScreen
 import com.kit.wallet.feature.chat.IncomingTextShareCoordinator
@@ -929,6 +930,7 @@ private fun KitNavHost(
                     onBack = { navController.popBackStack() },
                     onAddParticipants = { navController.navigate(Dest.groupAdd(chatId)) },
                     onEditDescription = { navController.navigate(Dest.groupDescription(chatId)) },
+                    onEditPhoto = { navController.navigate(Dest.groupPhoto(chatId)) },
                     // A group that has been left has no conversation and no group screen left to
                     // return to, so both come off the stack together.
                     onLeft = {
@@ -948,6 +950,11 @@ private fun KitNavHost(
         composable(Dest.GROUP_DESCRIPTION) {
             FeatureRouteContent(signedIn, capabilities, Dest.GROUP_DESCRIPTION) {
                 GroupDescriptionScreen(onBack = { navController.popBackStack() })
+            }
+        }
+        composable(Dest.GROUP_PHOTO) {
+            FeatureRouteContent(signedIn, capabilities, Dest.GROUP_PHOTO) {
+                GroupPhotoScreen(onBack = { navController.popBackStack() })
             }
         }
         composable(Dest.VOICE_CALL) { entry ->

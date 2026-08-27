@@ -44,6 +44,7 @@ class AppCapabilitiesTest {
         assertFalse(serverOnly.routeUsable(Dest.CONTACTS))
         assertFalse(serverOnly.routeUsable(Dest.NEW_GROUP))
         assertFalse(serverOnly.routeUsable(Dest.GROUP_ADD))
+        assertFalse(serverOnly.routeUsable(Dest.GROUP_PHOTO))
         assertTrue(ready.messagingUsable)
         assertTrue(ready.routeUsable(Dest.CONTACTS))
         assertTrue(ready.routeUsable(Dest.CONVERSATION))

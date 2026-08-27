@@ -91,6 +91,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -100,6 +101,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -173,7 +175,6 @@ import com.kit.wallet.ui.model.acceptsReactions
 import com.kit.wallet.ui.model.acceptsReplies
 import com.kit.wallet.ui.model.replyPreviewLabel
 import java.io.File
-import java.util.UUID
 import com.kit.wallet.ui.theme.KitGreen300
 import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
@@ -187,6 +188,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -579,7 +581,17 @@ fun ConversationScreen(
         groupPaymentsEnabled = groupPaymentsEnabled && currentChat.isGroup,
         groupPayments = groupPayments,
         groupMembers = groupMembers,
-        onSendGroupPayment = { splitMode, audience, selected, total, custom, note, pin, onSent ->
+        onSendGroupPayment = {
+                splitMode,
+                audience,
+                selected,
+                total,
+                custom,
+                note,
+                pin,
+                idempotencyKey,
+                onSent,
+            ->
             viewModel.sendGroupPayment(
                 splitMode = splitMode,
                 audience = audience,
@@ -588,7 +600,7 @@ fun ConversationScreen(
                 customAmounts = custom,
                 note = note,
                 paymentPin = pin,
-                idempotencyKey = "android-group-payment-${UUID.randomUUID()}",
+                idempotencyKey = idempotencyKey,
                 groupPaymentsEnabled = groupPaymentsEnabled,
                 onSent = onSent,
             )
@@ -784,7 +796,11 @@ internal fun ConversationContent(
     /** The server's live view of every group payment this thread mentions, keyed by lower-case id. */
     groupPayments: Map<String, GroupPaymentSummary> = emptyMap(),
     groupMembers: List<ChatMember> = emptyList(),
-    onSendGroupPayment: GroupPaymentSendHandler = { _, _, _, _, _, _, _, done -> done() },
+    onSendGroupPayment: GroupPaymentSendHandler = {
+            _, _, _, _, _, _, _, _, done ->
+        done()
+        true
+    },
     onAcceptGroupShare: (Message) -> Unit = {},
     onRejectGroupShare: (Message, String?) -> Unit = { _, _ -> },
     onReverseGroupPayment: (Message, String?, String) -> Unit = { _, _, _ -> },
@@ -954,15 +970,22 @@ internal fun ConversationContent(
     // Keep the newest message visible, just like WhatsApp: jump to the bottom the first time the
     // thread loads, then follow new messages only while the reader is already near the bottom.
     // A reader who scrolled up to older history is never yanked; a chip offers the way back.
-    val listState = rememberLazyListState()
+    val listState = key(chat.id) { rememberLazyListState() }
     val conversationRows = remember(messages) { groupConversationRows(messages) }
+    val conversationRowKeys = remember(conversationRows) { conversationRows.map(ConversationRow::key) }
+    val messageIds = remember(messages) { messages.map(Message::id) }
+    val groupPaymentHydrationKey = remember(groupPayments) {
+        // The live map is capped by the ViewModel. Keep the complete immutable values so any card
+        // content change that can alter its measured height restarts the narrowly guarded effect.
+        groupPayments.toSortedMap().values.toList()
+    }
     // A group writes a member's name once per run, not once per bubble. Computed over the whole
     // thread because the answer for any one message depends on what came before it.
     val senderNamedIds = remember(messages, chat.isGroup) {
         senderNamedMessageIds(messages, chat.isGroup)
     }
-    var renderedMessageCount by remember { mutableStateOf(0) }
-    var pendingNewMessages by remember { mutableStateOf(0) }
+    var renderedMessageIds by remember(chat.id) { mutableStateOf<Set<String>?>(null) }
+    var pendingNewMessages by remember(chat.id) { mutableStateOf(0) }
     val coroutineScopeForScroll = rememberCoroutineScope()
     // Tapping a quote takes the thread to what it quotes. A target that is not in the loaded
     // history does nothing at all, rather than scrolling somewhere arbitrary and calling it the
@@ -979,7 +1002,7 @@ internal fun ConversationContent(
     }
     // The list header adds two leading items (date + encryption notice) and a trailing spacer,
     // so the newest message sits just above the final index.
-    val nearBottom by remember {
+    val nearBottom by remember(listState) {
         derivedStateOf {
             val info = listState.layoutInfo
             val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: 0
@@ -989,22 +1012,69 @@ internal fun ConversationContent(
     LaunchedEffect(nearBottom) {
         if (nearBottom) pendingNewMessages = 0
     }
-    LaunchedEffect(messages.size, messages.lastOrNull()?.id) {
-        if (messages.isEmpty()) return@LaunchedEffect
-        val bottomIndex = conversationRows.size + 2
-        val lastFromMe = messages.lastOrNull()?.fromMe == true
-        when {
-            renderedMessageCount == 0 -> listState.scrollToItem(bottomIndex)
-            messages.size > renderedMessageCount && (nearBottom || lastFromMe) ->
-                listState.animateScrollToItem(bottomIndex)
-            messages.size > renderedMessageCount ->
-                pendingNewMessages += messages.size - renderedMessageCount
+    LaunchedEffect(chat.id, conversationRowKeys, messageIds) {
+        if (messages.isEmpty()) {
+            // Keep null for a brand-new conversation composition so its first hydrated rows take
+            // the explicit jump path. A thread whose existing rows were removed is already
+            // positioned and can treat its next row as an ordinary addition.
+            if (renderedMessageIds != null) renderedMessageIds = emptySet()
+            pendingNewMessages = 0
+            return@LaunchedEffect
         }
-        renderedMessageCount = messages.size
+        val bottomIndex = conversationRows.size + CONVERSATION_LEADING_ITEMS
+        val decision = conversationScrollDecision(renderedMessageIds, messages, nearBottom)
+        when (decision.action) {
+            ConversationScrollAction.JUMP_TO_NEWEST,
+            ConversationScrollAction.FOLLOW_NEWEST,
+            -> {
+                // A preloaded encrypted projection can be present before LazyColumn has measured a
+                // single row. Wait for this exact row set to exist before positioning; if a newer
+                // projection arrives first this effect is cancelled and restarted for that set.
+                snapshotFlow { listState.layoutInfo.totalItemsCount }
+                    .first { totalItems -> totalItems > bottomIndex }
+                if (decision.action == ConversationScrollAction.JUMP_TO_NEWEST) {
+                    listState.scrollToItem(bottomIndex)
+                } else {
+                    listState.animateScrollToItem(bottomIndex)
+                }
+                pendingNewMessages = 0
+            }
+            ConversationScrollAction.KEEP_POSITION -> {
+                pendingNewMessages += decision.unseenMessages
+            }
+        }
+        renderedMessageIds = messageIds.toSet()
+    }
+    LaunchedEffect(chat.id, groupPaymentHydrationKey) {
+        if (
+            !shouldRepinAfterGroupPaymentHydration(
+                conversationPositioned = renderedMessageIds != null,
+                nearBottom = nearBottom,
+                scrollInProgress = listState.isScrollInProgress,
+            )
+        ) return@LaunchedEffect
+
+        // Let the hydrated payment card take its final size, then ask again. A finger drag or a
+        // move into older history during that frame wins and cancels the correction.
+        withFrameNanos { }
+        if (
+            !shouldRepinAfterGroupPaymentHydration(
+                conversationPositioned = renderedMessageIds != null,
+                nearBottom = nearBottom,
+                scrollInProgress = listState.isScrollInProgress,
+            )
+        ) return@LaunchedEffect
+        // Read the live tail rather than the row count captured when hydration began. The payment
+        // announcement may insert its own row during the frame above; a stale index would then
+        // point at that card and race the normal new-message follow effect.
+        val tailIndex = listState.layoutInfo.totalItemsCount - 1
+        if (tailIndex >= 0) {
+            listState.scrollToItem(tailIndex)
+        }
     }
     // A bubble below the fold is not an indicator. Follow it into view, but only for a reader who
     // is already at the bottom — the same rule a new message gets, for the same reason.
-    LaunchedEffect(chat.typing) {
+    LaunchedEffect(chat.id, chat.typing) {
         if (chat.typing && nearBottom) {
             listState.animateScrollToItem(conversationRows.size + 3)
         }
@@ -1379,7 +1449,7 @@ internal fun ConversationContent(
                 .offset { IntOffset(0, -cameraRevealPx.roundToInt()) }
                 .padding(horizontal = 14.dp),
         ) {
-            item {
+            item(key = "conversation-date-heading") {
                 Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Surface(
                         shape = CircleShape,
@@ -1394,7 +1464,7 @@ internal fun ConversationContent(
                     }
                 }
             }
-            item {
+            item(key = "conversation-encryption-notice") {
                 Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Surface(
                         shape = MaterialTheme.shapes.small,
@@ -1582,7 +1652,7 @@ internal fun ConversationContent(
                     TypingBubble(label = groupTypingLabel(chat.typingNames))
                 }
             }
-            item { Spacer(Modifier.height(8.dp)) }
+            item(key = "conversation-tail") { Spacer(Modifier.height(8.dp)) }
         }
         if (pendingNewMessages > 0) {
             Surface(

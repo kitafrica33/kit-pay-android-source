@@ -139,7 +139,9 @@ data class AppCapabilities(
             // These three do exchange: starting a conversation, picking someone to start it with,
             // and changing who is in a group are all server-authenticated actions that need a
             // ready end-to-end session before they can be honoured.
-            Dest.CONTACTS, Dest.NEW_GROUP, Dest.GROUP_ADD, Dest.GROUP_DESCRIPTION ->
+            Dest.CONTACTS, Dest.NEW_GROUP, Dest.GROUP_ADD, Dest.GROUP_DESCRIPTION,
+            Dest.GROUP_PHOTO,
+            ->
                 messagingUsable
             // Including an in-progress call: a failed capability poll must never hang one up.
             Dest.CALLS, Dest.CALL_CONTACTS, Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL ->

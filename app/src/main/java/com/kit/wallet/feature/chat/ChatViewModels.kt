@@ -1489,18 +1489,18 @@ class ConversationViewModel @Inject internal constructor(
         idempotencyKey: String,
         groupPaymentsEnabled: Boolean,
         onSent: () -> Unit = {},
-    ) {
-        val selectedChat = chat.value ?: return
+    ): Boolean {
+        val selectedChat = chat.value ?: return false
         val repo = groupPaymentRepo
         if (!groupPaymentsEnabled || repo == null) {
             mutableError.value = "Group payments are not available right now"
-            return
+            return false
         }
         if (!selectedChat.isGroup) {
             mutableError.value = "Group payments can only be sent in a group"
-            return
+            return false
         }
-        if (!historyAvailable.value || mutableSending.value) return
+        if (!historyAvailable.value || mutableSending.value) return false
         mutableSending.value = true
         mutableError.value = null
         viewModelScope.launch {
@@ -1531,13 +1531,17 @@ class ConversationViewModel @Inject internal constructor(
                     paymentPin = paymentPin,
                 )
                 storeGroupPayment(payment)
+                // The server has confirmed the payment and its authoritative state is already in
+                // the local projection. Close the composer now: the encrypted announcement below
+                // is deliberately best-effort and must never leave a successful payment looking
+                // as though it is still being submitted.
+                onSent()
                 // The roster in the descriptor is the server's answer, not the composer's: for
                 // "everybody" this device never chose the members in the first place.
                 val roster = payment.recipients.mapNotNull { it.userId }
                 KitGroupPaymentMessage.announcing(payment, roster)?.encode()?.let { descriptor ->
                     runCatching { chatRepo.sendGroupPaymentEvent(selectedChat.id, descriptor) }
                 }
-                onSent()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -1546,6 +1550,7 @@ class ConversationViewModel @Inject internal constructor(
                 mutableSending.value = false
             }
         }
+        return true
     }
 
     /** Takes this account's own share. Never a step-up: the money is already held for them. */

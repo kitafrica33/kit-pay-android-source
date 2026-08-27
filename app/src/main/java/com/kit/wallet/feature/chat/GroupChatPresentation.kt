@@ -32,6 +32,10 @@ internal fun groupTypingLabel(names: List<String>): String? {
 internal fun groupMemberCountLabel(count: Int): String =
     if (count == 1) "1 participant" else "$count participants"
 
+/** Only the same roles the server accepts may open photo-changing controls. */
+internal fun canEditGroupPhoto(viewer: ChatMember?): Boolean =
+    viewer?.role?.canManageMembers == true
+
 /** What the account looking at a participant list may do to one of its rows. */
 internal data class GroupMemberActions(
     val canPromote: Boolean = false,
