@@ -89,6 +89,31 @@ class AuthUiHardeningTest {
     }
 
     @Test
+    fun `authentication setup and identity journeys own the full screen`() {
+        listOf(
+            "app/src/main/java/com/kit/wallet/feature/auth/PhoneLoginScreen.kt",
+            "app/src/main/java/com/kit/wallet/feature/auth/OtpScreen.kt",
+            "app/src/main/java/com/kit/wallet/feature/auth/AccountAccessScreens.kt",
+            "app/src/main/java/com/kit/wallet/feature/auth/PinSetupScreen.kt",
+            "app/src/main/java/com/kit/wallet/feature/settings/ProfileEditorScreen.kt",
+            "app/src/main/java/com/kit/wallet/feature/settings/KycScreen.kt",
+        ).forEach { path ->
+            val screen = source(path)
+            assertTrue("$path must claim the full available canvas", screen.contains("fillMaxSize"))
+        }
+
+        val gate = source(
+            "app/src/main/java/com/kit/wallet/feature/auth/SessionUnlockGate.kt",
+        )
+        assertTrue(gate.contains("Surface(Modifier.fillMaxSize()"))
+        assertFalse("Pending identity must not be a dialog", gate.contains("Dialog("))
+
+        val activity = source("app/src/main/java/com/kit/wallet/MainActivity.kt")
+        assertTrue(activity.contains("private fun SessionRestorationGate("))
+        assertFalse("Session restoration must not be an alert", activity.contains("AlertDialog"))
+    }
+
+    @Test
     fun `Didit request transports explicit consent without a hardcoded grant`() {
         val screen = source("app/src/main/java/com/kit/wallet/feature/settings/KycScreen.kt")
         val viewModel = source(

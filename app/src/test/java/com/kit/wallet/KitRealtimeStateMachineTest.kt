@@ -1,6 +1,9 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
+import com.kit.wallet.data.notifications.CallLifecycleEvent
+import com.kit.wallet.data.notifications.CallLifecycleEventBus
+import com.kit.wallet.data.notifications.CallLifecycleKind
 import com.kit.wallet.data.realtime.ChannelAuthDto
 import com.kit.wallet.data.realtime.ChannelAuthRequest
 import com.kit.wallet.data.realtime.KitForegroundSource
@@ -10,6 +13,7 @@ import com.kit.wallet.data.realtime.KitNetworkSource
 import com.kit.wallet.data.realtime.KitPresenceRegistry
 import com.kit.wallet.data.realtime.KitRealtimeAuthApi
 import com.kit.wallet.data.realtime.KitRealtimeBackoff
+import com.kit.wallet.data.realtime.KitRealtimeCallAnswerSink
 import com.kit.wallet.data.realtime.KitRealtimeClock
 import com.kit.wallet.data.realtime.KitRealtimeCoordinator
 import com.kit.wallet.data.realtime.KitRealtimeFallbackPoller
@@ -46,6 +50,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
@@ -793,14 +798,86 @@ class KitRealtimeStateMachineTest {
         assertTrue(world.presence.presence.value.isEmpty())
     }
 
+    // --- the answer signal ------------------------------------------------------
+
+    @Test
+    fun `an answered frame on this account's own channel reaches the call screen intact`() =
+        stateMachineTest { world ->
+            world.goLive()
+
+            world.frame(answeredFrame())
+
+            assertEquals(1, world.answeredCalls.size)
+            val event = world.answeredCalls.single()
+            assertEquals(CALL_ID, event.callId)
+            assertEquals(CallLifecycleKind.ANSWERED, event.kind)
+            // Both halves or neither: one without the other cannot be turned into an
+            // elapsed time without reading this device's clock.
+            assertEquals(ANSWERED_AT, event.answeredAt)
+            assertEquals(SERVER_TIME, event.serverTime)
+        }
+
+    @Test
+    fun `an answered frame on any other channel is dropped`() = stateMachineTest { world ->
+        world.goLive()
+        world.observe(CONVERSATION)
+        world.subscribed(CONVERSATION_CHANNEL, members = setOf(SELF, PEER))
+
+        // A channel we are genuinely subscribed to, and one we are not. Neither is this
+        // account's own private channel, which is the only place the server sends this.
+        world.frame(answeredFrame(channel = CONVERSATION_CHANNEL))
+        world.frame(answeredFrame(channel = "private-kit.user.$PEER"))
+
+        assertTrue(world.answeredCalls.isEmpty())
+    }
+
+    @Test
+    fun `an answered frame is ignored when the server never advertised the signal`() =
+        stateMachineTest(calls = false) { world ->
+            world.goLive()
+
+            world.frame(answeredFrame())
+
+            // Nothing is lost by refusing it: the `call.answered` push carries the same
+            // answer, and a server with the rollout off is not sending this at all.
+            assertTrue(world.answeredCalls.isEmpty())
+        }
+
+    @Test
+    fun `a malformed or mislabelled answer never reaches the call screen`() = stateMachineTest { world ->
+        world.goLive()
+
+        listOf(
+            // Wrong schema version.
+            answeredFrame(version = 2),
+            // A state this frame is not allowed to announce. Accepting it would let one
+            // event type move a call into a state the rest of the client never expects
+            // from it.
+            answeredFrame(state = "ended"),
+            answeredFrame(state = "ACTIVE"),
+            // Each required member blank in turn: a half-applied answer would leave the
+            // timer anchored to something the server never said.
+            answeredFrame(callId = ""),
+            answeredFrame(answeredAt = ""),
+            answeredFrame(answeredBy = ""),
+            answeredFrame(serverTime = ""),
+            // No channel at all, so it cannot be attributed to this account.
+            """{"event":"kit.call.answered","data":{"v":1,"call_id":"$CALL_ID","state":"active",""" +
+                """"answered_at":"$ANSWERED_AT","answered_by":"$PEER","server_time":"$SERVER_TIME"}}""",
+        ).forEach(world::frame)
+
+        assertTrue(world.answeredCalls.isEmpty())
+    }
+
     // --- the world --------------------------------------------------------------
 
     private fun stateMachineTest(
         advertise: Boolean = true,
         typing: Boolean = true,
+        calls: Boolean = true,
         body: (World) -> Unit,
     ) = runTest {
-        val world = World(this, advertise, typing)
+        val world = World(this, advertise, typing, calls)
         try {
             body(world)
         } finally {
@@ -815,6 +892,7 @@ class KitRealtimeStateMachineTest {
         testScope: TestScope,
         advertise: Boolean,
         typingAdvertised: Boolean,
+        callsAdvertised: Boolean,
     ) {
         private val scheduler = testScope.testScheduler
         private val workScope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(scheduler))
@@ -829,11 +907,13 @@ class KitRealtimeStateMachineTest {
         val presence = KitPresenceRegistry()
         val typing = KitTypingRegistry(presence, clock)
         val typingSignaller = KitTypingSignaller(auth, clock, workScope)
+        val callEvents = CallLifecycleEventBus()
+        val answeredCalls = mutableListOf<CallLifecycleEvent>()
 
         val coordinator = KitRealtimeCoordinator(
             transport = transport,
             authApi = auth,
-            walletApi = capabilitiesApi(advertise, typingAdvertised),
+            walletApi = capabilitiesApi(advertise, typingAdvertised, callsAdvertised),
             // `ApiFailureEnvelope` is `generateAdapter = false`, so the reflective
             // factory is not optional here: a bare Moshi throws in the executor's
             // constructor, before a single frame is exchanged.
@@ -847,6 +927,7 @@ class KitRealtimeStateMachineTest {
             nudgeSink = KitRealtimeNudgeSink(
                 KitForegroundSyncTrigger(engine, StandardTestDispatcher(scheduler)),
             ),
+            callAnswerSink = KitRealtimeCallAnswerSink(callEvents),
             fallbackPoller = KitRealtimeFallbackPoller(clock),
             clock = clock,
             scope = workScope,
@@ -855,6 +936,10 @@ class KitRealtimeStateMachineTest {
         val state: KitRealtimeState get() = coordinator.state.value
 
         init {
+            // Collected before the coordinator starts, so no frame can be published into
+            // a bus nobody is listening to yet and pass for one that was dropped.
+            workScope.launch { callEvents.events.collect { answeredCalls += it } }
+            settle()
             coordinator.start()
             settle()
         }
@@ -1226,6 +1311,22 @@ class KitRealtimeStateMachineTest {
         const val SOCKET_URL =
             "wss://realtime.kit.africa/app/app-key?protocol=7&client=kit-android&version=1"
 
+        const val CALL_ID = "33333333-3333-4333-8333-333333333333"
+        const val ANSWERED_AT = "2026-08-27T09:15:04Z"
+        const val SERVER_TIME = "2026-08-27T09:15:05Z"
+
+        fun answeredFrame(
+            channel: String = USER_CHANNEL,
+            callId: String = CALL_ID,
+            version: Int = 1,
+            state: String = "active",
+            answeredAt: String = ANSWERED_AT,
+            answeredBy: String = PEER,
+            serverTime: String = SERVER_TIME,
+        ) = """{"event":"kit.call.answered","channel":"$channel","data":{"v":$version,""" +
+            """"call_id":"$callId","state":"$state","answered_at":"$answeredAt",""" +
+            """"answered_by":"$answeredBy","server_time":"$serverTime"}}"""
+
         const val NUDGE_FRAME =
             """{"event":"kit.sync.nudge","channel":"$USER_CHANNEL","data":{"v":1}}"""
 
@@ -1246,12 +1347,16 @@ class KitRealtimeStateMachineTest {
          * directly is how a suspend function reports "completed without suspending"
          * across the JVM's `Continuation` calling convention.
          */
-        fun capabilitiesApi(advertise: Boolean, typing: Boolean): KitWalletApi = Proxy.newProxyInstance(
+        fun capabilitiesApi(
+            advertise: Boolean,
+            typing: Boolean,
+            calls: Boolean,
+        ): KitWalletApi = Proxy.newProxyInstance(
             KitWalletApi::class.java.classLoader,
             arrayOf(KitWalletApi::class.java),
         ) { instance, method, arguments ->
             when (method.name) {
-                "capabilities" -> capabilitiesEnvelope(advertise, typing)
+                "capabilities" -> capabilitiesEnvelope(advertise, typing, calls)
                 "toString" -> "FakeCapabilitiesApi"
                 "hashCode" -> System.identityHashCode(instance)
                 "equals" -> instance === arguments?.firstOrNull()
@@ -1259,7 +1364,7 @@ class KitRealtimeStateMachineTest {
             }
         } as KitWalletApi
 
-        fun capabilitiesEnvelope(advertise: Boolean, typing: Boolean) = ApiEnvelope(
+        fun capabilitiesEnvelope(advertise: Boolean, typing: Boolean, calls: Boolean) = ApiEnvelope(
             ok = true,
             data = CapabilitiesDto(
                 apiVersion = "v1",
@@ -1285,6 +1390,7 @@ class KitRealtimeStateMachineTest {
                             ),
                             presence = true,
                             typing = typing,
+                            calls = calls,
                         )
                     },
                 ),

@@ -4,40 +4,51 @@ import android.util.Log
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.local.ConversationPrefEntity
 import com.kit.wallet.data.local.ConversationPrefsDao
-import com.kit.wallet.data.messaging.KitChatMediaKind
-import com.kit.wallet.data.messaging.KitMediaMessage
-import com.kit.wallet.data.messaging.KitPaymentAction
-import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.ConversationRosterStore
 import com.kit.wallet.data.messaging.ConversationSystemEvent
 import com.kit.wallet.data.messaging.ConversationSystemEventStore
-import com.kit.wallet.data.messaging.MEMBERSHIP_ADDED_EVENT
-import com.kit.wallet.data.messaging.MEMBERSHIP_REMOVED_EVENT
-import com.kit.wallet.data.messaging.MEMBERSHIP_ROLE_CHANGED_EVENT
-import com.kit.wallet.data.messaging.KitReactionAction
-import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.messaging.ImmediateMediaSpool
 import com.kit.wallet.data.messaging.ImmediateSendIntent
 import com.kit.wallet.data.messaging.ImmediateSendIntentStore
 import com.kit.wallet.data.messaging.ImmediateSendKind
 import com.kit.wallet.data.messaging.ImmediateSendState
+import com.kit.wallet.data.messaging.KitChatMediaKind
+import com.kit.wallet.data.messaging.KitEditMessage
+import com.kit.wallet.data.messaging.KitGroupPaymentAction
+import com.kit.wallet.data.messaging.KitGroupPaymentMessage
+import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitPaymentAction
+import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.KitReactionAction
+import com.kit.wallet.data.messaging.KitReactionMessage
+import com.kit.wallet.data.messaging.KitUserAuthoredTextPolicy
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionRecord
-import com.kit.wallet.data.messaging.MediaAttachmentCipher
 import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
+import com.kit.wallet.data.messaging.MEMBERSHIP_ADDED_EVENT
+import com.kit.wallet.data.messaging.MEMBERSHIP_REMOVED_EVENT
+import com.kit.wallet.data.messaging.MEMBERSHIP_ROLE_CHANGED_EVENT
+import com.kit.wallet.data.messaging.MediaAttachmentCipher
+import com.kit.wallet.data.messaging.MediaAttachmentStreamCipher
+import com.kit.wallet.data.messaging.MessageReplyQuotes
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.ScheduledSendStore
+import com.kit.wallet.data.messaging.SecureMediaCache
+import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.messaging.SecureMessagingActivationCapability
 import com.kit.wallet.data.messaging.SecureMessagingActiveSession
 import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
 import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
 import com.kit.wallet.data.messaging.SecureMessagingCommittedResult
+import com.kit.wallet.data.messaging.SecureMessagingComposerDraftStore
+import com.kit.wallet.data.messaging.SecureMessagingConversationCapabilityUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingCryptoEngine
 import com.kit.wallet.data.messaging.SecureMessagingCryptoTransaction
 import com.kit.wallet.data.messaging.SecureMessagingCryptoWireMapper
+import com.kit.wallet.data.messaging.SecureMessagingEncryptedSend
 import com.kit.wallet.data.messaging.SecureMessagingEncryptionPlan
 import com.kit.wallet.data.messaging.SecureMessagingEncryptionRequest
-import com.kit.wallet.data.messaging.SecureMessagingEncryptedSend
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
 import com.kit.wallet.data.messaging.SecureMessagingMissingSessionSet
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
@@ -45,8 +56,8 @@ import com.kit.wallet.data.messaging.SecureMessagingProjectionPage
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingSyncCompletionSignal
-import com.kit.wallet.data.messaging.SecureMessagingComposerDraftStore
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
+import com.kit.wallet.data.messaging.authenticatedOutboundMessageKind
 import com.kit.wallet.data.messaging.isRecoverableSecureMessagingStateLoss
 import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
 import com.kit.wallet.data.messaging.requireDurablyCommittedSessions
@@ -54,11 +65,14 @@ import com.kit.wallet.data.realtime.KitPresenceRegistry
 import com.kit.wallet.data.realtime.KitTypingRegistry
 import com.kit.wallet.data.remote.ADMIN_CONVERSATION_ROLE
 import com.kit.wallet.data.remote.GROUP_CONVERSATION_TYPE
-import com.kit.wallet.data.remote.ENCRYPTED_REACTION_MESSAGE_KIND
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.MEMBER_CONVERSATION_ROLE
 import com.kit.wallet.data.remote.OWNER_CONVERSATION_ROLE
+import com.kit.wallet.data.remote.ValidatedMessageDeliveryInfo
+import com.kit.wallet.data.remote.ProfileAvatarUploader
+import com.kit.wallet.data.remote.isValidMessagingGroupDescription
 import com.kit.wallet.data.remote.isValidMessagingGroupTitle
+import com.kit.wallet.data.remote.normalizeMessagingGroupDescription
 import com.kit.wallet.data.remote.normalizeMessagingGroupTitle
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionInvalidatedException
@@ -69,12 +83,19 @@ import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
+import com.kit.wallet.ui.model.GroupPaymentEventKind
 import com.kit.wallet.ui.model.Message
+import com.kit.wallet.ui.model.MessageDeliveryInfo
+import com.kit.wallet.ui.model.MessageDeliveryPerson
 import com.kit.wallet.ui.model.MessageKind
 import com.kit.wallet.ui.model.MessageReaction
 import com.kit.wallet.ui.model.PaymentEventKind
+import com.kit.wallet.ui.model.acceptsEdits
+import com.kit.wallet.ui.model.acceptsDeliveryInfo
 import com.kit.wallet.ui.model.acceptsReactions
+import com.kit.wallet.ui.model.acceptsReplies
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
+import java.io.File
 import java.io.IOException
 import java.time.Clock
 import java.time.Instant
@@ -100,8 +121,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -140,6 +161,10 @@ internal data class AuthenticatedConversation(
     val viewerUserId: String,
     val currentUserRole: String,
     val members: List<AuthenticatedConversationMember>,
+    /** Server-visible group description; null for direct chats and undescribed groups. */
+    val description: String? = null,
+    /** The group photo's public address; render-time origin pinning decides whether to fetch. */
+    val photoUrl: String? = null,
 ) {
     val isGroup: Boolean get() = type == GROUP_CONVERSATION_TYPE
 
@@ -186,6 +211,8 @@ internal data class AuthenticatedProjectedText(
     val text: String,
     val sentAt: Instant,
     val deliveryState: AuthenticatedTextDeliveryState,
+    /** The authenticated reply binding, when this message answers another. */
+    val replyToMessageId: String? = null,
 )
 
 internal data class AuthenticatedProjectionPage(
@@ -197,6 +224,14 @@ internal data class AuthenticatedProjectionPage(
 internal class SecureMessagingChatSession internal constructor(
     val sessionEpoch: String,
     internal val identity: Any,
+    /**
+     * Whether the server advertised message corrections for this authenticated account.
+     *
+     * Carried on the session rather than read back through the opaque transport handle so the
+     * repository can publish it at the same instant it publishes the projection, and so it dies
+     * with the activation it came from. Fail closed: a session that never said so cannot edit.
+     */
+    internal val messageEditsEnabled: Boolean = false,
 )
 
 /** A newer local intent must wait until this conversation's older ciphertext is reconciled. */
@@ -332,6 +367,60 @@ internal fun foldAuthenticatedReactions(
     }
 }
 
+/** The wording a message ended up with, and the moment its author replaced the original. */
+internal data class AuthenticatedMessageEdit(
+    val text: String,
+    val editedAtEpochMillis: Long,
+)
+
+/**
+ * Folds every authenticated edit descriptor onto the message whose wording it replaces.
+ *
+ * [ordered] must already be in [authenticatedProjectionOrder], because that order is what decides
+ * which correction stands: the last one its author wrote wins, so replaying the same log — in
+ * whole or in part, on any device — converges on the same wording and duplicates need no separate
+ * handling.
+ *
+ * Only the authenticated Signal sender of the original may replace it. The descriptor names no
+ * author, so the attribution cannot be forged, and an edit from anybody else is simply dropped
+ * rather than rendered: a peer does not get to put words in someone else's bubble.
+ *
+ * The fifteen-minute window is deliberately *not* re-checked here. The server is what authorises a
+ * correction, and it is the only party with an untampered clock for both messages; re-deciding it
+ * on the reader's side could keep showing words the sender has already taken back, which is the
+ * one outcome editing exists to prevent.
+ */
+internal fun foldAuthenticatedEdits(
+    ordered: List<AuthenticatedProjectedText>,
+): Map<String, AuthenticatedMessageEdit> {
+    val originals = ordered.associateBy(AuthenticatedProjectedText::messageId)
+    val applied = linkedMapOf<String, AuthenticatedMessageEdit>()
+    ordered.forEach { projected ->
+        val edit = KitEditMessage.parse(projected.text) ?: return@forEach
+        // A permanent local failure never reached the server or another device. Applying it would
+        // rewrite the message on this installation alone and leave the two sides disagreeing about
+        // what was said.
+        if (projected.deliveryState == AuthenticatedTextDeliveryState.PERMANENT_FAILURE) {
+            return@forEach
+        }
+        val target = originals[edit.targetMessageId] ?: return@forEach
+        if (!target.senderUserId.equals(projected.senderUserId, ignoreCase = true)) return@forEach
+        // Corrections apply to what someone said, never to an annotation on it or to another
+        // correction: chains of those would let one descriptor rewrite the meaning of a second.
+        if (KitReactionMessage.isReactionText(target.text)) return@forEach
+        if (KitEditMessage.isEditText(target.text)) return@forEach
+        // Nor to a photo, a voice note or a document. Its descriptor is what points recipients at
+        // the ciphertext they have already downloaded; replacing it with a sentence would strand
+        // that media with nothing left to name it.
+        if (KitMediaMessage.isMediaText(target.text)) return@forEach
+        applied[edit.targetMessageId] = AuthenticatedMessageEdit(
+            text = edit.body,
+            editedAtEpochMillis = projected.sentAt.toEpochMilli(),
+        )
+    }
+    return applied
+}
+
 /** Testable repository-facing surface; the production implementation retains opaque handles. */
 internal interface SecureMessagingChatRuntime {
     val activeSession: StateFlow<SecureMessagingChatSession?>
@@ -429,6 +518,23 @@ internal interface SecureMessagingChatRuntime {
         conversationId: String,
     ): Unit = error("This runtime does not support group conversations")
 
+    suspend fun updateGroupDescription(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        description: String?,
+    ): AuthenticatedConversation = error("This runtime does not support group conversations")
+
+    suspend fun attachGroupPhoto(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        assetId: String,
+    ): AuthenticatedConversation = error("This runtime does not support group conversations")
+
+    suspend fun removeGroupPhoto(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+    ): AuthenticatedConversation = error("This runtime does not support group conversations")
+
     suspend fun projectionPage(
         session: SecureMessagingChatSession,
         afterRecordKey: String?,
@@ -439,6 +545,12 @@ internal interface SecureMessagingChatRuntime {
         session: SecureMessagingChatSession,
         conversationId: String,
     )
+
+    suspend fun messageDeliveryInfo(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        messageId: String,
+    ): ValidatedMessageDeliveryInfo = error("This runtime cannot report what became of a message")
 
     suspend fun synchronizeConversation(
         session: SecureMessagingChatSession,
@@ -461,28 +573,32 @@ internal interface SecureMessagingChatRuntime {
         session: SecureMessagingChatSession,
         conversationId: String,
         attachmentId: String,
-        ciphertext: ByteArray,
+        ciphertext: File,
         mediaType: String,
         keyMaterialBase64: String,
         plaintextBytes: Int,
         caption: String?,
     ): String = error("This secure messaging runtime does not support queued media")
 
-    /** Encrypts, uploads and sends one image as an end-to-end encrypted media message. */
+    /** Encrypts, uploads and sends one attachment as an end-to-end encrypted media message. */
     suspend fun sendImage(
         session: SecureMessagingChatSession,
         conversationId: String,
-        bytes: ByteArray,
+        source: SecureMediaSource,
         mediaType: String,
         caption: String?,
     ): Unit = error("This secure messaging runtime does not support media messages")
 
-    /** Downloads and decrypts the media blob referenced by an authenticated media descriptor. */
-    suspend fun openMedia(
+    /**
+     * Downloads and decrypts the blob an authenticated media descriptor references, writing the
+     * plaintext to [destination] and returning its size. Nothing unauthenticated is ever written.
+     */
+    suspend fun openMediaToFile(
         session: SecureMessagingChatSession,
         conversationId: String,
         descriptorText: String,
-    ): ByteArray =
+        destination: File,
+    ): Int =
         error("This secure messaging runtime does not support media messages")
 }
 
@@ -510,6 +626,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 SecureMessagingChatSession(
                     sessionEpoch = it.binding.sessionEpoch,
                     identity = it,
+                    messageEditsEnabled = it.transport.messageEditsEnabled,
                 )
             }
         }
@@ -779,6 +896,29 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         active.transport.removeGroupMember(conversation, userId)
     }
 
+    override suspend fun updateGroupDescription(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        description: String?,
+    ): AuthenticatedConversation = mutateGroup(session, conversationId) { active, conversation ->
+        active.transport.updateGroupDescription(conversation, description)
+    }
+
+    override suspend fun attachGroupPhoto(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        assetId: String,
+    ): AuthenticatedConversation = mutateGroup(session, conversationId) { active, conversation ->
+        active.transport.attachGroupPhoto(conversation, assetId)
+    }
+
+    override suspend fun removeGroupPhoto(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+    ): AuthenticatedConversation = mutateGroup(session, conversationId) { active, conversation ->
+        active.transport.removeGroupPhoto(conversation)
+    }
+
     override suspend fun leaveGroupConversation(
         session: SecureMessagingChatSession,
         conversationId: String,
@@ -869,6 +1009,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 text = durable.authenticatedText,
                 sentAt = projected.sentAt,
                 deliveryState = projected.deliveryState.toAuthenticated(fromCurrentUser),
+                replyToMessageId = durable.replyToMessageId,
             )
         },
         nextAfterRecordKey = nextAfterRecordKey,
@@ -968,6 +1109,9 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         val roster = active.transport.roster(conversation, expectedOwner)
         if (KitReactionMessage.parse(text) != null) {
             active.transport.requireReactionCapability(conversation, roster)
+        }
+        if (KitEditMessage.parse(text) != null) {
+            active.transport.requireMessageEditCapability(conversation, roster)
         }
         val plan = active.transport.encryptionPlan(conversation, roster)
         val pending = retry?.takeIf {
@@ -1071,14 +1215,14 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         session: SecureMessagingChatSession,
         conversationId: String,
         attachmentId: String,
-        ciphertext: ByteArray,
+        ciphertext: File,
         mediaType: String,
         keyMaterialBase64: String,
         plaintextBytes: Int,
         caption: String?,
     ): String {
         require(CANONICAL_UUID.matches(attachmentId)) { "Invalid queued attachment ID" }
-        require(ciphertext.isNotEmpty()) { "Attachment ciphertext is empty" }
+        require(ciphertext.isFile && ciphertext.length() > 0) { "Attachment ciphertext is empty" }
         val normalizedMediaType = requireNotNull(KitMediaMessage.normalizeMediaType(mediaType)) {
             "Choose a supported photo, voice note, video or document"
         }
@@ -1118,29 +1262,38 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     override suspend fun sendImage(
         session: SecureMessagingChatSession,
         conversationId: String,
-        bytes: ByteArray,
+        source: SecureMediaSource,
         mediaType: String,
         caption: String?,
     ) {
-        require(bytes.isNotEmpty()) { "Choose a file to send securely" }
-        require(bytes.size <= MAX_IMAGE_PLAINTEXT_BYTES) {
-            "Files up to ${MAX_IMAGE_PLAINTEXT_BYTES / (1024 * 1024)} MB are supported"
-        }
         val normalizedMediaType = requireNotNull(KitMediaMessage.normalizeMediaType(mediaType)) {
             "Choose a supported photo, voice note, video or document"
         }
         val active = requireCurrent(session)
         val conversation = requireConversation(active, conversationId)
-        var encrypted: MediaAttachmentCipher.EncryptedAttachment? = null
+        var streamed: MediaAttachmentStreamCipher.StreamedAttachment? = null
+        // The ciphertext is spooled to app-private disk rather than held in heap, which is what
+        // lets an attachment be far larger than the process could ever allocate.
+        // Android points java.io.tmpdir at this app's own cache directory, so a null parent here
+        // is still app-private storage and no Context has to reach this layer to say so.
+        val spooled = File.createTempFile("kit-media-", ".ciphertext", null)
         try {
             // Assign inside the non-cancellable worker before dispatching back. If cancellation
             // wins that return handoff, finally still owns and erases every produced array.
-            withContext(Dispatchers.Default + NonCancellable) {
-                encrypted = MediaAttachmentCipher.encrypt(bytes)
+            withContext(Dispatchers.IO + NonCancellable) {
+                streamed = spooled.outputStream().buffered().use { output ->
+                    source.open().use { input ->
+                        MediaAttachmentStreamCipher.encrypt(
+                            source = input.buffered(),
+                            destination = output,
+                            maximumPlaintextBytes = MAX_IMAGE_PLAINTEXT_BYTES,
+                        )
+                    }
+                }
             }
             coroutineContext.ensureActive()
-            val owned = checkNotNull(encrypted)
-            val uploaded = active.transport.uploadAttachment(normalizedMediaType, owned.ciphertext)
+            val owned = checkNotNull(streamed)
+            val uploaded = active.transport.uploadAttachment(normalizedMediaType, spooled)
             check(sessions.currentOrNull() === active) {
                 "Secure messaging session changed while uploading encrypted media"
             }
@@ -1151,7 +1304,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 ciphertextByteSize = uploaded.byteSize,
                 ciphertextSha256 = uploaded.ciphertextSha256,
                 keyMaterialBase64 = Base64.getEncoder().encodeToString(owned.keyMaterial),
-                plaintextByteSize = owned.plaintextSize,
+                plaintextByteSize = owned.plaintextByteSize,
                 caption = caption?.trim()?.takeIf(String::isNotEmpty),
             )
             val authenticatedText = descriptor.encode()
@@ -1160,38 +1313,37 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             }
             sendText(session, conversation.conversationId, authenticatedText)
         } finally {
-            encrypted?.ciphertext?.fill(0)
-            encrypted?.keyMaterial?.fill(0)
-            encrypted?.sha256?.fill(0)
+            streamed?.keyMaterial?.fill(0)
+            streamed?.sha256?.fill(0)
+            spooled.delete()
         }
     }
 
-    override suspend fun openMedia(
+    override suspend fun openMediaToFile(
         session: SecureMessagingChatSession,
         conversationId: String,
         descriptorText: String,
-    ): ByteArray {
+        destination: File,
+    ): Int {
         val media = requireNotNull(KitMediaMessage.parse(descriptorText)) {
             "This message does not reference readable secure media"
         }
         val active = requireCurrent(session)
         requireConversation(active, conversationId)
-        var ciphertext: ByteArray? = null
         var keyMaterial: ByteArray? = null
         var expectedSha256: ByteArray? = null
-        var plaintext: ByteArray? = null
-        var returned = false
+        // Ciphertext lands on app-private disk instead of in heap; nothing is decrypted out of it
+        // until its authenticated digest and HMAC have both been checked over every byte.
+        val ciphertext = File.createTempFile("kit-media-", ".ciphertext", null)
         try {
-            // Retrofit returns a streaming ResponseBody. Assign the bounded result inside the
-            // worker so prompt cancellation cannot discard the only reference before cleanup.
-            withContext(Dispatchers.IO + NonCancellable) {
-                ciphertext = active.transport.downloadAttachment(
+            val downloadedBytes = withContext(Dispatchers.IO + NonCancellable) {
+                active.transport.downloadAttachmentToFile(
                     storageKey = media.storageKey,
                     maximumBytes = media.ciphertextByteSize,
+                    destination = ciphertext,
                 )
             }
             coroutineContext.ensureActive()
-            val downloaded = checkNotNull(ciphertext)
             keyMaterial = media.keyMaterial()
             expectedSha256 = media.ciphertextSha256Bytes()
             val key = checkNotNull(keyMaterial)
@@ -1199,37 +1351,42 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             check(sessions.currentOrNull() === active) {
                 "Secure messaging session changed while downloading encrypted media"
             }
-            check(downloaded.size.toLong() == media.ciphertextByteSize) {
+            check(downloadedBytes == media.ciphertextByteSize) {
                 "The encrypted media blob does not match its authenticated size"
             }
-            // decrypt() enforces the authenticated SHA-256 digest and the HMAC before returning.
-            withContext(Dispatchers.Default + NonCancellable) {
-                plaintext = MediaAttachmentCipher.decrypt(
-                    ciphertext = downloaded,
-                    keyMaterial = key,
-                    expectedSha256 = digest,
-                )
+            val plaintextBytes = withContext(Dispatchers.IO + NonCancellable) {
+                destination.outputStream().buffered().use { output ->
+                    MediaAttachmentStreamCipher.decrypt(
+                        ciphertext = ciphertext,
+                        keyMaterial = key,
+                        expectedSha256 = digest,
+                        destination = output,
+                    )
+                }
             }
             coroutineContext.ensureActive()
-            val decrypted = checkNotNull(plaintext)
-            plaintext = decrypted
-            check(decrypted.size == media.plaintextByteSize) {
+            check(plaintextBytes == media.plaintextByteSize) {
                 "The decrypted media does not match its authenticated size"
             }
-            check(
-                sessions.publishIfCurrent(active) {
-                    returned = true
-                },
-            ) {
+            check(sessions.publishIfCurrent(active) {}) {
                 "Secure messaging session changed while decrypting encrypted media"
             }
-            return decrypted
+            return plaintextBytes
         } finally {
-            if (!returned) plaintext?.fill(0)
-            ciphertext?.fill(0)
             keyMaterial?.fill(0)
             expectedSha256?.fill(0)
+            ciphertext.delete()
         }
+    }
+
+    override suspend fun messageDeliveryInfo(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        messageId: String,
+    ): ValidatedMessageDeliveryInfo {
+        val active = requireCurrent(session)
+        val conversation = requireConversation(active, conversationId)
+        return active.transport.messageInfo(conversation, messageId)
     }
 
     override suspend fun markConversationRead(
@@ -1466,11 +1623,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             committed = true
             SecureMessagingCryptoWireMapper.encryption(
                 result,
-                messageKind = if (KitReactionMessage.parse(text) != null) {
-                    ENCRYPTED_REACTION_MESSAGE_KIND
-                } else {
-                    com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
-                },
+                messageKind = authenticatedOutboundMessageKind(text),
             )
         } finally {
             request.close()
@@ -1503,6 +1656,8 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         members = members.map {
             AuthenticatedConversationMember(userId = it.userId, name = it.name, role = it.role)
         },
+        description = description,
+        photoUrl = photoUrl,
     )
 
     private fun SecureMessagingProjectionDeliveryState.toAuthenticated(
@@ -1639,7 +1794,12 @@ class EncryptedChatRepository @Inject internal constructor(
     private val immediateSends: ImmediateSendIntentStore? = null,
     private val immediateMediaSpool: ImmediateMediaSpool? = null,
     private val immediateSendScheduler: SecureMessagingSyncScheduler? = null,
+    private val secureMediaCache: SecureMediaCache? = null,
+    private val avatarUploader: ProfileAvatarUploader? = null,
 ) : ChatRepository {
+    /** Serializes caller-owned media IDs across lookup, spool write and durable intent commit. */
+    private val idempotentMediaSendMutex = Mutex()
+
     // Drafts are a best-effort convenience riding the encrypted messaging state store; they are
     // erased with that state on logout and must never fail or gate any messaging operation.
     override suspend fun composerDraft(chatId: String): String? =
@@ -1666,6 +1826,14 @@ class EncryptedChatRepository @Inject internal constructor(
 
     private val mutableLocalHistoryReady = MutableStateFlow(false)
     override val localHistoryReady: StateFlow<Boolean> = mutableLocalHistoryReady.asStateFlow()
+
+    // Corrections need a live authenticated session to be gated at all: the capability is a fact
+    // about the account, and the local store cannot know it. So this is published only alongside
+    // the message-ready publication and withdrawn with it, which leaves an offline or still
+    // starting app with no edit affordance rather than one that would fail on use.
+    private val mutableMessageEditsAvailable = MutableStateFlow(false)
+    override val messageEditsAvailable: StateFlow<Boolean> =
+        mutableMessageEditsAvailable.asStateFlow()
 
     // Viewer-local pin/mute decoration happens synchronously at the publication edge so the
     // authenticated projection flow stays byte-derived from the encrypted store while readers
@@ -1786,6 +1954,7 @@ class EncryptedChatRepository @Inject internal constructor(
         val mediaType: String,
         val caption: String?,
         val plaintextBytes: Int,
+        val replyToMessageId: String? = null,
     )
 
     private val stagingMedia = MutableStateFlow<List<StagingMedia>>(emptyList())
@@ -1935,7 +2104,12 @@ class EncryptedChatRepository @Inject internal constructor(
                         // blanking the app. A real sign-out never returns, so the retained
                         // plaintext is erased after a short grace that a returning session
                         // cancels via collectLatest.
-                        synchronized(publicationLock) { mutableReadiness.value = false }
+                        synchronized(publicationLock) {
+                            mutableReadiness.value = false
+                            // The chats stay on screen through a lifecycle blip, but the edit
+                            // affordance does not: no session means no capability to prove.
+                            mutableMessageEditsAvailable.value = false
+                        }
                         delay(SIGNED_OUT_CLEAR_GRACE_MILLIS)
                         clearPublishedStateIfCurrent(null)
                         return@collectLatest
@@ -2278,6 +2452,38 @@ class EncryptedChatRepository @Inject internal constructor(
         }
     }
 
+    override suspend fun updateGroupDescription(chatId: String, description: String?) {
+        val canonical = description
+            ?.let(::normalizeMessagingGroupDescription)
+            ?.takeIf(String::isNotEmpty)
+        canonical?.let {
+            require(isValidMessagingGroupDescription(it)) { "That description is too long" }
+        }
+        mutateGroupMembership(chatId) { session ->
+            runtime.updateGroupDescription(session, chatId, canonical)
+        }
+    }
+
+    override suspend fun updateGroupPhoto(chatId: String, jpegBytes: ByteArray) {
+        val uploader = checkNotNull(avatarUploader) {
+            "Group photos are unavailable in this configuration"
+        }
+        // The upload rides the same moderated pipeline as a profile photo — intent, direct
+        // upload, scan, sanitize — and only the resulting clean asset id is offered to the
+        // group. The server then re-checks ownership, management rights and the sanitizer's
+        // proof before anything changes.
+        val assetId = uploader.uploadReadyAvatarAsset(jpegBytes)
+        mutateGroupMembership(chatId) { session ->
+            runtime.attachGroupPhoto(session, chatId, assetId)
+        }
+    }
+
+    override suspend fun removeGroupPhoto(chatId: String) {
+        mutateGroupMembership(chatId) { session ->
+            runtime.removeGroupPhoto(session, chatId)
+        }
+    }
+
     override suspend fun leaveGroupConversation(chatId: String) {
         val session = requireReadySession()
         // A direct chat cannot be left, only deleted, and there is no delete here: leaving one
@@ -2311,6 +2517,7 @@ class EncryptedChatRepository @Inject internal constructor(
     override suspend fun sendMessage(
         chatId: String,
         text: String,
+        replyToMessageId: String?,
         onDurablyCommitted: (clientMessageId: String) -> Unit,
     ) = sendValidatedText(
         chatId = chatId,
@@ -2318,6 +2525,7 @@ class EncryptedChatRepository @Inject internal constructor(
         retryClientMessageId = null,
         authorship = AuthoredContent.USER_TEXT,
         onDurablyCommitted = onDurablyCommitted,
+        replyToMessageId = replyToMessageId,
     )
 
     override suspend fun sendMessageForOwner(
@@ -2334,6 +2542,20 @@ class EncryptedChatRepository @Inject internal constructor(
         expectedOwner = owner,
     )
 
+    override suspend fun sendIdempotentMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        text: String,
+        clientMessageId: String,
+    ) = sendValidatedText(
+        chatId = chatId,
+        text = text,
+        retryClientMessageId = null,
+        authorship = AuthoredContent.USER_TEXT,
+        expectedOwner = owner,
+        idempotentClientMessageId = clientMessageId,
+    )
+
     override suspend fun sendPaymentEvent(
         chatId: String,
         descriptor: String,
@@ -2343,6 +2565,18 @@ class EncryptedChatRepository @Inject internal constructor(
         text = descriptor,
         retryClientMessageId = null,
         authorship = AuthoredContent.PAYMENT_EVENT,
+        onDurablyCommitted = onDurablyCommitted,
+    )
+
+    override suspend fun sendGroupPaymentEvent(
+        chatId: String,
+        descriptor: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit,
+    ) = sendValidatedText(
+        chatId = chatId,
+        text = descriptor,
+        retryClientMessageId = null,
+        authorship = AuthoredContent.GROUP_PAYMENT_EVENT,
         onDurablyCommitted = onDurablyCommitted,
     )
 
@@ -2423,8 +2657,59 @@ class EncryptedChatRepository @Inject internal constructor(
         )
     }
 
+    override suspend fun editMessage(chatId: String, messageId: String, text: String) {
+        // Refuse before anything is parked in the offline queue. The send path checks the roster
+        // too, but by then the correction is already durable, and a queued edit the account was
+        // never entitled to send would only be retired later with nothing to show for it.
+        if (!mutableMessageEditsAvailable.value) {
+            throw SecureMessagingConversationCapabilityUnavailableException(
+                "Encrypted message edits are not enabled",
+            )
+        }
+        val current = conversation(chatId).value.firstOrNull { it.id == messageId }
+        // Correcting a message this device has not authenticated locally would send a descriptor
+        // pointing at nothing the peer can resolve back to a bubble.
+        requireNotNull(current) { "That message is no longer in this conversation" }
+        require(current.fromMe) { "Only your own messages can be edited" }
+        val normalized = text.trim()
+        require(current.acceptsEdits(clock.instant().toEpochMilli())) {
+            "This message is too old to edit"
+        }
+        require(normalized != current.text) { "That is the same wording" }
+        require(KitEditMessage.isAcceptableBody(normalized)) {
+            "Enter the wording you meant to send"
+        }
+        sendValidatedText(
+            chatId = chatId,
+            text = KitEditMessage(targetMessageId = messageId, body = normalized).encode(),
+            retryClientMessageId = null,
+            authorship = AuthoredContent.EDIT,
+        )
+    }
+
+    /**
+     * Checks a chosen reply target against this device's own view of the thread.
+     *
+     * A reply pins an ID the peer has to be able to resolve back to a bubble. Sending one that
+     * names a message this device never authenticated — or one still waiting in the outbox under a
+     * client ID the server has not replaced yet — would arrive as an answer to nothing.
+     */
+    private fun resolvedReplyTarget(chatId: String, replyToMessageId: String?): String? {
+        val target = replyToMessageId?.trim()?.takeIf(String::isNotEmpty) ?: return null
+        val current = conversation(chatId).value.firstOrNull { it.id == target }
+        requireNotNull(current) { "That message is no longer in this conversation" }
+        require(current.acceptsReplies) { "That message cannot be replied to yet" }
+        return target
+    }
+
     /** Which caller produced the authenticated text, and therefore which rules validate it. */
-    private enum class AuthoredContent { USER_TEXT, PAYMENT_EVENT, REACTION }
+    private enum class AuthoredContent {
+        USER_TEXT,
+        PAYMENT_EVENT,
+        GROUP_PAYMENT_EVENT,
+        REACTION,
+        EDIT,
+    }
 
     private suspend fun sendValidatedText(
         chatId: String,
@@ -2433,6 +2718,8 @@ class EncryptedChatRepository @Inject internal constructor(
         authorship: AuthoredContent,
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
         expectedOwner: SessionFence? = null,
+        replyToMessageId: String? = null,
+        idempotentClientMessageId: String? = null,
     ) {
         val normalized = text.trim()
         require(normalized.isNotEmpty()) { "Enter a message to send securely" }
@@ -2440,35 +2727,56 @@ class EncryptedChatRepository @Inject internal constructor(
             AuthoredContent.PAYMENT_EVENT -> require(KitPaymentMessage.parse(normalized) != null) {
                 "Kit Pay could not validate this payment event"
             }
+            AuthoredContent.GROUP_PAYMENT_EVENT ->
+                require(KitGroupPaymentMessage.parse(normalized) != null) {
+                    "Kit Pay could not validate this group payment event"
+                }
             AuthoredContent.REACTION -> require(KitReactionMessage.parse(normalized) != null) {
                 "Kit Pay could not validate this reaction"
             }
-            AuthoredContent.USER_TEXT -> require(
-                KitPaymentMessage.allowsUserAuthoredText(normalized) &&
-                    !KitReactionMessage.beginsWithReservedPrefix(normalized),
-            ) {
+            AuthoredContent.EDIT -> require(KitEditMessage.parse(normalized) != null) {
+                "Kit Pay could not validate this edit"
+            }
+            AuthoredContent.USER_TEXT -> require(KitUserAuthoredTextPolicy.allows(normalized)) {
                 "Messages cannot start with one of Kit Pay's reserved prefixes"
             }
         }
+        val replyTarget = resolvedReplyTarget(chatId, replyToMessageId)
         val queue = immediateSends
         val owner = expectedOwner ?: authenticationSessions?.current()?.fence()
+        require(retryClientMessageId == null || idempotentClientMessageId == null) {
+            "A secure send cannot be both an explicit retry and an idempotent enqueue"
+        }
+        idempotentClientMessageId?.let {
+            require(ImmediateSendIntent.CANONICAL_UUID.matches(it)) {
+                "Invalid idempotent secure-message ID"
+            }
+        }
         if (retryClientMessageId == null && queue != null && owner != null) {
             if (authenticationSessions?.current()?.fence() != owner) {
                 throw SessionInvalidatedException()
             }
             check(chat(chatId) != null) { "The secure conversation is no longer available" }
             val intent = ImmediateSendIntent(
-                id = UUID.randomUUID().toString(),
+                id = idempotentClientMessageId ?: UUID.randomUUID().toString(),
                 conversationId = chatId,
                 kind = when (authorship) {
                     AuthoredContent.USER_TEXT -> ImmediateSendKind.TEXT
                     AuthoredContent.PAYMENT_EVENT -> ImmediateSendKind.PAYMENT_EVENT
+                    AuthoredContent.GROUP_PAYMENT_EVENT ->
+                        ImmediateSendKind.GROUP_PAYMENT_EVENT
                     AuthoredContent.REACTION -> ImmediateSendKind.REACTION
+                    AuthoredContent.EDIT -> ImmediateSendKind.EDIT
                 },
                 createdAtEpochMillis = clock.instant().toEpochMilli(),
                 text = normalized,
+                replyToMessageId = replyTarget,
             )
-            queue.enqueueForOwner(owner, intent)
+            if (idempotentClientMessageId == null) {
+                queue.enqueueForOwner(owner, intent)
+            } else {
+                queue.enqueueIdempotentForOwner(owner, intent)
+            }
             onDurablyCommitted(intent.id)
             immediateSendScheduler?.schedule()
             return
@@ -2486,29 +2794,76 @@ class EncryptedChatRepository @Inject internal constructor(
                 conversationId = chatId,
                 text = normalized,
                 retryClientMessageId = retryClientMessageId,
-                replyToMessageId = if (authorship == AuthoredContent.REACTION) {
-                    checkNotNull(KitReactionMessage.parse(normalized)).targetMessageId
-                } else {
-                    null
+                // A reaction and an edit each carry their own target inside the descriptor the
+                // peer authenticates them against; the envelope must name that same message.
+                replyToMessageId = when (authorship) {
+                    AuthoredContent.REACTION ->
+                        checkNotNull(KitReactionMessage.parse(normalized)).targetMessageId
+                    AuthoredContent.EDIT ->
+                        checkNotNull(KitEditMessage.parse(normalized)).targetMessageId
+                    else -> replyTarget
                 },
                 onDurablyCommitted = onDurablyCommitted,
                 expectedOwner = expectedOwner,
+                idempotentClientMessageId = idempotentClientMessageId,
             )
         } finally {
             refresh(session, contacts.contacts.value)
         }
     }
 
-    override suspend fun sendImageMessage(
+    override suspend fun sendMediaMessage(
         chatId: String,
-        bytes: ByteArray,
+        source: SecureMediaSource,
         mediaType: String,
         caption: String?,
+        replyToMessageId: String?,
+    ) = sendMediaMessageInternal(
+        chatId = chatId,
+        source = source,
+        mediaType = mediaType,
+        caption = caption,
+        replyToMessageId = replyToMessageId,
+        expectedOwner = null,
+        idempotentClientMessageId = null,
+    )
+
+    override suspend fun sendIdempotentMediaMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        source: SecureMediaSource,
+        mediaType: String,
+        clientMessageId: String,
+        caption: String?,
+    ) = idempotentMediaSendMutex.withLock {
+        sendMediaMessageInternal(
+            chatId = chatId,
+            source = source,
+            mediaType = mediaType,
+            caption = caption,
+            replyToMessageId = null,
+            expectedOwner = owner,
+            idempotentClientMessageId = clientMessageId,
+        )
+    }
+
+    private suspend fun sendMediaMessageInternal(
+        chatId: String,
+        source: SecureMediaSource,
+        mediaType: String,
+        caption: String?,
+        replyToMessageId: String?,
+        expectedOwner: SessionFence?,
+        idempotentClientMessageId: String?,
     ) {
         val queue = immediateSends
         val spool = immediateMediaSpool
-        val owner = authenticationSessions?.current()?.fence()
+        val owner = expectedOwner ?: authenticationSessions?.current()?.fence()
+        val replyTarget = resolvedReplyTarget(chatId, replyToMessageId)
         if (queue != null && spool != null && owner != null) {
+            if (authenticationSessions?.current()?.fence() != owner) {
+                throw SessionInvalidatedException()
+            }
             check(chat(chatId) != null) { "The secure conversation is no longer available" }
             val normalizedMediaType = requireNotNull(KitMediaMessage.normalizeMediaType(mediaType)) {
                 "Choose a supported photo, voice note, video or document"
@@ -2519,7 +2874,29 @@ class EncryptedChatRepository @Inject internal constructor(
                     normalizedCaption.toByteArray(Charsets.UTF_8).size <=
                     ImmediateSendIntent.MAX_CAPTION_UTF8_BYTES,
             ) { "Queued media caption is too large" }
-            val id = UUID.randomUUID().toString()
+            idempotentClientMessageId?.let {
+                require(ImmediateSendIntent.CANONICAL_UUID.matches(it)) {
+                    "Invalid idempotent secure-media ID"
+                }
+            }
+            val id = idempotentClientMessageId ?: UUID.randomUUID().toString()
+            if (idempotentClientMessageId != null) {
+                queue.findForOwner(owner, id)?.let { existing ->
+                    check(
+                        existing.kind == ImmediateSendKind.MEDIA &&
+                            existing.conversationId == chatId &&
+                            existing.mediaType == normalizedMediaType &&
+                            existing.caption == normalizedCaption &&
+                            existing.replyToMessageId == replyTarget &&
+                            existing.mediaPlaintextBytes.toLong() == source.declaredByteCount,
+                    ) { "An immediate-send identity belongs to different media" }
+                    if (existing.state == ImmediateSendState.RETRY_REQUIRED) {
+                        queue.rearmForOwner(owner, existing.id)
+                    }
+                    immediateSendScheduler?.schedule()
+                    return
+                }
+            }
             val createdAt = clock.instant().toEpochMilli()
             stagingMedia.update { current ->
                 current + StagingMedia(
@@ -2529,26 +2906,31 @@ class EncryptedChatRepository @Inject internal constructor(
                     createdAtEpochMillis = createdAt,
                     mediaType = normalizedMediaType,
                     caption = normalizedCaption,
-                    plaintextBytes = bytes.size,
+                    plaintextBytes = source.declaredByteCount
+                        .coerceIn(0L, MAX_IMAGE_PLAINTEXT_BYTES.toLong()).toInt(),
+                    replyToMessageId = replyTarget,
                 )
             }
             try {
-                val material = spool.stage(id, bytes)
-                queue.enqueueForOwner(
-                    owner,
-                    ImmediateSendIntent(
-                        id = id,
-                        conversationId = chatId,
-                        kind = ImmediateSendKind.MEDIA,
-                        createdAtEpochMillis = createdAt,
-                        mediaType = normalizedMediaType,
-                        caption = normalizedCaption,
-                        mediaPlaintextBytes = material.plaintextBytes,
-                        mediaCiphertextBytes = material.ciphertextBytes,
-                        mediaKeyBase64 = material.keyBase64,
-                        mediaSha256Base64 = material.sha256Base64,
-                    ),
+                val material = spool.stage(id, source)
+                val intent = ImmediateSendIntent(
+                    id = id,
+                    conversationId = chatId,
+                    kind = ImmediateSendKind.MEDIA,
+                    createdAtEpochMillis = createdAt,
+                    mediaType = normalizedMediaType,
+                    caption = normalizedCaption,
+                    mediaPlaintextBytes = material.plaintextBytes,
+                    mediaCiphertextBytes = material.ciphertextBytes,
+                    mediaKeyBase64 = material.keyBase64,
+                    mediaSha256Base64 = material.sha256Base64,
+                    replyToMessageId = replyTarget,
                 )
+                if (idempotentClientMessageId == null) {
+                    queue.enqueueForOwner(owner, intent)
+                } else {
+                    queue.enqueueIdempotentForOwner(owner, intent)
+                }
             } catch (error: Throwable) {
                 spool.discard(id)
                 throw error
@@ -2558,15 +2940,21 @@ class EncryptedChatRepository @Inject internal constructor(
             immediateSendScheduler?.schedule()
             return
         }
+        check(idempotentClientMessageId == null && expectedOwner == null) {
+            "The durable secure-media outbox is unavailable"
+        }
         val session = requireReadySession()
         try {
-            runtime.sendImage(session, chatId, bytes, mediaType, caption)
+            runtime.sendImage(session, chatId, source, mediaType, caption)
         } finally {
             refresh(session, contacts.contacts.value)
         }
     }
 
-    override suspend fun openImageMessage(chatId: String, mediaDescriptor: String): ByteArray {
+    override suspend fun openImageMessage(
+        chatId: String,
+        mediaDescriptor: String,
+    ): SecureMediaFile {
         if (mediaDescriptor.startsWith(LOCAL_MEDIA_DESCRIPTOR_PREFIX)) {
             val id = mediaDescriptor.removePrefix(LOCAL_MEDIA_DESCRIPTOR_PREFIX)
             val intent = immediateSends?.find(id)
@@ -2580,26 +2968,46 @@ class EncryptedChatRepository @Inject internal constructor(
             check(intent != null && intent.conversationId == chatId && intent.kind == ImmediateSendKind.MEDIA) {
                 "The queued secure attachment is no longer available"
             }
-            val ciphertext = checkNotNull(immediateMediaSpool).readCiphertext(intent)
-            val key = intent.mediaKeyMaterial()
-            val digest = intent.mediaSha256()
-            return try {
-                MediaAttachmentCipher.decrypt(ciphertext, key, digest)
-            } finally {
-                ciphertext.fill(0)
-                key.fill(0)
-                digest.fill(0)
+            val mediaType = checkNotNull(intent.mediaType)
+            val cache = requireSecureMediaCache()
+            cache.cached(mediaDescriptor, mediaType)?.let { return it }
+            val ciphertext = checkNotNull(immediateMediaSpool).ciphertextFile(intent)
+            return cache.store(mediaDescriptor, mediaType) { destination ->
+                val key = intent.mediaKeyMaterial()
+                val digest = intent.mediaSha256()
+                try {
+                    destination.outputStream().buffered().use { output ->
+                        MediaAttachmentStreamCipher.decrypt(ciphertext, key, digest, output)
+                    }
+                } finally {
+                    key.fill(0)
+                    digest.fill(0)
+                }
             }
         }
+        val mediaType = requireNotNull(KitMediaMessage.parse(mediaDescriptor)?.mediaType) {
+            "This message does not reference readable secure media"
+        }
+        val cache = requireSecureMediaCache()
+        cache.cached(mediaDescriptor, mediaType)?.let { return it }
         val session = requireReadySession()
-        return runtime.openMedia(session, chatId, mediaDescriptor)
+        return cache.store(mediaDescriptor, mediaType) { destination ->
+            runtime.openMediaToFile(session, chatId, mediaDescriptor, destination)
+        }
+    }
+
+    // Asked for only once the descriptor has been judged openable at all. A missing cache is a
+    // wiring fault, and reporting it ahead of "still being prepared" would hide the real answer
+    // behind an internal one.
+    private fun requireSecureMediaCache(): SecureMediaCache = checkNotNull(secureMediaCache) {
+        "This chat repository does not support secure media messages"
     }
 
     /** Worker-only upload step; money/media selection never passes through this boundary. */
     internal suspend fun prepareImmediateMediaDescriptor(
         owner: SessionFence,
         intent: ImmediateSendIntent,
-        ciphertext: ByteArray,
+        ciphertext: File,
     ): String {
         require(intent.kind == ImmediateSendKind.MEDIA && intent.preparedMediaDescriptor == null)
         val session = requireReadySession()
@@ -2638,10 +3046,12 @@ class EncryptedChatRepository @Inject internal constructor(
                 session = session,
                 conversationId = intent.conversationId,
                 text = text,
-                replyToMessageId = if (intent.kind == ImmediateSendKind.REACTION) {
-                    checkNotNull(KitReactionMessage.parse(text)).targetMessageId
-                } else {
-                    null
+                replyToMessageId = when (intent.kind) {
+                    ImmediateSendKind.REACTION ->
+                        checkNotNull(KitReactionMessage.parse(text)).targetMessageId
+                    ImmediateSendKind.EDIT ->
+                        checkNotNull(KitEditMessage.parse(text)).targetMessageId
+                    else -> intent.replyToMessageId
                 },
                 onDurablyCommitted = { onDurablyCommitted() },
                 expectedOwner = owner,
@@ -2656,6 +3066,41 @@ class EncryptedChatRepository @Inject internal constructor(
         val session = requireReadySession()
         runtime.markConversationRead(session, chatId)
         refresh(session, contacts.contacts.value)
+    }
+
+    override suspend fun messageDeliveryInfo(
+        chatId: String,
+        messageId: String,
+    ): MessageDeliveryInfo {
+        val session = requireReadySession()
+        // Refused here as well as by the server, so a screen that should never have offered the
+        // question gets a local no rather than a 403 it would have to translate.
+        val sentFromHere = conversation(chatId).value.any {
+            it.id == messageId && it.acceptsDeliveryInfo
+        }
+        check(sentFromHere) { "Only the person who sent a message can see what became of it" }
+        val validated = runtime.messageDeliveryInfo(session, chatId, messageId)
+        val members = synchronized(conversationLock) { rawMembers.value[chatId].orEmpty() }
+        val addressBook = contacts.contacts.value
+        return MessageDeliveryInfo(
+            messageId = validated.messageId,
+            sentAtEpochMillis = validated.sentAt.toEpochMilli(),
+            recipients = validated.recipients.map { recipient ->
+                val member = members.firstOrNull { it.userId.equals(recipient.userId, true) }
+                val contact = addressBook.firstOrNull { it.id.equals(recipient.userId, true) }
+                MessageDeliveryPerson(
+                    userId = recipient.userId,
+                    // This phone's own name for somebody first: a group can contain people who
+                    // were never saved here, and only then is the server's name worth showing.
+                    name = contact?.name?.takeIf(String::isNotBlank)
+                        ?: member?.name?.takeIf(String::isNotBlank)
+                        ?: recipient.name,
+                    avatarUrl = member?.avatarUrl ?: contact?.avatarUrl,
+                    deliveredAtEpochMillis = recipient.deliveredAt?.toEpochMilli() ?: 0,
+                    readAtEpochMillis = recipient.readAt?.toEpochMilli() ?: 0,
+                )
+            },
+        )
     }
 
     override suspend fun synchronizeConversation(chatId: String) {
@@ -2784,6 +3229,7 @@ class EncryptedChatRepository @Inject internal constructor(
                         ImmediateSendState.RETRY_REQUIRED ->
                             AuthenticatedTextDeliveryState.RETRY_REQUIRED
                     },
+                    replyToMessageId = intent.replyToMessageId,
                 )
             }
         }
@@ -2838,11 +3284,17 @@ class EncryptedChatRepository @Inject internal constructor(
                     conversation?.displayNameOf(senderUserId) ?: DEFAULT_PEER_NAME
                 },
             )
-            val bubbles = ordered.filterNot { KitReactionMessage.isReactionText(it.text) }
+            val edits = foldAuthenticatedEdits(ordered)
+            val bubbles = ordered
+                .filterNot {
+                    KitReactionMessage.isReactionText(it.text) ||
+                        KitEditMessage.isEditText(it.text)
+                }
                 .map { projected ->
                     toUiMessage(
                         projected = projected,
                         reactions = reactions[projected.messageId].orEmpty(),
+                        edit = edits[projected.messageId],
                         // Only a group needs an author label on the bubble; a direct chat's
                         // sender is already the person named at the top of the screen.
                         senderName = conversation
@@ -2879,10 +3331,17 @@ class EncryptedChatRepository @Inject internal constructor(
             }.orEmpty()
             // sortedBy is stable, so the authenticated bubbles keep their order exactly and a
             // notice slots in after anything sent in the same millisecond.
-            (bubbles + localMedia + preparingMedia + notices).sortedBy { it.sortEpochMillis }
+            MessageReplyQuotes.resolve(
+                (bubbles + localMedia + preparingMedia + notices).sortedBy { it.sortEpochMillis },
+            )
         }
+        // Neither a reaction nor a correction is a bubble, a chat preview or an unread of its
+        // own: both are annotations on something already in the thread.
         val projectedByConversation = orderedByConversation.mapValues { (_, ordered) ->
-            ordered.filterNot { KitReactionMessage.isReactionText(it.text) }
+            ordered.filterNot {
+                KitReactionMessage.isReactionText(it.text) ||
+                    KitEditMessage.isEditText(it.text)
+            }
         }
         val latestByConversation = messageLists.mapValues { (_, messages) ->
             messages.lastOrNull { it.kind != MessageKind.SYSTEM }
@@ -2925,9 +3384,14 @@ class EncryptedChatRepository @Inject internal constructor(
                 isGroup = conversation.isGroup,
                 lastFromMe = last?.fromMe == true,
                 lastState = last?.state ?: DeliveryState.READ,
-                // A group has no photo to show: the app never uploads one, and borrowing a
-                // member's avatar would misname the chat.
-                avatarUrl = conversation.peerUserId?.let { avatarsByUser[it.lowercase()] },
+                // A group shows its own photo, never a member's: borrowing an avatar would
+                // misname the chat. A direct chat shows the peer, address book first.
+                avatarUrl = if (conversation.isGroup) {
+                    conversation.photoUrl
+                } else {
+                    conversation.peerUserId?.let { avatarsByUser[it.lowercase()] }
+                },
+                description = conversation.description,
             )
         }
         // Participant lists are ordered the way the group reads them: whoever can act on the
@@ -2987,6 +3451,7 @@ class EncryptedChatRepository @Inject internal constructor(
         // rather than cleared, so nothing blanks between the two.
         publishedLocalActivation = null
         publishedSession = session
+        mutableMessageEditsAvailable.value = session.messageEditsEnabled
         // Publish readiness last: observing true implies this activation's chats/messages were
         // already committed under the same repository publication lock.
         mutableReadiness.value = true
@@ -3041,15 +3506,27 @@ class EncryptedChatRepository @Inject internal constructor(
         projected: AuthenticatedProjectedText,
         reactions: List<MessageReaction>,
         senderName: String? = null,
+        edit: AuthenticatedMessageEdit? = null,
     ): Message {
         val media = KitMediaMessage.parse(projected.text)
         val mediaKind = media?.let { KitChatMediaKind.fromMediaType(it.mediaType) }
         val payment = if (media == null) KitPaymentMessage.parse(projected.text) else null
+        val groupPayment = if (media == null && payment == null) {
+            KitGroupPaymentMessage.parse(projected.text)
+        } else {
+            null
+        }
         return Message(
             id = projected.messageId,
             text = when {
+                // A correction replaces the visible wording and nothing else: a photo stays the
+                // photo it was, and only the caption under it reads differently.
+                edit != null && payment == null && groupPayment == null -> edit.text
                 media != null -> media.caption ?: mediaKind!!.previewLabel
                 payment != null -> payment.note.orEmpty()
+                // The announcement's own line is built in the chat, where the members' names are
+                // known; the note is all of it that survives this layer.
+                groupPayment != null -> groupPayment.note.orEmpty()
                 else -> projected.text
             },
             time = formatChatTime(projected.sentAt),
@@ -3062,11 +3539,16 @@ class EncryptedChatRepository @Inject internal constructor(
                 mediaKind == KitChatMediaKind.VIDEO -> MessageKind.VIDEO
                 mediaKind == KitChatMediaKind.DOCUMENT -> MessageKind.DOCUMENT
                 mediaKind == KitChatMediaKind.IMAGE -> MessageKind.IMAGE
+                groupPayment != null -> groupPayment.action.toMessageKind()
                 payment == null -> MessageKind.TEXT
                 else -> payment.action.toMessageKind()
             },
             // The opaque authenticated descriptor; the UI passes it back for follow-up actions.
-            mediaDescriptor = if (media != null || payment != null) projected.text else null,
+            mediaDescriptor = if (media != null || payment != null || groupPayment != null) {
+                projected.text
+            } else {
+                null
+            },
             mediaType = media?.mediaType,
             mediaPlaintextBytes = media?.plaintextByteSize ?: 0,
             amountMinor = when {
@@ -3080,8 +3562,12 @@ class EncryptedChatRepository @Inject internal constructor(
             paymentReason = payment?.reason,
             paymentCurrencyCode = payment?.currencyCode ?: "UGX",
             paymentCurrencyScale = payment?.currencyScale ?: com.kit.wallet.ui.model.Money.SCALE,
+            groupPaymentId = groupPayment?.groupPaymentId,
+            groupPaymentEvent = groupPayment?.action?.toGroupPaymentEventKind(),
             sortEpochMillis = projected.sentAt.toEpochMilli(),
             reactions = reactions,
+            replyToMessageId = projected.replyToMessageId,
+            editedAtEpochMillis = edit?.editedAtEpochMillis ?: 0L,
         )
     }
 
@@ -3107,6 +3593,7 @@ class EncryptedChatRepository @Inject internal constructor(
             mediaType = mediaType,
             mediaPlaintextBytes = intent.mediaPlaintextBytes,
             sortEpochMillis = intent.createdAtEpochMillis,
+            replyToMessageId = intent.replyToMessageId,
         )
     }
 
@@ -3133,6 +3620,7 @@ class EncryptedChatRepository @Inject internal constructor(
             mediaType = staging.mediaType,
             mediaPlaintextBytes = staging.plaintextBytes,
             sortEpochMillis = staging.createdAtEpochMillis,
+            replyToMessageId = staging.replyToMessageId,
         )
     }
 
@@ -3148,6 +3636,10 @@ class EncryptedChatRepository @Inject internal constructor(
         MessageKind.PAYMENT_TRANSFER,
         MessageKind.PAYMENT_EVENT,
         -> mediaDescriptor?.let(KitPaymentMessage::parse)?.previewLabel() ?: "💸 Payment"
+        // A group payment's own words are the announcement, which needs names this layer has not
+        // resolved. The chat list says what happened without pretending to know who to.
+        MessageKind.GROUP_PAYMENT -> "💛 Group payment"
+        MessageKind.GROUP_PAYMENT_EVENT -> "💛 Group payment update"
         else -> text
     }
 
@@ -3181,6 +3673,22 @@ class EncryptedChatRepository @Inject internal constructor(
         KitPaymentAction.EXPIRED,
         -> MessageKind.PAYMENT_EVENT
     }
+
+    private fun KitGroupPaymentAction.toMessageKind(): MessageKind = when (this) {
+        KitGroupPaymentAction.SENT -> MessageKind.GROUP_PAYMENT
+        KitGroupPaymentAction.ACCEPTED,
+        KitGroupPaymentAction.REJECTED,
+        KitGroupPaymentAction.RETURNED,
+        -> MessageKind.GROUP_PAYMENT_EVENT
+    }
+
+    private fun KitGroupPaymentAction.toGroupPaymentEventKind(): GroupPaymentEventKind =
+        when (this) {
+            KitGroupPaymentAction.SENT -> GroupPaymentEventKind.ANNOUNCED
+            KitGroupPaymentAction.ACCEPTED -> GroupPaymentEventKind.ACCEPTED
+            KitGroupPaymentAction.REJECTED -> GroupPaymentEventKind.REJECTED
+            KitGroupPaymentAction.RETURNED -> GroupPaymentEventKind.RETURNED
+        }
 
     private fun KitPaymentAction.toPaymentEventKind(): PaymentEventKind = when (this) {
         KitPaymentAction.REQUEST -> PaymentEventKind.REQUESTED
@@ -3238,6 +3746,7 @@ class EncryptedChatRepository @Inject internal constructor(
     private fun clearPublishedStateLocked(owner: SecureMessagingChatSession?) {
         mutableReadiness.value = false
         mutableLocalHistoryReady.value = false
+        mutableMessageEditsAvailable.value = false
         publishedSession = owner
         publishedLocalActivation = null
         publishChats(emptyList())

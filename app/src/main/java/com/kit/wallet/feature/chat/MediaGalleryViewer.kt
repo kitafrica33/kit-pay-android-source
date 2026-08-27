@@ -64,6 +64,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
+import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.data.messaging.chatMediaFileExtension
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
@@ -93,15 +94,15 @@ internal fun reportCurrentGalleryMessage(
 /**
  * WhatsApp-style connected full-screen gallery over the conversation's media messages:
  * open on the tapped item, swipe left/right through the rest, pinch/pan/double-tap zoom
- * for photos, inline playback for videos, and share/save actions. Decrypted bytes come
- * from the conversation's bounded in-memory media cache; adjacent pages load on demand.
+ * for photos, inline playback for videos, and share/save actions. Each page reads the opened
+ * attachment from the conversation's bounded on-disk cache; adjacent pages load on demand.
  */
 @Composable
 internal fun ConversationMediaGallery(
     chatName: String,
     mediaMessages: List<Message>,
     initialMessageId: String,
-    mediaBytes: Map<String, ByteArray>,
+    mediaFiles: Map<String, SecureMediaFile>,
     mediaLoading: Set<String>,
     mediaErrors: Map<String, String>,
     onLoad: (Message) -> Unit,
@@ -137,7 +138,7 @@ internal fun ConversationMediaGallery(
             .map(mediaMessages::get)
             .forEach { message ->
                 if (
-                    !mediaBytes.containsKey(message.id) &&
+                    mediaFiles[message.id]?.exists != true &&
                     message.id !in mediaLoading &&
                     !mediaErrors.containsKey(message.id)
                 ) {
@@ -161,12 +162,12 @@ internal fun ConversationMediaGallery(
                 modifier = Modifier.fillMaxSize(),
             ) { page ->
                 val message = mediaMessages[page]
-                val bytes = mediaBytes[message.id]
+                val media = mediaFiles[message.id]
                 when {
-                    bytes != null && message.kind == MessageKind.IMAGE ->
-                        ZoomableGalleryImage(messageId = message.id, bytes = bytes)
-                    bytes != null && message.kind == MessageKind.VIDEO ->
-                        GalleryVideoPage(message = message, bytes = bytes)
+                    media != null && message.kind == MessageKind.IMAGE ->
+                        ZoomableGalleryImage(messageId = message.id, media = media)
+                    media != null && message.kind == MessageKind.VIDEO ->
+                        GalleryVideoPage(message = message, media = media)
                     mediaErrors.containsKey(message.id) -> GalleryStatePage(
                         text = mediaErrors[message.id] ?: "This media could not be loaded",
                         actionLabel = "Tap to retry",
@@ -207,7 +208,7 @@ internal fun ConversationMediaGallery(
                     )
                 }
                 val current = mediaMessages.getOrNull(pagerState.currentPage)
-                val currentBytes = current?.let { mediaBytes[it.id] }
+                val currentMedia = current?.let { mediaFiles[it.id] }
                 if (current != null && current.id in reportableMessageIds) {
                     IconButton(
                         onClick = {
@@ -227,12 +228,12 @@ internal fun ConversationMediaGallery(
                     }
                 }
                 IconButton(
-                    enabled = currentBytes != null,
+                    enabled = currentMedia != null,
                     onClick = {
                         val message = current ?: return@IconButton
-                        val bytes = currentBytes ?: return@IconButton
+                        val media = currentMedia ?: return@IconButton
                         actionNotice = runCatching {
-                            shareGalleryMedia(context, message, bytes)
+                            shareGalleryMedia(context, message, media.file)
                             null
                         }.getOrElse { "This media could not be shared" }
                     },
@@ -240,16 +241,16 @@ internal fun ConversationMediaGallery(
                     Icon(
                         Icons.Rounded.Share,
                         contentDescription = "Share",
-                        tint = Color.White.copy(alpha = if (currentBytes != null) 1f else 0.4f),
+                        tint = Color.White.copy(alpha = if (currentMedia != null) 1f else 0.4f),
                     )
                 }
                 IconButton(
-                    enabled = currentBytes != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
+                    enabled = currentMedia != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
                     onClick = {
                         val message = current ?: return@IconButton
-                        val bytes = currentBytes ?: return@IconButton
+                        val media = currentMedia ?: return@IconButton
                         actionNotice = runCatching {
-                            saveGalleryMedia(context, message, bytes)
+                            saveGalleryMedia(context, message, media.file)
                             "Saved to your gallery"
                         }.getOrElse { "This media could not be saved" }
                     },
@@ -259,7 +260,7 @@ internal fun ConversationMediaGallery(
                         contentDescription = "Save",
                         tint = Color.White.copy(
                             alpha = if (
-                                currentBytes != null &&
+                                currentMedia != null &&
                                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
                             ) {
                                 1f
@@ -383,11 +384,9 @@ internal fun ConversationMediaGallery(
 
 /** Pinch, pan and double-tap zoom for one decrypted photo, clamped to sensible bounds. */
 @Composable
-private fun ZoomableGalleryImage(messageId: String, bytes: ByteArray) {
+private fun ZoomableGalleryImage(messageId: String, media: SecureMediaFile) {
     val bitmap by produceState<ImageBitmap?>(initialValue = null, messageId) {
-        value = withOwnedSecureMediaSnapshot(bytes) { owned ->
-            withContext(Dispatchers.Default) { decodeBoundedSecureImage(owned) }
-        }
+        value = withContext(Dispatchers.Default) { decodeBoundedSecureImage(media.file) }
     }
     var scale by remember(messageId) { mutableFloatStateOf(1f) }
     var offset by remember(messageId) { mutableStateOf(Offset.Zero) }
@@ -441,17 +440,17 @@ private fun ZoomableGalleryImage(messageId: String, bytes: ByteArray) {
 
 /** Full-screen playback for one decrypted video from a private temp file, cleaned on leave. */
 @Composable
-private fun GalleryVideoPage(message: Message, bytes: ByteArray) {
+private fun GalleryVideoPage(message: Message, media: SecureMediaFile) {
     val context = LocalContext.current
     var playing by remember(message.id) { mutableStateOf(false) }
+    // A video the user started is theirs until it ends: leaving Kit Pay hands it to the system's
+    // floating window instead of cutting it off, and the window goes when the video does.
+    ChatVideoPictureInPictureEffect(isPlaying = playing)
     if (!playing) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             val poster by produceState<ImageBitmap?>(initialValue = null, message.id) {
-                value = withOwnedSecureMediaSnapshot(bytes) { owned ->
-                    withContext(Dispatchers.Default) {
-                        videoPosterFrame(context, owned, message.mediaType ?: "video/mp4")
-                            ?.asImageBitmap()
-                    }
+                value = withContext(Dispatchers.Default) {
+                    videoPosterFrame(media.file)?.asImageBitmap()
                 }
             }
             poster?.let {
@@ -466,7 +465,13 @@ private fun GalleryVideoPage(message: Message, bytes: ByteArray) {
                 Modifier
                     .size(64.dp)
                     .background(Color.Black.copy(alpha = 0.5f), CircleShape)
-                    .pointerInput(message.id) { detectTapGestures { playing = true } },
+                    .pointerInput(message.id) {
+                        detectTapGestures {
+                            // Two things must never share the audio route.
+                            VoiceNotePlayer.stop()
+                            playing = true
+                        }
+                    },
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
@@ -481,7 +486,7 @@ private fun GalleryVideoPage(message: Message, bytes: ByteArray) {
         val file = remember(message.id) {
             writeChatMediaTempFile(
                 context = context,
-                plaintext = bytes,
+                source = media.file,
                 mediaType = message.mediaType ?: "video/mp4",
                 displayName = null,
             )
@@ -497,6 +502,12 @@ private fun GalleryVideoPage(message: Message, bytes: ByteArray) {
                         it.setAnchorView(this)
                     })
                     setOnPreparedListener { player -> player.start() }
+                    // The end of the video is the end of the floating window.
+                    setOnCompletionListener { playing = false }
+                    setOnErrorListener { _, _, _ ->
+                        playing = false
+                        false
+                    }
                 }
             },
             modifier = Modifier.fillMaxSize(),
@@ -532,11 +543,11 @@ private fun GalleryStatePage(text: String?, actionLabel: String?, onAction: () -
 private fun shareGalleryMedia(
     context: android.content.Context,
     message: Message,
-    bytes: ByteArray,
+    source: File,
 ) {
     val mediaType = message.mediaType
         ?: if (message.kind == MessageKind.VIDEO) "video/mp4" else "image/jpeg"
-    val file = writeChatMediaTempFile(context, bytes, mediaType, displayName = null)
+    val file = writeChatMediaTempFile(context, source, mediaType, displayName = null)
     val uri = FileProvider.getUriForFile(context, "${context.packageName}.chatmedia", file)
     context.startActivity(
         Intent.createChooser(
@@ -553,7 +564,7 @@ private fun shareGalleryMedia(
 private fun saveGalleryMedia(
     context: android.content.Context,
     message: Message,
-    bytes: ByteArray,
+    source: File,
 ) {
     check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) { "Saving requires Android 10" }
     val mediaType = message.mediaType
@@ -575,8 +586,10 @@ private fun saveGalleryMedia(
     val uri = checkNotNull(context.contentResolver.insert(collection, values)) {
         "The gallery did not accept this media"
     }
-    context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-        ?: error("The gallery entry could not be written")
+    // Streamed, not written in one go: a saved video is as large as the wire now allows.
+    context.contentResolver.openOutputStream(uri)?.use { output ->
+        source.inputStream().use { input -> input.copyTo(output) }
+    } ?: error("The gallery entry could not be written")
 }
 
 /** Cleans stale decrypted temp files left behind by interrupted viewers, on a best-effort basis. */

@@ -14,7 +14,10 @@
         <item name="postSplashScreenTheme">@style/Theme.KitWallet</item>
     </style>
 
-    <!-- Invisible, no-history relay used only to validate an Android text share and immediately
-         hand it to MainActivity through process memory. -->
-    <style name="Theme.KitWallet.ShareRelay" parent="android:style/Theme.NoDisplay" />
+    <!-- A share can take long enough to copy that this must be a real Activity theme. Android
+         requires Theme.NoDisplay activities to finish before onResume; using it while staging a
+         large attachment made the system close Kit Pay before the recipient picker opened. -->
+    <style name="Theme.KitWallet.ShareRelay" parent="Theme.KitWallet">
+        <item name="android:windowBackground">@color/kit_navy</item>
+    </style>
 </resources>

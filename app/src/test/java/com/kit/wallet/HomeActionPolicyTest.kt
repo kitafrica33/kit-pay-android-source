@@ -109,6 +109,7 @@ class HomeActionPolicyTest {
             KitFeature.BILLS to true,
             KitFeature.AIRTIME to true,
             KitFeature.BANK_TRANSFERS to true,
+            KitFeature.BANK_DEPOSITS to true,
             KitFeature.MOBILE_MONEY to true,
             KitFeature.KYC to true,
         ),

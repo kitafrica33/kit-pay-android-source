@@ -3,20 +3,36 @@ package com.kit.wallet
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.annotation.VisibleForTesting
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -36,11 +52,15 @@ import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.feature.chat.ChatMediaScratch
 import com.kit.wallet.feature.chat.ACTION_OPEN_TEXT_SHARE
 import com.kit.wallet.feature.chat.EXTRA_TEXT_SHARE_TOKEN
 import com.kit.wallet.feature.chat.IncomingTextShareRequest
 import com.kit.wallet.feature.chat.IncomingTextShareStore
+import com.kit.wallet.feature.chat.SharedInboxStore
 import com.kit.wallet.navigation.KitApp
+import com.kit.wallet.ui.components.KitGreenButton
+import com.kit.wallet.ui.components.KitOutlinedButton
 import com.kit.wallet.ui.theme.KitWalletTheme
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import com.kit.wallet.worker.scheduleAuthenticatedMessagingCatchUp
@@ -73,7 +93,7 @@ class MainActivity : FragmentActivity() {
     private var pendingDeepLink by mutableStateOf<String?>(null)
     private var pendingSecureMessage by mutableStateOf<PendingSecureMessageRoute?>(null)
     private var pendingTextShare by mutableStateOf<IncomingTextShareRequest?>(null)
-    private var deferredTextShare: IncomingTextShareRequest? = null
+    private val queuedTextShares = ArrayDeque<IncomingTextShareRequest>()
     private var pendingTextShareSending = false
     private var sessionRestorationActionInFlight by mutableStateOf(false)
     private var sessionRestorationActionFailed by mutableStateOf(false)
@@ -83,6 +103,15 @@ class MainActivity : FragmentActivity() {
         installSplashScreen()
         super.onCreate(savedInstanceState)
         pendingDeepLink = savedInstanceState?.getString(STATE_PENDING_DEEP_LINK)
+        // A share nobody ever delivered is plaintext the user has forgotten about — including
+        // anything a previous process left staged. It goes before this one reads its own intent.
+        lifecycleScope.launch(Dispatchers.IO) {
+            SharedInboxStore.purgeExpired(applicationContext)
+            // Same reasoning one directory over: a viewer or capture that died with the process
+            // left decrypted bytes in the cache, and nothing else will ever come back for them.
+            ChatMediaScratch.purgeStaleOnce(applicationContext)
+        }
+        restoreRetainedTextShares()
         handleIntent(intent)
         enableEdgeToEdge()
         setContent {
@@ -126,12 +155,16 @@ class MainActivity : FragmentActivity() {
                             ?.conversationId,
                         onSecureMessageRouteConsumed = { pendingSecureMessage = null },
                         incomingTextShare = pendingTextShare,
+                        incomingTextShareOwnerMatches = pendingTextShare?.let { request ->
+                            val batch = (request.payload as? com.kit.wallet.feature.chat.IncomingTextShare.Accepted)
+                                ?.batch
+                            batch?.owner?.matches(activeSession?.fence()) ?: true
+                        } ?: true,
                         onTextShareConsumed = { token ->
-                            if (pendingTextShare?.token == token) {
-                                pendingTextShare = deferredTextShare
-                                deferredTextShare = null
-                                pendingTextShareSending = false
-                            }
+                            consumeTextShare(token)
+                        },
+                        onTextShareDeferred = { token ->
+                            deferTextShare(token)
                         },
                         onTextShareSendingChanged = { token, sending ->
                             if (pendingTextShare?.token == token) {
@@ -148,6 +181,10 @@ class MainActivity : FragmentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        // A pinned partial share can be deferred without deleting its remaining plaintext. A
+        // normal launcher reopen reaches this singleTask instance through onNewIntent, so merge
+        // retained manifests before consuming any new share token.
+        restoreRetainedTextShares()
         handleIntent(intent)
     }
 
@@ -224,18 +261,88 @@ class MainActivity : FragmentActivity() {
             currentSessionEpoch = sessions.current()?.sessionId,
         )?.let { pendingSecureMessage = it }
         intent?.takeKitDeepLink()?.let { pendingDeepLink = it }
-        val incomingTextShare = intent?.takeIncomingTextShare() ?: return
-        if (pendingTextShareSending && pendingTextShare != null) {
-            // Keep the explicitly confirmed send visible until it resolves. Retain at most the
-            // newest follow-up share in memory so repeated external Intents cannot grow a queue.
-            deferredTextShare = incomingTextShare
+        val incomingTextShare = intent?.takeIncomingTextShare(applicationContext) ?: return
+        installIncomingTextShare(incomingTextShare)
+    }
+
+    private fun installIncomingTextShare(incomingTextShare: IncomingTextShareRequest) {
+        if (
+            pendingTextShare?.token == incomingTextShare.token ||
+            queuedTextShares.any { it.token == incomingTextShare.token }
+        ) return
+        val currentPendingShare = pendingTextShare
+        if (
+            incomingTextShare.payload is com.kit.wallet.feature.chat.IncomingTextShare.Rejected &&
+            currentPendingShare != null
+        ) {
+            // A malformed/oversized/over-capacity share owns no plaintext. Keep at most the latest
+            // explanation behind the active review instead of deleting or displacing that review.
+            queuedTextShares.removeAll {
+                it.payload is com.kit.wallet.feature.chat.IncomingTextShare.Rejected
+            }
+            queuedTextShares.addLast(incomingTextShare)
+            return
+        }
+        if (
+            currentPendingShare != null &&
+            (pendingTextShareSending || currentPendingShare.hasPinnedDestination())
+        ) {
+            // Keep the explicitly confirmed send visible until it resolves. Persistence admits at
+            // most four retained batches, so keeping the in-memory order cannot grow unbounded.
+            queuedTextShares.addLast(incomingTextShare)
         } else {
+            pendingTextShare?.takeUnless(IncomingTextShareRequest::hasPinnedDestination)
+                ?.let(::retireTextShare)
             pendingTextShare = incomingTextShare
-            deferredTextShare = null
             pendingTextShareSending = false
         }
     }
+
+    private fun restoreRetainedTextShares() {
+        val retained = IncomingTextShareStore.restore(applicationContext)
+        if (retained.isEmpty()) return
+        // Merge rather than replace: onNewIntent can arrive while a confirmed share is still
+        // queueing. A partially queued batch becomes reachable again on ordinary launcher reopen
+        // without displacing or duplicating any request already shown in this process.
+        val knownTokens = buildSet {
+            pendingTextShare?.token?.let(::add)
+            queuedTextShares.forEach { add(it.token) }
+        }
+        retained.filterNot { it.token in knownTokens }.forEach(queuedTextShares::addLast)
+        if (pendingTextShare == null) {
+            pendingTextShare = queuedTextShares.removeFirstOrNull()
+            pendingTextShareSending = false
+        }
+    }
+
+    private fun consumeTextShare(token: String) {
+        IncomingTextShareStore.acknowledge(applicationContext, token)
+        if (pendingTextShare?.token == token) {
+            pendingTextShare = queuedTextShares.removeFirstOrNull()
+            pendingTextShareSending = false
+        } else {
+            queuedTextShares.removeAll { it.token == token }
+        }
+    }
+
+    /** Hides a pinned retry without deleting its remaining plaintext; restart restores it. */
+    private fun deferTextShare(token: String) {
+        if (pendingTextShare?.token == token) {
+            pendingTextShare = queuedTextShares.removeFirstOrNull()
+            pendingTextShareSending = false
+        } else {
+            queuedTextShares.removeAll { it.token == token }
+        }
+    }
+
+    private fun retireTextShare(request: IncomingTextShareRequest) {
+        IncomingTextShareStore.acknowledge(applicationContext, request.token)
+    }
 }
+
+private fun IncomingTextShareRequest.hasPinnedDestination(): Boolean =
+    ((payload as? com.kit.wallet.feature.chat.IncomingTextShare.Accepted)
+        ?.batch?.pinnedConversationId != null)
 
 @Composable
 private fun SessionRestorationGate(
@@ -248,54 +355,105 @@ private fun SessionRestorationGate(
     onCancelSignInAgain: () -> Unit,
     onConfirmSignInAgain: () -> Unit,
 ) {
-    Surface(modifier = Modifier.fillMaxSize()) {}
-    if (discardConfirmationRequested) {
-        AlertDialog(
-            onDismissRequest = onCancelSignInAgain,
-            title = { Text("Erase this device's secure session?") },
-            text = {
-                Text(
+    BackHandler {
+        if (discardConfirmationRequested && !actionInFlight) onCancelSignInAgain()
+    }
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(horizontal = 32.dp, vertical = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Spacer(Modifier.weight(1f))
+            Box(
+                modifier = Modifier
+                    .size(72.dp)
+                    .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Rounded.Lock,
+                    contentDescription = null,
+                    modifier = Modifier.size(32.dp),
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
+            Spacer(Modifier.height(24.dp))
+            Text(
+                if (discardConfirmationRequested) {
+                    "Erase this device's secure session?"
+                } else {
+                    "Restore your Kit Pay session"
+                },
+                style = MaterialTheme.typography.headlineMedium,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                if (discardConfirmationRequested) {
                     "Signing in again erases the saved login plus this device's local " +
                         "end-to-end encrypted message keys and history. History can be " +
-                        "recovered only if another enrolled device still has it.",
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = onConfirmSignInAgain, enabled = !actionInFlight) {
-                    Text("Erase and sign in")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = onCancelSignInAgain, enabled = !actionInFlight) {
-                    Text("Keep session")
-                }
-            },
-        )
-        return
-    }
-    AlertDialog(
-        onDismissRequest = {},
-        title = { Text("Restore your Kit Pay session") },
-        text = {
-            Text(
-                when {
-                    actionFailed -> "Kit Pay could not complete that action. Unlock your device and retry."
-                    automaticRetryAvailable ->
-                        "Your encrypted sign-in is still safe. Unlock this device, then retry."
-                    else -> "Kit Pay could not safely open the saved sign-in. Retry, or choose " +
-                        "Sign in again to review the local data that must be erased."
+                        "recovered only if another enrolled device still has it."
+                } else {
+                    when {
+                        actionFailed ->
+                            "Kit Pay could not complete that action. Unlock your device and retry."
+                        automaticRetryAvailable ->
+                            "Your encrypted sign-in is still safe. Unlock this device, then retry."
+                        else ->
+                            "Kit Pay could not safely open the saved sign-in. Retry, or sign in " +
+                                "again after reviewing the local data that must be erased."
+                    }
                 },
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
             )
-        },
-        confirmButton = {
-            TextButton(onClick = onRetry, enabled = !actionInFlight) { Text("Retry") }
-        },
-        dismissButton = {
-            TextButton(onClick = onRequestSignInAgain, enabled = !actionInFlight) {
-                Text("Sign in again")
+            Spacer(Modifier.height(32.dp))
+            if (discardConfirmationRequested) {
+                KitGreenButton(
+                    text = "Erase and sign in",
+                    onClick = onConfirmSignInAgain,
+                    enabled = !actionInFlight,
+                    loading = actionInFlight,
+                )
+                Spacer(Modifier.height(12.dp))
+                KitOutlinedButton(
+                    text = "Keep session",
+                    onClick = onCancelSignInAgain,
+                    enabled = !actionInFlight,
+                )
+            } else {
+                KitGreenButton(
+                    text = "Retry",
+                    onClick = onRetry,
+                    enabled = !actionInFlight,
+                    loading = actionInFlight,
+                )
+                Spacer(Modifier.height(12.dp))
+                KitOutlinedButton(
+                    text = "Sign in again",
+                    onClick = onRequestSignInAgain,
+                    enabled = !actionInFlight,
+                )
             }
-        },
-    )
+            Spacer(Modifier.weight(1f))
+            if (!discardConfirmationRequested) {
+                Text(
+                    "Your wallet remains locked until the session is safely restored.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+    }
 }
 
 private const val SESSION_RESTORE_ATTEMPTS = 3
@@ -467,15 +625,17 @@ private fun Intent.takeAuthorizedSecureMessageRoute(
     }
 }
 
-private fun Intent.takeIncomingTextShare(): IncomingTextShareRequest? {
+private fun Intent.takeIncomingTextShare(context: android.content.Context): IncomingTextShareRequest? {
     if (action != ACTION_OPEN_TEXT_SHARE) return null
     val token = getStringExtra(EXTRA_TEXT_SHARE_TOKEN).orEmpty()
 
     // Do not leave even the opaque one-time hand-off token on the Activity Intent. The actual
-    // shared text never enters this Intent and cannot be reconstructed after process death.
+    // shared text never enters this Intent; the opaque token claims its private durable manifest.
     removeExtra(EXTRA_TEXT_SHARE_TOKEN)
     action = null
-    return token.takeIf(String::isNotBlank)?.let(IncomingTextShareStore::take)
+    return token.takeIf(String::isNotBlank)?.let {
+        IncomingTextShareStore.claim(context, it)
+    }
 }
 
 /**

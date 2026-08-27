@@ -40,29 +40,35 @@ internal class ImmediateMediaSpool internal constructor(
         File(context.noBackupFilesDir, DIRECTORY_NAME),
     )
 
-    suspend fun stage(id: String, plaintext: ByteArray): ImmediateMediaMaterial {
+    /**
+     * Encrypts [source] straight into the spool, never materializing its plaintext in heap.
+     *
+     * The bytes are read once, at this moment, because that is while the caller still holds
+     * whatever permission opened them — a picker's content URI may not survive until the queue
+     * drains. After this returns, only ciphertext is needed to finish the send.
+     */
+    suspend fun stage(id: String, source: SecureMediaSource): ImmediateMediaMaterial {
         require(ImmediateSendIntent.CANONICAL_UUID.matches(id)) { "Invalid media-spool ID" }
-        require(plaintext.isNotEmpty()) { "Choose a file to send securely" }
-        require(plaintext.size <= MAX_IMAGE_PLAINTEXT_BYTES) {
-            "Files up to ${MAX_IMAGE_PLAINTEXT_BYTES / (1024 * 1024)} MB are supported"
-        }
-        var encrypted: MediaAttachmentCipher.EncryptedAttachment? = null
+        var streamed: MediaAttachmentStreamCipher.StreamedAttachment? = null
         try {
             beforeEncryption()
-            encrypted = withContext(Dispatchers.Default + NonCancellable) {
-                MediaAttachmentCipher.encrypt(plaintext)
-            }
-            val owned = checkNotNull(encrypted)
-            withContext(Dispatchers.IO + NonCancellable) {
+            streamed = withContext(Dispatchers.IO + NonCancellable) {
                 fileMutex.withLock {
                     directory.mkdirs()
                     check(directory.isDirectory) { "Secure media outbox is unavailable" }
                     val temporary = File(directory, ".$id.tmp")
                     val destination = file(id)
                     try {
-                        FileOutputStream(temporary).use { output ->
-                            output.write(owned.ciphertext)
+                        val produced = FileOutputStream(temporary).use { output ->
+                            val result = source.open().use { input ->
+                                MediaAttachmentStreamCipher.encrypt(
+                                    source = input.buffered(),
+                                    destination = output.buffered(),
+                                    maximumPlaintextBytes = MAX_IMAGE_PLAINTEXT_BYTES,
+                                )
+                            }
                             output.fd.sync()
+                            result
                         }
                         check(temporary.renameTo(destination)) {
                             "Secure media could not be committed to the local outbox"
@@ -71,25 +77,30 @@ internal class ImmediateMediaSpool internal constructor(
                         // Until a prune observes that record, an older snapshot must not delete
                         // this newly committed file out from under its caller.
                         stagedBeforeQueueSnapshot += id
+                        produced
                     } finally {
                         if (temporary.exists()) temporary.delete()
                     }
                 }
             }
+            val owned = checkNotNull(streamed)
             return ImmediateMediaMaterial(
-                plaintextBytes = owned.plaintextSize,
-                ciphertextBytes = owned.ciphertext.size,
+                plaintextBytes = owned.plaintextByteSize,
+                ciphertextBytes = owned.ciphertextByteSize.toInt(),
                 keyBase64 = Base64.getEncoder().encodeToString(owned.keyMaterial),
                 sha256Base64 = Base64.getEncoder().encodeToString(owned.sha256),
             )
         } finally {
-            encrypted?.ciphertext?.fill(0)
-            encrypted?.keyMaterial?.fill(0)
-            encrypted?.sha256?.fill(0)
+            streamed?.keyMaterial?.fill(0)
+            streamed?.sha256?.fill(0)
         }
     }
 
-    suspend fun readCiphertext(intent: ImmediateSendIntent): ByteArray {
+    /**
+     * Confirms the spooled blob is still exactly the one the queue recorded and hands back the
+     * file itself, so the upload can stream from disk instead of through a 200 MB array.
+     */
+    suspend fun ciphertextFile(intent: ImmediateSendIntent): File {
         require(intent.kind == ImmediateSendKind.MEDIA)
         return withContext(Dispatchers.IO) {
             fileMutex.withLock {
@@ -99,17 +110,15 @@ internal class ImmediateMediaSpool internal constructor(
                         "The queued secure attachment is no longer available",
                     )
                 }
-                val bytes = source.readBytes()
                 val expected = intent.mediaSha256()
-                val actual = MessageDigest.getInstance("SHA-256").digest(bytes)
+                val actual = source.streamingSha256()
                 try {
                     if (!MessageDigest.isEqual(expected, actual)) {
-                        bytes.fill(0)
                         throw ImmediateMediaSpoolUnavailableException(
                             "The queued secure attachment failed its integrity check",
                         )
                     }
-                    bytes
+                    source
                 } finally {
                     expected.fill(0)
                     actual.fill(0)

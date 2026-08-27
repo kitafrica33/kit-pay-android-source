@@ -3,6 +3,7 @@ package com.kit.wallet
 import com.kit.wallet.feature.chat.camera.MIN_CLIP_MILLIS
 import com.kit.wallet.feature.chat.camera.VideoTrimPlan
 import com.kit.wallet.feature.chat.camera.planVideoTrim
+import com.kit.wallet.feature.chat.camera.videoSendMediaType
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -69,6 +70,30 @@ class ChatVideoTrimPlanTest {
     fun `keepAudio passes through to the plan`() {
         assertTrue(planVideoTrim(0, 2_000, 5_000, keepAudio = true)!!.keepAudio)
         assertFalse(planVideoTrim(0, 2_000, 5_000, keepAudio = false)!!.keepAudio)
+    }
+
+    @Test
+    fun `an edited video re-muxes to MP4 and an untouched one keeps its own container`() {
+        // Trimming and muting both go through MediaMuxer, whose output is MP4 regardless of
+        // what came in — so the label must follow the bytes, not the source.
+        assertEquals(
+            "video/mp4",
+            videoSendMediaType(edited = true, sourceMediaType = "video/webm"),
+        )
+        assertEquals(
+            "video/mp4",
+            videoSendMediaType(edited = true, sourceMediaType = "video/quicktime"),
+        )
+        // An untouched library pick is sent byte-for-byte; relabeling it would hand the
+        // recipient bytes that do not match their name.
+        assertEquals(
+            "video/quicktime",
+            videoSendMediaType(edited = false, sourceMediaType = "video/quicktime"),
+        )
+        assertEquals(
+            "video/mp4",
+            videoSendMediaType(edited = false, sourceMediaType = "video/mp4"),
+        )
     }
 
     @Test

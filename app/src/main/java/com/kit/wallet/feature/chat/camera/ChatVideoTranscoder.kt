@@ -13,6 +13,13 @@ import kotlin.math.max
 
 internal const val MIN_CLIP_MILLIS = 500L
 
+/**
+ * The largest library video the trim editor will copy into cache. A disk guard, not a wire
+ * cap: the wire cap still applies to the trimmed clip, and stream-copy trimming means a short
+ * window cut from a long, heavy video is exactly what this editor is for.
+ */
+internal const val MAX_LIBRARY_VIDEO_SOURCE_BYTES = 1_073_741_824L
+
 private const val DEFAULT_SAMPLE_BUFFER_BYTES = 1 shl 20
 
 internal data class VideoTrimPlan(
@@ -43,6 +50,14 @@ internal fun planVideoTrim(
         keepAudio = keepAudio,
     )
 }
+
+/**
+ * The wire type a video leaves with. Any edit — trim or mute — re-muxes into MP4; an untouched
+ * clip keeps its own container, because relabeling a QuickTime or WebM file as video/mp4 would
+ * hand the recipient bytes that do not match their name.
+ */
+internal fun videoSendMediaType(edited: Boolean, sourceMediaType: String): String =
+    if (edited) "video/mp4" else sourceMediaType
 
 /**
  * Stream-copies compressed samples from a recorded clip into a trimmed MP4 without

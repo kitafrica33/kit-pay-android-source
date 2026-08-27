@@ -15,6 +15,7 @@ import com.kit.wallet.data.local.WalletDao
 import com.kit.wallet.data.local.WalletTransactionDao
 import com.kit.wallet.data.media.ProfileAvatarByteStore
 import com.kit.wallet.data.media.ProfileAvatarImages
+import com.kit.wallet.data.remote.UpdateMessagingConversationRequestAdapter
 import com.kit.wallet.data.remote.UpdateProfileRequestAdapter
 import com.kit.wallet.data.repository.AndroidKeystoreBeneficiaryPhoneIdentity
 import com.kit.wallet.data.repository.BeneficiaryPhoneIdentity
@@ -138,6 +139,7 @@ object StorageModule {
         // Ahead of the reflective factory, which would otherwise claim the type and drop the
         // explicit null that clears a username.
         .add(UpdateProfileRequestAdapter())
+        .add(UpdateMessagingConversationRequestAdapter())
         .add(KotlinJsonAdapterFactory())
         .build()
 

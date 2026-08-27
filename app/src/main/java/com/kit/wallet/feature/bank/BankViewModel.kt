@@ -3,9 +3,14 @@ package com.kit.wallet.feature.bank
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.repository.BankingRepository
+import com.kit.wallet.data.repository.BankDeposit
+import com.kit.wallet.data.repository.BankDepositRepository
+import com.kit.wallet.data.repository.BankFundingAccount
 import com.kit.wallet.data.remote.isKitInsufficientFundsError
 import com.kit.wallet.data.repository.FinancialOperationQuote
 import com.kit.wallet.data.repository.ProfilePhotoDirectory
+import com.kit.wallet.data.repository.UnavailableBankDepositRepository
+import com.kit.wallet.data.repository.WalletCurrency
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.ui.model.BankOperationKind
@@ -23,6 +28,8 @@ import kotlinx.coroutines.flow.stateIn
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 
 @HiltViewModel
 class BankViewModel @Inject constructor(
@@ -30,6 +37,7 @@ class BankViewModel @Inject constructor(
     private val wallet: WalletRepository,
     private val walletSync: WalletSyncRepository,
     profilePhotos: ProfilePhotoDirectory,
+    private val bankDeposits: BankDepositRepository = UnavailableBankDepositRepository,
 ) : ViewModel() {
 
     /**
@@ -56,6 +64,9 @@ class BankViewModel @Inject constructor(
 
     val bankTransfers = banking.operations
     val banks = banking.banks
+    val fundingAccounts: StateFlow<List<BankFundingAccount>> = bankDeposits.fundingAccounts
+    val deposits: StateFlow<List<BankDeposit>> = bankDeposits.deposits
+    val walletCurrency: StateFlow<WalletCurrency> = wallet.walletCurrency
 
     private val mutableBusy = MutableStateFlow(false)
     val busy = mutableBusy.asStateFlow()
@@ -64,6 +75,7 @@ class BankViewModel @Inject constructor(
     val error = mutableError.asStateFlow()
     private val mutableQuote = MutableStateFlow<FinancialOperationQuote?>(null)
     val quote = mutableQuote.asStateFlow()
+    private var depositPoll: Job? = null
 
     /**
      * A withdrawal or transfer this wallet cannot pay for, raised once and cleared by the screen.
@@ -90,6 +102,52 @@ class BankViewModel @Inject constructor(
         onDone: () -> Unit,
     ) {
         runCommand(onDone) { banking.addBeneficiary(bankId, accountNumber, label, kind) }
+    }
+
+    fun refreshDeposits(enabled: Boolean) {
+        if (!enabled) return
+        runCommand { bankDeposits.refresh() }
+    }
+
+    fun createDeposit(
+        fundingAccountId: String,
+        amountMinor: Long,
+        note: String?,
+        onDone: (BankDeposit) -> Unit,
+    ) {
+        runDepositCommand(onDone) {
+            bankDeposits.create(fundingAccountId, amountMinor, note)
+        }
+    }
+
+    fun uploadDepositProof(
+        depositId: String,
+        bytes: ByteArray,
+        filename: String,
+        mimeType: String,
+        onDone: (BankDeposit) -> Unit,
+    ) {
+        runDepositCommand(onDone) {
+            bankDeposits.attachProof(depositId, bytes, filename, mimeType)
+        }
+    }
+
+    fun refreshDeposit(depositId: String, onDone: (BankDeposit) -> Unit = {}) {
+        runDepositCommand(onDone) { bankDeposits.refreshDeposit(depositId) }
+    }
+
+    fun observeDeposit(depositId: String?) {
+        depositPoll?.cancel()
+        depositPoll = null
+        if (depositId == null) return
+        depositPoll = viewModelScope.launch {
+            repeat(120) {
+                delay(5_000)
+                val current = deposits.value.firstOrNull { it.id == depositId } ?: return@launch
+                if (current.terminal) return@launch
+                runCatching { bankDeposits.refreshDeposit(depositId) }
+            }
+        }
     }
 
     fun preview(
@@ -169,6 +227,26 @@ class BankViewModel @Inject constructor(
                 throw cancelled
             } catch (error: Exception) {
                 mutableError.value = error.message ?: "The bank request could not be completed"
+            } finally {
+                mutableBusy.value = false
+            }
+        }
+    }
+
+    private fun runDepositCommand(
+        onDone: (BankDeposit) -> Unit,
+        command: suspend () -> BankDeposit,
+    ) {
+        if (mutableBusy.value) return
+        viewModelScope.launch {
+            mutableBusy.value = true
+            mutableError.value = null
+            try {
+                onDone(command())
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "The bank deposit could not be completed"
             } finally {
                 mutableBusy.value = false
             }

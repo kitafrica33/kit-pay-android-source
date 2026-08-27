@@ -330,7 +330,12 @@ internal fun ChatsContent(
                             .padding(horizontal = 20.dp, vertical = 9.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        KitAvatar(hit.chat.name, size = 40.dp, avatarUrl = hit.chat.avatarUrl)
+                        KitAvatar(
+                            hit.chat.name,
+                            size = 40.dp,
+                            avatarUrl = hit.chat.avatarUrl,
+                            isGroup = hit.chat.isGroup,
+                        )
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text(
@@ -597,7 +602,13 @@ private fun ChatRow(
                 modifier = Modifier.padding(end = 12.dp),
             )
         }
-        KitAvatar(chat.name, size = 52.dp, online = chat.online, avatarUrl = chat.avatarUrl)
+        KitAvatar(
+            chat.name,
+            size = 52.dp,
+            online = chat.online,
+            avatarUrl = chat.avatarUrl,
+            isGroup = chat.isGroup,
+        )
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
             Text(

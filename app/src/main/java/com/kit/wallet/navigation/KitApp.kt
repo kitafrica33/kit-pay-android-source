@@ -15,7 +15,15 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Call
@@ -43,6 +51,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.dp
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -59,6 +68,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.kit.wallet.data.auth.AuthChallengeKind
 import com.kit.wallet.data.notifications.IncomingCallPayload
 import com.kit.wallet.data.remote.KitFeature
+import com.kit.wallet.data.remote.MESSAGING_GROUPS_FEATURE
 import com.kit.wallet.feature.auth.AuthViewModel
 import com.kit.wallet.feature.auth.AccountAccessViewModel
 import com.kit.wallet.feature.auth.ForgotPasswordScreen
@@ -82,10 +92,14 @@ import com.kit.wallet.feature.chat.ChatsScreen
 import com.kit.wallet.feature.chat.ChatsViewModel
 import com.kit.wallet.feature.chat.ConversationScreen
 import com.kit.wallet.feature.chat.GroupAddParticipantsScreen
+import com.kit.wallet.feature.chat.GroupDescriptionScreen
 import com.kit.wallet.feature.chat.GroupProfileScreen
 import com.kit.wallet.feature.chat.NewGroupScreen
 import com.kit.wallet.feature.chat.IncomingTextShareCoordinator
 import com.kit.wallet.feature.chat.IncomingTextShareRequest
+import com.kit.wallet.feature.chat.VoiceNoteMiniBar
+import com.kit.wallet.feature.chat.VoiceNoteMiniBarPolicy
+import com.kit.wallet.feature.chat.VoiceNotePlayer
 import com.kit.wallet.feature.contacts.ContactPickerPurpose
 import com.kit.wallet.feature.contacts.ContactsScreen
 import com.kit.wallet.feature.home.HomeScreen
@@ -114,13 +128,15 @@ private data class Tab(
 )
 
 @Composable
-fun KitApp(
+internal fun KitApp(
     deepLinkUri: String? = null,
     onDeepLinkConsumed: () -> Unit = {},
     secureMessageConversationId: String? = null,
     onSecureMessageRouteConsumed: () -> Unit = {},
     incomingTextShare: IncomingTextShareRequest? = null,
+    incomingTextShareOwnerMatches: Boolean = true,
     onTextShareConsumed: (String) -> Unit = {},
+    onTextShareDeferred: (String) -> Unit = {},
     onTextShareSendingChanged: (String, Boolean) -> Unit = { _, _ -> },
     onNotificationCapabilityChanged: () -> Unit = {},
     authViewModel: AuthViewModel = hiltViewModel(),
@@ -149,6 +165,8 @@ fun KitApp(
     }
     val chatsBadgeViewModel: ChatsViewModel = hiltViewModel()
     val totalUnread by chatsBadgeViewModel.totalUnread.collectAsStateWithLifecycle()
+    val localMessagingOutboxAvailable by
+        chatsBadgeViewModel.historyAvailable.collectAsStateWithLifecycle()
     val tabs = buildList {
         add(Tab(Dest.HOME, "Home", Icons.Outlined.AccountBalanceWallet, Icons.Filled.AccountBalanceWallet))
         if (capabilities.messagingEntryVisible) {
@@ -175,6 +193,11 @@ fun KitApp(
     val currentRoute = backStack?.destination?.route
     val signInFlowActive = currentRoute in SIGN_IN_ROUTES
     val showBottomBar = signedIn && currentRoute in tabs.map { it.route }
+    val voiceNotePlayback by VoiceNotePlayer.state.collectAsStateWithLifecycle()
+    val voiceNoteBarVisible = VoiceNoteMiniBarPolicy.isVisible(
+        hasPlayback = voiceNotePlayback.playing != null,
+        isSourceOnScreen = voiceNotePlayback.isSourceOnScreen,
+    )
 
     LaunchedEffect(
         deepLinkUri,
@@ -371,27 +394,47 @@ fun KitApp(
             }
         },
     ) { innerPadding ->
-        KitNavHost(
-            navController = navController,
-            startDestination = if (signedIn) Dest.HOME else Dest.ONBOARDING,
-            signedIn = signedIn,
-            authViewModel = authViewModel,
-            accountAccessViewModel = accountAccessViewModel,
-            authState = authState,
-            capabilities = capabilities,
-            modifier = if (showBottomBar) Modifier.padding(innerPadding) else Modifier,
-        )
+        // A voice note keeps playing after the bubble that started it is scrolled past, or the
+        // thread is left entirely. Its only remaining control rides above every screen — the same
+        // place a minimized call sits — until the note ends or the user dismisses it.
+        Column {
+            if (voiceNoteBarVisible) {
+                VoiceNoteMiniBar(Modifier.statusBarsPadding())
+                Spacer(Modifier.height(VoiceNoteMiniBarPolicy.CONTENT_GAP_DP.dp))
+            }
+            Box(
+                if (voiceNoteBarVisible) {
+                    Modifier.consumeWindowInsets(WindowInsets.statusBars)
+                } else {
+                    Modifier
+                },
+            ) {
+                KitNavHost(
+                    navController = navController,
+                    startDestination = if (signedIn) Dest.HOME else Dest.ONBOARDING,
+                    signedIn = signedIn,
+                    authViewModel = authViewModel,
+                    accountAccessViewModel = accountAccessViewModel,
+                    authState = authState,
+                    capabilities = capabilities,
+                    modifier = if (showBottomBar) Modifier.padding(innerPadding) else Modifier,
+                )
+            }
+        }
     }
 
     incomingTextShare?.let { request ->
         IncomingTextShareCoordinator(
             request = request,
+            ownerMatchesCurrentSession = incomingTextShareOwnerMatches,
             signedIn = signedIn,
             accountSetupRequired = profileSetupRequired || currentRoute in ACCOUNT_SETUP_ROUTES,
             signInFlowActive = signInFlowActive,
             capabilitiesLoaded = capabilities.loaded,
             capabilityLoadFailed = capabilities.loadFailed,
-            secureMessagingUsable = capabilities.messagingUsable,
+            secureMessagingServerCompatible = capabilities.messagingServerCompatible,
+            groupMessagingEnabled = capabilities.lastKnownEnabled(MESSAGING_GROUPS_FEATURE),
+            localOutboxAvailable = localMessagingOutboxAvailable,
             onSignIn = {
                 if (!signInFlowActive) {
                     navController.navigate(Dest.PHONE_LOGIN) { launchSingleTop = true }
@@ -399,6 +442,7 @@ fun KitApp(
             },
             onRetryCapabilities = capabilitiesViewModel::refresh,
             onConsumed = { onTextShareConsumed(request.token) },
+            onDeferred = { onTextShareDeferred(request.token) },
             onSendingChanged = { sending ->
                 onTextShareSendingChanged(request.token, sending)
             },
@@ -800,7 +844,11 @@ private fun KitNavHost(
         }
         composable(Dest.BANK) {
             FeatureRouteContent(signedIn, capabilities, Dest.BANK) {
-                BankScreen(onBack = { navController.popBackStack() })
+                BankScreen(
+                    onBack = { navController.popBackStack() },
+                    depositsEnabled = capabilities.bankDepositsUsable,
+                    outboundEnabled = capabilities.bankTransfersUsable,
+                )
             }
         }
         composable(Dest.MOBILE_MONEY) {
@@ -843,6 +891,14 @@ private fun KitNavHost(
                         KitFeature.INTERNAL_TRANSFERS,
                         KitFeature.CLAIMABLE_TRANSFERS,
                     ),
+                    // A group payment is a held transfer per member, so it needs everything a
+                    // one-to-one claim needs, and its own rollout flag on top.
+                    groupPaymentsEnabled = capabilities.allEnabled(
+                        KitFeature.WALLETS,
+                        KitFeature.INTERNAL_TRANSFERS,
+                        KitFeature.CLAIMABLE_TRANSFERS,
+                        KitFeature.GROUP_PAYMENTS,
+                    ),
                     abuseReportingEnabled = capabilities.enabled(KitFeature.ABUSE_REPORTING),
                     onBack = { navController.popBackStack() },
                     onVoiceCall = { navController.navigate(Dest.voiceCall(it)) },
@@ -872,6 +928,7 @@ private fun KitNavHost(
                 GroupProfileScreen(
                     onBack = { navController.popBackStack() },
                     onAddParticipants = { navController.navigate(Dest.groupAdd(chatId)) },
+                    onEditDescription = { navController.navigate(Dest.groupDescription(chatId)) },
                     // A group that has been left has no conversation and no group screen left to
                     // return to, so both come off the stack together.
                     onLeft = {
@@ -886,6 +943,11 @@ private fun KitNavHost(
         composable(Dest.GROUP_ADD) {
             FeatureRouteContent(signedIn, capabilities, Dest.GROUP_ADD) {
                 GroupAddParticipantsScreen(onBack = { navController.popBackStack() })
+            }
+        }
+        composable(Dest.GROUP_DESCRIPTION) {
+            FeatureRouteContent(signedIn, capabilities, Dest.GROUP_DESCRIPTION) {
+                GroupDescriptionScreen(onBack = { navController.popBackStack() })
             }
         }
         composable(Dest.VOICE_CALL) { entry ->

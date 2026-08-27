@@ -106,6 +106,13 @@ data class KitExtendedColors(
     val onChatBubbleOther: Color,
     val balanceCardStart: Color,
     val balanceCardEnd: Color,
+    /** The gold a group payment is drawn in, and the surface it sits on. */
+    val gold: Color,
+    val goldContainer: Color,
+    val onGoldContainer: Color,
+    /** The two ends of the sheen along a group payment card's edge. */
+    val goldSheenStart: Color,
+    val goldSheenEnd: Color,
 )
 
 private val LightExtended = KitExtendedColors(
@@ -123,6 +130,11 @@ private val LightExtended = KitExtendedColors(
     onChatBubbleOther = KitInk,
     balanceCardStart = KitNavy700,
     balanceCardEnd = KitNavy900,
+    gold = KitGold,
+    goldContainer = KitGoldContainer,
+    onGoldContainer = KitInk,
+    goldSheenStart = KitGoldSheenStart,
+    goldSheenEnd = KitGoldSheenEnd,
 )
 
 private val DarkExtended = KitExtendedColors(
@@ -140,6 +152,11 @@ private val DarkExtended = KitExtendedColors(
     onChatBubbleOther = KitFog,
     balanceCardStart = KitNavy600,
     balanceCardEnd = KitNavy900,
+    gold = KitGoldDark,
+    goldContainer = KitGoldContainerDark,
+    onGoldContainer = KitFog,
+    goldSheenStart = KitGoldSheenStartDark,
+    goldSheenEnd = KitGoldSheenEndDark,
 )
 
 private val LocalKitColors = staticCompositionLocalOf { LightExtended }

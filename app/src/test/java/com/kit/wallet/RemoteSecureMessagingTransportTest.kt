@@ -7,6 +7,7 @@ import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
 import com.kit.wallet.data.messaging.OpaqueCryptoBytes
 import com.kit.wallet.data.messaging.SecureMessagingActivationCapability
 import com.kit.wallet.data.messaging.SecureMessagingCommittedResult
+import com.kit.wallet.data.messaging.SecureMessagingConversationCapabilityUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingCompanionStateIntent
 import com.kit.wallet.data.messaging.SecureMessagingCryptoAddress
 import com.kit.wallet.data.messaging.SecureMessagingCryptoOperation
@@ -41,6 +42,9 @@ import com.kit.wallet.data.remote.MessagingKeyTransparencyDto
 import com.kit.wallet.data.remote.MessagingReadReceiptDto
 import com.kit.wallet.data.remote.MessagingOneTimePrekeyDto
 import com.kit.wallet.data.remote.MessagingPqPrekeyDto
+import com.kit.wallet.data.remote.MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY
+import com.kit.wallet.data.remote.MESSAGING_REACTIONS_DEVICE_CAPABILITY
+import com.kit.wallet.data.remote.MessagingDeviceClientDto
 import com.kit.wallet.data.remote.MessagingDeviceRosterDto
 import com.kit.wallet.data.remote.MessagingDeviceRosterEntryDto
 import com.kit.wallet.data.remote.MessagingSignedPrekeyDto
@@ -378,6 +382,143 @@ class RemoteSecureMessagingTransportTest {
             )
             assertEquals(before, server.requestCount)
         }
+    }
+
+    @Test
+    fun `an edit is refused while the account gate is off however capable the roster`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation()
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        val conversation = session.conversations().first()
+        server.takeRequest()
+        enqueueRoster(authoritativeRoster(EVERY_CAPABILITY))
+        val roster = session.roster(conversation)
+        server.takeRequest()
+        val before = server.requestCount
+
+        val failure = runCatching {
+            session.requireMessageEditCapability(conversation, roster)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+        assertEquals(before, server.requestCount)
+        // Reactions ride the same roster and the same account, and they are on. So the refusal
+        // above is this account's edit gate rather than a roster that said nothing at all.
+        session.requireReactionCapability(conversation, roster)
+    }
+
+    @Test
+    fun `an edit is refused when the direct peer never attested corrections`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation(EDITS_READY_CAPABILITIES)
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        val conversation = session.conversations().first()
+        server.takeRequest()
+        enqueueRoster(authoritativeRoster(REACTIONS_ONLY_CAPABILITY))
+        val roster = session.roster(conversation)
+        server.takeRequest()
+        val before = server.requestCount
+
+        val failure = runCatching {
+            session.requireMessageEditCapability(conversation, roster)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+        assertEquals(before, server.requestCount)
+        session.requireReactionCapability(conversation, roster)
+    }
+
+    @Test
+    fun `an edit is refused when a roster device says nothing about its capabilities`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation(EDITS_READY_CAPABILITIES)
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        val conversation = session.conversations().first()
+        server.takeRequest()
+        // No client block at all — the shape every build that predates the attestation sends.
+        enqueueRoster(authoritativeRoster(peerCapabilities = null))
+        val roster = session.roster(conversation)
+        server.takeRequest()
+
+        val failure = runCatching {
+            session.requireMessageEditCapability(conversation, roster)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+    }
+
+    @Test
+    fun `an edit is allowed once the account gate and every direct peer agree`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation(EDITS_READY_CAPABILITIES)
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        val conversation = session.conversations().first()
+        server.takeRequest()
+        enqueueRoster(authoritativeRoster(EVERY_CAPABILITY))
+        val roster = session.roster(conversation)
+        server.takeRequest()
+        val before = server.requestCount
+
+        session.requireMessageEditCapability(conversation, roster)
+
+        // Deciding costs nothing on the wire: the roster it reads was already fetched.
+        assertEquals(before, server.requestCount)
+    }
+
+    @Test
+    fun `one stale device withholds edits from a mixed version group`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation(EDITS_READY_CAPABILITIES)
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        server.enqueue(jsonResponse(GROUP_CONVERSATIONS))
+        val group = session.conversations().single()
+        server.takeRequest()
+        enqueueRoster(
+            groupRoster(
+                firstPeerCapabilities = EVERY_CAPABILITY,
+                secondPeerCapabilities = REACTIONS_ONLY_CAPABILITY,
+            ),
+        )
+        val roster = session.roster(group)
+        server.takeRequest()
+
+        val failure = runCatching {
+            session.requireMessageEditCapability(group, roster)
+        }.exceptionOrNull()
+
+        // The other member's up-to-date phone is not enough: their second device would render the
+        // correction as a bubble full of descriptor text, and nobody in the group can see that.
+        assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+    }
+
+    @Test
+    fun `a group allows edits once every enrolled device attests`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation(EDITS_READY_CAPABILITIES)
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        server.enqueue(jsonResponse(GROUP_CONVERSATIONS))
+        val group = session.conversations().single()
+        server.takeRequest()
+        enqueueRoster(
+            groupRoster(
+                firstPeerCapabilities = EVERY_CAPABILITY,
+                secondPeerCapabilities = EVERY_CAPABILITY,
+            ),
+        )
+        val roster = session.roster(group)
+        server.takeRequest()
+
+        session.requireMessageEditCapability(group, roster)
     }
 
     @Test
@@ -893,8 +1034,8 @@ class RemoteSecureMessagingTransportTest {
         return lifecycle to lifecycle.beginSession(BINDING)
     }
 
-    private fun enqueueActivation() {
-        server.enqueue(jsonResponse(READY_CAPABILITIES))
+    private fun enqueueActivation(capabilities: String = READY_CAPABILITIES) {
+        server.enqueue(jsonResponse(capabilities))
         server.enqueue(jsonResponse(PROFILE))
         server.enqueue(jsonResponse(DEVICES))
     }
@@ -1061,18 +1202,41 @@ class RemoteSecureMessagingTransportTest {
         return transaction.commit() as SecureMessagingCommittedResult.Decrypted
     }
 
-    private fun authoritativeRoster(): MessagingDeviceRosterDto {
-        val devices = listOf(
-            rosterDevice(CURRENT_DEVICE_ID, CURRENT_USER_ID, 1, 42, 0x11),
-            rosterDevice(PEER_DEVICE_ID, PEER_USER_ID, 2, 43, 0x21),
-        )
-        val hash = sha256(canonicalRosterBytes(devices))
+    private fun authoritativeRoster(
+        peerCapabilities: Map<String, Boolean?>? = null,
+    ): MessagingDeviceRosterDto = rosterOf(
+        rosterDevice(CURRENT_DEVICE_ID, CURRENT_USER_ID, 1, 42, 0x11, EVERY_CAPABILITY),
+        rosterDevice(PEER_DEVICE_ID, PEER_USER_ID, 2, 43, 0x21, peerCapabilities),
+    )
+
+    /**
+     * A group whose other member has two enrolled devices, only the first of which may attest.
+     *
+     * Mixed-version groups are the case a direct chat cannot express: everyone the person can see
+     * is up to date, and one forgotten second phone still has to withhold the feature. Canonical
+     * roster order is (userId, signalDeviceId, deviceId), and [CURRENT_USER_ID] sorts before
+     * [OTHER_USER_ID], so this listing is already in it.
+     */
+    private fun groupRoster(
+        firstPeerCapabilities: Map<String, Boolean?>?,
+        secondPeerCapabilities: Map<String, Boolean?>?,
+    ): MessagingDeviceRosterDto = rosterOf(
+        rosterDevice(CURRENT_DEVICE_ID, CURRENT_USER_ID, 1, 42, 0x11, EVERY_CAPABILITY),
+        rosterDevice(PEER_DEVICE_ID, OTHER_USER_ID, 2, 43, 0x21, firstPeerCapabilities),
+        rosterDevice(OUTSIDER_DEVICE_ID, OTHER_USER_ID, 3, 44, 0x31, secondPeerCapabilities),
+    )
+
+    private fun rosterOf(vararg devices: MessagingDeviceRosterEntryDto): MessagingDeviceRosterDto {
+        val listed = devices.toList()
+        // The advertised capabilities deliberately sit outside the canonical bytes, so a roster
+        // that gains them keeps the hash the server already published.
+        val hash = sha256(canonicalRosterBytes(listed))
         return MessagingDeviceRosterDto(
             conversationId = CONVERSATION_ID,
             rosterRevision = "v1:sha256:$hash",
             rosterHash = hash,
             hashAlgorithm = "sha256",
-            devices = devices,
+            devices = listed,
         )
     }
 
@@ -1166,6 +1330,7 @@ class RemoteSecureMessagingTransportTest {
         signalDeviceId: Int,
         registrationId: Int,
         seed: Int,
+        capabilities: Map<String, Boolean?>? = null,
     ): MessagingDeviceRosterEntryDto {
         val identityKey = signalValue(5, seed, 33)
         val signedKey = signalValue(5, seed + 1, 33)
@@ -1188,6 +1353,14 @@ class RemoteSecureMessagingTransportTest {
             rotatedAt = null,
             identityKeyChangedAt = TIMESTAMP,
             bundleVersionChangedAt = TIMESTAMP,
+            client = capabilities?.let {
+                MessagingDeviceClientDto(
+                    platform = "android",
+                    version = "0.2.30",
+                    build = 41,
+                    capabilities = it,
+                )
+            },
         )
     }
 
@@ -1304,12 +1477,40 @@ class RemoteSecureMessagingTransportTest {
             serverDeviceId = CURRENT_DEVICE_ID,
             installationId = "installation-1",
         )
+        /** A device new enough to render both reserved-prefix descriptors as what they are. */
+        val EVERY_CAPABILITY: Map<String, Boolean?> = mapOf(
+            MESSAGING_REACTIONS_DEVICE_CAPABILITY to true,
+            MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY to true,
+        )
+
+        /**
+         * A device that shipped reactions but not corrections.
+         *
+         * Spelled with the edit key explicitly false rather than absent, because an older build
+         * that simply never mentions the key must be read the same way: not supported.
+         */
+        val REACTIONS_ONLY_CAPABILITY: Map<String, Boolean?> = mapOf(
+            MESSAGING_REACTIONS_DEVICE_CAPABILITY to true,
+            MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY to false,
+        )
+
         const val READY_CAPABILITIES = """
             {"ok":true,"data":{"api_version":"v1","currency":{"code":"UGX","scale":"2"},
             "features":{"messaging":true,"messaging_groups":true,"messaging_reactions_e2ee_v1":true},"authentication":{},"protocols":{"messaging":{
             "ready":true,"version":"v2","suite":"signal-pqxdh-kyber1024-double-ratchet-v2",
             "post_quantum":true}}}}
         """
+        /**
+         * The same activation, with the server having switched corrections on for this account.
+         *
+         * [READY_CAPABILITIES] deliberately stays without the key so the ordinary fixtures keep
+         * exercising the gate-off path that every device sees until the rollout begins.
+         */
+        val EDITS_READY_CAPABILITIES: String = READY_CAPABILITIES.replace(
+            "\"messaging_reactions_e2ee_v1\":true",
+            "\"messaging_reactions_e2ee_v1\":true,\"messaging_message_edits_v1\":true",
+        )
+
         const val PROFILE = """
             {"ok":true,"data":{"id":"$CURRENT_USER_ID","name":"Kit User"}}
         """

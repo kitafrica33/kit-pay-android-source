@@ -15,8 +15,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -47,20 +49,26 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.Call
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Done
 import androidx.compose.material.icons.rounded.DoneAll
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.Payments
 import androidx.compose.material.icons.rounded.Photo
 import androidx.compose.material.icons.rounded.PhotoCamera
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Security
+import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
@@ -84,6 +92,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -93,6 +102,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -102,8 +112,6 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.input.pointer.PointerEventPass
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -128,8 +136,10 @@ import com.kit.wallet.R
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitPaymentMessage
-import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
-import com.kit.wallet.data.messaging.readBoundedMedia
+import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.SecureMediaSource
+import com.kit.wallet.data.messaging.displayName
+import com.kit.wallet.data.messaging.secureMediaSource
 import com.kit.wallet.data.repository.AbuseReportContext
 import com.kit.wallet.data.repository.AbuseReportSelectionPolicy
 import com.kit.wallet.data.repository.AbuseReportTarget
@@ -139,12 +149,17 @@ import com.kit.wallet.feature.funding.TopUpSheet
 import com.kit.wallet.feature.funding.TopUpViewModel
 import com.kit.wallet.feature.chat.camera.CameraPull
 import com.kit.wallet.feature.chat.camera.KitChatCameraFlow
+import com.kit.wallet.feature.chat.camera.KitChatVideoEditorFlow
+import com.kit.wallet.feature.chat.camera.LibraryVideoDraft
+import com.kit.wallet.feature.chat.camera.stageLibraryVideoForEditing
 import com.kit.wallet.ui.components.GroupedAmountTransformation
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.kitNameAccent
 import com.kit.wallet.ui.model.CallDirection
+import com.kit.wallet.ui.model.ChatMember
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.DeliveryState
+import com.kit.wallet.ui.model.GroupPaymentSummary
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
 import com.kit.wallet.ui.model.Money
@@ -152,7 +167,13 @@ import com.kit.wallet.ui.model.PaymentEventKind
 import com.kit.wallet.ui.model.TransferClaim
 import com.kit.wallet.ui.model.TransferClaimStatus
 import com.kit.wallet.ui.model.TopUpRequirement
+import com.kit.wallet.ui.model.acceptsDeliveryInfo
+import com.kit.wallet.ui.model.acceptsEdits
 import com.kit.wallet.ui.model.acceptsReactions
+import com.kit.wallet.ui.model.acceptsReplies
+import com.kit.wallet.ui.model.replyPreviewLabel
+import java.io.File
+import java.util.UUID
 import com.kit.wallet.ui.theme.KitGreen300
 import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
@@ -176,11 +197,20 @@ private data class PendingAbuseReport(
     val reportedName: String,
 )
 
+/** A selection resolved far enough to send: how to open it, what it is, what to call it. */
+private data class PickedMedia(
+    val source: SecureMediaSource,
+    val mediaType: String,
+    val caption: String? = null,
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConversationScreen(
     chatId: String,
     claimableTransfersEnabled: Boolean,
+    /** Whether this account may send a payment into the group, and answer one it was sent. */
+    groupPaymentsEnabled: Boolean = false,
     abuseReportingEnabled: Boolean = false,
     onBack: () -> Unit,
     onVoiceCall: (String) -> Unit,
@@ -211,15 +241,20 @@ fun ConversationScreen(
     }
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val historyAvailable by viewModel.historyAvailable.collectAsStateWithLifecycle()
+    val messageEditsAvailable by viewModel.messageEditsAvailable.collectAsStateWithLifecycle()
     val chat by viewModel.chat.collectAsStateWithLifecycle()
     val sending by viewModel.sending.collectAsStateWithLifecycle()
     val retryingMessageId by viewModel.retryingMessageId.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
-    val mediaBytes by viewModel.mediaBytes.collectAsStateWithLifecycle()
+    val mediaFiles by viewModel.mediaFiles.collectAsStateWithLifecycle()
     val mediaLoading by viewModel.mediaLoading.collectAsStateWithLifecycle()
     val mediaErrors by viewModel.mediaErrors.collectAsStateWithLifecycle()
     val restoredDraft by viewModel.restoredDraft.collectAsStateWithLifecycle()
+    val replyTarget by viewModel.replyTarget.collectAsStateWithLifecycle()
+    val editTarget by viewModel.editTarget.collectAsStateWithLifecycle()
+    val messageInfo by viewModel.messageInfo.collectAsStateWithLifecycle()
     val transferClaims by viewModel.transferClaims.collectAsStateWithLifecycle()
+    val groupPayments by viewModel.groupPayments.collectAsStateWithLifecycle()
     val groupMembers by viewModel.groupMembers.collectAsStateWithLifecycle()
     val refusedForFunds by viewModel.topUpRequired.collectAsStateWithLifecycle()
     val topUpRequirement by topUp.requirement.collectAsStateWithLifecycle()
@@ -231,52 +266,56 @@ fun ConversationScreen(
     }
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    // Every picker/capture result funnels through one bounded reader that hands plaintext
-    // ownership to the ViewModel send job (which erases it on completion or failure).
-    fun sendPickedMedia(read: suspend () -> Triple<ByteArray, String, String?>) {
+    // Every picker/capture result funnels through one place that hands the ViewModel a way to
+    // *open* the selection rather than the bytes of it, so the size of what someone attaches
+    // stops being the size of what this process has to hold.
+    fun sendPickedMedia(prepare: suspend () -> PickedMedia) {
         coroutineScope.launch {
-            var selectedBytes: ByteArray? = null
             try {
-                var mediaType = "application/octet-stream"
-                var caption: String? = null
-                withContext(Dispatchers.IO + NonCancellable) {
-                    val (bytes, type, name) = read()
-                    selectedBytes = bytes
-                    mediaType = type
-                    caption = name
-                }
+                val picked = withContext(Dispatchers.IO + NonCancellable) { prepare() }
                 coroutineContext.ensureActive()
-                val owned = checkNotNull(selectedBytes)
-                viewModel.sendMedia(owned, mediaType, caption)
-                selectedBytes = null // Ownership moved to the ViewModel send job.
+                viewModel.sendMedia(picked.source, picked.mediaType, picked.caption)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
                 viewModel.reportMediaSelectionError(
                     error.message ?: "The selected file could not be opened",
                 )
-            } finally {
-                selectedBytes?.fill(0)
             }
         }
     }
 
+    // A picked video opens the same trim/mute/caption editor the in-app camera uses, so a
+    // library clip can be cut down before it is encrypted — the raw pick never goes straight
+    // to the wire anymore. Photos keep their existing transcode-and-send path.
+    var libraryVideoDraft by remember { mutableStateOf<LibraryVideoDraft?>(null) }
     val pickLibraryMedia = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
     ) { uri ->
         if (uri != null) {
-            sendPickedMedia {
-                val resolvedType = context.contentResolver.getType(uri).orEmpty().lowercase()
-                if (resolvedType.startsWith("video/")) {
-                    val bytes = context.contentResolver.openInputStream(uri)?.use {
-                        it.readBoundedMedia(MAX_IMAGE_PLAINTEXT_BYTES)
-                    } ?: error("The selected video could not be opened")
-                    val mediaType = KitMediaMessage.normalizeMediaType(resolvedType) ?: "video/mp4"
-                    Triple(bytes, mediaType, null)
-                } else {
+            val resolvedType = context.contentResolver.getType(uri).orEmpty().lowercase()
+            if (resolvedType.startsWith("video/")) {
+                coroutineScope.launch {
+                    try {
+                        val staged = withContext(Dispatchers.IO) {
+                            stageLibraryVideoForEditing(context, uri, resolvedType)
+                        }
+                        libraryVideoDraft = staged
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        viewModel.reportMediaSelectionError(
+                            error.message ?: "The selected video could not be opened",
+                        )
+                    }
+                }
+            } else {
+                sendPickedMedia {
+                    // Photos are re-encoded first (orientation, size, stripped metadata), so this
+                    // one really is bytes in heap — a transcoded still, not a source file.
                     val bytes = transcodeChatImage(context.contentResolver, uri)
                         ?: error("The selected photo could not be prepared")
-                    Triple(bytes, "image/jpeg", null)
+                    PickedMedia(SecureMediaSource.ofBytes(bytes), "image/jpeg")
                 }
             }
         }
@@ -322,23 +361,14 @@ fun ConversationScreen(
     ) { uri ->
         if (uri != null) {
             sendPickedMedia {
-                val bytes = context.contentResolver.openInputStream(uri)?.use {
-                    it.readBoundedMedia(MAX_IMAGE_PLAINTEXT_BYTES)
-                } ?: error("The selected document could not be opened")
-                val mediaType = KitMediaMessage.normalizeMediaType(
-                    context.contentResolver.getType(uri).orEmpty(),
-                ) ?: "application/octet-stream"
-                // The wire descriptor has no filename field; the caption carries it (iOS parity).
-                val displayName = context.contentResolver.query(
-                    uri,
-                    arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
-                    null,
-                    null,
-                    null,
-                )?.use { cursor ->
-                    if (cursor.moveToFirst()) cursor.getString(0) else null
-                }
-                Triple(bytes, mediaType, displayName?.take(120))
+                PickedMedia(
+                    source = context.contentResolver.secureMediaSource(uri),
+                    mediaType = KitMediaMessage.normalizeMediaType(
+                        context.contentResolver.getType(uri).orEmpty(),
+                    ) ?: "application/octet-stream",
+                    // The wire descriptor has no filename field; the caption carries it (iOS parity).
+                    caption = context.contentResolver.displayName(uri),
+                )
             }
         }
     }
@@ -392,13 +422,20 @@ fun ConversationScreen(
             )
         }
     }
+    messageInfo?.let { state ->
+        MessageInfoScreen(
+            state = state,
+            onRetry = viewModel::retryMessageInfo,
+            onDismiss = viewModel::closeMessageInfo,
+        )
+    }
     var galleryMessageId by remember { mutableStateOf<String?>(null) }
     galleryMessageId?.let { openedId ->
         ConversationMediaGallery(
             chatName = currentChat.name,
             mediaMessages = messages.filter { it.kind in GALLERY_MEDIA_KINDS },
             initialMessageId = openedId,
-            mediaBytes = mediaBytes,
+            mediaFiles = mediaFiles,
             mediaLoading = mediaLoading,
             mediaErrors = mediaErrors,
             onLoad = viewModel::openMedia,
@@ -428,15 +465,42 @@ fun ConversationScreen(
         KitChatCameraFlow(
             maxTransferBytes = viewModel.captureByteLimit(),
             onDismiss = { cameraFlowOpen = false },
-            onSendMedia = { bytes, mediaType, caption ->
-                viewModel.sendMedia(bytes, mediaType, caption)
+            onSendMedia = { encoded ->
+                viewModel.sendMedia(
+                    source = encoded.source,
+                    mediaType = encoded.mediaType,
+                    caption = encoded.caption,
+                    onFinished = encoded.release,
+                )
             },
             onError = viewModel::reportMediaSelectionError,
         )
     }
+    libraryVideoDraft?.let { staged ->
+        KitChatVideoEditorFlow(
+            draft = staged,
+            maxTransferBytes = viewModel.captureByteLimit(),
+            onDismiss = { libraryVideoDraft = null },
+            onSendMedia = { encoded ->
+                viewModel.sendMedia(
+                    source = encoded.source,
+                    mediaType = encoded.mediaType,
+                    caption = encoded.caption,
+                    onFinished = encoded.release,
+                )
+            },
+            onError = viewModel::reportMediaSelectionError,
+        )
+    }
+    // Group-payment wire is believed only in the company of the announcement that vouches for it,
+    // and never at all in a one-to-one thread. Everything that fails is dropped here rather than
+    // reaching a bubble, because an unrenderable descriptor is not a message.
+    val visibleMessages = remember(messages, currentChat.isGroup) {
+        projectedGroupPaymentMessages(messages, currentChat.isGroup)
+    }
     ConversationContent(
         chat = currentChat,
-        messages = messages,
+        messages = visibleMessages,
         onBack = onBack,
         onVoiceCall = onVoiceCall,
         onVideoCall = onVideoCall,
@@ -452,6 +516,15 @@ fun ConversationScreen(
         onToggleReaction = { message, emoji ->
             viewModel.toggleReaction(message.id, emoji)
         },
+        replyTarget = replyTarget,
+        onBeginReply = viewModel::beginReply,
+        onCancelReply = viewModel::cancelReply,
+        editTarget = editTarget,
+        editsEnabled = messageEditsAvailable,
+        onBeginEdit = viewModel::beginEdit,
+        onCancelEdit = viewModel::cancelEdit,
+        onOpenMessageInfo = viewModel::openMessageInfo,
+        onSubmitEdit = viewModel::submitEdit,
         abuseReportingAvailable = abuseReportingEnabled && accountReportTarget != null,
         reportableMessageIds = reportableMessageIds,
         onReportAccount = {
@@ -501,6 +574,34 @@ fun ConversationScreen(
         onReverseTransfer = { message, reason, pin ->
             viewModel.reverseTransfer(message, reason, pin, claimableTransfersEnabled)
         },
+        // A group payment needs the roster for two different reasons: to name the members an
+        // announcement only carries ids for, and to offer the composer somebody to pay.
+        groupPaymentsEnabled = groupPaymentsEnabled && currentChat.isGroup,
+        groupPayments = groupPayments,
+        groupMembers = groupMembers,
+        onSendGroupPayment = { splitMode, audience, selected, total, custom, note, pin, onSent ->
+            viewModel.sendGroupPayment(
+                splitMode = splitMode,
+                audience = audience,
+                selected = selected,
+                totalInput = total,
+                customAmounts = custom,
+                note = note,
+                paymentPin = pin,
+                idempotencyKey = "android-group-payment-${UUID.randomUUID()}",
+                groupPaymentsEnabled = groupPaymentsEnabled,
+                onSent = onSent,
+            )
+        },
+        onAcceptGroupShare = { message ->
+            viewModel.acceptGroupPaymentShare(message, groupPaymentsEnabled)
+        },
+        onRejectGroupShare = { message, reason ->
+            viewModel.rejectGroupPaymentShare(message, reason, groupPaymentsEnabled)
+        },
+        onReverseGroupPayment = { message, reason, pin ->
+            viewModel.reverseUnclaimedGroupPayment(message, reason, pin, groupPaymentsEnabled)
+        },
         // Dormant-feature guard: the composer hides the affordances, and these keep even a
         // stale composition from opening a picker while the release profile is text-only.
         onAttachLibrary = {
@@ -534,7 +635,7 @@ fun ConversationScreen(
             }
         },
         mediaEnabled = BuildConfig.MEDIA_MESSAGING_ENABLED,
-        mediaBytes = mediaBytes,
+        mediaFiles = mediaFiles,
         mediaLoading = mediaLoading,
         mediaErrors = mediaErrors,
         onOpenMedia = viewModel::openMedia,
@@ -587,6 +688,16 @@ private fun SecureConversationLoading(onBack: () -> Unit) {
 }
 
 private const val COMPOSER_DRAFT_PERSIST_DELAY_MILLIS = 600L
+
+/**
+ * The date heading and the encryption notice, which sit above the first message.
+ *
+ * They are list items like any other, so a row's index in the thread is not its index in the list.
+ */
+private const val CONVERSATION_LEADING_ITEMS = 2
+
+/** How often the thread re-checks which of one's own messages are still inside the edit window. */
+private const val EDIT_WINDOW_TICK_MILLIS = 15_000L
 
 /** In-memory plaintext plus a monotonic edit fence for delayed durable-send callbacks. */
 internal data class ConversationComposerState(
@@ -668,6 +779,15 @@ internal fun ConversationContent(
     onAcceptTransfer: (Message) -> Unit = {},
     onRejectTransfer: (Message, String?) -> Unit = { _, _ -> },
     onReverseTransfer: (Message, String?, String) -> Unit = { _, _, _ -> },
+    /** Whether this thread can send a payment to its members, and answer one it was sent. */
+    groupPaymentsEnabled: Boolean = false,
+    /** The server's live view of every group payment this thread mentions, keyed by lower-case id. */
+    groupPayments: Map<String, GroupPaymentSummary> = emptyMap(),
+    groupMembers: List<ChatMember> = emptyList(),
+    onSendGroupPayment: GroupPaymentSendHandler = { _, _, _, _, _, _, _, done -> done() },
+    onAcceptGroupShare: (Message) -> Unit = {},
+    onRejectGroupShare: (Message, String?) -> Unit = { _, _ -> },
+    onReverseGroupPayment: (Message, String?, String) -> Unit = { _, _, _ -> },
     onAttachLibrary: () -> Unit = {},
     onAttachCamera: () -> Unit = {},
     onAttachVideoNote: () -> Unit = {},
@@ -675,7 +795,7 @@ internal fun ConversationContent(
     onOpenCamera: () -> Unit = {},
     onSendVoiceNote: (ByteArray) -> Unit = {},
     mediaEnabled: Boolean = false,
-    mediaBytes: Map<String, ByteArray> = emptyMap(),
+    mediaFiles: Map<String, SecureMediaFile> = emptyMap(),
     mediaLoading: Set<String> = emptySet(),
     mediaErrors: Map<String, String> = emptyMap(),
     onOpenMedia: (Message) -> Unit = {},
@@ -683,6 +803,30 @@ internal fun ConversationContent(
     onOpenViewer: (Message) -> Unit = {},
     reactionsEnabled: Boolean = false,
     onToggleReaction: (Message, String) -> Unit = { _, _ -> },
+    /** The message the composer is currently answering, when one was picked. */
+    replyTarget: Message? = null,
+    onBeginReply: (Message) -> Unit = {},
+    onCancelReply: () -> Unit = {},
+    /** The message whose wording the composer is currently rewriting, when one was picked. */
+    editTarget: Message? = null,
+    /**
+     * Whether the authenticated account may correct a message at all.
+     *
+     * Fail closed by default and separate from [sendEnabled]: a device can be perfectly able to
+     * exchange messages while this account's server capability for corrections is still off, and
+     * offering an Edit item then would only produce a refusal.
+     */
+    editsEnabled: Boolean = false,
+    onBeginEdit: (Message) -> Unit = {},
+    onCancelEdit: () -> Unit = {},
+    /**
+     * Asks what became of a message this account sent.
+     *
+     * Separate from every send-side action: it changes nothing, and it is the one long-press item
+     * that is about a message already gone rather than about saying something new.
+     */
+    onOpenMessageInfo: (Message) -> Unit = {},
+    onSubmitEdit: (String, () -> Unit) -> Unit = { _, _ -> },
     abuseReportingAvailable: Boolean = false,
     reportableMessageIds: Set<String> = emptySet(),
     onReportAccount: () -> Unit = {},
@@ -710,6 +854,16 @@ internal fun ConversationContent(
     // composer is continuously mirrored into the hardware-encrypted messaging draft store, which
     // restores it across rotation and process death and is erased with the messaging state.
     var composerState by remember { mutableStateOf(ConversationComposerState()) }
+    var editState by remember { mutableStateOf(ConversationComposerState()) }
+    // Ticked rather than read once, so an "Edit" option leaves the menu when its fifteen minutes
+    // run out instead of lingering until something else happens to redraw the thread.
+    var editClock by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(EDIT_WINDOW_TICK_MILLIS)
+            editClock = System.currentTimeMillis()
+        }
+    }
     LaunchedEffect(restoredDraft) {
         val restored = restoredDraft ?: return@LaunchedEffect
         if (restored.isNotBlank() && composerState.text.isEmpty()) {
@@ -731,7 +885,18 @@ internal fun ConversationContent(
         // The only way a send ends without releasing the composer is by failing before it was
         // durably committed, and that always reports an error. Re-arming Send here is therefore
         // exactly as permissive as it should be: retry after a failure, never a duplicate.
-        if (error != null) composerState = composerState.releasedForRetry()
+        if (error != null) {
+            composerState = composerState.releasedForRetry()
+            editState = editState.releasedForRetry()
+        }
+    }
+    // A correction is written in its own state rather than in the composer's, so half a sentence
+    // someone had already typed survives being interrupted by a second thought about an earlier
+    // message — and so the draft store, which mirrors the composer, is never handed wording that
+    // belongs to a message already sent.
+    LaunchedEffect(editTarget?.id) {
+        editState = ConversationComposerState()
+            .edited(editTarget?.text.orEmpty())
     }
     LaunchedEffect(Unit) {
         // Deliberately undebounced here, and deliberately not folded into the draft collector
@@ -758,6 +923,32 @@ internal fun ConversationContent(
     // Sending money back is the one payment action that owes the other side an explanation, so
     // Reject and Reverse route through a prompt that collects one.
     var reasonTarget by remember { mutableStateOf<TransferReasonPrompt?>(null) }
+    var showGroupPaymentComposer by remember(chat.id) { mutableStateOf(false) }
+    // Declining a share and returning the unclaimed ones both explain themselves, for the same
+    // reason a one-to-one reversal does.
+    var groupAnswerTarget by remember { mutableStateOf<GroupPaymentAnswerPrompt?>(null) }
+    // A group payment names its members by id; only the roster can turn one into a name.
+    val memberNames = remember(groupMembers) {
+        groupMembers.associateBy({ it.userId.lowercase() }, { it.name })
+    }
+    val displayGroupMemberName: (String) -> String = remember(memberNames) {
+        { userId -> memberNames[userId.lowercase()] ?: "Kit Pay user" }
+    }
+    // A voice note outlives the bubble that started it, and the floating bar still has to say who
+    // is speaking and where — so the thread hands over everything only it can resolve, now.
+    val voiceNoteChatContext = remember(chat.id, chat.name, chat.isGroup, displayGroupMemberName) {
+        VoiceNoteChatContext(
+            conversationId = chat.id,
+            conversationTitle = chat.name,
+            displayName = { userId ->
+                when {
+                    userId.isBlank() -> "You"
+                    chat.isGroup -> displayGroupMemberName(userId)
+                    else -> chat.name
+                }
+            },
+        )
+    }
     var conversationMenuOpen by remember(chat.id) { mutableStateOf(false) }
 
     // Keep the newest message visible, just like WhatsApp: jump to the bottom the first time the
@@ -765,9 +956,27 @@ internal fun ConversationContent(
     // A reader who scrolled up to older history is never yanked; a chip offers the way back.
     val listState = rememberLazyListState()
     val conversationRows = remember(messages) { groupConversationRows(messages) }
+    // A group writes a member's name once per run, not once per bubble. Computed over the whole
+    // thread because the answer for any one message depends on what came before it.
+    val senderNamedIds = remember(messages, chat.isGroup) {
+        senderNamedMessageIds(messages, chat.isGroup)
+    }
     var renderedMessageCount by remember { mutableStateOf(0) }
     var pendingNewMessages by remember { mutableStateOf(0) }
     val coroutineScopeForScroll = rememberCoroutineScope()
+    // Tapping a quote takes the thread to what it quotes. A target that is not in the loaded
+    // history does nothing at all, rather than scrolling somewhere arbitrary and calling it the
+    // message: the quote itself already says which words it is, which is the useful half.
+    val jumpToMessage: (String) -> Unit = { targetId ->
+        val row = conversationRows.indexOfFirst { candidate ->
+            candidate.messages.any { it.id == targetId }
+        }
+        if (row >= 0) {
+            coroutineScopeForScroll.launch {
+                listState.animateScrollToItem(row + CONVERSATION_LEADING_ITEMS)
+            }
+        }
+    }
     // The list header adds two leading items (date + encryption notice) and a trailing spacer,
     // so the newest message sits just above the final index.
     val nearBottom by remember {
@@ -887,7 +1096,38 @@ internal fun ConversationContent(
             },
         )
     }
+    if (showGroupPaymentComposer && groupPaymentsEnabled) {
+        GroupPaymentComposerDialog(
+            members = groupMembers,
+            // The wallet decides the currency; this is the label on the fields, and the draft
+            // policy re-reads the real one before a single minor unit moves.
+            currencyCode = groupPayments.values.firstOrNull()?.currencyCode ?: Money.SYMBOL,
+            sending = sending,
+            error = error,
+            biometricsAvailable = biometricsAvailable,
+            onDismiss = { showGroupPaymentComposer = false },
+            onSend = onSendGroupPayment,
+        )
+    }
+    groupAnswerTarget?.let { prompt ->
+        GroupPaymentAnswerDialog(
+            returningUnclaimed = prompt.returningUnclaimed,
+            sending = sending,
+            error = error,
+            biometricsAvailable = biometricsAvailable,
+            onDismiss = { groupAnswerTarget = null },
+            onConfirm = { reason, pin ->
+                if (prompt.returningUnclaimed) {
+                    onReverseGroupPayment(prompt.message, reason, pin)
+                } else {
+                    onRejectGroupShare(prompt.message, reason)
+                }
+                groupAnswerTarget = null
+            },
+        )
+    }
 
+    ProvideVoiceNoteChatContext(voiceNoteChatContext) {
     Scaffold(
         containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
         topBar = {
@@ -904,7 +1144,13 @@ internal fun ConversationContent(
                             Modifier
                         },
                     ) {
-                        KitAvatar(chat.name, size = 40.dp, online = chat.online, avatarUrl = chat.avatarUrl)
+                        KitAvatar(
+                            chat.name,
+                            size = 40.dp,
+                            online = chat.online,
+                            avatarUrl = chat.avatarUrl,
+                            isGroup = chat.isGroup,
+                        )
                         Spacer(Modifier.width(10.dp))
                         Column {
                             Text(chat.name, style = MaterialTheme.typography.titleMedium)
@@ -984,35 +1230,74 @@ internal fun ConversationContent(
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                     )
                 }
+                if (editTarget != null) {
+                    EditComposerBar(target = editTarget, onCancel = onCancelEdit)
+                } else {
+                    replyTarget?.let { target ->
+                        ReplyComposerBar(
+                            target = target,
+                            peerName = chat.name,
+                            onCancel = onCancelReply,
+                        )
+                    }
+                }
                 Composer(
-                    draft = composerState.text,
+                    draft = if (editTarget != null) editState.text else composerState.text,
                     onDraft = {
-                        composerState = composerState.edited(it)
+                        if (editTarget != null) {
+                            editState = editState.edited(it)
+                        } else {
+                            composerState = composerState.edited(it)
+                        }
                         if (error != null) onClearError()
                     },
                     onSend = {
                         // Null means this exact composer content is already on its way, which is
                         // what a second tap before the durable commit looks like.
-                        composerState.submitted()?.let { submitted ->
-                            composerState = submitted
-                            onSend(submitted.text) {
-                                composerState = composerState.clearIfUnchanged(submitted)
+                        if (editTarget != null) {
+                            editState.submitted()?.let { submitted ->
+                                editState = submitted
+                                onSubmitEdit(submitted.text) {
+                                    editState = editState.clearIfUnchanged(submitted)
+                                }
+                            }
+                        } else {
+                            composerState.submitted()?.let { submitted ->
+                                composerState = submitted
+                                onSend(submitted.text) {
+                                    composerState = composerState.clearIfUnchanged(submitted)
+                                }
                             }
                         }
                     },
-                    submissionInFlight = composerState.submittedGeneration != null,
+                    submissionInFlight = if (editTarget != null) {
+                        editState.submittedGeneration != null
+                    } else {
+                        composerState.submittedGeneration != null
+                    },
+                    voiceDraftKey = chat.id,
                     onAttachLibrary = onAttachLibrary,
                     onAttachCamera = onAttachCamera,
                     onAttachVideoNote = onAttachVideoNote,
                     onAttachDocument = onAttachDocument,
                     onSendVoiceNote = onSendVoiceNote,
-                    mediaEnabled = mediaEnabled,
+                    // A correction replaces words with words. Everything that would instead start
+                    // a *new* message — an attachment, a voice note, a payment, a send-later — is
+                    // withdrawn while the mode is open, so no gesture can quietly leave it.
+                    mediaEnabled = mediaEnabled && editTarget == null,
                     onRequestPayment = {
                         if (error != null) onClearError()
                         showRequestDialog = true
                     },
+                    groupPaymentsEnabled = groupPaymentsEnabled && editTarget == null,
+                    paymentsEnabled = editTarget == null,
+                    onPayGroup = {
+                        if (error != null) onClearError()
+                        showGroupPaymentComposer = true
+                    },
                     sendEnabled = sendEnabled,
-                    schedulingEnabled = schedulingEnabled,
+                    editing = editTarget != null,
+                    schedulingEnabled = schedulingEnabled && editTarget == null,
                     onScheduleSend = {
                         if (error != null) onClearError()
                         if (composerState.text.isNotBlank()) {
@@ -1029,9 +1314,6 @@ internal fun ConversationContent(
         val cameraPullMaxPx = with(density) { CAMERA_PULL_MAX_REVEAL.toPx() }
         val cameraPullThresholdPx = with(density) { CAMERA_PULL_OPEN_THRESHOLD.toPx() }
         var cameraRevealPx by remember { mutableFloatStateOf(0f) }
-        // The camera opens on release and only on release. Fling callbacks are not a reliable
-        // "the finger left the screen" signal, so the gesture end is observed directly below.
-        var cameraPullPointerDown by remember { mutableStateOf(false) }
         val currentOnOpenCamera by rememberUpdatedState(onOpenCamera)
         val cameraPullConnection = remember(mediaEnabled, cameraPullMaxPx, cameraPullThresholdPx) {
             object : NestedScrollConnection {
@@ -1054,48 +1336,32 @@ internal fun ConversationContent(
                     return Offset(0f, -used)
                 }
 
-                // Deliberately does not open the camera. This can be dispatched while the finger is
-                // still down, which is the whole bug: the panel says "release to open the camera"
-                // and then the camera would appear mid-drag. The release handler below owns it.
-                override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity =
-                    Velocity.Zero
+                /**
+                 * Where the release is decided, and the only place it is.
+                 *
+                 * A scroll container dispatches this from the end of its drag — one call, once the
+                 * finger is genuinely off the glass — which is the same signal pull-to-refresh
+                 * settles on. The gesture used to watch pointers on the surrounding box instead and
+                 * open from there; that never fired for a pull the list had taken over, so the panel
+                 * kept promising a camera that never arrived.
+                 */
+                override suspend fun onPreFling(available: Velocity): Velocity {
+                    if (!mediaEnabled || cameraRevealPx <= 0f) return Velocity.Zero
+                    val open = CameraPull.shouldOpen(cameraRevealPx, cameraPullThresholdPx)
+                    // Settle the panel first either way, so the reveal never stays stuck open.
+                    animate(cameraRevealPx, 0f) { value, _ -> cameraRevealPx = value }
+                    if (open) currentOnOpenCamera()
+                    // The reveal — not the list — absorbed the drag that built this velocity, so the
+                    // list must not fling on it and carry the thread away under the camera.
+                    return available
+                }
             }
         }
         Box(
             Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .nestedScroll(cameraPullConnection)
-                // Observes the gesture without consuming it, so the list still scrolls normally.
-                // Watching pointers directly is what makes "release" mean release: it fires once
-                // the last finger lifts, whether or not the list happened to fling afterwards.
-                .pointerInput(mediaEnabled) {
-                    if (!mediaEnabled) return@pointerInput
-                    while (true) {
-                        awaitPointerEventScope {
-                            var event = awaitPointerEvent(PointerEventPass.Initial)
-                            while (event.changes.none { it.pressed }) {
-                                event = awaitPointerEvent(PointerEventPass.Initial)
-                            }
-                            cameraPullPointerDown = true
-                            while (event.changes.any { it.pressed }) {
-                                event = awaitPointerEvent(PointerEventPass.Initial)
-                            }
-                            cameraPullPointerDown = false
-                        }
-                        if (cameraRevealPx > 0f) {
-                            val open = CameraPull.shouldOpenOnRelease(
-                                revealPx = cameraRevealPx,
-                                thresholdPx = cameraPullThresholdPx,
-                                pointerDown = cameraPullPointerDown,
-                            )
-                            // Settle the panel first either way, so the reveal never stays stuck
-                            // open when the release produced no fling to collapse it.
-                            animate(cameraRevealPx, 0f) { value, _ -> cameraRevealPx = value }
-                            if (open) currentOnOpenCamera()
-                        }
-                    }
-                },
+                .nestedScroll(cameraPullConnection),
         ) {
         if (cameraRevealPx > 0f) {
             CameraPeekPanel(
@@ -1166,7 +1432,7 @@ internal fun ConversationContent(
                     ImageGroupBubble(
                         messages = group.messages,
                         fromMe = group.messages.first().fromMe,
-                        mediaBytes = mediaBytes,
+                        mediaFiles = mediaFiles,
                         mediaLoading = mediaLoading,
                         mediaErrors = mediaErrors,
                         onOpenMedia = onOpenMedia,
@@ -1175,6 +1441,7 @@ internal fun ConversationContent(
                         onToggleReaction = onToggleReaction,
                         reportableMessageIds = reportableMessageIds,
                         onReportMessage = onReportMessage,
+                        showSenderName = group.messages.first().id in senderNamedIds,
                     )
                     return@items
                 }
@@ -1190,6 +1457,46 @@ internal fun ConversationContent(
                             }
                         },
                     )
+                } else if (message.kind == MessageKind.GROUP_PAYMENT) {
+                    // Only ever drawn from a descriptor the projection already vouched for, so a
+                    // null here means the message is not one and nothing should be drawn at all.
+                    message.groupPaymentDescriptor()?.let { descriptor ->
+                        val payment = groupPayments[descriptor.groupPaymentId]
+                        GroupPaymentChatCard(
+                            descriptor = descriptor,
+                            payment = payment,
+                            // Buttons are drawn from the server's answer, and only while that
+                            // answer is about the payment this card announces.
+                            contradictsServer = payment != null &&
+                                !descriptor.matchesAuthoritativePayment(payment),
+                            isOutgoing = message.fromMe,
+                            senderName = message.senderName?.takeIf(String::isNotBlank)
+                                ?: message.senderUserId?.let(displayGroupMemberName)
+                                ?: chat.name,
+                            displayName = displayGroupMemberName,
+                            isBusy = sending,
+                            onAccept = { onAcceptGroupShare(message) },
+                            onDecline = {
+                                groupAnswerTarget =
+                                    GroupPaymentAnswerPrompt(message, returningUnclaimed = false)
+                            },
+                            onReturnUnclaimed = {
+                                groupAnswerTarget =
+                                    GroupPaymentAnswerPrompt(message, returningUnclaimed = true)
+                            },
+                        )
+                    }
+                } else if (message.kind == MessageKind.GROUP_PAYMENT_EVENT) {
+                    // One member's answer, in gold, said the way a date heading is said.
+                    message.groupPaymentDescriptor()?.let { descriptor ->
+                        GroupPaymentCopy.outcome(
+                            action = descriptor.action,
+                            actorName = message.senderName?.takeIf(String::isNotBlank)
+                                ?: message.senderUserId?.let(displayGroupMemberName)
+                                ?: "A member",
+                            isViewerActor = message.fromMe,
+                        )?.let { GroupPaymentOutcomeChip(it) }
+                    }
                 } else if (message.kind == MessageKind.PAYMENT_EVENT) {
                     // Outcomes are the conversation talking about itself, not either person
                     // talking. They read like the encryption notice: centred, unattributed.
@@ -1212,7 +1519,7 @@ internal fun ConversationContent(
                                 }
                             }
                         },
-                        mediaBytes = mediaBytes[message.id],
+                        media = mediaFiles[message.id],
                         mediaLoading = message.id in mediaLoading,
                         mediaError = mediaErrors[message.id],
                         onOpenMedia = { onOpenMedia(message) },
@@ -1220,6 +1527,15 @@ internal fun ConversationContent(
                         onOpenViewer = { onOpenViewer(message) },
                         reactable = reactionsEnabled && message.acceptsReactions,
                         onToggleReaction = { emoji -> onToggleReaction(message, emoji) },
+                        replyable = sendEnabled && message.acceptsReplies,
+                        onReply = { onBeginReply(message) },
+                        editable = sendEnabled && editsEnabled &&
+                            message.acceptsEdits(editClock),
+                        onEdit = { onBeginEdit(message) },
+                        infoable = sendEnabled && message.acceptsDeliveryInfo,
+                        onInfo = { onOpenMessageInfo(message) },
+                        onJumpToQuoted = jumpToMessage,
+                        quotedAuthorFallback = chat.name,
                         reportable = message.id in reportableMessageIds,
                         onReport = { onReportMessage(message) },
                         outcome = outcomes[message.id],
@@ -1250,6 +1566,7 @@ internal fun ConversationContent(
                         onSendScheduledNow = { onSendScheduledNow(message) },
                         onEditSchedule = { scheduleTarget = ScheduleTarget.Existing(message) },
                         onCancelSchedule = { onCancelScheduledSend(message) },
+                        showSenderName = message.id in senderNamedIds,
                     )
                 }
             }
@@ -1307,6 +1624,7 @@ internal fun ConversationContent(
             }
         }
         }
+    }
     }
 }
 
@@ -1386,7 +1704,7 @@ internal fun MessageBubble(
     retrying: Boolean,
     retryEnabled: Boolean,
     onRetry: () -> Unit,
-    mediaBytes: ByteArray? = null,
+    media: SecureMediaFile? = null,
     mediaLoading: Boolean = false,
     mediaError: String? = null,
     onOpenMedia: () -> Unit = {},
@@ -1395,6 +1713,24 @@ internal fun MessageBubble(
     /** False while secure messaging is unavailable, so the palette is never offered offline. */
     reactable: Boolean = false,
     onToggleReaction: (String) -> Unit = {},
+    /** False while secure messaging is unavailable, or for a bubble nobody can answer yet. */
+    replyable: Boolean = false,
+    onReply: () -> Unit = {},
+    /** True only for one's own message, inside the fifteen minutes it may still be reworded. */
+    editable: Boolean = false,
+    onEdit: () -> Unit = {},
+    /** True only for one's own message, which is the only one the server will report on. */
+    infoable: Boolean = false,
+    onInfo: () -> Unit = {},
+    /** Takes the thread to the message this one quotes. */
+    onJumpToQuoted: (String) -> Unit = {},
+    /**
+     * Who to credit a quoted message to when the message itself names nobody.
+     *
+     * A direct chat labels no bubble, because the header already says who the other person is —
+     * so a quote of their message has nothing to read off, and the thread supplies their name.
+     */
+    quotedAuthorFallback: String = "",
     reportable: Boolean = false,
     onReport: () -> Unit = {},
     /** How this conversation recorded the payment ending, when it did. */
@@ -1411,6 +1747,14 @@ internal fun MessageBubble(
     onSendScheduledNow: () -> Unit = {},
     onEditSchedule: () -> Unit = {},
     onCancelSchedule: () -> Unit = {},
+    /**
+     * Whether this bubble opens a run by its author, and so carries their name.
+     *
+     * The thread decides, not the bubble: a name is a heading for a stretch of messages, and the
+     * bubble cannot see what came before it. A direct chat never labels anything, so the default
+     * of true costs it nothing.
+     */
+    showSenderName: Boolean = true,
 ) {
     val colors = KitTheme.colors
     val bubbleColor = if (msg.fromMe) colors.chatBubbleMe else colors.chatBubbleOther
@@ -1434,6 +1778,8 @@ internal fun MessageBubble(
         MessageKind.PAYMENT_REQUEST,
         MessageKind.PAYMENT_TRANSFER,
         MessageKind.PAYMENT_EVENT,
+        MessageKind.GROUP_PAYMENT,
+        MessageKind.GROUP_PAYMENT_EVENT,
         MessageKind.CALL,
         MessageKind.SYSTEM,
         -> null
@@ -1461,17 +1807,53 @@ internal fun MessageBubble(
         )
     }
 
+    SwipeToReplyRow(
+        enabled = replyable,
+        onReply = onReply,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
     Box(Modifier.fillMaxWidth()) {
         Column(
             Modifier
                 .align(if (msg.fromMe) Alignment.CenterEnd else Alignment.CenterStart)
-                .padding(bottom = if (msg.reactions.isEmpty()) 8.dp else 18.dp)
+                // The chip row is drawn REACTION_CHIP_OVERLAP higher than it is laid out, so that
+                // much of the gap below is already spoken for.
+                .padding(bottom = if (msg.reactions.isEmpty()) 8.dp else 2.dp)
                 .widthIn(max = 300.dp),
         ) {
             DropdownMenu(
                 expanded = actionMenuOpen,
                 onDismissRequest = { actionMenuOpen = false },
             ) {
+                // First in the menu because it is the commonest thing to want, and because the
+                // swipe that also does it is not something a screen reader can perform.
+                if (replyable) {
+                    DropdownMenuItem(
+                        text = { Text("Reply") },
+                        onClick = {
+                            actionMenuOpen = false
+                            onReply()
+                        },
+                    )
+                }
+                if (editable) {
+                    DropdownMenuItem(
+                        text = { Text("Edit") },
+                        onClick = {
+                            actionMenuOpen = false
+                            onEdit()
+                        },
+                    )
+                }
+                if (infoable) {
+                    DropdownMenuItem(
+                        text = { Text("Info") },
+                        onClick = {
+                            actionMenuOpen = false
+                            onInfo()
+                        },
+                    )
+                }
                 if (msg.isScheduledEntry) {
                     DropdownMenuItem(
                         text = { Text("Send now") },
@@ -1555,7 +1937,8 @@ internal fun MessageBubble(
                     null
                 },
                 modifier = if (
-                    copyableText != null || reactable || reportable || msg.isScheduledEntry
+                    copyableText != null || reactable || replyable || editable || infoable ||
+                    reportable || msg.isScheduledEntry
                 ) {
                     Modifier.combinedClickable(
                         onClick = {},
@@ -1569,7 +1952,8 @@ internal fun MessageBubble(
                     // Only a group names its senders, and only for other people's bubbles: the
                     // side of the screen already says which ones are mine. The accent matches
                     // this person's avatar, so the same author reads the same way down a thread.
-                    if (!msg.fromMe) {
+                    // Within a run by one member it is written once, on the message that opens it.
+                    if (!msg.fromMe && showSenderName) {
                         msg.senderName?.takeIf(String::isNotBlank)?.let { author ->
                             Text(
                                 author,
@@ -1583,18 +1967,24 @@ internal fun MessageBubble(
                         }
                     }
                     msg.replyToText?.let { reply ->
-                        Surface(
-                            color = MaterialTheme.colorScheme.secondary.copy(alpha = 0.10f),
-                            shape = MaterialTheme.shapes.extraSmall,
-                            modifier = Modifier.padding(bottom = 6.dp),
-                        ) {
-                            Text(
-                                reply,
-                                style = MaterialTheme.typography.bodySmall,
-                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
-                                maxLines = 1,
-                            )
+                        val quotedAuthor = when {
+                            msg.replyToFromMe -> "You"
+                            else -> msg.replyToSenderName?.takeIf(String::isNotBlank)
+                                ?: quotedAuthorFallback.takeIf(String::isNotBlank)
+                                ?: "Message"
                         }
+                        QuotedMessagePreview(
+                            author = quotedAuthor,
+                            preview = reply,
+                            accent = kitNameAccent(quotedAuthor),
+                            // Tinted from the bubble's own text rather than the theme, so the quote
+                            // sits inside whichever of the two bubble colours is around it.
+                            background = contentColor.copy(alpha = 0.10f),
+                            onClick = msg.replyToMessageId?.let { target ->
+                                { onJumpToQuoted(target) }
+                            },
+                            modifier = Modifier.padding(bottom = 6.dp),
+                        )
                     }
                     when (msg.kind) {
                         MessageKind.PAYMENT -> PaymentChatCard(msg)
@@ -1617,7 +2007,7 @@ internal fun MessageBubble(
                         )
                         MessageKind.VOICE_NOTE -> SecureVoiceNoteContent(
                             msg = msg,
-                            mediaBytes = mediaBytes,
+                            media = media,
                             mediaLoading = mediaLoading,
                             mediaError = mediaError,
                             onOpenMedia = onOpenMedia,
@@ -1625,7 +2015,7 @@ internal fun MessageBubble(
                         )
                         MessageKind.VIDEO -> SecureVideoContent(
                             msg = msg,
-                            mediaBytes = mediaBytes,
+                            media = media,
                             mediaLoading = mediaLoading,
                             mediaError = mediaError,
                             onOpenMedia = onOpenMedia,
@@ -1634,7 +2024,7 @@ internal fun MessageBubble(
                         )
                         MessageKind.DOCUMENT -> SecureDocumentContent(
                             msg = msg,
-                            mediaBytes = mediaBytes,
+                            media = media,
                             mediaLoading = mediaLoading,
                             mediaError = mediaError,
                             onOpenMedia = onOpenMedia,
@@ -1642,17 +2032,20 @@ internal fun MessageBubble(
                         )
                         MessageKind.IMAGE -> SecureImageContent(
                             msg = msg,
-                            mediaBytes = mediaBytes,
+                            media = media,
                             mediaLoading = mediaLoading,
                             mediaError = mediaError,
                             onOpenMedia = onOpenMedia,
                             onRetryMedia = onRetryMedia,
                             onOpenViewer = onOpenViewer,
                         )
-                        // PAYMENT_EVENT and SYSTEM never reach a bubble — the list renders them
-                        // centred — and CALL is handled by CallLogBubble before this point.
+                        // PAYMENT_EVENT, SYSTEM and both group-payment kinds never reach a bubble
+                        // — the list renders the golden card and the outcome line full width — and
+                        // CALL is handled by CallLogBubble before this point.
                         MessageKind.TEXT,
                         MessageKind.PAYMENT_EVENT,
+                        MessageKind.GROUP_PAYMENT,
+                        MessageKind.GROUP_PAYMENT_EVENT,
                         MessageKind.SYSTEM,
                         MessageKind.CALL,
                         -> Text(msg.text, style = MaterialTheme.typography.bodyLarge)
@@ -1744,6 +2137,17 @@ internal fun MessageBubble(
                             )
                             Spacer(Modifier.width(5.dp))
                         }
+                        if (msg.editedAtEpochMillis > 0) {
+                            // Beside the original time, not instead of it: the message still
+                            // belongs where it was said, and the marker only admits it was
+                            // reworded afterwards.
+                            Text(
+                                "Edited",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = contentColor.copy(alpha = 0.65f),
+                            )
+                            Spacer(Modifier.width(5.dp))
+                        }
                         Text(
                             msg.time,
                             style = MaterialTheme.typography.labelSmall,
@@ -1783,10 +2187,145 @@ internal fun MessageBubble(
                 reactions = msg.reactions,
                 onToggle = onToggleReaction,
                 onShowReactors = { reactorsOpen = true },
+                // Riding up over the bubble's bottom edge is what makes a reaction read as part
+                // of the message rather than a separate little row underneath it. The rim is the
+                // thread's own background, so the chip looks punched through the bubble.
+                ringColor = MaterialTheme.colorScheme.background,
                 modifier = Modifier
                     .align(if (msg.fromMe) Alignment.End else Alignment.Start)
-                    .padding(horizontal = 10.dp),
+                    .offset(y = -REACTION_CHIP_OVERLAP)
+                    .padding(horizontal = 12.dp),
             )
+        }
+    }
+    }
+}
+
+/**
+ * The message being answered, drawn above the answer and inside the composer alike.
+ *
+ * One composable for both places on purpose: what someone is about to quote and what they ended up
+ * quoting should be recognisably the same object, so choosing a message and reading the result
+ * never feel like two different things.
+ */
+@Composable
+internal fun QuotedMessagePreview(
+    author: String,
+    preview: String,
+    accent: Color,
+    background: Color,
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null,
+) {
+    Row(
+        modifier
+            .clip(RoundedCornerShape(7.dp))
+            .background(background)
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .height(IntrinsicSize.Min),
+    ) {
+        // The bar down the leading edge is what makes a quote read as a quote at a glance, before
+        // any of its words are. It takes the author's own accent, the same one their name carries
+        // at the top of a bubble, so a run of answers to one person stays legible as such.
+        Box(
+            Modifier
+                .fillMaxHeight()
+                .width(3.dp)
+                .background(accent),
+        )
+        Column(Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) {
+            Text(
+                author,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = accent,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                preview,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.alpha(0.85f),
+            )
+        }
+    }
+}
+
+/**
+ * The bar above the composer while an answer is being written.
+ *
+ * It stays until the message is sent or the cross is tapped, because "which message am I
+ * answering" is a thing someone can lose track of between picking it and finishing the sentence.
+ */
+@Composable
+internal fun ReplyComposerBar(
+    target: Message,
+    peerName: String,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val author = when {
+        target.fromMe -> "You"
+        else -> target.senderName?.takeIf(String::isNotBlank)
+            ?: peerName.takeIf(String::isNotBlank)
+            ?: "Message"
+    }
+    Row(
+        modifier
+            .fillMaxWidth()
+            .padding(start = 14.dp, end = 6.dp, top = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        QuotedMessagePreview(
+            author = author,
+            preview = target.replyPreviewLabel(),
+            accent = kitNameAccent(author),
+            background = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        IconButton(onClick = onCancel) {
+            Icon(Icons.Rounded.Close, contentDescription = "Cancel reply")
+        }
+    }
+}
+
+/**
+ * The bar above the composer while a message is being corrected.
+ *
+ * It shows the wording as it currently stands, so the change can be read against what everyone
+ * else is still looking at, and it names the mode outright — an edit and an answer both put a
+ * quote above the keyboard, and only the heading tells them apart.
+ */
+@Composable
+internal fun EditComposerBar(
+    target: Message,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier
+            .fillMaxWidth()
+            .padding(start = 14.dp, end = 6.dp, top = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.Rounded.Edit,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        QuotedMessagePreview(
+            author = "Edit message",
+            preview = target.replyPreviewLabel(),
+            accent = MaterialTheme.colorScheme.primary,
+            background = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        IconButton(onClick = onCancel) {
+            Icon(Icons.Rounded.Close, contentDescription = "Cancel edit")
         }
     }
 }
@@ -2200,6 +2739,17 @@ private fun TimelineNotice(summary: String) {
     }
 }
 
+/**
+ * Which group payment is being answered, and whether the answer moves other people's money.
+ *
+ * Declining touches only this member's own share; returning the unclaimed shares is the sender
+ * pulling back everybody else's, which is why only one of the two is approved.
+ */
+private data class GroupPaymentAnswerPrompt(
+    val message: Message,
+    val returningUnclaimed: Boolean,
+)
+
 /** Which held transfer is being sent back, and by which side. */
 private data class TransferReasonPrompt(
     val message: Message,
@@ -2517,33 +3067,29 @@ private fun formatCallDuration(seconds: Long): String {
 }
 
 /**
- * An end-to-end encrypted photo bubble. A user tap starts its serialized ciphertext download;
- * decrypted bytes render entirely in memory and nothing is written to disk in plaintext.
+ * An end-to-end encrypted photo bubble. A user tap starts its serialized ciphertext download; the
+ * decrypted copy stays in app-private, no-backup storage and is decoded straight from there.
  */
 @Composable
 private fun SecureImageContent(
     msg: Message,
-    mediaBytes: ByteArray?,
+    media: SecureMediaFile?,
     mediaLoading: Boolean,
     mediaError: String?,
     onOpenMedia: () -> Unit,
     onRetryMedia: () -> Unit,
     onOpenViewer: () -> Unit = {},
 ) {
-    var bitmap by remember(mediaBytes) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-    var decodeFailed by remember(mediaBytes) { mutableStateOf(false) }
-    var decoding by remember(mediaBytes) { mutableStateOf(mediaBytes != null) }
-    LaunchedEffect(mediaBytes) {
+    var bitmap by remember(media) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var decodeFailed by remember(media) { mutableStateOf(false) }
+    var decoding by remember(media) { mutableStateOf(media != null) }
+    LaunchedEffect(media) {
         bitmap = null
         decodeFailed = false
-        decoding = mediaBytes != null
-        if (mediaBytes != null) {
-            bitmap = withOwnedSecureMediaSnapshot(mediaBytes) { ownedBytes ->
-                withContext(Dispatchers.Default) {
-                    secureImageDecodeMutex.withLock {
-                        decodeBoundedSecureImage(ownedBytes)
-                    }
-                }
+        decoding = media != null
+        if (media != null) {
+            bitmap = withContext(Dispatchers.Default) {
+                secureImageDecodeMutex.withLock { decodeBoundedSecureImage(media.file) }
             }
             decodeFailed = bitmap == null
             decoding = false
@@ -2590,7 +3136,7 @@ private fun SecureImageContent(
             ) {
                 CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
             }
-            mediaBytes == null -> Box(
+            media == null -> Box(
                 Modifier
                     .size(width = 220.dp, height = 160.dp)
                     .clip(RoundedCornerShape(12.dp))
@@ -2637,9 +3183,26 @@ internal suspend fun <T> withOwnedSecureMediaSnapshot(
 }
 
 internal fun decodeBoundedSecureImage(bytes: ByteArray): androidx.compose.ui.graphics.ImageBitmap? =
+    decodeBoundedBitmap { options ->
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+    }
+
+/**
+ * Decodes an opened attachment without ever holding its file in heap.
+ *
+ * A photo that arrived from another platform can be far larger than anything this app would
+ * encode, and at a 200 MB cap "read it all, then decode it" is two copies of a problem. Decoding
+ * from the file lets the bounds pass and the sampled pass each read only what they need.
+ */
+internal fun decodeBoundedSecureImage(file: File): androidx.compose.ui.graphics.ImageBitmap? =
+    decodeBoundedBitmap { options -> BitmapFactory.decodeFile(file.path, options) }
+
+private inline fun decodeBoundedBitmap(
+    decode: (BitmapFactory.Options) -> android.graphics.Bitmap?,
+): androidx.compose.ui.graphics.ImageBitmap? =
     try {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        decode(bounds)
         val width = bounds.outWidth
         val height = bounds.outHeight
         if (width <= 0 || height <= 0 || width > MAX_SOURCE_IMAGE_DIMENSION ||
@@ -2656,8 +3219,7 @@ internal fun decodeBoundedSecureImage(bytes: ByteArray): androidx.compose.ui.gra
             ) {
                 sampleSize = Math.multiplyExact(sampleSize, 2)
             }
-            val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.asImageBitmap()
+            decode(BitmapFactory.Options().apply { inSampleSize = sampleSize })?.asImageBitmap()
         }
     } catch (_: RuntimeException) {
         // Malformed or unsupported decoder input is rendered through the existing retry/error UI.
@@ -2690,6 +3252,8 @@ private fun Composer(
     draft: String,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
+    /** Stable conversation identity the voice-note draft is preserved under. */
+    voiceDraftKey: String = "",
     onAttachLibrary: () -> Unit = {},
     onAttachCamera: () -> Unit = {},
     onAttachVideoNote: () -> Unit = {},
@@ -2698,6 +3262,11 @@ private fun Composer(
     onVoiceNoteTooShort: () -> Unit = {},
     mediaEnabled: Boolean = false,
     onRequestPayment: () -> Unit = {},
+    /** Whether asking for money is on offer. False while a correction is being written. */
+    paymentsEnabled: Boolean = true,
+    /** Whether this thread can pay its members. False everywhere but a group. */
+    groupPaymentsEnabled: Boolean = false,
+    onPayGroup: () -> Unit = {},
     /**
      * Whether a message can actually leave this device right now.
      *
@@ -2710,41 +3279,74 @@ private fun Composer(
     sendEnabled: Boolean = true,
     /** Whether the current composer content has already been handed to the send path. */
     submissionInFlight: Boolean = false,
+    /**
+     * Whether what is being written replaces an existing message rather than starting a new one.
+     *
+     * Only the outbound control changes: a tick, because the thing this finishes is an edit that
+     * is already in the transcript, not a message being launched into it.
+     */
+    editing: Boolean = false,
     /** Whether holding Send may offer to hold the message back until a chosen time. */
     schedulingEnabled: Boolean = false,
     onScheduleSend: () -> Unit = {},
 ) {
     val context = LocalContext.current
-    val recorder = remember { VoiceNoteRecorder(context) }
-    var recording by remember { mutableStateOf(false) }
+    // The recorder outlives this composable on purpose: a draft keyed to the conversation
+    // survives navigation, recomposition, and configuration changes, and leaves the
+    // registry only by being sent or explicitly discarded.
+    val recorder = remember(voiceDraftKey) { VoiceNoteDrafts.recorder(voiceDraftKey, context) }
+    var draftPhase by remember(voiceDraftKey) {
+        mutableStateOf(
+            if (recorder.hasDraft) VoiceNoteDraftPhase.PAUSED else VoiceNoteDraftPhase.IDLE,
+        )
+    }
     var attachMenuOpen by remember { mutableStateOf(false) }
     var sendMenuOpen by remember { mutableStateOf(false) }
-    var recordingElapsedMillis by remember { mutableStateOf(0L) }
+    var recordingElapsedMillis by remember(voiceDraftKey) {
+        mutableStateOf(recorder.elapsedMillis())
+    }
     var recordingLevel by remember { mutableStateOf(0f) }
+    val preview = remember(voiceDraftKey) {
+        VoiceNoteDraftPreviewPlayer(
+            onFinished = {
+                draftPhase = VoiceNoteDraftPolicy.endPreview(draftPhase) ?: draftPhase
+            },
+        )
+    }
     val recordPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        if (granted) {
+        if (granted && VoiceNoteDraftPolicy.startRecording(draftPhase) != null) {
             runCatching { recorder.start() }
-                .onSuccess { recording = true }
+                .onSuccess { draftPhase = VoiceNoteDraftPhase.RECORDING }
         }
     }
-    LaunchedEffect(recording) {
-        while (recording) {
+    LaunchedEffect(draftPhase, voiceDraftKey) {
+        while (draftPhase == VoiceNoteDraftPhase.RECORDING) {
             recordingElapsedMillis = recorder.elapsedMillis()
             recordingLevel = recorder.level()
-            if (recordingElapsedMillis >=
-                com.kit.wallet.data.messaging.KitChatMediaLimits.VOICE_NOTE_MAX_DURATION_MILLIS
-            ) {
-                recorder.finish()?.let { onSendVoiceNote(it.bytes) }
-                recording = false
+            if (VoiceNoteDraftPolicy.capacityReached(recordingElapsedMillis)) {
+                // The cap pauses the draft rather than sending it: encryption and upload
+                // happen strictly at Send, and Send stays the user's explicit act.
+                recorder.pause()
+                recordingElapsedMillis = recorder.elapsedMillis()
+                draftPhase = if (recorder.hasDraft) {
+                    VoiceNoteDraftPhase.PAUSED
+                } else {
+                    VoiceNoteDraftPhase.IDLE
+                }
             }
             delay(80)
         }
     }
-    DisposableEffect(Unit) {
+    DisposableEffect(voiceDraftKey) {
         onDispose {
-            recorder.cancel()
+            // An ordinary UI interruption pauses and preserves the draft — the microphone
+            // must not keep running behind the user's back, but nothing they said is lost.
+            // Only the explicit discard, or Send, ever deletes it.
+            preview.stop()
+            recorder.pause()
+            if (!recorder.hasDraft) VoiceNoteDrafts.release(voiceDraftKey)
         }
     }
     Column(
@@ -2789,14 +3391,17 @@ private fun Composer(
                 shadowElevation = 1.dp,
                 modifier = Modifier.weight(1f),
             ) {
-                if (recording) {
+                if (draftPhase != VoiceNoteDraftPhase.IDLE) {
                     Row(
                         Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         IconButton(onClick = {
+                            // The one deliberate way a draft dies.
+                            preview.stop()
                             recorder.cancel()
-                            recording = false
+                            VoiceNoteDrafts.release(voiceDraftKey)
+                            draftPhase = VoiceNoteDraftPhase.IDLE
                         }) {
                             Icon(
                                 Icons.Rounded.Delete,
@@ -2804,21 +3409,111 @@ private fun Composer(
                                 tint = MaterialTheme.colorScheme.error,
                             )
                         }
-                        Box(
-                            Modifier
-                                .size(10.dp)
-                                .background(MaterialTheme.colorScheme.error, CircleShape),
-                        )
-                        Spacer(Modifier.width(8.dp))
+                        when (draftPhase) {
+                            VoiceNoteDraftPhase.RECORDING -> IconButton(onClick = {
+                                VoiceNoteDraftPolicy.pause(draftPhase)?.let { paused ->
+                                    recorder.pause()
+                                    recordingElapsedMillis = recorder.elapsedMillis()
+                                    draftPhase = if (recorder.hasDraft) {
+                                        paused
+                                    } else {
+                                        VoiceNoteDraftPhase.IDLE
+                                    }
+                                }
+                            }) {
+                                Icon(
+                                    Icons.Rounded.Pause,
+                                    contentDescription = "Pause recording",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+
+                            VoiceNoteDraftPhase.PAUSED -> IconButton(
+                                onClick = {
+                                    VoiceNoteDraftPolicy.beginPreview(
+                                        draftPhase,
+                                        recorder.hasPlayableSegments,
+                                    )?.let { previewing ->
+                                        draftPhase = previewing
+                                        preview.play(recorder.previewFiles())
+                                    }
+                                },
+                                enabled = recorder.hasPlayableSegments,
+                            ) {
+                                Icon(
+                                    Icons.Rounded.PlayArrow,
+                                    contentDescription = "Listen to the draft",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+
+                            VoiceNoteDraftPhase.PREVIEWING -> IconButton(onClick = {
+                                preview.stop()
+                                VoiceNoteDraftPolicy.endPreview(draftPhase)?.let {
+                                    draftPhase = it
+                                }
+                            }) {
+                                Icon(
+                                    Icons.Rounded.Stop,
+                                    contentDescription = "Stop listening",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+
+                            VoiceNoteDraftPhase.IDLE -> Unit
+                        }
+                        if (draftPhase == VoiceNoteDraftPhase.RECORDING) {
+                            Box(
+                                Modifier
+                                    .size(10.dp)
+                                    .background(MaterialTheme.colorScheme.error, CircleShape),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                        }
                         Text(
                             formatVoiceNoteTime(recordingElapsedMillis),
                             style = MaterialTheme.typography.labelLarge,
                         )
                         Spacer(Modifier.width(10.dp))
-                        RecorderLevelWave(
-                            level = recordingLevel,
-                            modifier = Modifier.weight(1f),
-                        )
+                        if (draftPhase == VoiceNoteDraftPhase.RECORDING) {
+                            RecorderLevelWave(
+                                level = recordingLevel,
+                                modifier = Modifier.weight(1f),
+                            )
+                        } else {
+                            Text(
+                                if (draftPhase == VoiceNoteDraftPhase.PREVIEWING) {
+                                    "Playing…"
+                                } else {
+                                    "Paused"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f),
+                            )
+                            IconButton(
+                                onClick = {
+                                    VoiceNoteDraftPolicy.resume(
+                                        draftPhase,
+                                        recorder.elapsedMillis(),
+                                    )?.let { next ->
+                                        preview.stop()
+                                        runCatching { recorder.resume() }
+                                            .onSuccess { draftPhase = next }
+                                    }
+                                },
+                                enabled = VoiceNoteDraftPolicy.resume(
+                                    draftPhase,
+                                    recordingElapsedMillis,
+                                ) != null,
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Mic,
+                                    contentDescription = "Resume recording",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
                     }
                 } else {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2837,7 +3532,9 @@ private fun Composer(
                             ),
                             maxLines = 4,
                         )
-                        if (mediaEnabled) {
+                        // Paying the group lives here too, and does not depend on media: a
+                        // text-only build still has money to send.
+                        if (mediaEnabled || groupPaymentsEnabled) {
                             Box {
                                 IconButton(
                                     onClick = { attachMenuOpen = true },
@@ -2853,47 +3550,65 @@ private fun Composer(
                                     expanded = attachMenuOpen,
                                     onDismissRequest = { attachMenuOpen = false },
                                 ) {
-                                    DropdownMenuItem(
-                                        text = { Text("Photo & video library") },
-                                        leadingIcon = { Icon(Icons.Rounded.Photo, null) },
-                                        onClick = {
-                                            attachMenuOpen = false
-                                            onAttachLibrary()
-                                        },
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text("Camera") },
-                                        leadingIcon = { Icon(Icons.Rounded.PhotoCamera, null) },
-                                        onClick = {
-                                            attachMenuOpen = false
-                                            onAttachCamera()
-                                        },
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text("Video note") },
-                                        leadingIcon = { Icon(Icons.Rounded.Videocam, null) },
-                                        onClick = {
-                                            attachMenuOpen = false
-                                            onAttachVideoNote()
-                                        },
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text("Document") },
-                                        leadingIcon = { Icon(Icons.Rounded.Description, null) },
-                                        onClick = {
-                                            attachMenuOpen = false
-                                            onAttachDocument()
-                                        },
-                                    )
+                                    if (mediaEnabled) {
+                                        DropdownMenuItem(
+                                            text = { Text("Photo & video library") },
+                                            leadingIcon = { Icon(Icons.Rounded.Photo, null) },
+                                            onClick = {
+                                                attachMenuOpen = false
+                                                onAttachLibrary()
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Camera") },
+                                            leadingIcon = {
+                                                Icon(Icons.Rounded.PhotoCamera, null)
+                                            },
+                                            onClick = {
+                                                attachMenuOpen = false
+                                                onAttachCamera()
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Video note") },
+                                            leadingIcon = { Icon(Icons.Rounded.Videocam, null) },
+                                            onClick = {
+                                                attachMenuOpen = false
+                                                onAttachVideoNote()
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Document") },
+                                            leadingIcon = {
+                                                Icon(Icons.Rounded.Description, null)
+                                            },
+                                            onClick = {
+                                                attachMenuOpen = false
+                                                onAttachDocument()
+                                            },
+                                        )
+                                    }
+                                    if (groupPaymentsEnabled) {
+                                        DropdownMenuItem(
+                                            text = { Text("Pay the group") },
+                                            leadingIcon = { Icon(Icons.Rounded.Payments, null) },
+                                            onClick = {
+                                                attachMenuOpen = false
+                                                onPayGroup()
+                                            },
+                                        )
+                                    }
                                 }
                             }
                         }
-                        IconButton(onClick = onRequestPayment, enabled = sendEnabled) {
-                            Icon(
-                                Icons.Rounded.Payments,
-                                contentDescription = "Request a payment",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                        if (paymentsEnabled) {
+                            IconButton(onClick = onRequestPayment, enabled = sendEnabled) {
+                                Icon(
+                                    Icons.Rounded.Payments,
+                                    contentDescription = "Request a payment",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                     }
                 }
@@ -2902,7 +3617,7 @@ private fun Composer(
             // One dimmed circle covers all three states: the outbound action is present and in the
             // same place whether or not the session is ready, so nothing jumps when it becomes so.
             val actionAlpha = if (sendEnabled) 1f else 0.38f
-            if (recording) {
+            if (draftPhase != VoiceNoteDraftPhase.IDLE) {
                 Box(
                     Modifier
                         .size(50.dp)
@@ -2911,8 +3626,12 @@ private fun Composer(
                             CircleShape,
                         )
                         .clickable(enabled = sendEnabled) {
+                            // The only place the draft leaves the device: the segments are
+                            // stitched, read back, and handed to the encrypted send path.
+                            preview.stop()
                             val finished = recorder.finish()
-                            recording = false
+                            VoiceNoteDrafts.release(voiceDraftKey)
+                            draftPhase = VoiceNoteDraftPhase.IDLE
                             if (finished != null) onSendVoiceNote(finished.bytes) else onVoiceNoteTooShort()
                         },
                     contentAlignment = Alignment.Center,
@@ -2990,8 +3709,9 @@ private fun Composer(
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(
-                            Icons.AutoMirrored.Rounded.Send,
+                            if (editing) Icons.Rounded.Check else Icons.AutoMirrored.Rounded.Send,
                             contentDescription = when {
+                                editing -> "Save the change"
                                 !sendEnabled -> "Send, available once secure messaging is ready"
                                 schedulingEnabled -> "Send. Hold to send later"
                                 else -> "Send"

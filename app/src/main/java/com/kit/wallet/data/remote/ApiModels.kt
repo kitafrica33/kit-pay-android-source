@@ -54,6 +54,8 @@ data class RealtimeProtocolDto(
     val channels: RealtimeChannelsDto? = null,
     val presence: Boolean? = null,
     val typing: Boolean? = null,
+    /** Whether the server sends `kit.call.answered` on the user channel. */
+    val calls: Boolean? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -806,6 +808,12 @@ data class RtcCredentialsDto(
 data class CallSessionDto(
     val call: CallDto,
     val rtc: RtcCredentialsDto,
+    /**
+     * When the server built this response. Paired with `call.answered_at` it gives the
+     * call's true age at delivery measured on one clock, so a timer started from it never
+     * inherits the phone's drift. Null on servers that predate the field.
+     */
+    @Json(name = "server_time") val serverTime: String? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -972,6 +980,89 @@ data class BankDto(
 @JsonClass(generateAdapter = false)
 data class BankListDto(
     val items: List<BankDto>? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class BankFundingAccountBankDto(
+    val id: String,
+    val name: String,
+    val code: String,
+    @Json(name = "country_code") val countryCode: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class BankFundingAccountDto(
+    val id: String,
+    val label: String,
+    val bank: BankFundingAccountBankDto,
+    @Json(name = "account_name") val accountName: String,
+    @Json(name = "account_number") val accountNumber: String,
+    @Json(name = "account_number_masked") val accountNumberMasked: String,
+    @Json(name = "branch_name") val branchName: String? = null,
+    @Json(name = "branch_code") val branchCode: String? = null,
+    @Json(name = "swift_code") val swiftCode: String? = null,
+    val instructions: String? = null,
+    val currency: String,
+    val status: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class BankFundingAccountListDto(
+    val items: List<BankFundingAccountDto> = emptyList(),
+)
+
+@JsonClass(generateAdapter = false)
+data class BankDepositProofDto(
+    @Json(name = "asset_id") val assetId: String,
+    val filename: String,
+    val status: String,
+    @Json(name = "scan_status") val scanStatus: String,
+    @Json(name = "mime_type") val mimeType: String? = null,
+    @Json(name = "byte_size") val byteSize: Long? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class BankDepositRejectionDto(
+    val code: String,
+    val reason: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class BankDepositRequestDto(
+    val id: String,
+    val reference: String,
+    @Json(name = "wallet_id") val walletId: String,
+    val amount: String,
+    val currency: CurrencyDto,
+    val status: String,
+    val source: String,
+    @Json(name = "funding_account") val fundingAccount: BankFundingAccountDto,
+    val proof: BankDepositProofDto? = null,
+    @Json(name = "bank_transaction_reference") val bankTransactionReference: String? = null,
+    @Json(name = "customer_note") val customerNote: String? = null,
+    val rejection: BankDepositRejectionDto? = null,
+    @Json(name = "expires_at") val expiresAt: String,
+    @Json(name = "created_at") val createdAt: String? = null,
+    @Json(name = "proof_submitted_at") val proofSubmittedAt: String? = null,
+    @Json(name = "completed_at") val completedAt: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class BankDepositRequestListDto(
+    val items: List<BankDepositRequestDto> = emptyList(),
+)
+
+@JsonClass(generateAdapter = false)
+data class CreateBankDepositRequest(
+    @Json(name = "wallet_id") val walletId: String,
+    @Json(name = "funding_account_id") val fundingAccountId: String,
+    val amount: String,
+    val note: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class AttachBankDepositProofRequest(
+    @Json(name = "media_asset_id") val mediaAssetId: String,
 )
 
 @JsonClass(generateAdapter = false)

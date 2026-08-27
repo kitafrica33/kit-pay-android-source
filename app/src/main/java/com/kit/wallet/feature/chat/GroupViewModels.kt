@@ -5,7 +5,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.remote.MAX_GROUP_MEMBERS
 import com.kit.wallet.data.remote.isValidMessagingGroupTitle
+import com.kit.wallet.data.remote.normalizeMessagingGroupDescription
 import com.kit.wallet.data.remote.normalizeMessagingGroupTitle
+import com.kit.wallet.data.remote.truncateMessagingGroupDescription
 import com.kit.wallet.data.remote.truncateMessagingGroupTitle
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
 import com.kit.wallet.data.remote.isKitConnectivityError
@@ -41,6 +43,13 @@ internal fun boundedMessagingGroupTitleInput(value: String): String {
     val normalizedTitle = normalizeMessagingGroupTitle(value)
     val boundedTitle = truncateMessagingGroupTitle(normalizedTitle)
     return if (boundedTitle == normalizedTitle) value else boundedTitle
+}
+
+/** The description editor's version of [boundedMessagingGroupTitleInput]: same reasoning. */
+internal fun boundedMessagingGroupDescriptionInput(value: String): String {
+    val normalized = normalizeMessagingGroupDescription(value)
+    val bounded = truncateMessagingGroupDescription(normalized)
+    return if (bounded == normalized) value else bounded
 }
 
 /**
@@ -251,6 +260,35 @@ class GroupProfileViewModel @Inject constructor(
         mutate("${member.name} could not be removed") {
             chatRepo.removeGroupMember(chatId, member.userId)
         }
+    }
+
+    /**
+     * Saves the description, where saving an emptied field clears it. [onSaved] runs only once
+     * the server has accepted the change, so the editor never closes over a refusal.
+     */
+    fun saveDescription(value: String, onSaved: () -> Unit = {}) {
+        val canonical = normalizeMessagingGroupDescription(value).takeIf(String::isNotEmpty)
+        mutate("The group description could not be changed", onSaved) {
+            chatRepo.updateGroupDescription(chatId, canonical)
+        }
+    }
+
+    /** Uploads an already-transcoded JPEG through the moderated pipeline as the group photo. */
+    fun changePhoto(jpegBytes: ByteArray) {
+        mutate("The group photo could not be changed") {
+            chatRepo.updateGroupPhoto(chatId, jpegBytes)
+        }
+    }
+
+    fun removePhoto() {
+        mutate("The group photo could not be removed") {
+            chatRepo.removeGroupPhoto(chatId)
+        }
+    }
+
+    /** Surfaces a local failure — an unreadable picked image — in the screen's own error row. */
+    fun reportError(message: String) {
+        mutableError.value = message
     }
 
     /** Leaves the group; [onLeft] runs only once the server has taken this account out of it. */

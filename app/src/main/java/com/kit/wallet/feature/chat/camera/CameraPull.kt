@@ -27,24 +27,16 @@ internal object CameraPull {
     }
 
     /**
-     * Whether the reveal has been pulled far enough that releasing now would open the camera.
-     * This drives the peek panel's label, so it deliberately says nothing about *when* the camera
-     * actually opens — see [shouldOpenOnRelease] for that.
+     * Whether the reveal has been pulled far enough to open the camera.
+     *
+     * Answers two questions at once, which is safe because only one of them is ever asked while a
+     * finger is down: it labels the peek panel during the drag, and it decides the camera at the
+     * end of it. "Release to open the camera" and what release actually does can therefore never
+     * disagree. The screen asks the second question from the scroll container's end-of-drag
+     * callback, so crossing the threshold mid-pull cannot open anything on its own.
      */
     fun shouldOpen(revealPx: Float, thresholdPx: Float): Boolean =
         thresholdPx > 0f && revealPx >= thresholdPx
-
-    /**
-     * The camera may only open once the gesture has genuinely ended. Scroll containers dispatch
-     * fling callbacks that can arrive while a finger is still down, so crossing the threshold is
-     * not on its own permission to open: the panel promises "release to open the camera", and
-     * opening mid-drag breaks that promise and steals a scroll the user was still making.
-     */
-    fun shouldOpenOnRelease(
-        revealPx: Float,
-        thresholdPx: Float,
-        pointerDown: Boolean,
-    ): Boolean = !pointerDown && shouldOpen(revealPx, thresholdPx)
 
     data class CollapseResult(val revealPx: Float, val consumedY: Float)
 }

@@ -4,15 +4,23 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.messaging.KitChatMediaLimits
+import com.kit.wallet.data.messaging.GroupPaymentAudience
+import com.kit.wallet.data.messaging.GroupPaymentSplitMode
+import com.kit.wallet.data.messaging.KitEditMessage
+import com.kit.wallet.data.messaging.KitGroupPaymentAction
+import com.kit.wallet.data.messaging.KitGroupPaymentMessage
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.KitReactionMessage
+import com.kit.wallet.data.messaging.KitUserAuthoredTextPolicy
 import com.kit.wallet.data.messaging.MessagingRichMediaCapability
 import com.kit.wallet.data.messaging.ScheduledSend
 import com.kit.wallet.data.messaging.ScheduledSendDispatcher
 import com.kit.wallet.data.messaging.ScheduledSendKind
 import com.kit.wallet.data.messaging.ScheduledSendState
 import com.kit.wallet.data.messaging.ScheduledSendStore
+import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.realtime.KitConversationSignals
 import com.kit.wallet.data.realtime.KitTypingSignals
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
@@ -22,6 +30,8 @@ import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatPaymentRequest
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
+import com.kit.wallet.data.repository.GroupPaymentDraftPolicy
+import com.kit.wallet.data.repository.GroupPaymentRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.data.repository.WalletSyncResult
@@ -32,13 +42,18 @@ import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.ChatMember
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
+import com.kit.wallet.ui.model.GroupPaymentSummary
 import com.kit.wallet.ui.model.Message
+import com.kit.wallet.ui.model.MessageDeliveryInfo
 import com.kit.wallet.ui.model.MessageKind
 import com.kit.wallet.ui.model.PaymentEventKind
 import com.kit.wallet.ui.model.TopUp
 import com.kit.wallet.ui.model.TopUpRequirement
 import com.kit.wallet.ui.model.TransferClaim
 import com.kit.wallet.ui.model.TransferClaimStatus
+import com.kit.wallet.ui.model.acceptsDeliveryInfo
+import com.kit.wallet.ui.model.acceptsEdits
+import com.kit.wallet.ui.model.acceptsReplies
 import dagger.hilt.android.lifecycle.HiltViewModel
 import java.time.Clock
 import java.time.Instant
@@ -193,11 +208,27 @@ class ChatsViewModel @Inject constructor(
     }
 }
 
+/**
+ * What the delivery-details sheet has to show about one message.
+ *
+ * Three states rather than a nullable record: the sheet opens before the answer exists, and the
+ * difference between "still asking", "nobody has read it yet" and "we could not ask" is the whole
+ * point of the screen.
+ */
+sealed interface MessageInfoState {
+    data object Loading : MessageInfoState
+
+    data class Loaded(val info: MessageDeliveryInfo) : MessageInfoState
+
+    data class Failed(val message: String) : MessageInfoState
+}
+
 @HiltViewModel
 class ConversationViewModel @Inject internal constructor(
     private val chatRepo: ChatRepository,
     private val walletRepo: WalletRepository,
     private val walletSync: WalletSyncRepository,
+    private val groupPaymentRepo: GroupPaymentRepository? = null,
     private val callRepo: CallRepository,
     private val messageSounds: MessageSoundPlayer,
     private val realtime: KitConversationSignals,
@@ -225,6 +256,14 @@ class ConversationViewModel @Inject internal constructor(
 
     val messagingAvailable = chatRepo.readiness
     val historyAvailable = chatRepo.localHistoryReady
+
+    /**
+     * Whether this account's server capability for corrections is on.
+     *
+     * The long-press Edit item is withdrawn while this is false, so a correction is never written
+     * that the send path would have to refuse once it read the conversation roster.
+     */
+    val messageEditsAvailable = chatRepo.messageEditsAvailable
     val chat: StateFlow<ChatPreview?> = chatRepo.chats
         .map { chats -> chats.singleOrNull { it.id == chatId } }
         .stateIn(
@@ -351,10 +390,121 @@ class ConversationViewModel @Inject internal constructor(
     private val mutableRetryingMessageId = MutableStateFlow<String?>(null)
     val retryingMessageId = mutableRetryingMessageId.asStateFlow()
 
-    private val mutableMediaBytes = MutableStateFlow<Map<String, ByteArray>>(emptyMap())
-    val mediaBytes = mutableMediaBytes.asStateFlow()
-    private val mediaCache = LinkedHashMap<String, ByteArray>()
-    private var mediaCacheByteCount = 0
+    /**
+     * The message the next send will answer, chosen by swiping a bubble.
+     *
+     * Held here rather than passed down through every send signature because that is what it is:
+     * part of the composer's state, like the draft text, and the same choice applies whether the
+     * answer turns out to be typed, photographed or spoken.
+     */
+    private val mutableReplyTarget = MutableStateFlow<Message?>(null)
+    val replyTarget = mutableReplyTarget.asStateFlow()
+
+    /** Answers [message], if it is something the other end can still resolve back to a bubble. */
+    fun beginReply(message: Message) {
+        if (!message.acceptsReplies) return
+        mutableEditTarget.value = null
+        mutableReplyTarget.value = message
+    }
+
+    fun cancelReply() {
+        mutableReplyTarget.value = null
+    }
+
+    /**
+     * The message whose wording is being corrected, chosen from its long-press menu.
+     *
+     * Editing is a mode of the composer rather than a dialog of its own: a correction is written
+     * with the same keyboard, and has to clear the same length and reserved-prefix rules, as the
+     * message it replaces. Only the bar above the composer differs, and it says which message is
+     * about to change.
+     */
+    private val mutableEditTarget = MutableStateFlow<Message?>(null)
+    val editTarget = mutableEditTarget.asStateFlow()
+
+    /**
+     * What the delivery-details sheet is showing, or null while it is closed.
+     *
+     * Failure is a state of its own rather than an empty list, because "nobody has read this yet"
+     * and "we could not ask" look identical on screen and mean opposite things.
+     */
+    private val mutableMessageInfo = MutableStateFlow<MessageInfoState?>(null)
+    val messageInfo = mutableMessageInfo.asStateFlow()
+    private var messageInfoJob: Job? = null
+
+    /** Kept so the sheet's own "Try again" does not need the bubble it was opened from. */
+    private var messageInfoTarget: Message? = null
+
+    /** Asks what became of [message], for its author alone. */
+    fun openMessageInfo(message: Message) {
+        if (!message.acceptsDeliveryInfo) return
+        messageInfoJob?.cancel()
+        messageInfoTarget = message
+        mutableMessageInfo.value = MessageInfoState.Loading
+        messageInfoJob = viewModelScope.launch {
+            val state = try {
+                MessageInfoState.Loaded(chatRepo.messageDeliveryInfo(chatId, message.id))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                MessageInfoState.Failed(
+                    if (error.isKitConnectivityError()) {
+                        "Kit could not reach the network to check this message."
+                    } else {
+                        "Kit could not load the details for this message."
+                    },
+                )
+            }
+            mutableMessageInfo.value = state
+        }
+    }
+
+    fun retryMessageInfo() {
+        messageInfoTarget?.let(::openMessageInfo)
+    }
+
+    fun closeMessageInfo() {
+        messageInfoJob?.cancel()
+        messageInfoJob = null
+        messageInfoTarget = null
+        mutableMessageInfo.value = null
+    }
+
+    /** Corrects [message], while its fifteen minutes are still running. */
+    fun beginEdit(message: Message) {
+        if (!messageEditsAvailable.value) return
+        if (!message.acceptsEdits(clock.millis())) return
+        mutableReplyTarget.value = null
+        mutableEditTarget.value = message
+    }
+
+    fun cancelEdit() {
+        mutableEditTarget.value = null
+    }
+
+    /**
+     * Takes the pending answer, leaving none behind.
+     *
+     * Read once per send and cleared in the same step, so a send that fails does not silently
+     * re-answer the same message when the next one goes out.
+     */
+    private fun consumeReplyTarget(): String? {
+        val target = mutableReplyTarget.value ?: return null
+        mutableReplyTarget.value = null
+        return target.id
+    }
+
+    /**
+     * Attachments this conversation has already opened, as files rather than bytes.
+     *
+     * The bytes themselves live in [com.kit.wallet.data.messaging.SecureMediaCache], which is
+     * bounded on disk and cleared at sign-out. What is held here is only the handle, so a window
+     * of open attachments costs a few hundred bytes of heap instead of tens of megabytes, and a
+     * 200 MB video is something the player can seek rather than something the heap must survive.
+     */
+    private val mutableMediaFiles = MutableStateFlow<Map<String, SecureMediaFile>>(emptyMap())
+    val mediaFiles = mutableMediaFiles.asStateFlow()
+    private val mediaCache = LinkedHashMap<String, SecureMediaFile>()
 
     private val mutableMediaLoading = MutableStateFlow<Set<String>>(emptySet())
     val mediaLoading = mutableMediaLoading.asStateFlow()
@@ -375,8 +525,21 @@ class ConversationViewModel @Inject internal constructor(
     private val mutableTransferClaims = MutableStateFlow<Map<String, TransferClaim>>(emptyMap())
     val transferClaims = mutableTransferClaims.asStateFlow()
 
+    /**
+     * Live state of the group payments this thread mentions, keyed by lowercased payment id.
+     *
+     * The announcement in the thread is a label. What a member may do, and what they are owed, is
+     * only ever read from here — and a card whose payment has not loaded shows a spinner rather
+     * than buttons drawn from a claim nobody verified.
+     */
+    private val mutableGroupPayments = MutableStateFlow<Map<String, GroupPaymentSummary>>(emptyMap())
+    val groupPayments = mutableGroupPayments.asStateFlow()
+
     /** Expiries this session has already written into the conversation, to avoid a second line. */
     private val announcedExpiries = mutableSetOf<String>()
+
+    /** Group-payment answers this session has already written, keyed by payment, act and actor. */
+    private val announcedGroupOutcomes = mutableSetOf<String>()
 
     // Encrypted composer draft restored once per conversation entry; consumed by the screen.
     private val mutableRestoredDraft = MutableStateFlow<String?>(null)
@@ -458,6 +621,7 @@ class ConversationViewModel @Inject internal constructor(
         // Refresh the call log so recent calls appear inline in the conversation.
         viewModelScope.launch { runCatching { callRepo.refresh() } }
         viewModelScope.launch { refreshTransferClaims() }
+        viewModelScope.launch { refreshGroupPayments() }
         dispatchScheduledDue()
         if (foregroundSyncJob?.isActive != true) {
             foregroundSyncJob = viewModelScope.launch { runForegroundSync() }
@@ -505,6 +669,8 @@ class ConversationViewModel @Inject internal constructor(
             // Held transfers settle from the other side, and expire with nobody acting at all.
             // There is no push for either.
             refreshTransferClaims()
+            // Nor for a group payment: other members take their shares without telling this device.
+            refreshGroupPayments()
             // A scheduled send whose minute passes while the chat is open should go out then, not
             // whenever the system next feels like running a worker.
             dispatchScheduledDue()
@@ -585,13 +751,11 @@ class ConversationViewModel @Inject internal constructor(
         val selectedChat = chat.value ?: return
         val normalized = text.trim()
         if (!historyAvailable.value || normalized.isBlank()) return
-        if (
-            !KitPaymentMessage.allowsUserAuthoredText(normalized) ||
-            KitReactionMessage.beginsWithReservedPrefix(normalized)
-        ) {
+        if (!KitUserAuthoredTextPolicy.allows(normalized)) {
             mutableError.value = "Messages cannot start with one of Kit Pay's reserved prefixes"
             return
         }
+        val replyToMessageId = consumeReplyTarget()
         viewModelScope.launch {
             val composerReleased = AtomicBoolean(false)
             fun releaseComposer() {
@@ -605,9 +769,12 @@ class ConversationViewModel @Inject internal constructor(
                 }
             }
             val failure = try {
-                chatRepo.sendMessage(selectedChat.id, normalized) {
-                    releaseComposer()
-                }
+                chatRepo.sendMessage(
+                    chatId = selectedChat.id,
+                    text = normalized,
+                    onDurablyCommitted = { releaseComposer() },
+                    replyToMessageId = replyToMessageId,
+                )
                 null
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -636,6 +803,60 @@ class ConversationViewModel @Inject internal constructor(
     }
 
     /**
+     * Replaces the wording of the message currently being edited.
+     *
+     * Retyping the same words is treated as changing one's mind about changing one's mind: the
+     * mode simply closes, because a correction that corrects nothing is not worth a second bubble
+     * in everybody's transcript. The fifteen-minute window is re-checked by the repository and
+     * again by the server, so a composer left open past the deadline cannot slip an edit through.
+     */
+    fun submitEdit(text: String, onEdited: () -> Unit = {}) {
+        val selectedChat = chat.value ?: return
+        val target = mutableEditTarget.value ?: return
+        val normalized = text.trim()
+        if (!historyAvailable.value || normalized.isBlank()) return
+        // The gate can close between opening the composer and pressing send — a lifecycle blip,
+        // a sign-out, a capability that went away. Close the mode rather than enqueue a
+        // correction nobody is entitled to send.
+        if (!messageEditsAvailable.value) {
+            mutableEditTarget.value = null
+            return
+        }
+        if (normalized == target.text) {
+            mutableEditTarget.value = null
+            onEdited()
+            return
+        }
+        if (!KitUserAuthoredTextPolicy.allows(normalized)) {
+            mutableError.value = "Messages cannot start with one of Kit Pay's reserved prefixes"
+            return
+        }
+        if (!KitEditMessage.isAcceptableBody(normalized)) {
+            mutableError.value = "That wording is too long to send"
+            return
+        }
+        viewModelScope.launch {
+            try {
+                chatRepo.editMessage(selectedChat.id, target.id, normalized)
+                mutableEditTarget.value = null
+                onEdited()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                // Unlike a first send, an edit that only failed on connectivity is already durably
+                // queued, so the mode closes and the outbox delivers it: keeping the composer open
+                // would invite the same correction to be written a second time.
+                if (error.isKitConnectivityError()) {
+                    mutableEditTarget.value = null
+                    onEdited()
+                } else {
+                    mutableError.value = error.message ?: "That message could not be edited"
+                }
+            }
+        }
+    }
+
+    /**
      * Holds [text] back until [atEpochMillis] instead of sending it now.
      *
      * Nothing is encrypted here. A scheduled message is stored as an intent and becomes ciphertext
@@ -648,10 +869,7 @@ class ConversationViewModel @Inject internal constructor(
         val selectedChat = chat.value ?: return
         val normalized = text.trim()
         if (normalized.isBlank()) return
-        if (
-            !KitPaymentMessage.allowsUserAuthoredText(normalized) ||
-            KitReactionMessage.beginsWithReservedPrefix(normalized)
-        ) {
+        if (!KitUserAuthoredTextPolicy.allows(normalized)) {
             mutableError.value = "Messages cannot start with one of Kit Pay's reserved prefixes"
             return
         }
@@ -1250,6 +1468,241 @@ class ConversationViewModel @Inject internal constructor(
         }
     }
 
+    // MARK: - Group payments
+
+    /**
+     * Sends one payment into this group and announces it.
+     *
+     * The composer's own retry key is what makes a timeout safe: a send that actually succeeded is
+     * answered with the same payment rather than paying a second time. The announcement afterwards
+     * is best-effort — the money has moved, the card's state comes from the server, and a failure
+     * here costs the written record, not the truth of what happened.
+     */
+    internal fun sendGroupPayment(
+        splitMode: GroupPaymentSplitMode,
+        audience: GroupPaymentAudience,
+        selected: List<GroupPaymentDraftPolicy.Member>,
+        totalInput: String,
+        customAmounts: Map<String, String>,
+        note: String?,
+        paymentPin: String,
+        idempotencyKey: String,
+        groupPaymentsEnabled: Boolean,
+        onSent: () -> Unit = {},
+    ) {
+        val selectedChat = chat.value ?: return
+        val repo = groupPaymentRepo
+        if (!groupPaymentsEnabled || repo == null) {
+            mutableError.value = "Group payments are not available right now"
+            return
+        }
+        if (!selectedChat.isGroup) {
+            mutableError.value = "Group payments can only be sent in a group"
+            return
+        }
+        if (!historyAvailable.value || mutableSending.value) return
+        mutableSending.value = true
+        mutableError.value = null
+        viewModelScope.launch {
+            try {
+                val source = walletRepo.spendingSource()
+                val drafted = GroupPaymentDraftPolicy.draft(
+                    sourceWalletId = source.walletId,
+                    splitMode = splitMode,
+                    audience = audience,
+                    selected = selected,
+                    totalInput = totalInput,
+                    customAmounts = customAmounts,
+                    note = note,
+                    scale = source.currencyScale,
+                    availableBalanceMinor = source.availableBalanceMinor,
+                )
+                val request = when (drafted) {
+                    is GroupPaymentDraftPolicy.Outcome.Ready -> drafted.request
+                    is GroupPaymentDraftPolicy.Outcome.Problem -> {
+                        mutableError.value = drafted.message
+                        return@launch
+                    }
+                }
+                val payment = repo.send(
+                    conversationId = selectedChat.id,
+                    request = request,
+                    idempotencyKey = idempotencyKey,
+                    paymentPin = paymentPin,
+                )
+                storeGroupPayment(payment)
+                // The roster in the descriptor is the server's answer, not the composer's: for
+                // "everybody" this device never chose the members in the first place.
+                val roster = payment.recipients.mapNotNull { it.userId }
+                KitGroupPaymentMessage.announcing(payment, roster)?.encode()?.let { descriptor ->
+                    runCatching { chatRepo.sendGroupPaymentEvent(selectedChat.id, descriptor) }
+                }
+                onSent()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "This group payment could not be sent"
+            } finally {
+                mutableSending.value = false
+            }
+        }
+    }
+
+    /** Takes this account's own share. Never a step-up: the money is already held for them. */
+    fun acceptGroupPaymentShare(
+        message: Message,
+        groupPaymentsEnabled: Boolean,
+        onDone: () -> Unit = {},
+    ) = settleGroupPaymentShare(
+        message = message,
+        outcome = KitGroupPaymentAction.ACCEPTED,
+        groupPaymentsEnabled = groupPaymentsEnabled,
+        onDone = onDone,
+    ) { repo, paymentId -> repo.acceptShare(paymentId) }
+
+    /** Turns this account's own share down; it goes back to the sender and nobody else's moves. */
+    fun rejectGroupPaymentShare(
+        message: Message,
+        reason: String?,
+        groupPaymentsEnabled: Boolean,
+        onDone: () -> Unit = {},
+    ) {
+        val canonicalReason = canonicalTransferClaimReason(reason)
+        settleGroupPaymentShare(
+            message = message,
+            outcome = KitGroupPaymentAction.REJECTED,
+            groupPaymentsEnabled = groupPaymentsEnabled,
+            onDone = onDone,
+        ) { repo, paymentId -> repo.rejectShare(paymentId, canonicalReason) }
+    }
+
+    /** The sender pulls back every share nobody has taken, after approving that one payment. */
+    fun reverseUnclaimedGroupPayment(
+        message: Message,
+        reason: String?,
+        paymentPin: String,
+        groupPaymentsEnabled: Boolean,
+        onDone: () -> Unit = {},
+    ) {
+        val canonicalReason = canonicalTransferClaimReason(reason)
+        settleGroupPaymentShare(
+            message = message,
+            outcome = KitGroupPaymentAction.RETURNED,
+            groupPaymentsEnabled = groupPaymentsEnabled,
+            onDone = onDone,
+        ) { repo, paymentId -> repo.reverseUnclaimed(paymentId, canonicalReason, paymentPin) }
+    }
+
+    /**
+     * The one path every group-payment decision takes: settle on the server, then write what this
+     * account did into the thread.
+     *
+     * The outcome line carries the payment and the act, and no amount at all — a share the group was
+     * never told is not republished by the person answering it.
+     */
+    private fun settleGroupPaymentShare(
+        message: Message,
+        outcome: KitGroupPaymentAction,
+        groupPaymentsEnabled: Boolean,
+        onDone: () -> Unit,
+        settle: suspend (GroupPaymentRepository, String) -> GroupPaymentSummary,
+    ) {
+        val selectedChat = chat.value ?: return
+        val descriptor = message.groupPaymentDescriptor() ?: return
+        val repo = groupPaymentRepo
+        if (!groupPaymentsEnabled || repo == null) {
+            mutableError.value = "Group payment decisions are not available right now"
+            return
+        }
+        if (!historyAvailable.value || mutableSending.value) return
+        val actor = walletRepo.currentAccountId?.takeIf(String::isNotBlank) ?: return
+        // Claim the in-flight marker before the first suspension so two fast taps cannot settle
+        // the same share twice.
+        mutableSending.value = true
+        mutableError.value = null
+        viewModelScope.launch {
+            try {
+                val settled = settle(repo, descriptor.groupPaymentId)
+                storeGroupPayment(settled)
+                check(walletRepo.currentAccountId.equals(actor, ignoreCase = true)) {
+                    "The signed-in account changed while answering this payment"
+                }
+                postGroupPaymentEvent(selectedChat.id, descriptor.groupPaymentId, outcome, actor)
+                onDone()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "This group payment could not be updated"
+                // A race can settle between the preflight read and the POST. Re-read this exact
+                // payment so the card stops offering an action over money that has already moved.
+                runCatching { repo.groupPayment(descriptor.groupPaymentId) }
+                    .getOrNull()
+                    ?.let(::storeGroupPayment)
+            } finally {
+                mutableSending.value = false
+            }
+        }
+    }
+
+    /**
+     * Writes one member's answer into the conversation. Best-effort, for the same reason a
+     * one-to-one outcome is: the money has already moved and the card reads its state from the
+     * server.
+     *
+     * The guard key is derived from the payment, the act and this account, so the same decision
+     * taken twice in one session writes one line instead of announcing "Ama took their share"
+     * again. The timeline drops repeats when it renders; this stops them being sent at all.
+     */
+    private suspend fun postGroupPaymentEvent(
+        chatId: String,
+        groupPaymentId: String,
+        outcome: KitGroupPaymentAction,
+        actorUserId: String,
+    ) {
+        val descriptor = KitGroupPaymentMessage.outcome(outcome, groupPaymentId)?.encode() ?: return
+        if (KitGroupPaymentMessage.parse(descriptor) == null) return
+        val guard = KitGroupPaymentMessage.outcomeMessageId(groupPaymentId, outcome, actorUserId)
+        if (!announcedGroupOutcomes.add(guard)) return
+        try {
+            chatRepo.sendGroupPaymentEvent(chatId, descriptor)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // Swallowed on purpose; see the note above.
+        }
+    }
+
+    /**
+     * Re-reads every group payment this thread mentions.
+     *
+     * A failure leaves the cards where they were rather than painting the chat red: the
+     * announcement is still readable, and a stale permission flag must never be what an accept
+     * button is drawn from.
+     */
+    private suspend fun refreshGroupPayments() {
+        val repo = groupPaymentRepo ?: return
+        if (chatId.isBlank() || !historyAvailable.value) return
+        val ids = conversationMessages.value
+            .mapNotNull { it.groupPaymentDescriptor()?.groupPaymentId }
+            .distinct()
+            .takeLast(MAX_TRACKED_GROUP_PAYMENTS)
+        if (ids.isEmpty()) return
+        for (paymentId in ids) {
+            val payment = try {
+                repo.groupPayment(paymentId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                continue
+            }
+            storeGroupPayment(payment)
+        }
+    }
+
+    private fun storeGroupPayment(payment: GroupPaymentSummary) {
+        mutableGroupPayments.value += payment.id.lowercase() to payment
+    }
+
     private suspend fun refreshTransferClaims() {
         val claims = try {
             walletRepo.transferClaims()
@@ -1295,6 +1748,68 @@ class ConversationViewModel @Inject internal constructor(
         sendMedia(bytes, mediaType, caption = null, onSent = onSent)
 
     /**
+     * Sends an attachment the user picked but this app never copied: a gallery video, a shared
+     * document, anything the platform will hand us a stream for. The bytes go from where they
+     * already live, straight through the cipher, into the ciphertext spool.
+     */
+    fun sendMedia(
+        source: SecureMediaSource,
+        mediaType: String,
+        caption: String? = null,
+        onSent: () -> Unit = {},
+        /**
+         * Runs once the source has been read to the end, whatever the outcome. Whoever staged the
+         * bytes — the camera's encoder, say — owns them until this fires, so it cannot delete a
+         * file the cipher is still streaming.
+         */
+        onFinished: () -> Unit = {},
+    ) {
+        val selectedChat = chat.value
+        if (selectedChat == null || !historyAvailable.value || mutableSending.value) {
+            mutableError.value = if (mutableSending.value) {
+                "Wait for the current attachment to finish sending, then try again"
+            } else {
+                "Secure messaging is temporarily unavailable"
+            }
+            onFinished()
+            return
+        }
+        val replyToMessageId = consumeReplyTarget()
+        val sendJob = viewModelScope.launch {
+            mutableSending.value = true
+            mutableError.value = null
+            try {
+                // A declared size of zero means the provider would not say; the cipher still stops
+                // at the compiled cap, so an unknown size can never become an oversized upload.
+                if (source.declaredByteCount > 0) {
+                    richMediaCapability?.requireSendable(
+                        mediaType.trim().lowercase(),
+                        source.declaredByteCount,
+                    )
+                }
+                chatRepo.sendMediaMessage(
+                    chatId = selectedChat.id,
+                    source = source,
+                    mediaType = mediaType,
+                    caption = caption,
+                    replyToMessageId = replyToMessageId,
+                )
+                onSent()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message
+                    ?: "The secure attachment could not be sent"
+            } finally {
+                mutableSending.value = false
+            }
+        }
+        // A launch into an already-cleared ViewModel can be cancelled before its body — and so
+        // before any finally block — ever starts. Completion is the one boundary that always runs.
+        sendJob.invokeOnCompletion { onFinished() }
+    }
+
+    /**
      * Recording/encoding cap for the in-app camera: the compiled policy clamped to what this
      * service currently accepts, so the camera improves for free when the service limit rises.
      */
@@ -1328,12 +1843,19 @@ class ConversationViewModel @Inject internal constructor(
             bytes.fill(0)
             return
         }
+        val replyToMessageId = consumeReplyTarget()
         val sendJob = viewModelScope.launch {
             mutableSending.value = true
             mutableError.value = null
             try {
                 richMediaCapability?.requireSendable(mediaType.trim().lowercase(), bytes.size.toLong())
-                chatRepo.sendImageMessage(selectedChat.id, bytes, mediaType, caption)
+                chatRepo.sendImageMessage(
+                    chatId = selectedChat.id,
+                    bytes = bytes,
+                    mediaType = mediaType,
+                    caption = caption,
+                    replyToMessageId = replyToMessageId,
+                )
                 onSent()
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -1355,33 +1877,32 @@ class ConversationViewModel @Inject internal constructor(
         val selectedChat = chat.value ?: return
         val descriptor = message.mediaDescriptor ?: return
         if (!historyAvailable.value) return
+        // A handle whose file the on-disk cache has since evicted is not an open attachment; it
+        // has to be fetched again rather than handed to a player that would find nothing there.
         if (
-            mutableMediaBytes.value.containsKey(message.id) ||
+            mutableMediaFiles.value[message.id]?.exists == true ||
             message.id in mutableMediaLoading.value ||
             mutableMediaErrors.value.containsKey(message.id)
         ) return
         mutableMediaLoading.value = mutableMediaLoading.value + message.id
         viewModelScope.launch {
-            var opened: ByteArray? = null
             try {
-                // One authenticated blob may transiently occupy ciphertext, plaintext and decode
-                // buffers. Serialize receive work. The non-cancellable handoff ensures a returned
-                // plaintext array is assigned before cancellation can discard its only owner.
-                secureMediaOpenMutex.withLock {
+                // Download and decrypt still stream through one fixed buffer each, but they do
+                // read and write whole attachments; serializing keeps two large receives from
+                // competing for the same disk and the same cache budget.
+                val opened = secureMediaOpenMutex.withLock {
                     withContext(NonCancellable) {
-                        opened = chatRepo.openImageMessage(selectedChat.id, descriptor)
+                        chatRepo.openImageMessage(selectedChat.id, descriptor)
                     }
                 }
                 coroutineContext.ensureActive()
-                cacheMedia(message.id, checkNotNull(opened))
-                opened = null // Ownership moved into the bounded cache.
+                cacheMedia(message.id, opened)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
                 mutableMediaErrors.value = mutableMediaErrors.value +
                     (message.id to (error.message ?: "The secure photo could not be opened"))
             } finally {
-                opened?.fill(0)
                 mutableMediaLoading.value = mutableMediaLoading.value - message.id
             }
         }
@@ -1393,42 +1914,31 @@ class ConversationViewModel @Inject internal constructor(
         openMedia(message)
     }
 
-    private fun cacheMedia(messageId: String, bytes: ByteArray) {
-        val erased = mutableListOf<ByteArray>()
-        val previous = mediaCache.remove(messageId)
-        if (previous != null) {
-            mediaCacheByteCount -= previous.size
-            erased += previous
+    /**
+     * Remembers an opened attachment, oldest-out once the window is full.
+     *
+     * Forgetting a handle deliberately does not delete its file: the same attachment may still be
+     * on screen in the gallery or in another conversation's view model, and the file is owned by
+     * the shared on-disk cache, which does its own bounded eviction and is wiped at sign-out.
+     */
+    private fun cacheMedia(messageId: String, media: SecureMediaFile) {
+        mediaCache.remove(messageId)
+        while (mediaCache.isNotEmpty() && mediaCache.size >= MAX_OPEN_MEDIA_ENTRIES) {
+            mediaCache.remove(mediaCache.entries.first().key)
         }
-        while (
-            mediaCache.isNotEmpty() &&
-            (mediaCache.size >= MAX_MEDIA_CACHE_ENTRIES ||
-                mediaCacheByteCount + bytes.size > MAX_MEDIA_CACHE_BYTES)
-        ) {
-            val oldest = mediaCache.entries.first()
-            mediaCache.remove(oldest.key)
-            mediaCacheByteCount -= oldest.value.size
-            erased += oldest.value
-        }
-        mediaCache[messageId] = bytes
-        mediaCacheByteCount += bytes.size
-        mutableMediaBytes.value = mediaCache.toMap()
-        erased.forEach { it.fill(0) }
+        mediaCache[messageId] = media
+        mutableMediaFiles.value = mediaCache.toMap()
     }
 
     private fun discardMedia(messageId: String) {
-        val removed = mediaCache.remove(messageId) ?: return
-        mediaCacheByteCount -= removed.size
-        mutableMediaBytes.value = mediaCache.toMap()
-        removed.fill(0)
+        if (mediaCache.remove(messageId) == null) return
+        mutableMediaFiles.value = mediaCache.toMap()
     }
 
     override fun onCleared() {
         foregroundSyncJob?.cancel()
-        mutableMediaBytes.value = emptyMap()
-        mediaCache.values.forEach { it.fill(0) }
+        mutableMediaFiles.value = emptyMap()
         mediaCache.clear()
-        mediaCacheByteCount = 0
         super.onCleared()
     }
 
@@ -1479,7 +1989,13 @@ class ConversationViewModel @Inject internal constructor(
         // not a message-sync cadence: messages arrive by nudge, or by the coordinator's fallback
         // ladder when the socket cannot carry them.
         const val IDLE_REFRESH_INTERVAL_MILLIS = 45_000L
-        const val MAX_MEDIA_CACHE_ENTRIES = 4
-        const val MAX_MEDIA_CACHE_BYTES = 24 * 1024 * 1024
+        // Only handles are held here, so this bounds a scroll window rather than a heap budget;
+        // the bytes are bounded on disk by SecureMediaCache.
+        const val MAX_OPEN_MEDIA_ENTRIES = 24
+
+        // A poll re-reads one payment per request. Long-lived groups accumulate them, and the
+        // cards a member can still act on are the recent ones; older announcements stay readable
+        // from their descriptor without a live read behind them.
+        const val MAX_TRACKED_GROUP_PAYMENTS = 24
     }
 }

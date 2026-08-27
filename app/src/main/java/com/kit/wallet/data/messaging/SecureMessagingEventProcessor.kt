@@ -1,10 +1,7 @@
 package com.kit.wallet.data.messaging
 
 import androidx.annotation.VisibleForTesting
-import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
 import com.kit.wallet.data.repository.WalletRefreshTrigger
-import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
-import com.kit.wallet.data.remote.ENCRYPTED_REACTION_MESSAGE_KIND
 import com.kit.wallet.data.remote.KitWalletApiException
 import java.io.IOException
 import java.time.Instant
@@ -238,16 +235,22 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     return@forEach
                 }
                 val reaction = KitReactionMessage.parse(durable.authenticatedText)
-                val plan = if (reaction != null) {
+                val edit = KitEditMessage.parse(durable.authenticatedText)
+                val plan = if (reaction != null || edit != null) {
                     try {
                         val roster = session.roster(conversation)
-                        session.requireReactionCapability(conversation, roster)
+                        if (reaction != null) {
+                            session.requireReactionCapability(conversation, roster)
+                        } else {
+                            session.requireMessageEditCapability(conversation, roster)
+                        }
                         session.encryptionPlan(conversation, roster)
                     } catch (_: SecureMessagingConversationCapabilityUnavailableException) {
-                        // This annotation cannot reach the roster and has no standalone retry UI.
-                        // Retire only its ciphertext so it disappears locally and a stale device
-                        // cannot starve later text/media or another conversation's recovery. The
-                        // user can add the reaction again after every device supports it.
+                        // Neither annotation can reach the roster, and neither has a standalone
+                        // retry bubble. Retire only its ciphertext so it disappears locally and a
+                        // stale device cannot starve later text/media or another conversation's
+                        // recovery. The reaction can be added, or the correction written, again
+                        // once every device supports it. The original wording still stands.
                         session.withProjectionLease { markOutboundPermanentFailure(durable) }
                         return@forEach
                     }
@@ -1181,19 +1184,23 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     ): Boolean {
         val descriptor = KitMediaMessage.parse(durable.authenticatedText)
         val reaction = KitReactionMessage.parse(durable.authenticatedText)
+        val edit = KitEditMessage.parse(durable.authenticatedText)
+        // Text that reaches for a reserved namespace but does not parse into it is refused rather
+        // than shown: rendering it as ordinary words would put a descriptor in someone's face,
+        // and treating it as the thing it almost is would accept content nothing validated.
         if (KitReactionMessage.isReactionText(durable.authenticatedText) && reaction == null) {
+            return false
+        }
+        if (KitEditMessage.isEditText(durable.authenticatedText) && edit == null) {
             return false
         }
         val authenticatedAttachments = descriptor?.let { listOf(it.toAttachmentRequest()) }
             ?: emptyList()
-        val authenticatedKind = when {
-            authenticatedAttachments.isNotEmpty() -> ENCRYPTED_ATTACHMENT_MESSAGE_KIND
-            reaction != null -> ENCRYPTED_REACTION_MESSAGE_KIND
-            else -> ENCRYPTED_MESSAGE_KIND
-        }
+        val authenticatedKind = authenticatedMessageKind(durable.authenticatedText)
         return envelope.kind == authenticatedKind &&
             envelope.attachments == authenticatedAttachments &&
-            (reaction == null || reaction.targetMessageId == envelope.replyToMessageId)
+            (reaction == null || reaction.targetMessageId == envelope.replyToMessageId) &&
+            (edit == null || edit.targetMessageId == envelope.replyToMessageId)
     }
 
     private suspend fun commitDecryption(

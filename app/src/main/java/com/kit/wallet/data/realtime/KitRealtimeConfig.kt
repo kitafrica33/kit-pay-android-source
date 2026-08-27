@@ -23,6 +23,7 @@ internal data class KitRealtimeConfig(
     val conversationChannelTemplate: String,
     val presenceEnabled: Boolean,
     val typingEnabled: Boolean,
+    val callAnswerEnabled: Boolean,
 ) {
     fun userChannel(userPublicId: String): String =
         userChannelTemplate.replace(USER_PLACEHOLDER, userPublicId)
@@ -81,6 +82,13 @@ internal data class KitRealtimeConfig(
             val presence = block.presence == true
             val typing = presence && block.typing == true
 
+            // The answer frame rides the user channel, which is always subscribed, so
+            // unlike typing it has no companion capability to depend on. It is still
+            // gated on the advertisement: a server that has the rollout switched off
+            // sends nothing, and a client that ignores an unadvertised frame simply
+            // waits for the `call.answered` push that has always carried the answer.
+            val callAnswer = block.calls == true
+
             return KitRealtimeConfig(
                 socketUrl = buildString {
                     append(scheme).append("://").append(host)
@@ -96,6 +104,7 @@ internal data class KitRealtimeConfig(
                 conversationChannelTemplate = conversationTemplate,
                 presenceEnabled = presence,
                 typingEnabled = typing,
+                callAnswerEnabled = callAnswer,
             )
         }
 

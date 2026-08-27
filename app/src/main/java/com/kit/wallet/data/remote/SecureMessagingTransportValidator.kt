@@ -153,6 +153,30 @@ object SecureMessagingTransportValidator {
             requireTransport(conversation.title == null, "$label carries a title")
         }
 
+        // Identity fields ride the same rule as the title: a group may carry them, a direct
+        // chat never does — a server that says otherwise is not describing a conversation this
+        // client knows how to trust. The description is normalized the way the server itself
+        // normalizes it, so legacy padding cannot make one value read as two.
+        val description = conversation.description
+            ?.let(::normalizeMessagingGroupDescription)
+            ?.takeIf(String::isNotEmpty)
+        if (group) {
+            description?.let {
+                requireTransport(isValidMessagingGroupDescription(it), "$label description bounds")
+            }
+        } else {
+            requireTransport(conversation.description == null, "$label carries a description")
+        }
+
+        val photoUrl = conversation.photoUrl?.trim()?.takeIf(String::isNotEmpty)
+        if (group) {
+            photoUrl?.let {
+                requireTransport(isPlausibleGroupPhotoUrl(it), "$label photo URL")
+            }
+        } else {
+            requireTransport(conversation.photoUrl == null, "$label carries a photo")
+        }
+
         val nullableMembers = required(conversation.members, "$label members")
         val memberBounds = if (group) 1..MAX_GROUP_MEMBERS else DIRECT_MEMBER_COUNT..DIRECT_MEMBER_COUNT
         requireTransport(nullableMembers.size in memberBounds, "$label member count")
@@ -202,6 +226,8 @@ object SecureMessagingTransportValidator {
             conversationId = id,
             type = type,
             title = title,
+            description = if (group) description else null,
+            photoUrl = if (group) photoUrl else null,
             createdBy = createdBy,
             viewerUserId = currentUserId,
             currentUserRole = role,
@@ -444,6 +470,10 @@ object SecureMessagingTransportValidator {
                 kind != ENCRYPTED_REACTION_MESSAGE_KIND || replyToMessageId != null,
                 "history candidate $index reaction reply target",
             )
+            requireTransport(
+                kind != ENCRYPTED_EDIT_MESSAGE_KIND || replyToMessageId != null,
+                "history candidate $index edit reply target",
+            )
             val sentAt = validatedIncoming?.sentAt
                 ?: requireMessageTimestamp(message.sentAt, "history candidate $index send time")
             requireTransport(message.revokedAt == null, "history candidate $index is revoked")
@@ -653,6 +683,107 @@ object SecureMessagingTransportValidator {
             userId = expectedCurrentUserId,
             lastReadMessageId = canonicalMessageId,
             readAt = readAt,
+        )
+    }
+
+    /**
+     * Validates one message's delivery record.
+     *
+     * Refused whole rather than shown in part: a reply that names another message, repeats a
+     * person, omits everybody, or carries a moment that predates the message itself is not a
+     * record anyone should read off, and half of one reads as fact just as readily as all of it.
+     * A moment the server has not witnessed arrives as null, which is an answer rather than an
+     * omission.
+     *
+     * [expectedRecipientIds] pins the answer to a recipient set this device already knows for
+     * certain, and is supplied only where certainty exists. A direct conversation qualifies: its
+     * counterpart cannot change, so anybody else named in the reply is somebody the server
+     * invented. A group does not: people join and leave, and the record is deliberately historical
+     * to the message, so a member added after the send is rightly absent and one since removed is
+     * rightly present. Checking a group against today's roster would reject exactly the truthful
+     * answers this record exists to give.
+     */
+    fun validateMessageInfo(
+        response: MessagingMessageInfoDto,
+        expectedConversationId: String,
+        expectedMessageId: String,
+        expectedRecipientIds: Set<String>? = null,
+    ): ValidatedMessageDeliveryInfo {
+        requireUuid(expectedConversationId, "expected message-info conversation ID")
+        requireUuid(expectedMessageId, "expected message-info message ID")
+        requireTransport(
+            response.conversationId == expectedConversationId,
+            "message-info conversation changed",
+        )
+        requireTransport(response.messageId == expectedMessageId, "message-info message changed")
+        val sentAt = requireMessageTimestamp(response.sentAt, "message-info sent time")
+        val nullableRecipients = required(response.recipients, "message-info recipients")
+        // A message this account sent went to somebody. An empty list is the server declining to
+        // say rather than reporting that nobody was addressed, and a screen headed "Read by 0 of
+        // 0" states that absence as though it were a finding.
+        requireTransport(
+            nullableRecipients.isNotEmpty(),
+            "message-info names nobody the message was addressed to",
+        )
+        requireTransport(
+            nullableRecipients.size <= MAX_GROUP_MEMBERS,
+            "message-info recipient list is too large",
+        )
+        val seen = mutableSetOf<String>()
+        val recipients = nullableRecipients.mapIndexed { index, nullableRecipient ->
+            val recipient = required(nullableRecipient, "message-info recipient $index")
+            val userId = required(recipient.userId, "message-info recipient $index user ID")
+            requireUuid(userId, "message-info recipient $index user ID")
+            requireTransport(seen.add(userId), "message-info repeats a recipient")
+            val name = required(recipient.name, "message-info recipient $index name").trim()
+            requireTransport(
+                name.isNotEmpty() && name.toByteArray(Charsets.UTF_8).size <= MAX_RECIPIENT_NAME_UTF8_BYTES,
+                "message-info recipient $index name",
+            )
+            val deliveredAt = recipient.deliveredAt?.let {
+                requireMessageTimestamp(it, "message-info recipient $index delivery time")
+            }
+            val readAt = recipient.readAt?.let {
+                requireMessageTimestamp(it, "message-info recipient $index read time")
+            }
+            // Nothing can be delivered or read before it was sent.
+            if (deliveredAt != null) {
+                requireTransport(
+                    !deliveredAt.isBefore(sentAt),
+                    "message-info recipient $index delivery chronology",
+                )
+            }
+            if (readAt != null) {
+                requireTransport(
+                    !readAt.isBefore(sentAt),
+                    "message-info recipient $index read chronology",
+                )
+                // Nobody opens a message that never arrived. A read moment without a delivery, or
+                // one that precedes it, describes a sequence of events that cannot have happened,
+                // and the sensible reading of an impossible record is that it is not a record.
+                requireTransport(
+                    deliveredAt != null && !readAt.isBefore(deliveredAt),
+                    "message-info recipient $index was read before it was delivered",
+                )
+            }
+            ValidatedMessageDeliveryRecipient(
+                userId = userId,
+                name = name,
+                deliveredAt = deliveredAt,
+                readAt = readAt,
+            )
+        }
+        if (expectedRecipientIds != null) {
+            requireTransport(
+                seen == expectedRecipientIds,
+                "message-info names people this conversation did not address",
+            )
+        }
+        return ValidatedMessageDeliveryInfo(
+            conversationId = expectedConversationId,
+            messageId = expectedMessageId,
+            sentAt = sentAt,
+            recipients = recipients,
         )
     }
 
@@ -913,6 +1044,11 @@ object SecureMessagingTransportValidator {
                 message.replyToMessageId != null,
             "outbound reaction reply target",
         )
+        requireTransport(
+            message.kind != ENCRYPTED_EDIT_MESSAGE_KIND ||
+                message.replyToMessageId != null,
+            "outbound edit reply target",
+        )
         // Attachment metadata rows accompany exactly the encrypted_attachment kind; the media
         // descriptor with its key material still travels only inside the per-device ciphertext.
         requireTransport(
@@ -1031,6 +1167,22 @@ object SecureMessagingTransportValidator {
     private fun <T : Any> required(value: T?, field: String): T =
         value ?: rejectTransport("$field is missing")
 
+    private const val MAX_RECIPIENT_NAME_UTF8_BYTES = 256
+
+    /**
+     * Structural sanity for a group photo address: HTTPS with a host, no control or whitespace
+     * characters, bounded length. Host trust is deliberately not judged here — the render layer
+     * applies the same origin pin profile avatars pass, and an untrusted origin there degrades
+     * to the generated group avatar rather than rejecting the whole conversation.
+     */
+    private fun isPlausibleGroupPhotoUrl(value: String): Boolean =
+        value.length <= MAX_GROUP_PHOTO_URL_LENGTH &&
+            value.none { it.isWhitespace() || it.isISOControl() } &&
+            runCatching { java.net.URI(value) }.getOrNull()?.let { uri ->
+                uri.scheme.equals("https", ignoreCase = true) && !uri.host.isNullOrBlank()
+            } == true
+
+    private const val MAX_GROUP_PHOTO_URL_LENGTH = 2_048
     private const val MAX_SERVER_DEVICES = 1_000
     private const val MAX_CONVERSATIONS = 10_000
     private const val MAX_SYNC_PAGE_SIZE = 100
@@ -1098,6 +1250,13 @@ data class ValidatedConversation(
     val type: String,
     /** Server-visible group name; always null for a direct chat, which discloses nothing. */
     val title: String?,
+    /** Server-visible group description; always null for a direct chat, like the title. */
+    val description: String?,
+    /**
+     * The group photo's public content address, structurally vetted here and host-pinned again
+     * at render time by the same trust policy profile avatars pass. Null for a direct chat.
+     */
+    val photoUrl: String?,
     val createdBy: String,
     /** The account this conversation was validated for; always present in [members]. */
     val viewerUserId: String,
@@ -1260,4 +1419,27 @@ data class ValidatedMessagingReadReceipt(
     val userId: String,
     val lastReadMessageId: String,
     val readAt: Instant,
+)
+
+/**
+ * One person a message was addressed to, and how far it got with them.
+ *
+ * Delivery is the earliest of that person's devices rather than the last, because a phone left in
+ * a pocket should not make a laptop's delivery look undelivered. A null moment means the server
+ * has not witnessed it, which is not the same as it having failed.
+ */
+data class ValidatedMessageDeliveryRecipient(
+    val userId: String,
+    /** The server's name for this person, used only where the local address book has none. */
+    val name: String,
+    val deliveredAt: Instant?,
+    val readAt: Instant?,
+)
+
+/** When a message was accepted for sending, and when it reached each of its recipients. */
+data class ValidatedMessageDeliveryInfo(
+    val conversationId: String,
+    val messageId: String,
+    val sentAt: Instant,
+    val recipients: List<ValidatedMessageDeliveryRecipient>,
 )

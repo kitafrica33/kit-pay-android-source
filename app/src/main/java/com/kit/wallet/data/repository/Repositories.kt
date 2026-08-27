@@ -1,5 +1,7 @@
 package com.kit.wallet.data.repository
 
+import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.ui.model.Beneficiary
 import com.kit.wallet.ui.model.BillProvider
 import com.kit.wallet.ui.model.BankInstitution
@@ -9,6 +11,7 @@ import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Message
+import com.kit.wallet.ui.model.MessageDeliveryInfo
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.model.Transaction
 import com.kit.wallet.ui.model.TransferClaim
@@ -84,6 +87,21 @@ data class WalletCurrency(
     val scale: Int = Money.SCALE,
 )
 
+/**
+ * The wallet a payment composed inside the app spends from, read against the live session rather
+ * than off a cached flow.
+ *
+ * A composer that has to name a source wallet — a group payment does — must not read one id from a
+ * StateFlow and a balance from another: between the two the signed-in account can change, and the
+ * approval the sender is about to give would name a wallet that is no longer theirs.
+ */
+data class WalletSpendingSource(
+    val walletId: String,
+    val currencyCode: String,
+    val currencyScale: Int,
+    val availableBalanceMinor: Long,
+)
+
 interface WalletRepository {
     /** Authenticated public account ID used to bind wallet objects to a direct conversation. */
     val currentAccountId: String?
@@ -98,6 +116,9 @@ interface WalletRepository {
      */
     val walletCurrency: StateFlow<WalletCurrency>
         get() = MutableStateFlow(WalletCurrency())
+
+    /** Resolves [WalletSpendingSource] for the account that is signed in right now. */
+    suspend fun spendingSource(): WalletSpendingSource = error("No active wallet is selected")
 
     val transactions: StateFlow<List<Transaction>>
     val beneficiaries: StateFlow<List<Beneficiary>>
@@ -248,6 +269,14 @@ interface ContactRepository {
     suspend fun searchByKitTag(query: String): List<Contact> = emptyList()
 }
 
+/**
+ * The one shared answer for every repository that cannot correct a sent message.
+ *
+ * A single immutable instance rather than a default-getter allocation, so a collector observing
+ * the fallback sees a stable flow instead of a new one on every read.
+ */
+private val MESSAGE_EDITS_UNAVAILABLE: StateFlow<Boolean> = MutableStateFlow(false)
+
 interface ChatRepository {
     /** Reacts to the current authentication epoch's READY secure-messaging session. */
     val readiness: StateFlow<Boolean>
@@ -264,10 +293,31 @@ interface ChatRepository {
     val localHistoryReady: StateFlow<Boolean>
         get() = readiness
 
+    /**
+     * Whether the authenticated account may correct a message it has already sent.
+     *
+     * Fail closed by default, and false whenever the server has not advertised the feature for
+     * this account: the composer withdraws the affordance rather than offering an edit that the
+     * send path would refuse once it read the conversation roster. The roster itself is the other
+     * half of the gate, and only the send path can consult it.
+     */
+    val messageEditsAvailable: StateFlow<Boolean>
+        get() = MESSAGE_EDITS_UNAVAILABLE
+
     val chats: StateFlow<List<ChatPreview>>
     fun chat(chatId: String): ChatPreview?
     fun conversation(chatId: String): StateFlow<List<Message>>
     suspend fun markConversationRead(chatId: String) = Unit
+
+    /**
+     * When a message this account sent was accepted, and how far it got with each recipient.
+     *
+     * Asked on demand rather than kept in the transcript: it is a question about one message,
+     * asked rarely, and holding a live delivery record for every bubble in a group would cost
+     * every reader something only its author ever looks at.
+     */
+    suspend fun messageDeliveryInfo(chatId: String, messageId: String): MessageDeliveryInfo =
+        error("This chat repository cannot report what became of a message")
     suspend fun synchronizeConversation(chatId: String) = Unit
 
     /** Viewer-local pin/mute preferences; never sent to the server (iOS parity). */
@@ -283,6 +333,13 @@ interface ChatRepository {
     suspend fun sendMessage(
         chatId: String,
         text: String,
+        /**
+         * The message being answered, when the sender picked one by swiping it.
+         *
+         * Ahead of [onDurablyCommitted] because that one is written as a trailing lambda almost
+         * everywhere it is called, and a trailing lambda always binds to the last parameter.
+         */
+        replyToMessageId: String? = null,
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
     )
 
@@ -294,12 +351,28 @@ interface ChatRepository {
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
     ): Unit = error("Owner-pinned secure messaging is unavailable")
 
+    /**
+     * Queues one caller-owned text intent under an exact, stable identity.
+     *
+     * This is deliberately separate from [sendMessage]: ordinary composer taps must always mint a
+     * fresh message, while a durable external-share hand-off must be safe to replay after process
+     * death or after a later item in the same batch failed. Implementations must either acknowledge
+     * byte-for-byte identical content already owned by [clientMessageId], or fail if that identity
+     * belongs to different content.
+     */
+    suspend fun sendIdempotentMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        text: String,
+        clientMessageId: String,
+    ): Unit = error("Idempotent owner-pinned secure messaging is unavailable")
+
     /** Sends a canonical descriptor produced by a payment flow, never by a text composer. */
     suspend fun sendPaymentEvent(
         chatId: String,
         descriptor: String,
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
-    ) = sendMessage(chatId, descriptor, onDurablyCommitted)
+    ) = sendMessage(chatId, descriptor, onDurablyCommitted = onDurablyCommitted)
 
     suspend fun sendPaymentEventForOwner(
         owner: SessionFence,
@@ -307,6 +380,17 @@ interface ChatRepository {
         descriptor: String,
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
     ): Unit = error("Owner-pinned secure messaging is unavailable")
+
+    /**
+     * Announces a group payment, or one member's answer to one. Its own entry point because the
+     * group wire has its own reserved prefix and its own validation, and neither of those is
+     * reachable from a text composer.
+     */
+    suspend fun sendGroupPaymentEvent(
+        chatId: String,
+        descriptor: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit = {},
+    ) = sendPaymentEvent(chatId, descriptor, onDurablyCommitted)
 
     suspend fun retryMessage(chatId: String, clientMessageId: String, text: String) {
         error("This chat repository does not support explicit secure-message retries")
@@ -319,18 +403,53 @@ interface ChatRepository {
         descriptor: String,
     ) = retryMessage(chatId, clientMessageId, descriptor)
 
-    /** Sends one image end-to-end encrypted; the server stores only opaque ciphertext. */
+    /**
+     * Sends one attachment end-to-end encrypted; the server stores only opaque ciphertext.
+     *
+     * [source] is opened at send time and streamed through the cipher, so an attachment never has
+     * to fit in heap and the plaintext is never copied onto this app's own storage on the way out.
+     */
+    suspend fun sendMediaMessage(
+        chatId: String,
+        source: SecureMediaSource,
+        mediaType: String,
+        caption: String? = null,
+        /** The message being answered, when the sender picked one by swiping it. */
+        replyToMessageId: String? = null,
+    ) {
+        error("This chat repository does not support secure media messages")
+    }
+
+    /** Media equivalent of [sendIdempotentMessageForOwner]. */
+    suspend fun sendIdempotentMediaMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        source: SecureMediaSource,
+        mediaType: String,
+        clientMessageId: String,
+        caption: String? = null,
+    ): Unit = error("Idempotent owner-pinned secure media messaging is unavailable")
+
+    /** Convenience for plaintext that genuinely is already in heap, such as a re-encoded photo. */
     suspend fun sendImageMessage(
         chatId: String,
         bytes: ByteArray,
         mediaType: String,
         caption: String? = null,
-    ) {
-        error("This chat repository does not support secure media messages")
-    }
+        replyToMessageId: String? = null,
+    ) = sendMediaMessage(
+        chatId = chatId,
+        source = SecureMediaSource.ofBytes(bytes),
+        mediaType = mediaType,
+        caption = caption,
+        replyToMessageId = replyToMessageId,
+    )
 
-    /** Downloads and decrypts the media referenced by a message's authenticated descriptor. */
-    suspend fun openImageMessage(chatId: String, mediaDescriptor: String): ByteArray {
+    /**
+     * Downloads and decrypts the media a message's authenticated descriptor references, returning
+     * it as an app-private file the platform's players and viewers can read directly.
+     */
+    suspend fun openImageMessage(chatId: String, mediaDescriptor: String): SecureMediaFile {
         error("This chat repository does not support secure media messages")
     }
 
@@ -341,6 +460,18 @@ interface ChatRepository {
      */
     suspend fun toggleReaction(chatId: String, messageId: String, emoji: String) {
         error("This chat repository does not support message reactions")
+    }
+
+    /**
+     * Replaces the wording of [messageId] — this account's own message — with [text].
+     *
+     * The correction travels end-to-end encrypted like any other message, so the server learns no
+     * more about the new wording than it did about the old. It supersedes the original in every
+     * participant's transcript rather than appending to it: the point of an edit is that the
+     * withdrawn words stop being shown.
+     */
+    suspend fun editMessage(chatId: String, messageId: String, text: String) {
+        error("This chat repository does not support editing messages")
     }
 
     /**
@@ -378,6 +509,25 @@ interface ChatRepository {
 
     /** Leaves the group and drops it locally. An owner must hand it over first. */
     suspend fun leaveGroupConversation(chatId: String) {
+        error("This chat repository does not support group conversations")
+    }
+
+    /**
+     * Sets or clears the group's description. Like the title, the description is deliberately
+     * server-visible — every member must read the same one — and, like every group mutation,
+     * the server is what decides whether this account may change it.
+     */
+    suspend fun updateGroupDescription(chatId: String, description: String?) {
+        error("This chat repository does not support group conversations")
+    }
+
+    /** Uploads [jpegBytes] through the moderated avatar pipeline and makes it the group photo. */
+    suspend fun updateGroupPhoto(chatId: String, jpegBytes: ByteArray) {
+        error("This chat repository does not support group conversations")
+    }
+
+    /** Takes the group photo down; every client falls back to the generated group avatar. */
+    suspend fun removeGroupPhoto(chatId: String) {
         error("This chat repository does not support group conversations")
     }
 
@@ -463,6 +613,10 @@ data class CallConnection(
     val room: String,
     /** Server-authoritative end of the ringing window; null only for legacy responses. */
     val ringExpiresAt: String? = null,
+    /** Server-authoritative instant the call became active; null until someone answers. */
+    val answeredAt: String? = null,
+    /** The server's own clock when it built this response, to age [answeredAt] against. */
+    val serverTime: String? = null,
 )
 
 interface BillsRepository {
@@ -506,6 +660,97 @@ interface BankingRepository {
      * payment has to be able to watch its own operation rather than the newest one in the list.
      */
     suspend fun submitOperation(quote: FinancialOperationQuote, paymentPin: String): String
+}
+
+/** Kit Pay's own receiving account. It is never a customer beneficiary. */
+data class BankFundingAccount(
+    val id: String,
+    val label: String,
+    val bankId: String,
+    val bankName: String,
+    val accountName: String,
+    val accountNumber: String,
+    val accountNumberMasked: String,
+    val branchName: String?,
+    val branchCode: String?,
+    val swiftCode: String?,
+    val instructions: String?,
+    val currencyCode: String,
+    val active: Boolean,
+)
+
+data class BankDepositProof(
+    val assetId: String,
+    val filename: String,
+    val status: String,
+    val scanStatus: String,
+    val mimeType: String?,
+    val byteSize: Long?,
+)
+
+data class BankDeposit(
+    val id: String,
+    val reference: String,
+    val walletId: String,
+    val amountMinor: Long,
+    val currencyCode: String,
+    val currencyScale: Int,
+    val status: String,
+    val fundingAccount: BankFundingAccount,
+    val proof: BankDepositProof?,
+    val bankTransactionReference: String?,
+    val customerNote: String?,
+    val rejectionReason: String?,
+    val expiresAt: String,
+    val createdAt: String?,
+    val completedAt: String?,
+) {
+    val terminal: Boolean
+        get() = status.lowercase() in setOf(
+            "approved", "completed", "rejected", "expired", "cancelled", "canceled",
+        )
+
+    fun acceptsProof(now: Instant = Instant.now()): Boolean =
+        status.lowercase() in setOf("awaiting_proof", "proof_submitted") &&
+            runCatching { Instant.parse(expiresAt).isAfter(now) }.getOrDefault(false)
+}
+
+interface BankDepositRepository {
+    val fundingAccounts: StateFlow<List<BankFundingAccount>>
+    val deposits: StateFlow<List<BankDeposit>>
+
+    suspend fun refresh()
+    suspend fun create(
+        fundingAccountId: String,
+        amountMinor: Long,
+        note: String?,
+    ): BankDeposit
+    suspend fun attachProof(
+        depositId: String,
+        bytes: ByteArray,
+        filename: String,
+        mimeType: String,
+    ): BankDeposit
+    suspend fun refreshDeposit(depositId: String): BankDeposit
+}
+
+object UnavailableBankDepositRepository : BankDepositRepository {
+    override val fundingAccounts = MutableStateFlow<List<BankFundingAccount>>(emptyList())
+    override val deposits = MutableStateFlow<List<BankDeposit>>(emptyList())
+    override suspend fun refresh() = Unit
+    override suspend fun create(
+        fundingAccountId: String,
+        amountMinor: Long,
+        note: String?,
+    ): BankDeposit = error("Bank deposits are unavailable")
+    override suspend fun attachProof(
+        depositId: String,
+        bytes: ByteArray,
+        filename: String,
+        mimeType: String,
+    ): BankDeposit = error("Bank deposits are unavailable")
+    override suspend fun refreshDeposit(depositId: String): BankDeposit =
+        error("Bank deposits are unavailable")
 }
 
 class FinancialOperationQuote internal constructor(

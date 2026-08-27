@@ -6,6 +6,7 @@ import com.kit.wallet.data.auth.DeviceIdentityProvider
 import com.kit.wallet.data.auth.RemoteAuthRepository
 import com.kit.wallet.data.repository.BillsRepository
 import com.kit.wallet.data.repository.BankingRepository
+import com.kit.wallet.data.repository.BankDepositRepository
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.CommunicationPrivacyRepository
@@ -23,6 +24,7 @@ import com.kit.wallet.data.repository.RemoteAbuseReportingRepository
 import com.kit.wallet.data.repository.SharedPreferencesAbuseReportAttemptStore
 import com.kit.wallet.data.repository.RemoteContactRepository
 import com.kit.wallet.data.repository.RemoteBankingRepository
+import com.kit.wallet.data.repository.RemoteBankDepositRepository
 import com.kit.wallet.data.repository.MobileMoneyRepository
 import com.kit.wallet.data.repository.RemoteMobileMoneyRepository
 import com.kit.wallet.data.repository.KycRepository
@@ -152,6 +154,12 @@ abstract class RepositoryBindingsModule {
     @Binds
     @Singleton
     abstract fun bindBankingRepository(implementation: RemoteBankingRepository): BankingRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindBankDepositRepository(
+        implementation: RemoteBankDepositRepository,
+    ): BankDepositRepository
 
     @Binds
     @Singleton

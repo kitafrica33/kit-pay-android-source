@@ -39,6 +39,23 @@ internal interface SecureMessagingWireApi {
         @Body request: CreateMessagingConversationRequest,
     ): ApiEnvelope<MessagingConversationDto>
 
+    @PATCH("api/kit-wallet/v1/messaging/conversations/{conversation}")
+    suspend fun updateMessagingConversation(
+        @Path("conversation") conversationId: String,
+        @Body request: UpdateMessagingConversationRequest,
+    ): ApiEnvelope<MessagingConversationDto>
+
+    @PUT("api/kit-wallet/v1/messaging/conversations/{conversation}/photo")
+    suspend fun attachMessagingConversationPhoto(
+        @Path("conversation") conversationId: String,
+        @Body request: AttachMessagingConversationPhotoRequest,
+    ): ApiEnvelope<MessagingConversationDto>
+
+    @DELETE("api/kit-wallet/v1/messaging/conversations/{conversation}/photo")
+    suspend fun removeMessagingConversationPhoto(
+        @Path("conversation") conversationId: String,
+    ): ApiEnvelope<MessagingConversationDto>
+
     @POST("api/kit-wallet/v1/messaging/conversations/{conversation}/members")
     suspend fun addMessagingConversationMember(
         @Path("conversation") conversationId: String,
@@ -109,6 +126,18 @@ internal interface SecureMessagingWireApi {
         @Path("message") messageId: String,
         @Body request: StoreMessagingHistoryEnvelopeRequest,
     ): ApiEnvelope<MessagingHistoryEnvelopeResultDto>
+
+    /**
+     * When one message was accepted, and when it reached and was opened by each recipient.
+     *
+     * The server answers this to the sender alone, so a 403 here is the contract working rather
+     * than a failure to explain.
+     */
+    @GET("api/kit-wallet/v1/messaging/conversations/{conversation}/messages/{message}/info")
+    suspend fun messagingMessageInfo(
+        @Path("conversation") conversationId: String,
+        @Path("message") messageId: String,
+    ): ApiEnvelope<MessagingMessageInfoDto>
 
     @GET("api/kit-wallet/v1/messaging/sync")
     suspend fun syncEncryptedMessages(

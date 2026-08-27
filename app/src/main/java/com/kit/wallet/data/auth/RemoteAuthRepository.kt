@@ -1,6 +1,7 @@
 package com.kit.wallet.data.auth
 
 import com.kit.wallet.data.notifications.PushTokenCoordinator
+import com.kit.wallet.data.messaging.SecureMediaCache
 import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
 import com.kit.wallet.data.messaging.AccountMessageArchivePurgeNotDurableException
 import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
@@ -74,6 +75,7 @@ class RemoteAuthRepository @Inject constructor(
         NoOpAccountMessageHistoryRetention,
     @ApplicationScope applicationScope: CoroutineScope,
     private val biometricSigningKey: BiometricKeyLifecycle? = null,
+    private val secureMediaCache: SecureMediaCache? = null,
 ) : AuthRepository {
 
     override val signedIn: StateFlow<Boolean> = sessions.session
@@ -639,6 +641,15 @@ class RemoteAuthRepository @Inject constructor(
                 sessionFailure?.addSuppressed(keyFailure)
                 if (sessionFailure == null) sessionFailure = keyFailure
             }
+            try {
+                // Decrypted attachments outlive a single conversation on purpose, so they have to
+                // be dropped here: the encrypted originals stay on the server and are re-fetched
+                // by whoever signs in next.
+                secureMediaCache?.clear()
+            } catch (mediaFailure: Exception) {
+                sessionFailure?.addSuppressed(mediaFailure)
+                if (sessionFailure == null) sessionFailure = mediaFailure
+            }
         }
 
         sessionFailure?.let { throw it }
@@ -683,6 +694,12 @@ class RemoteAuthRepository @Inject constructor(
         } catch (keyFailure: Exception) {
             sessionFailure?.addSuppressed(keyFailure)
             if (sessionFailure == null) sessionFailure = keyFailure
+        }
+        try {
+            secureMediaCache?.clear()
+        } catch (mediaFailure: Exception) {
+            sessionFailure?.addSuppressed(mediaFailure)
+            if (sessionFailure == null) sessionFailure = mediaFailure
         }
 
         sessionFailure?.let { throw it }

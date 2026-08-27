@@ -6,15 +6,21 @@ import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.ApiEnvelope
 import com.kit.wallet.data.remote.ConsumeMessagingKeyBundlesRequest
 import com.kit.wallet.data.remote.AddMessagingConversationMemberRequest
+import com.kit.wallet.data.remote.AttachMessagingConversationPhotoRequest
 import com.kit.wallet.data.remote.CreateMessagingConversationRequest
 import com.kit.wallet.data.remote.GROUP_CONVERSATION_TYPE
 import com.kit.wallet.data.remote.MEMBER_CONVERSATION_ROLE
 import com.kit.wallet.data.remote.MESSAGING_GROUPS_DEVICE_CAPABILITY
 import com.kit.wallet.data.remote.MESSAGING_GROUPS_FEATURE
+import com.kit.wallet.data.remote.MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY
+import com.kit.wallet.data.remote.MESSAGING_MESSAGE_EDITS_FEATURE
 import com.kit.wallet.data.remote.MESSAGING_REACTIONS_DEVICE_CAPABILITY
 import com.kit.wallet.data.remote.MESSAGING_REACTIONS_FEATURE
 import com.kit.wallet.data.remote.MessagingConversationDto
 import com.kit.wallet.data.remote.UpdateMessagingConversationMemberRequest
+import com.kit.wallet.data.remote.UpdateMessagingConversationRequest
+import com.kit.wallet.data.remote.isValidMessagingGroupDescription
+import com.kit.wallet.data.remote.normalizeMessagingGroupDescription
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
 import com.kit.wallet.data.remote.EncryptedAttachmentRequest
@@ -24,6 +30,7 @@ import com.kit.wallet.data.remote.MessageDeliveryAcknowledgementDto
 import com.kit.wallet.data.remote.MarkMessagingConversationReadRequest
 import com.kit.wallet.data.remote.MessagingConversationListDto
 import com.kit.wallet.data.remote.MessagingKeyStatusDto
+import com.kit.wallet.data.remote.MessagingMessageInfoDto
 import com.kit.wallet.data.remote.MessagingReadReceiptDto
 import com.kit.wallet.data.remote.StoreMessagingHistoryEnvelopeRequest
 import com.kit.wallet.data.remote.SECURE_MESSAGING_ROSTER_REVISION
@@ -34,6 +41,7 @@ import com.kit.wallet.data.remote.SecureMessagingWireValidationException
 import com.kit.wallet.data.remote.SecureMessagingWireValidator
 import com.kit.wallet.data.remote.ValidatedConversation
 import com.kit.wallet.data.remote.ValidatedMessageDeliveryAcknowledgement
+import com.kit.wallet.data.remote.ValidatedMessageDeliveryInfo
 import com.kit.wallet.data.remote.ValidatedMessagingDeviceRoster
 import com.kit.wallet.data.remote.ValidatedMessagingHistoryBackfillPage
 import com.kit.wallet.data.remote.ValidatedMessagingHistoryCandidate
@@ -49,8 +57,11 @@ import java.util.Collections
 import java.util.WeakHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
+import java.io.File
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 
 internal data class SecureMessagingRemoteContext(
@@ -91,6 +102,15 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         private val context: SecureMessagingRemoteContext,
         private val groupMessagingEnabled: Boolean = false,
         private val reactionMessagingEnabled: Boolean = false,
+        /**
+         * Whether this authenticated account may send corrections at all.
+         *
+         * Read once from the server's capability map and exposed so the composer can withdraw the
+         * affordance rather than offer an edit that the send path would then refuse. The roster
+         * check in [requireMessageEditCapability] is the fail-closed half; this is the half that
+         * keeps a person from writing a correction nobody could have received.
+         */
+        val messageEditsEnabled: Boolean = false,
     ) {
         /**
          * Opaque authority for one exact, server-validated conversation.
@@ -106,6 +126,8 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val conversationId: String,
             val type: String,
             val title: String?,
+            val description: String?,
+            val photoUrl: String?,
             val peerUserId: String?,
             val peerName: String?,
             val currentUserRole: String,
@@ -759,6 +781,83 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
 
         /**
+         * Sets or clears the group's description. A null [description] clears it; a non-null
+         * one is canonicalized here so the request type's own invariant can hold.
+         */
+        suspend fun updateGroupDescription(
+            conversation: SecureConversation,
+            description: String?,
+        ): SecureConversation {
+            require(groupMessagingEnabled) { "Group messaging is not enabled" }
+            val canonical = description
+                ?.let(::normalizeMessagingGroupDescription)
+                ?.takeIf(String::isNotEmpty)
+            canonical?.let {
+                require(isValidMessagingGroupDescription(it)) {
+                    "That group description is too long"
+                }
+            }
+            return mutateProfile(conversation) { conversationId ->
+                updateMessagingConversation(
+                    conversationId,
+                    UpdateMessagingConversationRequest(description = canonical),
+                )
+            }
+        }
+
+        /** Makes an already-uploaded, scanned avatar asset this group's photo. */
+        suspend fun attachGroupPhoto(
+            conversation: SecureConversation,
+            assetId: String,
+        ): SecureConversation {
+            require(groupMessagingEnabled) { "Group messaging is not enabled" }
+            return mutateProfile(conversation) { conversationId ->
+                attachMessagingConversationPhoto(
+                    conversationId,
+                    AttachMessagingConversationPhotoRequest(assetId = assetId),
+                )
+            }
+        }
+
+        suspend fun removeGroupPhoto(conversation: SecureConversation): SecureConversation {
+            require(groupMessagingEnabled) { "Group messaging is not enabled" }
+            return mutateProfile(conversation) { conversationId ->
+                removeMessagingConversationPhoto(conversationId)
+            }
+        }
+
+        /**
+         * One group-identity change, revalidated exactly like a membership change: the server's
+         * answer is validated, pinned to the same conversation, and reissued as the new handle.
+         */
+        private suspend fun mutateProfile(
+            conversation: SecureConversation,
+            call: suspend SecureMessagingWireApi.(String) -> ApiEnvelope<MessagingConversationDto>,
+        ): SecureConversation {
+            val validatedConversation = requireConversation(conversation)
+            require(validatedConversation.isGroup) {
+                "A direct conversation has no group identity to change"
+            }
+            val response = owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                call(validatedConversation.conversationId)
+            }
+            val validated = SecureMessagingTransportValidator.validateConversation(
+                response,
+                context.currentUserId,
+            )
+            check(validated.conversationId == validatedConversation.conversationId) {
+                "The server returned another conversation"
+            }
+            return issueConversation(validated)
+        }
+
+        /**
          * Leaves [conversation], returning nothing.
          *
          * The server answers with the conversation as it now stands, which no longer contains
@@ -1004,6 +1103,30 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             )
         }
 
+        /**
+         * Refuses a correction unless the account is enabled for it and every other device in the
+         * conversation says it understands `KITEDIT1`.
+         *
+         * Fail closed, exactly as reactions do: a peer that predates the descriptor would render
+         * the correction as a chat bubble full of protocol text, which is worse than the original
+         * wording simply standing.
+         */
+        fun requireMessageEditCapability(
+            conversation: SecureConversation,
+            roster: AuthoritativeRoster,
+        ) {
+            if (!messageEditsEnabled) {
+                throw SecureMessagingConversationCapabilityUnavailableException(
+                    "Encrypted message edits are not enabled",
+                )
+            }
+            requireRosterCapability(
+                requireConversation(conversation),
+                requireRoster(roster, conversation).validated,
+                MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY,
+            )
+        }
+
         private fun requireRosterCapability(
             conversation: ValidatedConversation,
             roster: ValidatedMessagingDeviceRoster,
@@ -1012,10 +1135,12 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             check(roster.memberUserIds() == conversation.memberUserIds()) {
                 "The capability roster does not cover every conversation member"
             }
-            if (!roster.devices().all { device ->
-                device.deviceId == context.currentDeviceId ||
-                    device.supportsClientCapability(capability)
-            }) {
+            if (!MessagingRosterCapabilityPolicy.everyPeerSupports(
+                    roster,
+                    capability,
+                    context.currentDeviceId,
+                )
+            ) {
                 throw SecureMessagingConversationCapabilityUnavailableException(
                     "A conversation device does not support $capability",
                 )
@@ -1372,10 +1497,42 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
          * Uploads opaque attachment ciphertext and returns its server identity. The response is
          * checked against the exact bytes sent so a corrupted store can never be referenced.
          */
-        suspend fun uploadAttachment(mediaType: String, ciphertext: ByteArray): UploadedAttachment {
+        suspend fun uploadAttachment(mediaType: String, ciphertext: ByteArray): UploadedAttachment =
+            uploadAttachment(
+                mediaType = mediaType,
+                byteSize = ciphertext.size.toLong(),
+                expectedSha256 = sha256Hex(ciphertext),
+                body = ciphertext.toRequestBody("application/octet-stream".toMediaType()),
+            )
+
+        /**
+         * File-backed variant: OkHttp streams the blob off disk a buffer at a time, so a 200 MB
+         * attachment costs the upload nothing in heap.
+         */
+        suspend fun uploadAttachment(mediaType: String, ciphertext: File): UploadedAttachment {
+            val byteSize = ciphertext.length()
+            check(ciphertext.isFile && byteSize > 0) { "Attachment ciphertext is unavailable" }
+            val digest = ciphertext.streamingSha256()
+            return try {
+                uploadAttachment(
+                    mediaType = mediaType,
+                    byteSize = byteSize,
+                    expectedSha256 = digest.toHexString(),
+                    body = ciphertext.asRequestBody("application/octet-stream".toMediaType()),
+                )
+            } finally {
+                digest.fill(0)
+            }
+        }
+
+        private suspend fun uploadAttachment(
+            mediaType: String,
+            byteSize: Long,
+            expectedSha256: String,
+            body: RequestBody,
+        ): UploadedAttachment {
             require(mediaType.isNotBlank() && mediaType.length <= 160) { "Invalid media type" }
-            require(ciphertext.isNotEmpty()) { "Attachment ciphertext is empty" }
-            val expectedSha256 = sha256Hex(ciphertext)
+            require(byteSize > 0) { "Attachment ciphertext is empty" }
             val response = owner.fencedSessionCall(
                 this,
                 issuanceIdentity,
@@ -1389,7 +1546,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                     ciphertext = MultipartBody.Part.createFormData(
                         "ciphertext",
                         "blob.bin",
-                        ciphertext.toRequestBody("application/octet-stream".toMediaType()),
+                        body,
                     ),
                 )
             }
@@ -1397,7 +1554,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             check(!storageKey.isNullOrBlank() && storageKey.length <= 512) {
                 "The attachment store returned an invalid storage key"
             }
-            check(response.byteSize == ciphertext.size.toLong()) {
+            check(response.byteSize == byteSize) {
                 "The attachment store recorded a different ciphertext size"
             }
             check(response.ciphertextSha256?.lowercase() == expectedSha256) {
@@ -1405,7 +1562,7 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             }
             return UploadedAttachment(
                 storageKey = storageKey,
-                byteSize = ciphertext.size.toLong(),
+                byteSize = byteSize,
                 ciphertextSha256 = expectedSha256,
             )
         }
@@ -1439,6 +1596,85 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 bytes?.fill(0)
                 throw error
             }
+        }
+
+        /**
+         * File-backed variant of [downloadAttachment]: the response body goes straight to disk.
+         *
+         * Integrity is still the caller's job against the end-to-end descriptor, never against
+         * anything the server asserts — this only changes where the unverified bytes wait.
+         */
+        suspend fun downloadAttachmentToFile(
+            storageKey: String,
+            maximumBytes: Long,
+            destination: File,
+        ): Long {
+            require(storageKey.isNotBlank() && storageKey.length <= 512) { "Invalid storage key" }
+            require(maximumBytes in 1..MAX_ATTACHMENT_DOWNLOAD_BYTES) { "Invalid download bound" }
+            val body = owner.rawFencedSessionCall(this, issuanceIdentity, lifecycle, fence) {
+                downloadMessagingAttachment(storageKey)
+            }
+            var written = 0L
+            try {
+                body.use { responseBody ->
+                    val length = responseBody.contentLength()
+                    check(length == -1L || length <= maximumBytes) {
+                        "The encrypted attachment exceeds its authenticated size"
+                    }
+                    written = responseBody.byteStream().use { input ->
+                        destination.outputStream().buffered().use { output ->
+                            input.copyBoundedTo(output, maximumBytes)
+                        }
+                    }
+                }
+                // Retrofit's response suspension ends before a streaming body is consumed. Fence
+                // the complete read so bytes from an obsolete activation never reach decryption.
+                lifecycle.assertCurrent(activation)
+                return written
+            } catch (error: Throwable) {
+                destination.delete()
+                throw error
+            }
+        }
+
+        /**
+         * When one message this account sent was accepted, and how far it got with each recipient.
+         *
+         * Read-only and about a message that already exists, so it asks nothing of the session
+         * beyond being the one that sent it — the server answers this to the sender alone.
+         */
+        suspend fun messageInfo(
+            conversation: SecureConversation,
+            messageId: String,
+        ): ValidatedMessageDeliveryInfo {
+            val validatedConversation = requireConversation(conversation)
+            requireUuid(messageId, "message-info message ID")
+            val response: MessagingMessageInfoDto = owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                messagingMessageInfo(validatedConversation.conversationId, messageId)
+            }
+            // A direct chat has exactly one counterpart, and membership of one cannot change, so
+            // the reply is pinned to that person. A group's record is historical to the message —
+            // people joined and left after it was sent — so today's roster is the wrong yardstick
+            // and pinning to it would reject the truthful answer.
+            val expectedRecipientIds = if (validatedConversation.isGroup) {
+                null
+            } else {
+                validatedConversation.others.mapTo(mutableSetOf()) { it.userId }
+            }
+            val validated = SecureMessagingTransportValidator.validateMessageInfo(
+                response = response,
+                expectedConversationId = validatedConversation.conversationId,
+                expectedMessageId = messageId,
+                expectedRecipientIds = expectedRecipientIds,
+            )
+            lifecycle.assertCurrent(activation)
+            return validated
         }
 
         suspend fun markConversationRead(
@@ -1728,6 +1964,8 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 conversationId = validated.conversationId,
                 type = validated.type,
                 title = validated.title,
+                description = validated.description,
+                photoUrl = validated.photoUrl,
                 peerUserId = validated.peerUserId,
                 peerName = validated.peerName,
                 currentUserRole = validated.currentUserRole,
@@ -2365,6 +2603,8 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             groupMessagingEnabled = capabilities.features?.get(MESSAGING_GROUPS_FEATURE) == true,
             reactionMessagingEnabled =
                 capabilities.features?.get(MESSAGING_REACTIONS_FEATURE) == true,
+            messageEditsEnabled =
+                capabilities.features?.get(MESSAGING_MESSAGE_EDITS_FEATURE) == true,
         )
         issuedSessions[session] = issuanceIdentity
         return session
@@ -2441,7 +2681,8 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         const val MAX_ATTACHMENT_DOWNLOAD_BYTES = MAX_IMAGE_CIPHERTEXT_BYTES
 
         fun sha256Hex(bytes: ByteArray): String =
-            MessageDigest.getInstance("SHA-256").digest(bytes)
-                .joinToString("") { "%02x".format(it) }
+            MessageDigest.getInstance("SHA-256").digest(bytes).toHexString()
+
+        fun ByteArray.toHexString(): String = joinToString("") { "%02x".format(it) }
     }
 }

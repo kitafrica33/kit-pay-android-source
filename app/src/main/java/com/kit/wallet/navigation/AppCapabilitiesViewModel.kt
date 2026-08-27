@@ -100,6 +100,12 @@ data class AppCapabilities(
     val bankTransfersUsable: Boolean
         get() = allEnabled(KitFeature.WALLETS, KitFeature.BANK_TRANSFERS)
 
+    val bankDepositsUsable: Boolean
+        get() = allEnabled(KitFeature.WALLETS, KitFeature.BANK_DEPOSITS)
+
+    val bankUsable: Boolean
+        get() = bankTransfersUsable || bankDepositsUsable
+
     val mobileMoneyUsable: Boolean
         get() = allEnabled(KitFeature.WALLETS, KitFeature.MOBILE_MONEY)
 
@@ -133,13 +139,14 @@ data class AppCapabilities(
             // These three do exchange: starting a conversation, picking someone to start it with,
             // and changing who is in a group are all server-authenticated actions that need a
             // ready end-to-end session before they can be honoured.
-            Dest.CONTACTS, Dest.NEW_GROUP, Dest.GROUP_ADD -> messagingUsable
+            Dest.CONTACTS, Dest.NEW_GROUP, Dest.GROUP_ADD, Dest.GROUP_DESCRIPTION ->
+                messagingUsable
             // Including an in-progress call: a failed capability poll must never hang one up.
             Dest.CALLS, Dest.CALL_CONTACTS, Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL ->
                 lastKnownEnabled(KitFeature.CALLS)
             Dest.BILLS, Dest.BILL_PAY -> billPaymentsUsable
             Dest.AIRTIME -> airtimeUsable
-            Dest.BANK -> bankTransfersUsable
+            Dest.BANK -> bankUsable
             Dest.MOBILE_MONEY -> mobileMoneyUsable
             // Receive shares the authenticated user's existing Kit tag/phone; it does not depend
             // on the still-unimplemented QR scanner or a separate client protocol.

@@ -34,7 +34,9 @@ internal enum class KitChatMediaKind {
 internal object KitChatMediaLimits {
     /** One shared transfer cap for every kind; the wire enforces the same bound on both ends. */
     const val MAX_TRANSFER_BYTES = MAX_IMAGE_PLAINTEXT_BYTES
-    const val MAX_TRANSFER_LABEL = "10 MB"
+
+    /** Derived, never restated, so the number a person is shown cannot drift from the real cap. */
+    val MAX_TRANSFER_LABEL: String = "${MAX_TRANSFER_BYTES / (1_024 * 1_024)} MB"
 
     /** Voice-note recording bounds shared with iOS (`VoiceNoteRecorder`). */
     const val VOICE_NOTE_MIN_DURATION_MILLIS = 1_000L

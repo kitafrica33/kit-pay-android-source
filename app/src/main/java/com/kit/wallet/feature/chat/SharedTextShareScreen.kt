@@ -18,8 +18,12 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -52,22 +56,30 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.repository.ChatRepository
+import com.kit.wallet.data.repository.ContactRepository
+import com.kit.wallet.data.session.SessionInvalidatedException
+import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.model.ChatPreview
+import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.security.SecureScreen
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 internal data class SharedTextSendState(
     val requestToken: String? = null,
     val sending: Boolean = false,
     val sent: Boolean = false,
+    val pinnedConversationId: String? = null,
+    val durablyQueuedComponents: Int = 0,
     val error: String? = null,
 )
 
@@ -77,48 +89,173 @@ internal enum class SharedTextSendStart {
     REJECTED,
 }
 
-internal fun directTextShareRecipients(
-    chats: List<ChatPreview>,
-    query: String = "",
-): List<ChatPreview> {
-    val normalizedQuery = query.trim()
-    return chats.filter { chat ->
-        !chat.isGroup && chat.name.contains(normalizedQuery, ignoreCase = true)
+internal sealed interface SharedRecipient {
+    val stableId: String
+    val name: String
+    val avatarUrl: String?
+
+    data class Conversation(val chat: ChatPreview) : SharedRecipient {
+        override val stableId: String = "conversation:${chat.id}"
+        override val name: String = chat.name
+        override val avatarUrl: String? = chat.avatarUrl
+    }
+
+    data class Person(
+        val contact: Contact,
+        /** Existing local thread, when this person has one outside the five recent rows. */
+        val existingChatId: String?,
+    ) : SharedRecipient {
+        override val stableId: String = "contact:${contact.id}"
+        override val name: String = contact.name
+        override val avatarUrl: String? = contact.avatarUrl
     }
 }
 
+internal data class SharedRecipientSections(
+    val recent: List<SharedRecipient.Conversation>,
+    val contacts: List<SharedRecipient.Person>,
+    val otherGroups: List<SharedRecipient.Conversation>,
+) {
+    val all: List<SharedRecipient> get() = recent + contacts + otherGroups
+}
+
+/** A restored partial batch must find its pinned chat even when that chat is older than Recents. */
+internal fun pinnedShareRecipient(
+    chats: List<ChatPreview>,
+    conversationId: String,
+    groupMessagingEnabled: Boolean = true,
+): SharedRecipient.Conversation? = chats.firstOrNull { chat ->
+    SharedInboxPolicy.canonicalConversationId(chat.id) == conversationId &&
+        (!chat.isGroup || groupMessagingEnabled)
+}?.let { SharedRecipient.Conversation(it) }
+
+/**
+ * Five conversations preserve repository recency order and mix people with groups. Everybody else
+ * comes from the eligible Kit Pay contact directory alphabetically; an older direct thread is
+ * reused instead of creating a duplicate. Groups have no contact row, so older ones get a final
+ * alphabetical section and remain reachable.
+ */
+internal fun shareRecipientSections(
+    chats: List<ChatPreview>,
+    contacts: List<Contact>,
+    query: String = "",
+    groupMessagingEnabled: Boolean = true,
+): SharedRecipientSections {
+    val normalizedQuery = query.trim()
+    fun matches(value: String): Boolean =
+        normalizedQuery.isEmpty() || value.contains(normalizedQuery, ignoreCase = true)
+
+    val eligibleChats = chats.filter { !it.isGroup || groupMessagingEnabled }
+    val recentChats = eligibleChats.take(MAXIMUM_RECENT_SHARE_CHATS)
+    val recent = recentChats
+        .filter { matches(it.name) }
+        .map { SharedRecipient.Conversation(it) }
+    val directChatsByPeer = eligibleChats.asSequence()
+        .filterNot(ChatPreview::isGroup)
+        .mapNotNull { chat -> chat.peerUserId?.let { peerId -> peerId to chat.id } }
+        .distinctBy { (peerId, _) -> peerId }
+        .toMap()
+    val recentDirectPeers = recent.asSequence()
+        .map(SharedRecipient.Conversation::chat)
+        .filterNot(ChatPreview::isGroup)
+        .mapNotNull(ChatPreview::peerUserId)
+        .toSet()
+    val otherContacts = contacts.asSequence()
+        .filter { it.isKitUser && it.id.isNotBlank() && it.id !in recentDirectPeers }
+        .filter {
+            matches(it.name) || matches(it.phone) ||
+                it.registeredName?.let(::matches) == true
+        }
+        .distinctBy(Contact::id)
+        .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER, Contact::name).thenBy(Contact::id))
+        .map { contact ->
+            SharedRecipient.Person(
+                contact = contact,
+                existingChatId = directChatsByPeer[contact.id],
+            )
+        }
+        .toList()
+    val otherGroups = eligibleChats.drop(MAXIMUM_RECENT_SHARE_CHATS)
+        .asSequence()
+        .filter(ChatPreview::isGroup)
+        .filter { matches(it.name) }
+        .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER, ChatPreview::name).thenBy(ChatPreview::id))
+        .map { SharedRecipient.Conversation(it) }
+        .toList()
+    return SharedRecipientSections(recent, otherContacts, otherGroups)
+}
+
+private const val MAXIMUM_RECENT_SHARE_CHATS = 5
+
 @HiltViewModel
 internal class SharedTextShareViewModel @Inject constructor(
+    private val sharedInbox: SharedInboxAccess,
     private val chatRepository: ChatRepository,
+    contactRepository: ContactRepository,
+    private val sessions: SessionStore,
 ) : ViewModel() {
-    val messagingAvailable = chatRepository.readiness
+    /**
+     * A send is accepted as soon as this account's encrypted local history/outbox is open. The
+     * repository publishes the bubble locally, then encrypts, queues and sends in the background.
+     * Requiring a live transport here would make Android's share sheet fail exactly when the user
+     * most needs the offline-first outbox.
+     */
+    val localOutboxAvailable = chatRepository.localHistoryReady
     val chats = chatRepository.chats
+    val contacts = contactRepository.contacts
 
     private val mutableSendState = MutableStateFlow(SharedTextSendState())
     val sendState = mutableSendState.asStateFlow()
     private var sendJob: Job? = null
 
-    fun begin(requestToken: String) {
+    fun begin(requestToken: String, pinnedConversationId: String? = null) {
         if (mutableSendState.value.requestToken == requestToken) return
         sendJob?.cancel()
         sendJob = null
-        mutableSendState.value = SharedTextSendState(requestToken = requestToken)
+        mutableSendState.value = SharedTextSendState(
+            requestToken = requestToken,
+            pinnedConversationId = pinnedConversationId,
+        )
     }
 
     fun send(
         requestToken: String,
-        chatId: String,
-        text: String,
+        recipient: SharedRecipient,
+        batch: SharedInboxBatch,
+        groupMessagingEnabled: Boolean = true,
         onFinished: () -> Unit,
     ): SharedTextSendStart {
-        if (mutableSendState.value.requestToken != requestToken) begin(requestToken)
+        if (mutableSendState.value.requestToken != requestToken) {
+            begin(requestToken, batch.pinnedConversationId)
+        }
         if (mutableSendState.value.sending) return SharedTextSendStart.ALREADY_SENDING
         if (mutableSendState.value.sent) return SharedTextSendStart.REJECTED
 
-        val directChatExists = chats.value.singleOrNull { it.id == chatId }?.isGroup == false
-        if (!messagingAvailable.value || !directChatExists || text.isBlank()) {
+        if (batch.text?.let(SharedInboxPolicy::allowsUserAuthoredText) == false) {
             mutableSendState.value = mutableSendState.value.copy(
-                error = "Choose an available direct secure conversation.",
+                error = "Messages cannot start with one of Kit Pay's reserved prefixes",
+            )
+            return SharedTextSendStart.REJECTED
+        }
+
+        val recipientExists = when (recipient) {
+            is SharedRecipient.Conversation ->
+                chats.value.any {
+                    it.id == recipient.chat.id && (!it.isGroup || groupMessagingEnabled)
+                }
+            is SharedRecipient.Person ->
+                contacts.value.any { it.id == recipient.contact.id && it.isKitUser }
+        }
+        val owner = sessions.current()?.fence()
+        if (
+            !localOutboxAvailable.value ||
+            !recipientExists ||
+            !batch.isDeliverable ||
+            owner == null ||
+            !batch.owner.matches(owner)
+        ) {
+            mutableSendState.value = mutableSendState.value.copy(
+                error = "Choose an available secure conversation.",
             )
             return SharedTextSendStart.REJECTED
         }
@@ -126,9 +263,85 @@ internal class SharedTextShareViewModel @Inject constructor(
         mutableSendState.value = mutableSendState.value.copy(sending = true, error = null)
         sendJob = viewModelScope.launch {
             try {
+                check(sessions.current()?.fence() == owner) {
+                    "Your Kit Pay session changed. Share this item again."
+                }
+                // Resolve every file before pinning or mutating the outbox. A missing item must
+                // reject the whole review rather than queue the readable prefix of the batch.
+                val prepared = withContext(Dispatchers.IO) {
+                    batch.items.map { item -> item to sharedInbox.source(batch, item) }
+                }
+                val chatId = when (recipient) {
+                    is SharedRecipient.Conversation -> recipient.chat.id
+                    is SharedRecipient.Person -> {
+                        val currentContact = checkNotNull(
+                            contacts.value.firstOrNull {
+                                it.id == recipient.contact.id && it.isKitUser
+                            },
+                        ) { "That Kit Pay contact is no longer available" }
+                        recipient.existingChatId
+                            ?.takeIf { id ->
+                                chats.value.any {
+                                    it.id == id && !it.isGroup &&
+                                        it.peerUserId == currentContact.id
+                                }
+                            }
+                            ?: chatRepository.openDirectConversation(currentContact).also {
+                                if (sessions.current()?.fence() != owner) {
+                                    throw SessionInvalidatedException()
+                                }
+                            }
+                    }
+                }
+                val canonicalChatId = checkNotNull(
+                    SharedInboxPolicy.canonicalConversationId(chatId),
+                ) { "That secure conversation is no longer available" }
+                check(
+                    batch.pinnedConversationId == null ||
+                        batch.pinnedConversationId == canonicalChatId,
+                ) { "This share is already assigned to another conversation" }
+                val pinnedBatch = withContext(Dispatchers.IO) {
+                    sharedInbox.pinDestination(batch, canonicalChatId)
+                }
+                mutableSendState.value = mutableSendState.value.copy(
+                    pinnedConversationId = canonicalChatId,
+                )
+
                 // This is the only send point. Reaching it requires both the capability gate and
-                // an explicit tap on the review screen's Send securely button.
-                chatRepository.sendMessage(chatId, text)
+                // an explicit tap on the review screen's Send securely button. Files go first and
+                // text last so the words read as the thing said about the attachments.
+                for ((item, source) in prepared) {
+                    chatRepository.sendIdempotentMediaMessageForOwner(
+                        owner = owner,
+                        chatId = canonicalChatId,
+                        source = source,
+                        mediaType = item.mediaType,
+                        clientMessageId = SharedInboxPolicy.deliveryMessageId(
+                            pinnedBatch.id,
+                            canonicalChatId,
+                            item.id,
+                        ),
+                    )
+                    mutableSendState.value = mutableSendState.value.copy(
+                        durablyQueuedComponents = mutableSendState.value.durablyQueuedComponents + 1,
+                    )
+                }
+                pinnedBatch.text?.takeIf(String::isNotBlank)?.let { text ->
+                    chatRepository.sendIdempotentMessageForOwner(
+                        owner = owner,
+                        chatId = canonicalChatId,
+                        text = text,
+                        clientMessageId = SharedInboxPolicy.deliveryMessageId(
+                            pinnedBatch.id,
+                            canonicalChatId,
+                            SharedInboxPolicy.TEXT_COMPONENT,
+                        ),
+                    )
+                    mutableSendState.value = mutableSendState.value.copy(
+                        durablyQueuedComponents = mutableSendState.value.durablyQueuedComponents + 1,
+                    )
+                }
+                discard(pinnedBatch)
                 mutableSendState.value = mutableSendState.value.copy(
                     sending = false,
                     sent = true,
@@ -155,32 +368,63 @@ internal class SharedTextShareViewModel @Inject constructor(
         sendJob = null
         mutableSendState.value = state.copy(sending = false)
     }
+
+    /** Staged plaintext outlives nothing: it goes as soon as it has been sent or given up on. */
+    fun discard(batch: SharedInboxBatch) {
+        sharedInbox.discard(batch)
+    }
 }
 
-/** Full-screen, explicit recipient-and-content review for an Android text share. */
+/** Full-screen, explicit recipient-and-content review for an Android share. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun SharedTextShareDialog(
     request: IncomingTextShareRequest,
-    text: String,
+    batch: SharedInboxBatch,
+    groupMessagingEnabled: Boolean,
     onDismiss: () -> Unit,
+    onDeferred: () -> Unit,
     onSent: () -> Unit,
     onSendingChanged: (Boolean) -> Unit,
     viewModel: SharedTextShareViewModel = hiltViewModel(),
 ) {
     val chats by viewModel.chats.collectAsStateWithLifecycle()
-    val messagingAvailable by viewModel.messagingAvailable.collectAsStateWithLifecycle()
+    val contacts by viewModel.contacts.collectAsStateWithLifecycle()
+    val localOutboxAvailable by viewModel.localOutboxAvailable.collectAsStateWithLifecycle()
     val sendState by viewModel.sendState.collectAsStateWithLifecycle()
     var query by remember(request.token) { mutableStateOf("") }
-    var selectedChatId by remember(request.token) { mutableStateOf<String?>(null) }
-    val directChats = remember(chats) { directTextShareRecipients(chats) }
-    val matchingChats = remember(chats, query) {
-        directTextShareRecipients(chats, query)
+    var selectedRecipientId by remember(request.token) { mutableStateOf<String?>(null) }
+    val unpinnedRecipientSections = remember(chats, contacts, query, groupMessagingEnabled) {
+        shareRecipientSections(chats, contacts, query, groupMessagingEnabled)
     }
-    val selectedChat = directChats.firstOrNull { it.id == selectedChatId }
+    val effectivePinnedConversationId =
+        sendState.pinnedConversationId ?: batch.pinnedConversationId
+    val recipientSections = remember(
+        chats,
+        unpinnedRecipientSections,
+        effectivePinnedConversationId,
+        groupMessagingEnabled,
+    ) {
+        effectivePinnedConversationId?.let { conversationId ->
+            SharedRecipientSections(
+                recent = listOfNotNull(
+                    pinnedShareRecipient(chats, conversationId, groupMessagingEnabled),
+                ),
+                contacts = emptyList(),
+                otherGroups = emptyList(),
+            )
+        } ?: unpinnedRecipientSections
+    }
+    val selectedRecipient = recipientSections.all
+        .firstOrNull { it.stableId == selectedRecipientId }
 
     LaunchedEffect(request.token) {
-        viewModel.begin(request.token)
+        viewModel.begin(request.token, batch.pinnedConversationId)
+    }
+    LaunchedEffect(effectivePinnedConversationId, recipientSections) {
+        if (effectivePinnedConversationId != null) {
+            selectedRecipientId = recipientSections.all.firstOrNull()?.stableId
+        }
     }
     LaunchedEffect(request.token, sendState.requestToken, sendState.sent) {
         if (sendState.requestToken == request.token && sendState.sent) onSent()
@@ -192,9 +436,13 @@ internal fun SharedTextShareDialog(
         }
     }
 
+    val dismissShare = {
+        if (effectivePinnedConversationId == null) onDismiss() else onDeferred()
+    }
+
     SecureScreen()
     Dialog(
-        onDismissRequest = { if (!sendState.sending) onDismiss() },
+        onDismissRequest = { if (!sendState.sending) dismissShare() },
         properties = DialogProperties(
             dismissOnClickOutside = false,
             usePlatformDefaultWidth = false,
@@ -211,7 +459,7 @@ internal fun SharedTextShareDialog(
                         title = { Text("Share with Kit Pay") },
                         navigationIcon = {
                             IconButton(
-                                onClick = onDismiss,
+                                onClick = dismissShare,
                                 enabled = !sendState.sending,
                             ) {
                                 Icon(Icons.Rounded.Close, contentDescription = "Cancel sharing")
@@ -234,24 +482,33 @@ internal fun SharedTextShareDialog(
                                     style = MaterialTheme.typography.bodySmall,
                                     modifier = Modifier.padding(bottom = 8.dp),
                                 )
+                                if (effectivePinnedConversationId != null) {
+                                    Text(
+                                        "The remaining items stay saved for this chat. You can retry now or after reopening Kit Pay.",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.padding(bottom = 8.dp),
+                                    )
+                                }
                             }
                             KitGreenButton(
                                 text = "Send securely",
                                 icon = Icons.AutoMirrored.Rounded.Send,
                                 loading = sendState.requestToken == request.token && sendState.sending,
-                                enabled = messagingAvailable &&
-                                    selectedChat != null &&
+                                enabled = localOutboxAvailable &&
+                                    selectedRecipient != null &&
                                     sendState.requestToken == request.token &&
                                     !sendState.sent,
                                 onClick = {
-                                    selectedChat?.let {
+                                    selectedRecipient?.let { recipient ->
                                         // Mark the request busy before starting the suspend call so
                                         // a simultaneous external share cannot hide this send.
                                         onSendingChanged(true)
                                         val start = viewModel.send(
                                             requestToken = request.token,
-                                            chatId = it.id,
-                                            text = text,
+                                            recipient = recipient,
+                                            batch = batch,
+                                            groupMessagingEnabled = groupMessagingEnabled,
                                             onFinished = { onSendingChanged(false) },
                                         )
                                         if (start == SharedTextSendStart.REJECTED) {
@@ -284,57 +541,104 @@ internal fun SharedTextShareDialog(
                                 tint = MaterialTheme.colorScheme.primary,
                             )
                             Spacer(Modifier.width(10.dp))
-                            Text(
-                                "Nothing is sent until you choose a secure chat and confirm below.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                            Column {
+                                Text(
+                                    "Nothing is sent until you choose a secure chat and confirm below.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text(
+                                    SharedInboxPolicy.summary(
+                                        itemCount = batch.items.size,
+                                        hasText = !batch.text.isNullOrEmpty(),
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                     }
                     item {
                         Text(
-                            "Choose recipient",
+                            if (effectivePinnedConversationId == null) {
+                                "Choose a person or group"
+                            } else {
+                                "Finish sharing to this chat"
+                            },
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.padding(horizontal = 20.dp),
                         )
                     }
-                    item {
-                        OutlinedTextField(
-                            value = query,
-                            onValueChange = { query = it },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 20.dp),
-                            leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
-                            placeholder = { Text("Search secure chats") },
-                            singleLine = true,
-                            shape = MaterialTheme.shapes.extraLarge,
-                        )
+                    if (effectivePinnedConversationId == null) {
+                        item {
+                            OutlinedTextField(
+                                value = query,
+                                onValueChange = { query = it },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 20.dp),
+                                leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
+                                placeholder = { Text("Search people and groups") },
+                                singleLine = true,
+                                shape = MaterialTheme.shapes.extraLarge,
+                            )
+                        }
                     }
-                    if (matchingChats.isEmpty()) {
+                    if (recipientSections.all.isEmpty()) {
                         item {
                             Text(
-                                if (directChats.isEmpty()) {
-                                    "No direct secure conversations are available yet. Start a secure chat in Kit Pay, then share again."
+                                if (!localOutboxAvailable) {
+                                    "Opening your encrypted conversations…"
+                                } else if (chats.isEmpty() && contacts.none(Contact::isKitUser)) {
+                                    "No Kit Pay conversations or contacts are available yet."
+                                } else if (effectivePinnedConversationId != null) {
+                                    "That selected conversation is no longer available. The remaining items are still saved."
                                 } else {
-                                    "No direct secure conversations match your search."
+                                    "No people or groups match your search."
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
                             )
                         }
-                    } else {
-                        items(matchingChats, key = ChatPreview::id) { chat ->
+                    }
+                    if (recipientSections.recent.isNotEmpty()) {
+                        item {
+                            RecipientSectionTitle(if (query.isBlank()) "Recent" else "Conversations")
+                        }
+                        items(recipientSections.recent, key = { it.stableId }) { recipient ->
                             RecipientRow(
-                                chat = chat,
-                                selected = chat.id == selectedChatId,
-                                onClick = { selectedChatId = chat.id },
+                                recipient = recipient,
+                                selected = recipient.stableId == selectedRecipientId,
+                                enabled = effectivePinnedConversationId == null,
+                                onClick = { selectedRecipientId = recipient.stableId },
                             )
                         }
                     }
-                    if (selectedChat != null) {
+                    if (recipientSections.contacts.isNotEmpty()) {
+                        item { RecipientSectionTitle("Contacts") }
+                        items(recipientSections.contacts, key = { it.stableId }) { recipient ->
+                            RecipientRow(
+                                recipient = recipient,
+                                selected = recipient.stableId == selectedRecipientId,
+                                enabled = effectivePinnedConversationId == null,
+                                onClick = { selectedRecipientId = recipient.stableId },
+                            )
+                        }
+                    }
+                    if (recipientSections.otherGroups.isNotEmpty()) {
+                        item { RecipientSectionTitle("More groups") }
+                        items(recipientSections.otherGroups, key = { it.stableId }) { recipient ->
+                            RecipientRow(
+                                recipient = recipient,
+                                selected = recipient.stableId == selectedRecipientId,
+                                enabled = effectivePinnedConversationId == null,
+                                onClick = { selectedRecipientId = recipient.stableId },
+                            )
+                        }
+                    }
+                    if (selectedRecipient != null) {
                         item { HorizontalDivider(Modifier.padding(vertical = 4.dp)) }
                         item {
                             Text(
@@ -346,8 +650,8 @@ internal fun SharedTextShareDialog(
                         }
                         item {
                             SharePreview(
-                                recipient = selectedChat,
-                                text = text,
+                                recipient = selectedRecipient,
+                                batch = batch,
                                 modifier = Modifier.padding(horizontal = 20.dp),
                             )
                         }
@@ -360,35 +664,64 @@ internal fun SharedTextShareDialog(
 }
 
 @Composable
-private fun RecipientRow(chat: ChatPreview, selected: Boolean, onClick: () -> Unit) {
+private fun RecipientSectionTitle(title: String) {
+    Text(
+        title,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+    )
+}
+
+@Composable
+private fun RecipientRow(
+    recipient: SharedRecipient,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val chat = (recipient as? SharedRecipient.Conversation)?.chat
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 20.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        KitAvatar(chat.name, size = 44.dp, online = chat.online, avatarUrl = chat.avatarUrl)
+        KitAvatar(
+            recipient.name,
+            size = 44.dp,
+            online = chat?.online == true,
+            avatarUrl = recipient.avatarUrl,
+        )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(
-                chat.name,
+                recipient.name,
                 style = MaterialTheme.typography.titleSmall,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "Direct secure conversation",
+                when {
+                    chat?.isGroup == true -> "Group"
+                    recipient is SharedRecipient.Person -> "Kit Pay contact"
+                    else -> "Direct conversation"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        RadioButton(selected = selected, onClick = onClick)
+        RadioButton(selected = selected, onClick = onClick, enabled = enabled)
     }
 }
 
 @Composable
-private fun SharePreview(recipient: ChatPreview, text: String, modifier: Modifier = Modifier) {
+private fun SharePreview(
+    recipient: SharedRecipient,
+    batch: SharedInboxBatch,
+    modifier: Modifier = Modifier,
+) {
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -410,9 +743,54 @@ private fun SharePreview(recipient: ChatPreview, text: String, modifier: Modifie
                 }
             }
             Spacer(Modifier.height(14.dp))
-            SelectionContainer {
-                Text(text, style = MaterialTheme.typography.bodyLarge)
+            batch.items.forEach { item ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        attachmentIcon(item.mediaType),
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            item.displayName,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            formatAttachmentSize(item.byteCount),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            batch.text?.takeIf(String::isNotEmpty)?.let { body ->
+                if (batch.items.isNotEmpty()) Spacer(Modifier.height(10.dp))
+                SelectionContainer {
+                    Text(body, style = MaterialTheme.typography.bodyLarge)
+                }
             }
         }
     }
+}
+
+private fun attachmentIcon(mediaType: String) = when {
+    mediaType.startsWith("image/") -> Icons.Rounded.Image
+    mediaType.startsWith("video/") -> Icons.Rounded.Videocam
+    mediaType.startsWith("audio/") -> Icons.Rounded.Mic
+    else -> Icons.Rounded.Description
+}
+
+private fun formatAttachmentSize(byteCount: Int): String = when {
+    byteCount >= 1_024 * 1_024 -> "%.1f MB".format(byteCount / (1_024.0 * 1_024.0))
+    byteCount >= 1_024 -> "${byteCount / 1_024} KB"
+    else -> "$byteCount bytes"
 }

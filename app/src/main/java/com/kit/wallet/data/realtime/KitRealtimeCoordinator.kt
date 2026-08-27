@@ -83,6 +83,7 @@ internal class KitRealtimeCoordinator @Inject constructor(
     private val typingRegistry: KitTypingRegistry,
     private val typingSignaller: KitTypingSignaller,
     private val nudgeSink: KitRealtimeNudgeSink,
+    private val callAnswerSink: KitRealtimeCallAnswerSink,
     private val fallbackPoller: KitRealtimeFallbackPoller,
     private val clock: KitRealtimeClock,
     @ApplicationScope private val scope: CoroutineScope,
@@ -580,6 +581,17 @@ internal class KitRealtimeCoordinator @Inject constructor(
             is KitRealtimeFrame.Typing -> subscribed[frame.channel]?.let {
                 typingRegistry.onTypingFrame(frame, it)
             }
+
+            // Only from this account's own private channel, and only when the server
+            // said it sends these. A frame on any other channel is somebody else's
+            // call, and one that arrives unadvertised is a server we have not agreed
+            // this contract with — either way the push still carries the answer, so
+            // dropping costs latency and nothing else.
+            is KitRealtimeFrame.CallAnswered -> {
+                if (frame.channel == userChannel && config?.callAnswerEnabled == true) {
+                    callAnswerSink.onCallAnswered(frame)
+                }
+            }
         }
     }
 
@@ -609,6 +621,7 @@ internal class KitRealtimeCoordinator @Inject constructor(
         holdOverUntilMillis = null
         pingSentAtMillis = null
         nudgeSink.open()
+        callAnswerSink.open()
         socketId?.let { if (config?.typingEnabled == true) typingSignaller.arm(it) }
 
         // Unconditional, on every transition into Live. Whatever arrived while the
@@ -725,6 +738,7 @@ internal class KitRealtimeCoordinator @Inject constructor(
         // already queued by the retiring socket then cannot tear down its successor.
         activeSocketGeneration = null
         nudgeSink.close()
+        callAnswerSink.close()
         typingSignaller.disarm()
         typingRegistry.clear()
 

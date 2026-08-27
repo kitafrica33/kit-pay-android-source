@@ -55,13 +55,13 @@ internal interface KitRealtimeAuthApi {
     ): Response<Unit>
 }
 
-@JsonClass(generateAdapter = false)
+@JsonClass(generateAdapter = true)
 internal data class ChannelAuthRequest(
     @Json(name = "socket_id") val socketId: String,
     @Json(name = "channel_name") val channelName: String,
 )
 
-@JsonClass(generateAdapter = false)
+@JsonClass(generateAdapter = true)
 internal data class TypingRequest(
     val state: String,
 ) {
@@ -76,7 +76,7 @@ internal data class TypingRequest(
  * `pusher:subscribe` byte for byte: it is covered by [auth], so re-encoding it
  * would invalidate the signature.
  */
-@JsonClass(generateAdapter = false)
+@JsonClass(generateAdapter = true)
 internal data class ChannelAuthDto(
     val auth: String? = null,
     @Json(name = "channel_data") val channelData: String? = null,

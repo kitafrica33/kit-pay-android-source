@@ -127,6 +127,7 @@ class ChatPaymentRequestRetryTest {
         override suspend fun sendMessage(
             chatId: String,
             text: String,
+            replyToMessageId: String?,
             onDurablyCommitted: (clientMessageId: String) -> Unit,
         ) {
             val behavior = behaviors.getOrNull(sentDescriptors.size) ?: SendBehavior.SUCCEED

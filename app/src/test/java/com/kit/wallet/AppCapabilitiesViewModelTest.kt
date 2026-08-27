@@ -245,6 +245,7 @@ class AppCapabilitiesViewModelTest {
         override suspend fun sendMessage(
             chatId: String,
             text: String,
+            replyToMessageId: String?,
             onDurablyCommitted: (clientMessageId: String) -> Unit,
         ) = error("Not used")
     }

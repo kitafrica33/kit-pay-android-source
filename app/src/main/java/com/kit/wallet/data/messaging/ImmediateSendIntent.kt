@@ -14,6 +14,16 @@ internal enum class ImmediateSendKind {
     PAYMENT_EVENT,
     REACTION,
     MEDIA,
+
+    /**
+     * A member's answer to a group payment. Appended after the original four on purpose: the
+     * durable codec writes this enum by ordinal, so an existing queued send must keep the number
+     * it was written with, and every later kind can only be added at the end.
+     */
+    GROUP_PAYMENT_EVENT,
+
+    /** Replacement wording for one of this account's own earlier messages. */
+    EDIT,
 }
 
 internal enum class ImmediateSendState {
@@ -44,11 +54,29 @@ internal data class ImmediateSendIntent(
     val mediaSha256Base64: String? = null,
     /** Canonical KITMEDIA1 descriptor after upload; persisted before Signal encryption. */
     val preparedMediaDescriptor: String? = null,
+    /**
+     * The message this send is an answer to, when the sender picked one.
+     *
+     * Carried on the intent rather than derived at promotion time because the answer is part of
+     * what was written: a queued reply that lost its target would go out as an unrelated remark.
+     * A reaction leaves this null — its target lives inside its own descriptor, which is what the
+     * peer authenticates it against.
+     */
+    val replyToMessageId: String? = null,
 ) {
     init {
         require(CANONICAL_UUID.matches(id)) { "Invalid immediate-send ID" }
         require(CONVERSATION_ID.matches(conversationId)) { "Invalid immediate-send conversation" }
         require(createdAtEpochMillis > 0L) { "An immediate send needs a creation time" }
+        replyToMessageId?.let {
+            require(CANONICAL_UUID.matches(it)) { "Invalid immediate-send reply target" }
+            require(it != id) { "A message cannot be a reply to itself" }
+            // A reaction's target is authenticated from its own descriptor. Writing it here too
+            // would create a second copy the peer never checks, and the two could disagree.
+            require(
+                kind != ImmediateSendKind.REACTION && kind != ImmediateSendKind.EDIT,
+            ) { "A queued reaction or edit carries its target in its descriptor" }
+        }
         when (kind) {
             ImmediateSendKind.TEXT -> {
                 require(text.isNotBlank()) { "An immediate send needs text" }
@@ -62,6 +90,18 @@ internal data class ImmediateSendIntent(
             }
             ImmediateSendKind.REACTION -> {
                 require(KitReactionMessage.parse(text) != null) { "Invalid queued reaction" }
+                requireStandardSecureMessagingText(text)
+                requireMediaFieldsAbsent()
+            }
+            ImmediateSendKind.EDIT -> {
+                require(KitEditMessage.parse(text) != null) { "Invalid queued edit" }
+                requireStandardSecureMessagingText(text)
+                requireMediaFieldsAbsent()
+            }
+            ImmediateSendKind.GROUP_PAYMENT_EVENT -> {
+                require(KitGroupPaymentMessage.parse(text) != null) {
+                    "Invalid queued group payment event"
+                }
                 requireStandardSecureMessagingText(text)
                 requireMediaFieldsAbsent()
             }
@@ -97,6 +137,8 @@ internal data class ImmediateSendIntent(
             ImmediateSendKind.TEXT,
             ImmediateSendKind.PAYMENT_EVENT,
             ImmediateSendKind.REACTION,
+            ImmediateSendKind.GROUP_PAYMENT_EVENT,
+            ImmediateSendKind.EDIT,
             -> text
             ImmediateSendKind.MEDIA -> preparedMediaDescriptor
         }
@@ -138,7 +180,16 @@ internal data class ImmediateSendIntent(
 
 /** Strict, bounded binary codec; future versions fail closed rather than being half-understood. */
 internal object ImmediateSendIntentCodec {
-    private const val VERSION = 1
+    private const val VERSION = 2
+
+    /**
+     * Version 1 is still read, and only read.
+     *
+     * A send already sitting in the queue when the app updated was written without a reply target,
+     * and it is a message someone meant to send. Refusing it would silently drop their words at
+     * exactly the moment they trusted the queue to hold them; the field it lacks is simply absent.
+     */
+    private const val OLDEST_READABLE_VERSION = 1
     private const val MAX_RECORD_BYTES = 64 * 1024
     private const val MAX_STRING_BYTES = 32 * 1024
 
@@ -159,6 +210,7 @@ internal object ImmediateSendIntentCodec {
             data.writeNullableString(intent.mediaKeyBase64)
             data.writeNullableString(intent.mediaSha256Base64)
             data.writeNullableString(intent.preparedMediaDescriptor)
+            data.writeNullableString(intent.replyToMessageId)
         }
         return output.toByteArray().also {
             require(it.size <= MAX_RECORD_BYTES) { "Immediate-send record is too large" }
@@ -169,7 +221,8 @@ internal object ImmediateSendIntentCodec {
         if (bytes.isEmpty() || bytes.size > MAX_RECORD_BYTES) return null
         return runCatching {
             DataInputStream(ByteArrayInputStream(bytes)).use { data ->
-                if (data.readUnsignedByte() != VERSION) return null
+                val version = data.readUnsignedByte()
+                if (version !in OLDEST_READABLE_VERSION..VERSION) return null
                 val kind = ImmediateSendKind.entries.getOrNull(data.readUnsignedByte()) ?: return null
                 val state = ImmediateSendState.entries.getOrNull(data.readUnsignedByte()) ?: return null
                 val decoded = ImmediateSendIntent(
@@ -186,6 +239,7 @@ internal object ImmediateSendIntentCodec {
                     mediaKeyBase64 = data.readNullableString(),
                     mediaSha256Base64 = data.readNullableString(),
                     preparedMediaDescriptor = data.readNullableString(),
+                    replyToMessageId = if (version >= 2) data.readNullableString() else null,
                 )
                 if (data.available() != 0) return null
                 decoded

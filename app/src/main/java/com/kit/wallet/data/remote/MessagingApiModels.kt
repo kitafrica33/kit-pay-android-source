@@ -125,6 +125,8 @@ data class MessagingConversationDto(
     val id: String? = null,
     val type: String? = null,
     val title: String? = null,
+    val description: String? = null,
+    @Json(name = "photo_url") val photoUrl: String? = null,
     @Json(name = "parent_id") val parentId: String? = null,
     @Json(name = "created_by") val createdBy: String? = null,
     val role: String? = null,
@@ -200,6 +202,42 @@ data class AddMessagingConversationMemberRequest(
 data class UpdateMessagingConversationMemberRequest(val role: String) {
     init {
         require(role in ASSIGNABLE_CONVERSATION_ROLES) { "Invalid conversation member role" }
+    }
+}
+
+/**
+ * Edits a group's own description.
+ *
+ * Android sends this request for no other reason, so there is no "leave it alone" shape here:
+ * a string sets the description and null clears it. The null has to reach the server as an
+ * explicit JSON null — the server reads an absent field as "unchanged" — which is why this
+ * type is written by [UpdateMessagingConversationRequestAdapter] rather than by the reflective
+ * adapter that would silently drop it.
+ */
+@JsonClass(generateAdapter = false)
+data class UpdateMessagingConversationRequest(
+    val description: String?,
+) {
+    init {
+        if (description != null) {
+            require(
+                description == normalizeMessagingGroupDescription(description) &&
+                    isValidMessagingGroupDescription(description),
+            ) {
+                "A group description must be canonical and at most " +
+                    "$MAX_GROUP_DESCRIPTION_LENGTH Unicode scalars and " +
+                    "$MAX_GROUP_DESCRIPTION_UTF8_BYTES UTF-8 bytes"
+            }
+        }
+    }
+}
+
+@JsonClass(generateAdapter = false)
+data class AttachMessagingConversationPhotoRequest(
+    @Json(name = "asset_id") val assetId: String,
+) {
+    init {
+        requireCanonicalMessagingUuid(assetId, "group photo asset ID")
     }
 }
 
@@ -368,6 +406,9 @@ data class SendEncryptedMessageRequest(
         }
         require(kind != ENCRYPTED_REACTION_MESSAGE_KIND || replyToMessageId != null) {
             "An encrypted reaction requires a reply target"
+        }
+        require(kind != ENCRYPTED_EDIT_MESSAGE_KIND || replyToMessageId != null) {
+            "An encrypted edit requires the message it replaces"
         }
         require(attachments.size <= MAX_SECURE_MESSAGE_ATTACHMENTS) {
             "An encrypted message supports at most $MAX_SECURE_MESSAGE_ATTACHMENTS attachments"
@@ -630,6 +671,23 @@ data class MessagingReadReceiptDto(
 )
 
 @JsonClass(generateAdapter = false)
+data class MessagingMessageInfoRecipientDto(
+    @Json(name = "user_id") val userId: String? = null,
+    val name: String? = null,
+    @Json(name = "delivered_at") val deliveredAt: String? = null,
+    @Json(name = "read_at") val readAt: String? = null,
+)
+
+/** Sent, delivered and read moments for one message, answered only to the person who sent it. */
+@JsonClass(generateAdapter = false)
+data class MessagingMessageInfoDto(
+    @Json(name = "message_id") val messageId: String? = null,
+    @Json(name = "conversation_id") val conversationId: String? = null,
+    @Json(name = "sent_at") val sentAt: String? = null,
+    val recipients: List<MessagingMessageInfoRecipientDto?>? = null,
+)
+
+@JsonClass(generateAdapter = false)
 data class MessagingAttachmentUploadDto(
     @Json(name = "storage_key") val storageKey: String? = null,
     @Json(name = "byte_size") val byteSize: Long? = null,
@@ -667,18 +725,26 @@ val ASSIGNABLE_CONVERSATION_ROLES: Set<String> = setOf(
 const val MAX_GROUP_MEMBERS = 32
 const val MAX_GROUP_TITLE_LENGTH = 64
 const val MAX_GROUP_TITLE_UTF8_BYTES = 120
+
+/** Mirrors the server's ConversationDescription bounds; a paragraph, not a label. */
+const val MAX_GROUP_DESCRIPTION_LENGTH = 512
+const val MAX_GROUP_DESCRIPTION_UTF8_BYTES = 1_024
 const val ENCRYPTED_MESSAGE_KIND = "encrypted"
 const val ENCRYPTED_ATTACHMENT_MESSAGE_KIND = "encrypted_attachment"
 const val ENCRYPTED_REACTION_MESSAGE_KIND = "encrypted_reaction"
+const val ENCRYPTED_EDIT_MESSAGE_KIND = "encrypted_edit"
 val SECURE_MESSAGE_KINDS: Set<String> = setOf(
     ENCRYPTED_MESSAGE_KIND,
     ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
     ENCRYPTED_REACTION_MESSAGE_KIND,
+    ENCRYPTED_EDIT_MESSAGE_KIND,
 )
 const val MESSAGING_GROUPS_FEATURE = "messaging_groups"
 const val MESSAGING_REACTIONS_FEATURE = "messaging_reactions_e2ee_v1"
+const val MESSAGING_MESSAGE_EDITS_FEATURE = "messaging_message_edits_v1"
 const val MESSAGING_GROUPS_DEVICE_CAPABILITY = "messaging_groups_v1"
 const val MESSAGING_REACTIONS_DEVICE_CAPABILITY = "messaging_reactions_e2ee_v1"
+const val MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY = "messaging_message_edits_v1"
 const val MAX_DELIVERY_ACKNOWLEDGEMENT_BATCH = 100
 const val MAX_SECURE_MESSAGE_RECIPIENT_DEVICES = 99
 const val MAX_SECURE_MESSAGE_ATTACHMENTS = 20
@@ -745,6 +811,65 @@ fun truncateMessagingGroupTitle(value: String): String {
         val token = String(Character.toChars(codePoint))
         val tokenBytes = token.toByteArray(StandardCharsets.UTF_8).size
         if (bytes + tokenBytes > MAX_GROUP_TITLE_UTF8_BYTES) break
+        result.append(token)
+        index += Character.charCount(codePoint)
+        scalars++
+        bytes += tokenBytes
+    }
+    return result.toString()
+}
+
+/**
+ * Canonicalizes a group description exactly the way the server does.
+ *
+ * Control characters and the bidirectional-override set are stripped wherever they appear —
+ * a description is a paragraph, so U+000A alone survives inside it — and then the same Unicode
+ * White_Space edge set the title uses is trimmed away. A value that normalizes to nothing is
+ * an absent description.
+ */
+fun normalizeMessagingGroupDescription(value: String): String {
+    val kept = StringBuilder(value.length)
+    for (character in value) {
+        // Surrogate halves are never in the stripped set; scalar well-formedness is judged
+        // separately by the validity check.
+        if (character.isSurrogate() ||
+            !isDisallowedMessagingGroupDescriptionCodePoint(character.code)
+        ) {
+            kept.append(character)
+        }
+    }
+    return normalizeMessagingGroupTitle(kept.toString())
+}
+
+private fun isDisallowedMessagingGroupDescriptionCodePoint(codePoint: Int): Boolean =
+    codePoint in 0x0000..0x0009 || codePoint in 0x000B..0x001F || codePoint == 0x007F ||
+        codePoint == 0x200E || codePoint == 0x200F ||
+        codePoint in 0x202A..0x202E || codePoint in 0x2066..0x2069
+
+fun isValidMessagingGroupDescription(value: String): Boolean {
+    val normalized = normalizeMessagingGroupDescription(value)
+    return normalized.isNotEmpty() &&
+        normalized.hasWellFormedUnicodeScalars() &&
+        normalized.codePointCount(0, normalized.length) <= MAX_GROUP_DESCRIPTION_LENGTH &&
+        normalized.toByteArray(StandardCharsets.UTF_8).size <= MAX_GROUP_DESCRIPTION_UTF8_BYTES
+}
+
+/** Bounds live editor input the way [truncateMessagingGroupTitle] bounds the title field. */
+fun truncateMessagingGroupDescription(value: String): String {
+    val result = StringBuilder()
+    var index = 0
+    var scalars = 0
+    var bytes = 0
+    while (index < value.length && scalars < MAX_GROUP_DESCRIPTION_LENGTH) {
+        if (value[index].isSurrogate() &&
+            (index + 1 >= value.length || !Character.isSurrogatePair(value[index], value[index + 1]))
+        ) {
+            break
+        }
+        val codePoint = value.codePointAt(index)
+        val token = String(Character.toChars(codePoint))
+        val tokenBytes = token.toByteArray(StandardCharsets.UTF_8).size
+        if (bytes + tokenBytes > MAX_GROUP_DESCRIPTION_UTF8_BYTES) break
         result.append(token)
         index += Character.charCount(codePoint)
         scalars++

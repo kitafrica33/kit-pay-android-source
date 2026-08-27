@@ -72,59 +72,37 @@ class ConversationCameraPullTest {
     }
 
     @Test
-    fun `crossing the threshold does not open the camera while a finger is still down`() {
-        // The peek panel already promises "release to open the camera" at this point, so the
-        // label and the behaviour have to agree: past the threshold, still pressed, still closed.
-        assertTrue(CameraPull.shouldOpen(revealPx = 250f, thresholdPx = 120f))
-        assertFalse(
-            CameraPull.shouldOpenOnRelease(
-                revealPx = 250f,
-                thresholdPx = 120f,
-                pointerDown = true,
-            ),
-        )
-    }
-
-    @Test
-    fun `releasing past the threshold opens the camera`() {
-        assertTrue(
-            CameraPull.shouldOpenOnRelease(
-                revealPx = 120f,
-                thresholdPx = 120f,
-                pointerDown = false,
-            ),
-        )
-    }
-
-    @Test
-    fun `releasing below the threshold does not open the camera`() {
-        assertFalse(
-            CameraPull.shouldOpenOnRelease(
-                revealPx = 119.9f,
-                thresholdPx = 120f,
-                pointerDown = false,
-            ),
-        )
-    }
-
-    @Test
-    fun `a full drag only opens at the moment of release`() {
+    fun `a full drag reaches the threshold and stays there for the release`() {
         val maxPx = 300f
         val thresholdPx = 120f
         var reveal = 0f
-        var opened = 0
 
-        // Every intermediate sample of a single continuous drag, with the finger still down.
-        for (delta in listOf(-40f, -50f, -35f, -60f, -80f)) {
+        // Every intermediate sample of a single continuous drag. The screen asks about opening
+        // only from the scroll container's end-of-drag callback, so these samples decide the peek
+        // panel's label and nothing else.
+        val labels = listOf(-40f, -50f, -35f, -60f, -80f).map { delta ->
             reveal = CameraPull.pull(reveal, availableY = delta, maxPx = maxPx)
-            if (CameraPull.shouldOpenOnRelease(reveal, thresholdPx, pointerDown = true)) opened++
+            CameraPull.shouldOpen(reveal, thresholdPx)
         }
         assertEquals(265f, reveal, EPSILON)
-        assertEquals(0, opened)
+        // "Keep pulling" until the threshold, "release to open the camera" after it.
+        assertEquals(listOf(false, false, true, true, true), labels)
 
-        // The finger lifts.
-        if (CameraPull.shouldOpenOnRelease(reveal, thresholdPx, pointerDown = false)) opened++
-        assertEquals(1, opened)
+        // The finger lifts on a reveal that is still past the threshold.
+        assertTrue(CameraPull.shouldOpen(reveal, thresholdPx))
+    }
+
+    @Test
+    fun `a drag that falls back under the threshold releases closed`() {
+        val thresholdPx = 120f
+        var reveal = CameraPull.pull(0f, availableY = -150f, maxPx = 300f)
+        assertTrue(CameraPull.shouldOpen(reveal, thresholdPx))
+
+        // Second thoughts on the way back down: the reveal pays the scroll off first, and by the
+        // time the finger lifts there is not enough of it left to open anything.
+        reveal = CameraPull.collapse(reveal, availableY = 40f).revealPx
+        assertEquals(110f, reveal, EPSILON)
+        assertFalse(CameraPull.shouldOpen(reveal, thresholdPx))
     }
 
     @Test

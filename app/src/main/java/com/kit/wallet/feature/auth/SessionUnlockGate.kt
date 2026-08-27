@@ -1,6 +1,7 @@
 package com.kit.wallet.feature.auth
 
 import androidx.biometric.BiometricPrompt
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -37,8 +38,6 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.kit.wallet.ui.components.KitGreenButton
@@ -71,6 +70,9 @@ fun SessionUnlockGate(
     onSignOut: () -> Unit,
     onVerifyIdentity: () -> Unit = {},
 ) {
+    BackHandler(enabled = true) {
+        // This is the authenticated app's front door. Leave through the explicit Sign out action.
+    }
     // A brand-new account has no wallet PIN and no biometric key yet: creating the first PIN is
     // the unlock method the server accepts for it, so the gate offers it inline.
     val needsFirstPin = !state.checking && state.methods.isEmpty() && !state.deviceIdentityRequired
@@ -124,48 +126,39 @@ fun SessionUnlockGate(
         }
     }
 
-    Dialog(
-        onDismissRequest = {},
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            dismissOnBackPress = false,
-            dismissOnClickOutside = false,
-        ),
-    ) {
-        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Column(
-                Modifier
-                    .fillMaxSize()
-                    .statusBarsPadding()
-                    .navigationBarsPadding()
-                    .padding(bottom = 16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Spacer(Modifier.weight(1f))
-                when {
-                    state.checking -> UnlockChecking()
-                    needsIdentity -> UnlockNeedsIdentity(
-                        state = state,
-                        pending = identityPending,
-                        onRetry = onRetry,
-                        onVerifyIdentity = onVerifyIdentity,
-                    )
-                    needsFirstPin -> UnlockCreatePin(state = state, onCreatePin = onCreatePin)
-                    "pin" in state.methods -> UnlockWithPin(
-                        state = state,
-                        biometricsOffered = biometricsOffered,
-                        onUnlock = onUnlock,
-                        onUseBiometrics = onRequestBiometric,
-                    )
-                    biometricsOffered -> UnlockBiometricsOnly(
-                        state = state,
-                        onUseBiometrics = onRequestBiometric,
-                    )
-                    else -> UnlockUnavailable(state = state, onRetry = onRetry)
-                }
-                Spacer(Modifier.weight(1f))
-                TextButton(onClick = onSignOut, enabled = !state.unlocking) { Text("Sign out") }
+    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(bottom = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Spacer(Modifier.weight(1f))
+            when {
+                state.checking -> UnlockChecking()
+                needsIdentity -> UnlockNeedsIdentity(
+                    state = state,
+                    pending = identityPending,
+                    onRetry = onRetry,
+                    onVerifyIdentity = onVerifyIdentity,
+                )
+                needsFirstPin -> UnlockCreatePin(state = state, onCreatePin = onCreatePin)
+                "pin" in state.methods -> UnlockWithPin(
+                    state = state,
+                    biometricsOffered = biometricsOffered,
+                    onUnlock = onUnlock,
+                    onUseBiometrics = onRequestBiometric,
+                )
+                biometricsOffered -> UnlockBiometricsOnly(
+                    state = state,
+                    onUseBiometrics = onRequestBiometric,
+                )
+                else -> UnlockUnavailable(state = state, onRetry = onRetry)
             }
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = onSignOut, enabled = !state.unlocking) { Text("Sign out") }
         }
     }
 }

@@ -107,6 +107,7 @@ class ContactsViewModelTest {
         override suspend fun sendMessage(
             chatId: String,
             text: String,
+            replyToMessageId: String?,
             onDurablyCommitted: (clientMessageId: String) -> Unit,
         ) = Unit
     }

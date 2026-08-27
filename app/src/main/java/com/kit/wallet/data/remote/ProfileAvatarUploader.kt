@@ -28,9 +28,20 @@ class ProfileAvatarUploader @Inject constructor(
     @param:RefreshHttpClient private val http: OkHttpClient,
 ) {
     suspend fun upload(jpegBytes: ByteArray): UserDto {
-        require(jpegBytes.isNotEmpty()) { "Choose a profile photo first" }
+        val assetId = uploadReadyAvatarAsset(jpegBytes)
+        return apiCalls.execute { api.attachProfileAvatar(AttachProfileAvatarRequest(assetId)) }
+    }
+
+    /**
+     * Everything but the attach: intent, direct upload, finalize, and the wait for the managed
+     * scan to report the asset ready and clean. Returns the asset id, which a profile attaches
+     * to the account and a group attaches to the conversation — the pipeline and every safety
+     * property are identical either way.
+     */
+    suspend fun uploadReadyAvatarAsset(jpegBytes: ByteArray): String {
+        require(jpegBytes.isNotEmpty()) { "Choose a photo first" }
         require(jpegBytes.size <= MAX_AVATAR_BYTES) {
-            "Profile photos up to ${MAX_AVATAR_BYTES / 1024} KB are supported"
+            "Photos up to ${MAX_AVATAR_BYTES / 1024} KB are supported"
         }
         val digest = MessageDigest.getInstance("SHA-256").digest(jpegBytes)
             .joinToString("") { "%02x".format(it) }
@@ -53,7 +64,7 @@ class ProfileAvatarUploader @Inject constructor(
             "The photo service finalized a different upload"
         }
         awaitReadyAndClean(assetId)
-        return apiCalls.execute { api.attachProfileAvatar(AttachProfileAvatarRequest(assetId)) }
+        return assetId
     }
 
     private suspend fun putBytes(upload: MediaUploadInstructionsDto, bytes: ByteArray) {

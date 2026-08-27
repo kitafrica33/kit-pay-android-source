@@ -13,6 +13,11 @@
 -keep,allowoptimization,allowshrinking interface com.kit.wallet.data.remote.SecureMessagingWireApi
 -keep,allowoptimization,allowshrinking interface com.kit.wallet.data.remote.SessionRefreshApi
 
+# Realtime channel auth is reached only after the WebSocket handshake. Keep its
+# proxy surface explicit so release shrinking cannot turn the first auth request
+# into a pre-network Retrofit failure. Its wire DTOs use Moshi codegen.
+-keep interface com.kit.wallet.data.realtime.KitRealtimeAuthApi { *; }
+
 # Firebase Messaging treats its excluded analytics connector as an optional integration.
 -dontwarn com.google.firebase.analytics.connector.AnalyticsConnector
 

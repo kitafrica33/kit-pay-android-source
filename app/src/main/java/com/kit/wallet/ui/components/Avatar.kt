@@ -5,6 +5,9 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Groups
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -78,6 +81,7 @@ fun KitAvatar(
     size: Dp = 48.dp,
     online: Boolean = false,
     avatarUrl: String? = null,
+    isGroup: Boolean = false,
 ) {
     val (fg, bg) = AvatarPalette[paletteIndexOf(name)]
     Box(modifier = modifier.size(size)) {
@@ -87,17 +91,47 @@ fun KitAvatar(
                 .background(bg, CircleShape),
             contentAlignment = Alignment.Center,
         ) {
-            // Initials render first and stay visible until the moderated photo loads, so lists
-            // never flash empty circles offline or while the image is fetched.
-            Text(
-                text = initialsOf(name),
-                color = fg,
-                fontSize = (size.value * 0.36f).sp,
-                fontWeight = FontWeight.SemiBold,
-            )
+            if (isGroup) {
+                // A group without a photo is drawn as a group, not as a person's initials:
+                // the glyph is what makes "several people" legible at a glance, and it keeps
+                // the name's deterministic colour so the row stays stable across sessions.
+                Icon(
+                    Icons.Rounded.Groups,
+                    contentDescription = null,
+                    tint = fg,
+                    modifier = Modifier.size(size * 0.52f),
+                )
+            } else {
+                // Initials render first and stay visible until the moderated photo loads, so
+                // lists never flash empty circles offline or while the image is fetched.
+                Text(
+                    text = initialsOf(name),
+                    color = fg,
+                    fontSize = (size.value * 0.36f).sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
             KitAvatarPhoto(avatarUrl = avatarUrl, size = size)
         }
-        if (online) {
+        if (isGroup) {
+            // The badge survives a photo: it is the unambiguous "this is a group" mark on
+            // every surface the avatar appears on, exactly where a person shows presence.
+            Box(
+                modifier = Modifier
+                    .size(size * 0.38f)
+                    .align(Alignment.BottomEnd)
+                    .border(2.dp, MaterialTheme.colorScheme.surface, CircleShape)
+                    .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Rounded.Groups,
+                    contentDescription = "Group",
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.size(size * 0.22f),
+                )
+            }
+        } else if (online) {
             Box(
                 modifier = Modifier
                     .size(size * 0.28f)

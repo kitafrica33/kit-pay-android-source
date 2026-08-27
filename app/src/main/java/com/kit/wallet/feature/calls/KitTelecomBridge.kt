@@ -230,6 +230,13 @@ enum class KitTelecomDisconnect(internal val cause: DisconnectCause) {
     REMOTE(DisconnectCause(DisconnectCause.REMOTE)),
     MISSED(DisconnectCause(DisconnectCause.MISSED)),
     ERROR(DisconnectCause(DisconnectCause.ERROR)),
+
+    /**
+     * Another device on this account picked the call up. Deliberately neither [REJECTED]
+     * nor [MISSED]: the system call log is what the user reads later, and recording an
+     * answered call as turned down or slept through would be a lie about their own history.
+     */
+    ANSWERED_ELSEWHERE(DisconnectCause(DisconnectCause.ANSWERED_ELSEWHERE)),
 }
 
 private enum class TelecomCallState { RINGING, DIALING, ACTIVE }

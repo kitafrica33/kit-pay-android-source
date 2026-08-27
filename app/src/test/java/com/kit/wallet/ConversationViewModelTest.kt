@@ -7,6 +7,8 @@ import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.messaging.SecureMessagingStateNotReadyException
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
 import com.kit.wallet.data.remote.KitWalletApiException
@@ -42,6 +44,8 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import java.io.File
+import java.util.UUID
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -500,16 +504,16 @@ class ConversationViewModelTest {
     }
 
     @Test
-    fun `decrypted media cache evicts and zeroizes its oldest entry`() = runTest {
-        val first = byteArrayOf(1, 2, 3)
+    fun `open media window evicts its oldest handle without deleting the file`() = runTest {
+        val opened = 25
         val repository = FakeChatRepository(
-            media = (1..5).associate { index ->
-                "descriptor-$index" to if (index == 1) first else byteArrayOf(index.toByte())
+            media = (1..opened).associate { index ->
+                "descriptor-$index" to byteArrayOf(index.toByte())
             },
         )
         val viewModel = viewModel(repository)
 
-        (1..5).forEach { index ->
+        (1..opened).forEach { index ->
             viewModel.openMedia(
                 Message(
                     id = "message-$index",
@@ -521,20 +525,24 @@ class ConversationViewModelTest {
             )
         }
 
-        assertEquals(setOf("message-2", "message-3", "message-4", "message-5"), viewModel.mediaBytes.value.keys)
-        assertTrue(first.all { it == 0.toByte() })
+        // The window is a window onto the cache, not a second copy of it: the oldest handle is
+        // dropped so the map cannot grow without bound, but the bytes stay where the on-disk
+        // cache put them, ready to be handed straight back on the next open.
+        assertEquals(
+            (2..opened).map { "message-$it" }.toSet(),
+            viewModel.mediaFiles.value.keys,
+        )
+        assertTrue(repository.mediaFile("descriptor-1").isFile)
+        repository.deleteMediaScratch()
     }
 
     @Test
-    fun `multi photo receive is serialized and remains within the cache byte budget`() = runTest {
+    fun `multi photo receive is serialized one attachment at a time`() = runTest {
         val releaseFirst = CompletableDeferred<Unit>()
-        val first = ByteArray(6 * 1024 * 1024) { 1 }
         val repository = FakeChatRepository(
             mediaBlockUntil = releaseFirst,
             media = (1..5).associate { index ->
-                "descriptor-$index" to if (index == 1) first else ByteArray(6 * 1024 * 1024) {
-                    index.toByte()
-                }
+                "descriptor-$index" to ByteArray(64) { index.toByte() }
             },
         )
         val viewModel = viewModel(repository)
@@ -560,11 +568,13 @@ class ConversationViewModelTest {
 
         assertEquals(5, repository.mediaOpenRequests)
         assertEquals(1, repository.maximumConcurrentMediaOpens)
+        // Five is well inside the handle window; serialization is what this test is about, and
+        // the byte budget it used to assert here now belongs to SecureMediaCache.
         assertEquals(
-            setOf("message-2", "message-3", "message-4", "message-5"),
-            viewModel.mediaBytes.value.keys,
+            (1..5).map { "message-$it" }.toSet(),
+            viewModel.mediaFiles.value.keys,
         )
-        assertTrue(first.all { it == 0.toByte() })
+        repository.deleteMediaScratch()
     }
 
     @Test
@@ -598,7 +608,7 @@ class ConversationViewModelTest {
     }
 
     @Test
-    fun `cancelled media-open handoff zeroizes plaintext returned after cancellation`() = runTest {
+    fun `cancelled media-open handoff publishes nothing`() = runTest {
         val release = CompletableDeferred<Unit>()
         val plaintext = byteArrayOf(21, 22, 23, 24)
         val repository = FakeChatRepository(
@@ -623,8 +633,10 @@ class ConversationViewModelTest {
         release.complete(Unit)
         runCurrent()
 
-        assertTrue(viewModel.mediaBytes.value.isEmpty())
-        assertTrue(plaintext.all { it == 0.toByte() })
+        // The attachment landed in the on-disk cache — that is the point of the cache — but a
+        // ViewModel whose scope is gone must not publish a handle to a screen that has left.
+        assertTrue(viewModel.mediaFiles.value.isEmpty())
+        repository.deleteMediaScratch()
     }
 
     @Test
@@ -1076,6 +1088,89 @@ class ConversationViewModelTest {
         paymentCurrencyScale = descriptor.currencyScale,
     )
 
+    @Test
+    fun `an answer carries its target and the composer stops answering once it is sent`() = runTest {
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository)
+        val target = deliveredMessage("target-message", "what time is it?")
+
+        viewModel.beginReply(target)
+        assertEquals(target, viewModel.replyTarget.value)
+
+        viewModel.send("half past four") {}
+
+        assertEquals(listOf(CHAT_ID to "half past four"), repository.sent)
+        assertEquals(listOf(target.id), repository.sentReplyTargets)
+        // The bar above the composer goes with the message; the next remark is a fresh one.
+        assertNull(viewModel.replyTarget.value)
+
+        viewModel.send("and it is raining") {}
+        assertEquals(listOf(target.id, null), repository.sentReplyTargets)
+    }
+
+    @Test
+    fun `cancelling an answer sends the next message as a fresh remark`() = runTest {
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository)
+
+        viewModel.beginReply(deliveredMessage("target-message", "what time is it?"))
+        viewModel.cancelReply()
+        assertNull(viewModel.replyTarget.value)
+
+        viewModel.send("never mind") {}
+
+        assertEquals(listOf<String?>(null), repository.sentReplyTargets)
+    }
+
+    @Test
+    fun `a message with no ID on the other end cannot be answered`() = runTest {
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository)
+
+        // Still on its way out: nothing has minted the ID an answer would have to point at, so
+        // swiping it must leave the composer exactly as it was rather than quoting a stub.
+        viewModel.beginReply(
+            Message("outgoing", "still sending", "12:00", fromMe = true, state = DeliveryState.SENDING),
+        )
+        assertNull(viewModel.replyTarget.value)
+
+        // A timeline record is the conversation talking about itself; there is no author to answer.
+        viewModel.beginReply(
+            Message(
+                "notice",
+                "Grace joined",
+                "12:00",
+                fromMe = false,
+                state = DeliveryState.DELIVERED,
+                kind = MessageKind.SYSTEM,
+            ),
+        )
+        assertNull(viewModel.replyTarget.value)
+    }
+
+    @Test
+    fun `a photo can be the answer just as a sentence can`() = runTest {
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository)
+        val target = deliveredMessage("target-message", "what does it look like?")
+
+        viewModel.beginReply(target)
+        viewModel.sendMedia(byteArrayOf(1, 2, 3), "image/jpeg")
+        advanceUntilIdle()
+
+        assertEquals(listOf(target.id), repository.sentImageReplyTargets)
+        assertNull(viewModel.replyTarget.value)
+    }
+
+    /** A message that has reached the other end, and so has an ID an answer can point at. */
+    private fun deliveredMessage(id: String, text: String) = Message(
+        id = id,
+        text = text,
+        time = "12:00",
+        fromMe = false,
+        state = DeliveryState.DELIVERED,
+    )
+
     private fun viewModel(
         repository: ChatRepository,
         wallet: WalletRepository = FakeWalletRepository(),
@@ -1220,6 +1315,19 @@ class ConversationViewModelTest {
         private val mediaBlockUntil: CompletableDeferred<Unit>? = null,
         private val media: Map<String, ByteArray> = emptyMap(),
     ) : ChatRepository {
+        // Attachments are handed to the UI as files now, so the fake writes real ones into a
+        // scratch directory the test tears down; nothing here can pass while production still
+        // expects bytes it can zeroize.
+        private val mediaDirectory: File =
+            File(System.getProperty("java.io.tmpdir"), "kit-media-test-${UUID.randomUUID()}")
+                .apply { mkdirs() }
+
+        fun mediaFile(descriptor: String): File = File(mediaDirectory, descriptor)
+
+        fun deleteMediaScratch() {
+            mediaDirectory.deleteRecursively()
+        }
+
         private val preview = ChatPreview(CHAT_ID, "Grace", "", "", peerUserId = PEER_USER_ID)
         override val readiness: StateFlow<Boolean> = MutableStateFlow(initiallyReady)
         private val mutableChats = MutableStateFlow(if (initiallyLoaded) listOf(preview) else emptyList())
@@ -1228,6 +1336,10 @@ class ConversationViewModelTest {
         val sent = mutableListOf<Pair<String, String>>()
         val retried = mutableListOf<Triple<String, String, String>>()
         val sentImages = mutableListOf<Triple<String, String, ByteArray>>()
+        /** What each send in [sent] was answering, in the same order; null for a fresh remark. */
+        val sentReplyTargets = mutableListOf<String?>()
+        /** The same, for each send in [sentImages]. */
+        val sentImageReplyTargets = mutableListOf<String?>()
         var syncRequests = 0
         var readRequests = 0
         var readCancellations = 0
@@ -1249,10 +1361,12 @@ class ConversationViewModelTest {
         override suspend fun sendMessage(
             chatId: String,
             text: String,
+            replyToMessageId: String?,
             onDurablyCommitted: (clientMessageId: String) -> Unit,
         ) {
             val attemptIndex = sent.size
             sent += chatId to text
+            sentReplyTargets += replyToMessageId
             val outcome = sendOutcomes?.getOrNull(attemptIndex) ?: FakeSendOutcome(
                 durablyCommitted = durablyCommitBeforeCompletion,
                 failure = failure,
@@ -1279,13 +1393,15 @@ class ConversationViewModelTest {
             blockUntil?.await()
         }
 
-        override suspend fun sendImageMessage(
+        override suspend fun sendMediaMessage(
             chatId: String,
-            bytes: ByteArray,
+            source: SecureMediaSource,
             mediaType: String,
             caption: String?,
+            replyToMessageId: String?,
         ) {
-            sentImages += Triple(chatId, mediaType, bytes.copyOf())
+            sentImages += Triple(chatId, mediaType, source.open().use { it.readBytes() })
+            sentImageReplyTargets += replyToMessageId
         }
 
         override suspend fun synchronizeConversation(chatId: String) {
@@ -1315,7 +1431,10 @@ class ConversationViewModelTest {
             }
         }
 
-        override suspend fun openImageMessage(chatId: String, mediaDescriptor: String): ByteArray {
+        override suspend fun openImageMessage(
+            chatId: String,
+            mediaDescriptor: String,
+        ): SecureMediaFile {
             mediaOpenRequests++
             concurrentMediaOpens++
             maximumConcurrentMediaOpens = maxOf(
@@ -1324,7 +1443,10 @@ class ConversationViewModelTest {
             )
             return try {
                 mediaBlockUntil?.await()
-                checkNotNull(media[mediaDescriptor])
+                val plaintext = checkNotNull(media[mediaDescriptor])
+                val file = mediaFile(mediaDescriptor)
+                file.writeBytes(plaintext)
+                SecureMediaFile(file, "image/jpeg", file.length().toLong())
             } finally {
                 concurrentMediaOpens--
             }

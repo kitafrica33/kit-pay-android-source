@@ -3,6 +3,7 @@ package com.kit.wallet.feature.chat
 import android.content.Context
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.SystemClock
 import com.kit.wallet.data.messaging.KitChatMediaLimits
 import java.io.File
 import java.util.UUID
@@ -11,7 +12,15 @@ import kotlin.math.min
 /**
  * Tap-to-start voice-note recorder matching the iOS `VoiceNoteRecorder` contract: AAC in an
  * MPEG-4 container (`audio/mp4`), 24 kHz mono at 32 kbps, at least one second and at most
- * thirty minutes. The temp file lives in the app cache only until the bytes are read back.
+ * thirty minutes.
+ *
+ * A draft is captured as a row of *segments*. An MPEG-4 file is only playable once its
+ * metadata is finalized at stop, so pausing stops the current recorder outright — turning
+ * what exists so far into a finished, listenable file — and resuming opens the next
+ * segment rather than reopening the old one. Send stitches the row back into the single
+ * `audio/mp4` the wire expects. The temp files live in the app cache, plaintext, and only
+ * until they are read back at Send or explicitly discarded; nothing is encrypted or
+ * uploaded before then.
  */
 internal class VoiceNoteRecorder(private val context: Context) {
     class Recording(val bytes: ByteArray, val durationMillis: Long) {
@@ -20,23 +29,109 @@ internal class VoiceNoteRecorder(private val context: Context) {
         }
     }
 
+    private val segments = mutableListOf<File>()
+    private var finalizedMillis: Long = 0
     private var recorder: MediaRecorder? = null
     private var output: File? = null
     private var startedAtMillis: Long = 0
 
     val isRecording: Boolean get() = recorder != null
 
-    fun elapsedMillis(): Long =
-        if (recorder == null) 0 else System.currentTimeMillis() - startedAtMillis
+    /** Whether any capture exists at all — an active segment or finalized ones. */
+    val hasDraft: Boolean get() = recorder != null || segments.isNotEmpty()
 
-    /** Live input level in 0..1 for the recording wave; 0 when idle. */
+    /** Whether at least one finalized, individually playable segment exists. */
+    val hasPlayableSegments: Boolean get() = segments.isNotEmpty()
+
+    /**
+     * Total captured audio: every finalized segment plus the live one. Measured on the
+     * monotonic clock, so a wall-clock step mid-recording cannot stretch or shrink it.
+     */
+    fun elapsedMillis(): Long = finalizedMillis + activeMillis()
+
+    /** Live input level in 0..1 for the recording wave; 0 when idle or paused. */
     fun level(): Float {
         val amplitude = runCatching { recorder?.maxAmplitude ?: 0 }.getOrDefault(0)
         return min(1f, amplitude / 12_000f)
     }
 
     fun start() {
+        check(!hasDraft) { "A voice note is already being recorded" }
+        beginSegment()
+    }
+
+    /**
+     * Finalizes the active segment into a playable file and stops the microphone. A
+     * near-empty segment that MPEG-4 cannot finalize is silently dropped — its handful of
+     * milliseconds is not audio the user could miss. Idempotent when already paused.
+     */
+    fun pause() {
+        val active = recorder ?: return
+        val file = output
+        val duration = activeMillis()
+        recorder = null
+        output = null
+        // stop() throws if nothing was captured yet; that segment is dropped either way.
+        val finalized = runCatching { active.stop() }.isSuccess
+        runCatching { active.release() }
+        if (finalized && file != null && file.isFile && file.length() > 0) {
+            segments += file
+            finalizedMillis += duration
+        } else {
+            file?.delete()
+        }
+    }
+
+    /** Opens the next segment of a paused draft. */
+    fun resume() {
         check(recorder == null) { "A voice note is already being recorded" }
+        beginSegment()
+    }
+
+    /**
+     * The finalized segments, in capture order, for local listen-back while paused. The
+     * files remain owned by this recorder: play them in place, never move or delete them.
+     */
+    fun previewFiles(): List<File> = segments.toList()
+
+    /** Stops and returns the finished note, or null when shorter than the one-second minimum. */
+    fun finish(): Recording? {
+        pause()
+        val files = segments.toList()
+        val duration = finalizedMillis
+        segments.clear()
+        finalizedMillis = 0
+        try {
+            if (files.isEmpty() || duration < KitChatMediaLimits.VOICE_NOTE_MIN_DURATION_MILLIS) {
+                return null
+            }
+            val bytes = VoiceNoteSegmentAssembler.assemble(files) ?: return null
+            if (!KitChatMediaLimits.fits(bytes.size.toLong())) return null
+            return Recording(bytes, min(duration, KitChatMediaLimits.VOICE_NOTE_MAX_DURATION_MILLIS))
+        } finally {
+            files.forEach { it.delete() }
+        }
+    }
+
+    /** The explicit discard: everything captured so far is deleted, live or finalized. */
+    fun cancel() {
+        val active = recorder
+        recorder = null
+        if (active != null) {
+            runCatching { active.stop() }
+            runCatching { active.release() }
+        }
+        output?.delete()
+        output = null
+        segments.forEach { it.delete() }
+        segments.clear()
+        finalizedMillis = 0
+    }
+
+    private fun activeMillis(): Long =
+        if (recorder == null) 0 else SystemClock.elapsedRealtime() - startedAtMillis
+
+    private fun beginSegment() {
         val file = File(context.cacheDir, "kit-voice-${UUID.randomUUID()}.m4a")
         val created = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             MediaRecorder(context)
@@ -51,7 +146,12 @@ internal class VoiceNoteRecorder(private val context: Context) {
             created.setAudioSamplingRate(24_000)
             created.setAudioChannels(1)
             created.setAudioEncodingBitRate(32_000)
-            created.setMaxDuration(KitChatMediaLimits.VOICE_NOTE_MAX_DURATION_MILLIS.toInt())
+            // Each segment may only spend what the earlier ones have left of the cap.
+            created.setMaxDuration(
+                (KitChatMediaLimits.VOICE_NOTE_MAX_DURATION_MILLIS - finalizedMillis)
+                    .coerceAtLeast(1_000)
+                    .toInt(),
+            )
             created.setOutputFile(file.absolutePath)
             created.prepare()
             created.start()
@@ -62,40 +162,6 @@ internal class VoiceNoteRecorder(private val context: Context) {
         }
         recorder = created
         output = file
-        startedAtMillis = System.currentTimeMillis()
-    }
-
-    /** Stops and returns the finished note, or null when shorter than the one-second minimum. */
-    fun finish(): Recording? {
-        val active = recorder ?: return null
-        val file = output
-        val duration = elapsedMillis()
-        stopAndRelease(active)
-        recorder = null
-        output = null
-        try {
-            if (file == null || duration < KitChatMediaLimits.VOICE_NOTE_MIN_DURATION_MILLIS) {
-                return null
-            }
-            val bytes = file.takeIf(File::isFile)?.readBytes() ?: return null
-            if (!KitChatMediaLimits.fits(bytes.size.toLong())) return null
-            return Recording(bytes, min(duration, KitChatMediaLimits.VOICE_NOTE_MAX_DURATION_MILLIS))
-        } finally {
-            file?.delete()
-        }
-    }
-
-    fun cancel() {
-        val active = recorder ?: return
-        stopAndRelease(active)
-        recorder = null
-        output?.delete()
-        output = null
-    }
-
-    private fun stopAndRelease(active: MediaRecorder) {
-        // stop() throws if nothing was captured yet; the note is discarded either way.
-        runCatching { active.stop() }
-        runCatching { active.release() }
+        startedAtMillis = SystemClock.elapsedRealtime()
     }
 }

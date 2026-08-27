@@ -1,5 +1,6 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.messaging.ImmediateMediaSpool
 import com.kit.wallet.data.messaging.ImmediateSendIntent
 import com.kit.wallet.data.messaging.ImmediateSendIntentCodec
@@ -98,6 +99,30 @@ class ImmediateSendIntentStoreTest {
         assertTrue(emptyRestart.items.value.isEmpty())
     }
 
+    @Test fun `idempotent enqueue acknowledges exact replay and rejects identity reuse`() = runTest {
+        val store = ImmediateSendIntentStore(disk, sessions)
+        val owner = checkNotNull(sessions.current()).fence()
+        val intent = textIntent()
+
+        store.enqueueIdempotentForOwner(owner, intent)
+        store.enqueueIdempotentForOwner(
+            owner,
+            intent.copy(createdAtEpochMillis = intent.createdAtEpochMillis + 1),
+        )
+        assertEquals(listOf(intent), store.items.value)
+
+        assertTrue(store.markRetryRequiredForOwner(owner, intent))
+        store.enqueueIdempotentForOwner(owner, intent)
+        assertEquals(ImmediateSendState.WAITING, store.items.value.single().state)
+
+        assertTrue(
+            runCatching {
+                store.enqueueIdempotentForOwner(owner, intent.copy(text = "different content"))
+            }.isFailure,
+        )
+        assertEquals("queued before roster work", store.items.value.single().text)
+    }
+
     @Test fun `account switch hides plaintext and rejects an obsolete writer`() = runTest {
         val store = ImmediateSendIntentStore(disk, sessions)
         val oldOwner = store.enqueue(textIntent())
@@ -118,7 +143,7 @@ class ImmediateSendIntentStoreTest {
         try {
             val spool = ImmediateMediaSpool(directory)
             val plaintext = "private photo bytes that must never be written".toByteArray()
-            val material = spool.stage(ID_ONE, plaintext)
+            val material = spool.stage(ID_ONE, SecureMediaSource.ofBytes(plaintext))
             val intent = ImmediateSendIntent(
                 id = ID_ONE,
                 conversationId = CONVERSATION_ID,
@@ -131,7 +156,7 @@ class ImmediateSendIntentStoreTest {
                 mediaSha256Base64 = material.sha256Base64,
             )
 
-            val ciphertext = spool.readCiphertext(intent)
+            val ciphertext = spool.ciphertextFile(intent).readBytes()
             assertFalse(ciphertext.contentEquals(plaintext))
             assertFalse(String(ciphertext, Charsets.UTF_8).contains(String(plaintext)))
             val key = Base64.getDecoder().decode(material.keyBase64)
@@ -156,7 +181,7 @@ class ImmediateSendIntentStoreTest {
         try {
             val spool = ImmediateMediaSpool(directory)
             val plaintext = "ciphertext awaiting its durable queue record".toByteArray()
-            val material = spool.stage(ID_ONE, plaintext)
+            val material = spool.stage(ID_ONE, SecureMediaSource.ofBytes(plaintext))
             val intent = ImmediateSendIntent(
                 id = ID_ONE,
                 conversationId = CONVERSATION_ID,
@@ -171,7 +196,7 @@ class ImmediateSendIntentStoreTest {
 
             // This snapshot may have been taken immediately before stage() committed the file.
             spool.prune(emptySet())
-            val retainedCiphertext = spool.readCiphertext(intent)
+            val retainedCiphertext = spool.ciphertextFile(intent).readBytes()
             assertEquals(material.ciphertextBytes, retainedCiphertext.size)
             retainedCiphertext.fill(0)
 

@@ -1,7 +1,6 @@
 package com.kit.wallet.data.messaging
 
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
-import com.kit.wallet.data.remote.ENCRYPTED_REACTION_MESSAGE_KIND
 import com.kit.wallet.data.remote.EncryptedDeviceEnvelopeRequest
 import com.kit.wallet.data.remote.MessagingOneTimePrekeyRequest
 import com.kit.wallet.data.remote.MessagingPqPrekeyRequest
@@ -503,11 +502,7 @@ object SecureMessagingCryptoWireMapper {
             envelopes = envelopes,
             replyToMessageId = durable.replyToMessageId,
         )
-        val messageKind = if (KitReactionMessage.parse(durable.authenticatedText) != null) {
-            ENCRYPTED_REACTION_MESSAGE_KIND
-        } else {
-            ENCRYPTED_MESSAGE_KIND
-        }
+        val messageKind = authenticatedOutboundMessageKind(durable.authenticatedText)
         return encryptedSend(fanout, planSnapshot, planSnapshot.provenance, messageKind)
     }
 

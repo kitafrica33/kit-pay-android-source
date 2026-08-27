@@ -78,7 +78,7 @@ class KitMediaMessageTest {
         assertNull(KitMediaMessage.parse(descriptor.copy(plaintextByteSize = 0).encode()))
         assertNull(
             KitMediaMessage.parse(
-                descriptor.copy(ciphertextByteSize = 10L * 1024L * 1024L + 65L).encode(),
+                descriptor.copy(ciphertextByteSize = 200L * 1024L * 1024L + 65L).encode(),
             ),
         )
         // Truncated key material must fail closed.

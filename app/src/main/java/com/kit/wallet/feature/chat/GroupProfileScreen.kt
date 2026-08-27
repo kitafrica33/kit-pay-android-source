@@ -1,5 +1,10 @@
 package com.kit.wallet.feature.chat
 
+import android.content.pm.PackageManager
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -19,6 +24,8 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PersonAdd
+import androidx.compose.material.icons.rounded.Photo
+import androidx.compose.material.icons.rounded.PhotoCamera
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
@@ -39,20 +46,30 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.remote.MAX_GROUP_MEMBERS
+import com.kit.wallet.feature.settings.transcodeProfileAvatar
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.model.ChatMember
 import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.theme.KitTheme
+import java.io.File
+import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * A group's own screen: who is in it, what each of them may do, and the way out.
@@ -66,6 +83,7 @@ import com.kit.wallet.ui.theme.KitTheme
 fun GroupProfileScreen(
     onBack: () -> Unit,
     onAddParticipants: () -> Unit,
+    onEditDescription: () -> Unit,
     onLeft: () -> Unit,
     viewModel: GroupProfileViewModel = hiltViewModel(),
 ) {
@@ -150,7 +168,12 @@ fun GroupProfileScreen(
                         .padding(vertical = 20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    KitAvatar(chat?.name.orEmpty(), size = 88.dp, avatarUrl = chat?.avatarUrl)
+                    KitAvatar(
+                        chat?.name.orEmpty(),
+                        size = 88.dp,
+                        avatarUrl = chat?.avatarUrl,
+                        isGroup = true,
+                    )
                     Spacer(Modifier.height(10.dp))
                     Text(
                         chat?.name.orEmpty(),
@@ -164,7 +187,24 @@ fun GroupProfileScreen(
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    if (canManage) {
+                        GroupPhotoControls(
+                            hasPhoto = chat?.avatarUrl != null,
+                            enabled = !busy,
+                            onPhotoPicked = viewModel::changePhoto,
+                            onRemovePhoto = viewModel::removePhoto,
+                            onError = viewModel::reportError,
+                        )
+                    }
                 }
+            }
+            item {
+                GroupDescriptionSection(
+                    description = chat?.description,
+                    canManage = canManage,
+                    enabled = !busy,
+                    onEdit = onEditDescription,
+                )
             }
             item {
                 Surface(
@@ -366,6 +406,170 @@ fun GroupAddParticipantsScreen(
                 )
             }
             item { Spacer(Modifier.height(24.dp)) }
+        }
+    }
+}
+
+/**
+ * The two ways in for a group photo and the one way out, offered only to managers.
+ *
+ * The picked image rides the exact profile-avatar preparation — square crop, downscale,
+ * bounded JPEG — so the server-side sanitizer sees the same shape of upload either way.
+ */
+@Composable
+private fun GroupPhotoControls(
+    hasPhoto: Boolean,
+    enabled: Boolean,
+    onPhotoPicked: (ByteArray) -> Unit,
+    onRemovePhoto: () -> Unit,
+    onError: (String) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var showSources by remember { mutableStateOf(false) }
+    var captureTarget by remember { mutableStateOf<Uri?>(null) }
+    var captureFile by remember { mutableStateOf<File?>(null) }
+
+    fun preparePhoto(uri: Uri, onFinished: () -> Unit = {}) {
+        scope.launch {
+            val jpeg = withContext(Dispatchers.Default) {
+                runCatching { transcodeProfileAvatar(context.contentResolver, uri) }.getOrNull()
+            }
+            onFinished()
+            if (jpeg == null) {
+                onError(
+                    "That image could not be read on this device. Try another photo or take " +
+                        "a new one.",
+                )
+            } else {
+                onPhotoPicked(jpeg)
+            }
+        }
+    }
+
+    val pickPhoto = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri -> if (uri != null) preparePhoto(uri) }
+    val takePhoto = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicture(),
+    ) { saved ->
+        val target = captureTarget
+        val file = captureFile
+        captureTarget = null
+        captureFile = null
+        if (saved && target != null) preparePhoto(target) { file?.delete() } else file?.delete()
+    }
+
+    fun launchCapture() {
+        val directory = File(context.cacheDir, "chat-capture").apply { mkdirs() }
+        val file = File(directory, "group-photo-${UUID.randomUUID()}.jpg")
+        captureFile = file
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.chatmedia", file)
+        captureTarget = uri
+        takePhoto.launch(uri)
+    }
+
+    val cameraPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            launchCapture()
+        } else {
+            onError("Camera access is needed to take a group photo.")
+        }
+    }
+
+    Box {
+        TextButton(onClick = { if (enabled) showSources = true }, enabled = enabled) {
+            Text(if (hasPhoto) "Change group photo" else "Add group photo")
+        }
+        DropdownMenu(expanded = showSources, onDismissRequest = { showSources = false }) {
+            DropdownMenuItem(
+                text = { Text("Choose from gallery") },
+                leadingIcon = { Icon(Icons.Rounded.Photo, contentDescription = null) },
+                onClick = {
+                    showSources = false
+                    pickPhoto.launch(
+                        PickVisualMediaRequest(
+                            ActivityResultContracts.PickVisualMedia.ImageOnly,
+                        ),
+                    )
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Take a photo") },
+                leadingIcon = { Icon(Icons.Rounded.PhotoCamera, contentDescription = null) },
+                onClick = {
+                    showSources = false
+                    val granted = ContextCompat.checkSelfPermission(
+                        context,
+                        android.Manifest.permission.CAMERA,
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (granted) {
+                        launchCapture()
+                    } else {
+                        cameraPermission.launch(android.Manifest.permission.CAMERA)
+                    }
+                },
+            )
+            if (hasPhoto) {
+                DropdownMenuItem(
+                    text = {
+                        Text("Remove photo", color = MaterialTheme.colorScheme.error)
+                    },
+                    onClick = {
+                        showSources = false
+                        onRemovePhoto()
+                    },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * What this group is for, in its own words.
+ *
+ * Everybody reads it here; managers can also edit it, and a group without one shows the
+ * affordance only to the people who could actually write it.
+ */
+@Composable
+private fun GroupDescriptionSection(
+    description: String?,
+    canManage: Boolean,
+    enabled: Boolean,
+    onEdit: () -> Unit,
+) {
+    if (description == null && !canManage) return
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp)
+            .padding(bottom = 12.dp),
+    ) {
+        if (description != null) {
+            Text(
+                "Description",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                description,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = if (canManage) {
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = enabled, onClick = onEdit)
+                } else {
+                    Modifier.fillMaxWidth()
+                },
+            )
+            if (canManage) {
+                TextButton(onClick = onEdit, enabled = enabled) { Text("Edit description") }
+            }
+        } else {
+            TextButton(onClick = onEdit, enabled = enabled) { Text("Add group description") }
         }
     }
 }

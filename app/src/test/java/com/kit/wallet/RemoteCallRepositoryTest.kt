@@ -21,8 +21,10 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.lang.reflect.Proxy
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class RemoteCallRepositoryTest {
@@ -45,9 +47,13 @@ class RemoteCallRepositoryTest {
         val second = repository.start(RECIPIENT_ID, video = true)
         repository.end(second.callId)
 
+        runCurrent()
+
         assertEquals(2, api.startedCalls)
         assertEquals(2, api.endedCalls)
-        assertEquals(4, api.callListRequests)
+        // Two awaited walks from ending the calls, and one background walk: the redial
+        // cancels and replaces the walk its predecessor started rather than stacking them.
+        assertEquals(3, api.callListRequests)
         assertEquals(0, contacts.refreshRequests)
         assertEquals("Saved locally", first.name)
         assertEquals("Saved locally", second.name)
@@ -78,6 +84,71 @@ class RemoteCallRepositoryTest {
         assertEquals(listOf(clientCallId), api.cancelledClientCallIds)
     }
 
+    @Test
+    fun `placing a call hands back room credentials before the history walk starts`() = runTest {
+        // The call log is paginated to exhaustion, so awaiting it here put several round
+        // trips between the tap and the first audio packet. Nothing on the call screen
+        // reads the log, so the walk runs behind the connection instead of in front of it.
+        val api = RecordingCallApi()
+        val repository = repository(api)
+
+        repository.start(RECIPIENT_ID, video = false)
+
+        assertEquals(0, api.callListRequests)
+
+        runCurrent()
+
+        assertEquals(1, api.callListRequests)
+    }
+
+    @Test
+    fun `answering hands back room credentials before the history walk starts`() = runTest {
+        val api = RecordingCallApi()
+        val repository = repository(api)
+
+        repository.accept(INCOMING_CALL_ID)
+
+        assertEquals(0, api.callListRequests)
+
+        runCurrent()
+
+        assertEquals(1, api.callListRequests)
+    }
+
+    @Test
+    fun `the accept response carries the server's answer instant to the call screen`() = runTest {
+        // Both halves of the anchor come from the same response, measured on one clock, so
+        // the timer the answering device shows never inherits the phone's own drift.
+        val api = RecordingCallApi()
+        val repository = repository(api)
+
+        val connection = repository.accept(INCOMING_CALL_ID)
+
+        assertEquals(INCOMING_CALL_ID, connection.callId)
+        assertEquals(ANSWERED_AT, connection.answeredAt)
+        assertEquals(SERVER_TIME, connection.serverTime)
+    }
+
+    @Test
+    fun `a call that has not been answered carries no anchor`() = runTest {
+        val api = RecordingCallApi()
+        val repository = repository(api)
+
+        val connection = repository.start(RECIPIENT_ID, video = false)
+
+        assertNull(connection.answeredAt)
+        assertNull(connection.serverTime)
+    }
+
+    private fun kotlinx.coroutines.test.TestScope.repository(api: RecordingCallApi) =
+        RemoteCallRepository(
+            api = api.proxy,
+            apiCalls = ApiCallExecutor(Moshi.Builder().add(KotlinJsonAdapterFactory()).build()),
+            contacts = RecordingContactRepository(),
+            sessions = sessionStore(),
+            scope = backgroundScope,
+        )
+
     private class RecordingContactRepository : ContactRepository {
         override val contacts: StateFlow<List<Contact>> = MutableStateFlow(
             listOf(
@@ -107,6 +178,8 @@ class RemoteCallRepositoryTest {
             private set
         var callListRequests = 0
             private set
+        var acceptedCalls = 0
+            private set
         val clientCallIds = mutableListOf<String>()
         val cancelledClientCallIds = mutableListOf<String>()
 
@@ -126,6 +199,10 @@ class RemoteCallRepositoryTest {
                         ok = true,
                         data = com.kit.wallet.data.remote.CancelCallAttemptDto(id, true),
                     )
+                }
+                "acceptCall" -> {
+                    acceptedCalls += 1
+                    ApiEnvelope(ok = true, data = answeredSession())
                 }
                 "endCall" -> ApiEnvelope(
                     ok = true,
@@ -173,6 +250,32 @@ class RemoteCallRepositoryTest {
     private companion object {
         const val RECIPIENT_ID = "550e8400-e29b-41d4-a716-446655440000"
         const val RECIPIENT_PHONE = "+256 700 000 001"
+        const val INCOMING_CALL_ID = "019f8c6f-cc57-720c-9a55-0000000000ff"
+        const val ANSWERED_AT = "2026-07-23T00:00:10Z"
+        const val SERVER_TIME = "2026-07-23T00:00:11Z"
+
+        fun answeredSession() = CallSessionDto(
+            call = CallDto(
+                id = INCOMING_CALL_ID,
+                name = "Registered name",
+                participantUserIds = listOf(RECIPIENT_ID),
+                direction = "incoming",
+                type = "voice",
+                video = false,
+                state = "active",
+                startedAt = "2026-07-23T00:00:00Z",
+                answeredAt = ANSWERED_AT,
+                ringExpiresAt = "2026-07-23T00:00:45Z",
+            ),
+            rtc = RtcCredentialsDto(
+                provider = "livekit",
+                url = "wss://rtc.pay.kit.africa",
+                token = "accepted-token",
+                room = "accepted-room",
+                expiresAt = "2026-07-23T00:05:00Z",
+            ),
+            serverTime = SERVER_TIME,
+        )
 
         fun callSession(sequence: Int) = CallSessionDto(
             call = CallDto(

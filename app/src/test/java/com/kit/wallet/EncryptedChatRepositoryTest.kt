@@ -1,8 +1,10 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.messaging.ConversationSystemEvent
 import com.kit.wallet.data.messaging.ConversationSystemEventStore
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
+import com.kit.wallet.data.messaging.KitEditMessage
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.KitReactionAction
@@ -1236,6 +1238,211 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `an account without the edit capability neither offers nor enqueues a correction`() =
+        runTest {
+            val runtime = FakeRuntime().apply {
+                conversations += conversation(CONVERSATION_ONE, "Grace")
+            }
+            val disk = TestSecureMessagingStateStore()
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val queue = ImmediateSendIntentStore(disk, authentication)
+            val directory = Files.createTempDirectory("kit-edit-gate-off-test").toFile()
+            try {
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = queue,
+                    immediateMediaSpool = ImmediateMediaSpool(directory),
+                )
+                runCurrent()
+
+                // The screen reads this to decide whether to show the Edit item at all.
+                assertFalse(repository.messageEditsAvailable.value)
+
+                val failure = runCatching {
+                    repository.editMessage(CONVERSATION_ONE, TARGET_MESSAGE_ID, "corrected")
+                }.exceptionOrNull()
+
+                assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+                // Nothing durable: the refusal happens before the offline queue is touched, so a
+                // correction the account was never entitled to send cannot outlive the attempt.
+                assertTrue(queue.items.value.isEmpty())
+                assertTrue(runtime.sendAttempts.isEmpty())
+            } finally {
+                directory.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `an account with the edit capability is refused by the thread rather than the gate`() =
+        runTest {
+            val runtime = FakeRuntime(messageEditsEnabled = true).apply {
+                conversations += conversation(CONVERSATION_ONE, "Grace")
+            }
+            val disk = TestSecureMessagingStateStore()
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val queue = ImmediateSendIntentStore(disk, authentication)
+            val directory = Files.createTempDirectory("kit-edit-gate-on-test").toFile()
+            try {
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = queue,
+                    immediateMediaSpool = ImmediateMediaSpool(directory),
+                )
+                runCurrent()
+
+                assertTrue(repository.messageEditsAvailable.value)
+
+                val failure = runCatching {
+                    repository.editMessage(CONVERSATION_ONE, TARGET_MESSAGE_ID, "corrected")
+                }.exceptionOrNull()
+
+                // Past the capability gate and stopped by this device's own view of the thread
+                // instead: no bubble here carries that ID. That is what distinguishes the two
+                // refusals, and it is why the gate-off case above is the gate and not this.
+                assertTrue(failure is IllegalArgumentException)
+                assertTrue(queue.items.value.isEmpty())
+            } finally {
+                directory.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `an incompatible edit retires without blocking later text`() = runTest {
+        val runtime = FakeRuntime(
+            beforeSend = { text ->
+                if (KitEditMessage.parse(text) != null) {
+                    SecureMessagingConversationCapabilityUnavailableException(
+                        "A conversation device does not support messaging_message_edits_v1",
+                    )
+                } else {
+                    null
+                }
+            },
+            messageEditsEnabled = true,
+        ).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val disk = TestSecureMessagingStateStore()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val queue = ImmediateSendIntentStore(disk, authentication)
+        val directory = Files.createTempDirectory("kit-immediate-edit-test").toFile()
+        try {
+            val spool = ImmediateMediaSpool(directory)
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+            val edit = KitEditMessage(
+                targetMessageId = TARGET_MESSAGE_ID,
+                body = "corrected",
+            ).encode()
+            queue.enqueue(
+                textIntent(OUTBOX_ID_ONE, CONVERSATION_ONE, edit, 1L)
+                    .copy(kind = ImmediateSendKind.EDIT),
+            )
+            queue.enqueue(textIntent(OUTBOX_ID_TWO, CONVERSATION_ONE, "still sends", 2L))
+
+            val outcome = ImmediateSendDispatcher(queue, spool, repository).dispatch()
+
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, outcome)
+            assertEquals(listOf(edit, "still sends"), runtime.sendAttempts.map { it.second })
+            assertTrue(queue.items.value.isEmpty())
+            // The original wording still stands; only the correction disappeared.
+            assertEquals(listOf("still sends"), runtime.projected.map { it.text })
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `a server rejected edit is not endlessly recoverable across a restart`() = runTest {
+        val runtime = FakeRuntime(
+            beforeSend = { text ->
+                if (KitEditMessage.parse(text) != null) {
+                    KitWalletApiException(
+                        code = "MESSAGE_EDIT_WINDOW_CLOSED",
+                        message = "That message can no longer be edited",
+                        statusCode = 409,
+                        connectivity = false,
+                    )
+                } else {
+                    null
+                }
+            },
+            messageEditsEnabled = true,
+        ).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val disk = TestSecureMessagingStateStore()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val queue = ImmediateSendIntentStore(disk, authentication)
+        val directory = Files.createTempDirectory("kit-immediate-rejected-edit-test").toFile()
+        try {
+            val spool = ImmediateMediaSpool(directory)
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+            val edit = KitEditMessage(
+                targetMessageId = TARGET_MESSAGE_ID,
+                body = "corrected",
+            ).encode()
+            queue.enqueue(
+                textIntent(OUTBOX_ID_ONE, CONVERSATION_ONE, edit, 1L)
+                    .copy(kind = ImmediateSendKind.EDIT),
+            )
+            queue.enqueue(textIntent(OUTBOX_ID_TWO, CONVERSATION_ONE, "still sends", 2L))
+
+            // A 409 is the server's final word, so nothing is scheduled to try again.
+            assertEquals(
+                ImmediateSendDispatchOutcome.IDLE,
+                ImmediateSendDispatcher(queue, spool, repository).dispatch(),
+            )
+            assertEquals(listOf(edit), runtime.sendAttempts.map { it.second })
+
+            val restartedQueue = ImmediateSendIntentStore(disk, authentication)
+            restartedQueue.loadForCurrentOwner()
+            val restartedRepository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = restartedQueue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+
+            val outcome = ImmediateSendDispatcher(
+                restartedQueue,
+                spool,
+                restartedRepository,
+            ).dispatch()
+
+            // A correction has no retry bubble of its own, so a restart has to discard it rather
+            // than present it forever — and the ordinary message queued behind it still goes out.
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, outcome)
+            assertEquals(listOf(edit, "still sends"), runtime.sendAttempts.map { it.second })
+            assertTrue(restartedQueue.items.value.isEmpty())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `missing local media retires without blocking later text`() = runTest {
         val runtime = FakeRuntime().apply {
             conversations += conversation(CONVERSATION_ONE, "Grace")
@@ -1249,7 +1456,7 @@ class EncryptedChatRepositoryTest {
         val plaintext = "media removed before dispatch".toByteArray()
         try {
             val spool = ImmediateMediaSpool(directory)
-            val material = spool.stage(OUTBOX_ID_ONE, plaintext)
+            val material = spool.stage(OUTBOX_ID_ONE, SecureMediaSource.ofBytes(plaintext))
             val media = ImmediateSendIntent(
                 id = OUTBOX_ID_ONE,
                 conversationId = CONVERSATION_ONE,
@@ -1559,6 +1766,31 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `a group presents its own photo and description, never a member's`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += groupConversation(
+                id = GROUP_ONE,
+                title = "Weekend savings",
+                others = listOf(USER_ONE to "Aisha"),
+            ).copy(
+                description = "Deposits every Friday",
+                photoUrl = "https://pay.kit.africa/conversations/$GROUP_ONE/photo/asset-1",
+            )
+        }
+        val repository = repository(runtime, MutableStateFlow(emptyList()))
+
+        runCurrent()
+
+        val chat = repository.chats.value.single()
+        assertTrue(chat.isGroup)
+        assertEquals("Deposits every Friday", chat.description)
+        assertEquals(
+            "https://pay.kit.africa/conversations/$GROUP_ONE/photo/asset-1",
+            chat.avatarUrl,
+        )
+    }
+
+    @Test
     fun `a group is named by its title and attributes each bubble and reaction to its author`() =
         runTest {
             val runtime = FakeRuntime().apply {
@@ -1612,8 +1844,10 @@ class EncryptedChatRepositoryTest {
             assertEquals("Weekend savings", chat.name)
             assertTrue(chat.isGroup)
             assertNull(chat.peerUserId)
-            // A group borrows nobody's photo, however many members have one.
+            // A group borrows nobody's photo, however many members have one; without a photo
+            // of its own it shows none, and without a description it claims none.
             assertNull(chat.avatarUrl)
+            assertNull(chat.description)
 
             val messages = repository.conversation(GROUP_ONE).value
             // The reaction annotates rather than becoming a bubble, exactly as in a direct chat.
@@ -2001,6 +2235,8 @@ class EncryptedChatRepositoryTest {
         permanentRecoveryFailures: Int = if (permanentRecoveryError == null) 0 else Int.MAX_VALUE,
         private val beforeSend: (String) -> Throwable? = { null },
         private val afterDurablyCommitted: (String) -> Throwable? = { null },
+        /** What the server said about this account's message-correction capability. */
+        private val messageEditsEnabled: Boolean = false,
     ) : SecureMessagingChatRuntime {
         private val authorityLock = Any()
         private val initialSession = epoch?.let(::newSession)
@@ -2456,7 +2692,8 @@ class EncryptedChatRepositoryTest {
             return committed
         }
 
-        private fun newSession(epoch: String) = SecureMessagingChatSession(epoch, Any())
+        private fun newSession(epoch: String) =
+            SecureMessagingChatSession(epoch, Any(), messageEditsEnabled)
     }
 
     private companion object {

@@ -9,6 +9,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -51,6 +53,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -60,6 +63,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.ui.components.kitNameAccent
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.acceptsReactions
@@ -77,31 +82,37 @@ internal fun chatMediaByteLabel(bytes: Int): String = when {
 }
 
 /**
- * An end-to-end encrypted voice note. Tap downloads and decrypts once; playback runs entirely
- * from memory through [VoiceNotePlayer] with the deterministic waveform both platforms share.
+ * An end-to-end encrypted voice note. Tap downloads and decrypts once; playback runs through
+ * [VoiceNotePlayer] with the deterministic waveform both platforms share.
+ *
+ * The bubble is a view onto the player, never the owner of it: the note goes on playing when this
+ * row scrolls away or the chat is left, and the floating bar takes over as its control. Tapping
+ * inside the waveform positions playback where the finger landed, and sliding along it scrubs.
  */
 @Composable
 internal fun SecureVoiceNoteContent(
     msg: Message,
-    mediaBytes: ByteArray?,
+    media: SecureMediaFile?,
     mediaLoading: Boolean,
     mediaError: String?,
     onOpenMedia: () -> Unit,
     onRetryMedia: () -> Unit,
 ) {
-    var playing by remember(msg.id) { mutableStateOf(VoiceNotePlayer.isPlaying(msg.id)) }
-    var progress by remember(msg.id) { mutableFloatStateOf(0f) }
+    val context = LocalContext.current
+    val chatContext = LocalVoiceNoteChatContext.current
+    val playback by VoiceNotePlayer.state.collectAsStateWithLifecycle()
+    val isCurrent = playback.isCurrent(msg.id)
+    val playing = isCurrent && !playback.isPaused
+    val progress = if (isCurrent) playback.progress else 0f
     var playbackError by remember(msg.id) { mutableStateOf<String?>(null) }
-    LaunchedEffect(playing) {
-        while (playing) {
-            progress = VoiceNotePlayer.progress(msg.id)
-            if (!VoiceNotePlayer.isPlaying(msg.id)) playing = false
-            delay(120)
-        }
-    }
+
+    // The player is told where its own bubble is, so it knows whether anything on screen can still
+    // stop it. Only the playing note's report is listened to, so a row scrolling by cannot lie.
     DisposableEffect(msg.id) {
-        onDispose { VoiceNotePlayer.pause(msg.id) }
+        VoiceNotePlayer.noteSourceVisibility(true, msg.id)
+        onDispose { VoiceNotePlayer.noteSourceVisibility(false, msg.id) }
     }
+
     val accent = LocalContentColor.current
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
@@ -111,16 +122,19 @@ internal fun SecureVoiceNoteContent(
                 .clickable(enabled = !mediaLoading) {
                     when {
                         mediaError != null -> onRetryMedia()
-                        mediaBytes == null -> onOpenMedia()
-                        playing -> {
-                            VoiceNotePlayer.pause(msg.id)
-                            playing = false
-                        }
+                        media == null -> onOpenMedia()
                         else -> {
                             playbackError = null
                             try {
-                                VoiceNotePlayer.play(msg.id, mediaBytes) { playing = false }
-                                playing = true
+                                VoiceNotePlayer.toggle(
+                                    context = context,
+                                    messageId = msg.id,
+                                    file = media.file,
+                                    // An own note never needs a roster lookup to be named.
+                                    playbackContext = chatContext.playbackContext(
+                                        msg.senderUserId.takeUnless { msg.fromMe },
+                                    ),
+                                )
                             } catch (error: Exception) {
                                 playbackError =
                                     error.message ?: "This voice note could not be played"
@@ -144,14 +158,15 @@ internal fun SecureVoiceNoteContent(
         Column {
             VoiceNoteWaveform(
                 messageId = msg.id,
-                playedFraction = if (playing || progress > 0f) progress else 0f,
+                playedFraction = progress,
                 accent = accent,
+                modifier = Modifier.voiceNoteSeekGestures(msg.id),
             )
             Text(
                 when {
                     mediaError != null -> mediaError
                     playbackError != null -> playbackError.orEmpty()
-                    mediaBytes != null -> "Voice note"
+                    media != null -> "Voice note"
                     else -> chatMediaByteLabel(msg.mediaPlaintextBytes).ifEmpty { "Voice note" }
                 },
                 style = MaterialTheme.typography.labelSmall,
@@ -166,11 +181,51 @@ internal fun SecureVoiceNoteContent(
     }
 }
 
+/**
+ * Tap-to-position and slide-to-scrub on the waveform, for whichever note is playing.
+ *
+ * The drag detector only claims the pointer once the finger has travelled horizontally, so a
+ * mostly-vertical drag stays with the thread's scrolling — the same rule [VoiceNoteSeekPolicy]
+ * states and iOS enforces with its gesture mask.
+ */
+private fun Modifier.voiceNoteSeekGestures(messageId: String): Modifier = this
+    .pointerInput(messageId) {
+        detectTapGestures { offset ->
+            if (!VoiceNotePlayer.state.value.isCurrent(messageId)) return@detectTapGestures
+            VoiceNotePlayer.seekToFraction(
+                VoiceNoteSeekPolicy.fractionAtX(offset.x, size.width.toFloat()),
+            )
+        }
+    }
+    .pointerInput(messageId) {
+        var start = 0f
+        var travelled = 0f
+        detectHorizontalDragGestures(
+            onDragStart = {
+                val state = VoiceNotePlayer.state.value
+                start = if (state.isCurrent(messageId)) state.progress else 0f
+                travelled = 0f
+            },
+            onHorizontalDrag = { _, delta ->
+                travelled += delta
+                if (!VoiceNotePlayer.state.value.isCurrent(messageId)) return@detectHorizontalDragGestures
+                VoiceNotePlayer.seekToFraction(
+                    VoiceNoteSeekPolicy.scrubbedFraction(start, travelled, size.width.toFloat()),
+                )
+            },
+        )
+    }
+
 /** 26 deterministic bars over a 138x22 track, identical shape math to the iOS waveform. */
 @Composable
-private fun VoiceNoteWaveform(messageId: String, playedFraction: Float, accent: Color) {
+private fun VoiceNoteWaveform(
+    messageId: String,
+    playedFraction: Float,
+    accent: Color,
+    modifier: Modifier = Modifier,
+) {
     val fractions = remember(messageId) { voiceNoteWaveformFractions(messageId) }
-    Canvas(Modifier.size(width = 138.dp, height = 22.dp)) {
+    Canvas(modifier.size(width = VoiceNoteSeekPolicy.WAVEFORM_WIDTH.dp, height = 22.dp)) {
         val barWidth = 2.6.dp.toPx()
         val spacing = 2.4.dp.toPx()
         fractions.forEachIndexed { index, fraction ->
@@ -191,12 +246,12 @@ private fun VoiceNoteWaveform(messageId: String, playedFraction: Float, accent: 
 
 /**
  * An end-to-end encrypted video bubble: poster frame with a play badge, then a full-screen
- * player fed from a private temp file that is deleted the moment the player closes.
+ * player fed from a private, named link to the opened file that is dropped when the player closes.
  */
 @Composable
 internal fun SecureVideoContent(
     msg: Message,
-    mediaBytes: ByteArray?,
+    media: SecureMediaFile?,
     mediaLoading: Boolean,
     mediaError: String?,
     onOpenMedia: () -> Unit,
@@ -205,14 +260,9 @@ internal fun SecureVideoContent(
 ) {
     val context = LocalContext.current
     var playerFile by remember(msg.id) { mutableStateOf<File?>(null) }
-    val poster by produceState<ImageBitmap?>(initialValue = null, mediaBytes) {
-        value = mediaBytes?.let { bytes ->
-            withOwnedSecureMediaSnapshot(bytes) { owned ->
-                withContext(Dispatchers.Default) {
-                    videoPosterFrame(context, owned, msg.mediaType ?: "video/mp4")
-                        ?.asImageBitmap()
-                }
-            }
+    val poster by produceState<ImageBitmap?>(initialValue = null, media) {
+        value = media?.let { opened ->
+            withContext(Dispatchers.Default) { videoPosterFrame(opened.file)?.asImageBitmap() }
         }
     }
     Column {
@@ -224,12 +274,12 @@ internal fun SecureVideoContent(
                 .clickable(enabled = !mediaLoading) {
                     when {
                         mediaError != null -> onRetryMedia()
-                        mediaBytes == null -> onOpenMedia()
+                        media == null -> onOpenMedia()
                         onOpenViewer != null -> onOpenViewer()
                         else -> playerFile = runCatching {
                             writeChatMediaTempFile(
                                 context = context,
-                                plaintext = mediaBytes,
+                                source = media.file,
                                 mediaType = msg.mediaType ?: "video/mp4",
                                 displayName = null,
                             )
@@ -269,7 +319,7 @@ internal fun SecureVideoContent(
         Text(
             when {
                 mediaError != null -> mediaError
-                mediaBytes != null -> "Play"
+                media != null -> "Play"
                 else -> chatMediaByteLabel(msg.mediaPlaintextBytes).ifEmpty { "Video" }
             },
             style = MaterialTheme.typography.labelSmall,
@@ -330,7 +380,7 @@ private fun SecureVideoPlayerDialog(file: File, onDismiss: () -> Unit) {
 @Composable
 internal fun SecureDocumentContent(
     msg: Message,
-    mediaBytes: ByteArray?,
+    media: SecureMediaFile?,
     mediaLoading: Boolean,
     mediaError: String?,
     onOpenMedia: () -> Unit,
@@ -344,14 +394,14 @@ internal fun SecureDocumentContent(
         modifier = Modifier.clickable(enabled = !mediaLoading) {
             when {
                 mediaError != null -> onRetryMedia()
-                mediaBytes == null -> onOpenMedia()
+                media == null -> onOpenMedia()
                 else -> {
                     openError = null
                     val result = runCatching {
                         val mediaType = msg.mediaType ?: "application/octet-stream"
                         val file = writeChatMediaTempFile(
                             context = context,
-                            plaintext = mediaBytes,
+                            source = media.file,
                             mediaType = mediaType,
                             displayName = msg.text.takeIf { it.isNotBlank() && it != "Document" },
                         )
@@ -398,7 +448,7 @@ internal fun SecureDocumentContent(
             )
             Text(
                 mediaError ?: openError ?: chatMediaByteLabel(msg.mediaPlaintextBytes)
-                    .ifEmpty { if (mediaBytes != null) "Tap to open" else "Tap to download" },
+                    .ifEmpty { if (media != null) "Tap to open" else "Tap to download" },
                 style = MaterialTheme.typography.labelSmall,
                 color = if (mediaError != null || openError != null) {
                     MaterialTheme.colorScheme.error
@@ -423,7 +473,7 @@ internal fun SecureDocumentContent(
 internal fun ImageGroupBubble(
     messages: List<Message>,
     fromMe: Boolean,
-    mediaBytes: Map<String, ByteArray>,
+    mediaFiles: Map<String, SecureMediaFile>,
     mediaLoading: Set<String>,
     mediaErrors: Map<String, String>,
     onOpenMedia: (Message) -> Unit,
@@ -432,6 +482,8 @@ internal fun ImageGroupBubble(
     onToggleReaction: (Message, String) -> Unit = { _, _ -> },
     reportableMessageIds: Set<String> = emptySet(),
     onReportMessage: (Message) -> Unit = {},
+    /** Whether this grid opens a run by its author. Decided by the thread, as for a bubble. */
+    showSenderName: Boolean = true,
 ) {
     val visible = messages.take(4)
     val hiddenCount = messages.size - visible.size
@@ -447,7 +499,7 @@ internal fun ImageGroupBubble(
         ) {
             // A grid has no bubble to write a name inside, so the group author sits above the
             // tiles. Grouping only joins photos from one author, so one label covers the grid.
-            if (!fromMe) {
+            if (!fromMe && showSenderName) {
                 messages.firstOrNull()?.senderName?.takeIf(String::isNotBlank)?.let { author ->
                     Text(
                         author,
@@ -464,7 +516,7 @@ internal fun ImageGroupBubble(
                 2 -> Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(tileSpacing)) {
                     visible.forEach { message ->
                         GroupImageTile(
-                            message, mediaBytes[message.id], message.id in mediaLoading,
+                            message, mediaFiles[message.id], message.id in mediaLoading,
                             mediaErrors.containsKey(message.id), 0,
                             Modifier.weight(1f).aspectRatio(1f),
                             onOpenMedia, onOpenViewer, reactable, onToggleReaction,
@@ -474,7 +526,7 @@ internal fun ImageGroupBubble(
                 }
                 3 -> {
                     GroupImageTile(
-                        visible[0], mediaBytes[visible[0].id], visible[0].id in mediaLoading,
+                        visible[0], mediaFiles[visible[0].id], visible[0].id in mediaLoading,
                         mediaErrors.containsKey(visible[0].id), 0,
                         Modifier.fillMaxWidth().aspectRatio(16f / 9f),
                         onOpenMedia, onOpenViewer, reactable, onToggleReaction,
@@ -483,7 +535,7 @@ internal fun ImageGroupBubble(
                     Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(tileSpacing)) {
                         visible.drop(1).forEach { message ->
                             GroupImageTile(
-                                message, mediaBytes[message.id], message.id in mediaLoading,
+                                message, mediaFiles[message.id], message.id in mediaLoading,
                                 mediaErrors.containsKey(message.id), 0,
                                 Modifier.weight(1f).aspectRatio(1f),
                                 onOpenMedia, onOpenViewer, reactable, onToggleReaction,
@@ -498,7 +550,7 @@ internal fun ImageGroupBubble(
                             val isLastVisible =
                                 rowIndex == 1 && columnIndex == rowMessages.lastIndex
                             GroupImageTile(
-                                message, mediaBytes[message.id], message.id in mediaLoading,
+                                message, mediaFiles[message.id], message.id in mediaLoading,
                                 mediaErrors.containsKey(message.id),
                                 if (isLastVisible) hiddenCount else 0,
                                 Modifier.weight(1f).aspectRatio(1f),
@@ -517,7 +569,7 @@ internal fun ImageGroupBubble(
 @Composable
 private fun GroupImageTile(
     message: Message,
-    bytes: ByteArray?,
+    media: SecureMediaFile?,
     loading: Boolean,
     failed: Boolean,
     overflowCount: Int,
@@ -529,11 +581,9 @@ private fun GroupImageTile(
     reportable: Boolean = false,
     onReportMessage: (Message) -> Unit = {},
 ) {
-    val thumbnail by produceState<ImageBitmap?>(initialValue = null, message.id, bytes != null) {
-        value = bytes?.let { owned ->
-            withOwnedSecureMediaSnapshot(owned) { snapshot ->
-                withContext(Dispatchers.Default) { decodeBoundedSecureImage(snapshot) }
-            }
+    val thumbnail by produceState<ImageBitmap?>(initialValue = null, message.id, media) {
+        value = media?.let { opened ->
+            withContext(Dispatchers.Default) { decodeBoundedSecureImage(opened.file) }
         }
     }
     val canReact = reactable && message.acceptsReactions
@@ -564,7 +614,7 @@ private fun GroupImageTile(
             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
             .combinedClickable(
                 enabled = !loading,
-                onClick = { if (bytes != null) onOpenViewer(message) else onOpenMedia(message) },
+                onClick = { if (media != null) onOpenViewer(message) else onOpenMedia(message) },
                 onLongClick = if (canReact || reportable) {
                     { paletteOpen = true }
                 } else {
@@ -588,7 +638,7 @@ private fun GroupImageTile(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.error,
             )
-            bytes == null -> Icon(
+            media == null -> Icon(
                 Icons.Rounded.Download,
                 contentDescription = "Load photo",
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,

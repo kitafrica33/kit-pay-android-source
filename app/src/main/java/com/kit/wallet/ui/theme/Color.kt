@@ -54,6 +54,19 @@ val KitWarningDark = Color(0xFFF7C566)
 val KitSuccess = KitGreen600
 val KitSuccessDark = KitGreen400
 
+// Gold. Money shared out in a group wears it, so it is never mistaken at a glance for an ordinary
+// message or for the green of a one-to-one payment. Both variants are darkened well past
+// decorative "shiny gold": the light one has to carry ink on it, and the dark one has to sit on a
+// near-black chat wallpaper. Byte-identical to the iOS `KitColor.gold` family.
+val KitGold = Color(0xFFB07E12)
+val KitGoldDark = Color(0xFFE0B044)
+val KitGoldContainer = Color(0xFFFCF0CD)
+val KitGoldContainerDark = Color(0xFF4A390E)
+val KitGoldSheenStart = Color(0xFFD6A636)
+val KitGoldSheenEnd = Color(0xFF8C600A)
+val KitGoldSheenStartDark = Color(0xFFF6CE6C)
+val KitGoldSheenEndDark = Color(0xFF966E1E)
+
 /** Read-receipt blue for double-tick "read" state, matching common messenger conventions. */
 val KitReadReceipt = Color(0xFF34B7F1)
 val KitReadReceiptDark = Color(0xFF53BDEB)

@@ -1,6 +1,7 @@
 package com.kit.wallet.feature.chat
 
 import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -35,7 +36,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.kit.wallet.ui.model.MessageReaction
 
 /**
@@ -101,9 +105,19 @@ internal val REACTION_PICKER_GROUPS: List<Pair<String, List<String>>> = listOf(
 internal val REACTION_PICKER_EMOJI: List<String> =
     REACTION_PICKER_GROUPS.flatMap { (_, emoji) -> emoji }.distinct()
 
+/** How far a chip row rides up over the bottom edge of the bubble it belongs to. */
+internal val REACTION_CHIP_OVERLAP = 10.dp
+
+/** The emoji's own size in a chip. Deliberately not a text style: this is a picture, not prose. */
+private val REACTION_CHIP_EMOJI_SIZE = 15.sp
+
 /**
- * The reaction chips under a bubble. Tapping one adds or removes this account's own reaction;
+ * The reaction chips on a bubble. Tapping one adds or removes this account's own reaction;
  * long-pressing shows who reacted.
+ *
+ * The chips are meant to sit *on* the message rather than beside it — see [REACTION_CHIP_OVERLAP]
+ * — which is why [ringColor] exists: a chip that straddles the bubble's edge needs a rim in
+ * whatever lies behind the bubble, or the two shapes merge into one smudge where they cross.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -112,6 +126,8 @@ internal fun MessageReactionChips(
     onToggle: (String) -> Unit,
     onShowReactors: () -> Unit,
     modifier: Modifier = Modifier,
+    /** The colour behind the bubble, or null where the chips do not cross an edge. */
+    ringColor: Color? = null,
 ) {
     if (reactions.isEmpty()) return
     Row(
@@ -126,12 +142,20 @@ internal fun MessageReactionChips(
         reactions.forEach { reaction ->
             Surface(
                 shape = CircleShape,
+                // Mine is filled, everybody else's is plain: at a glance down a thread, what the
+                // reader is looking for is which ones they have already answered.
                 color = if (reaction.fromMe) {
-                    MaterialTheme.colorScheme.secondary.copy(alpha = 0.18f)
+                    MaterialTheme.colorScheme.secondaryContainer
                 } else {
                     MaterialTheme.colorScheme.surface
                 },
-                shadowElevation = 1.dp,
+                contentColor = if (reaction.fromMe) {
+                    MaterialTheme.colorScheme.onSecondaryContainer
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                },
+                border = ringColor?.let { BorderStroke(2.dp, it) },
+                shadowElevation = 2.dp,
                 modifier = Modifier
                     .combinedClickable(
                         onClick = { onToggle(reaction.emoji) },
@@ -140,16 +164,22 @@ internal fun MessageReactionChips(
                     .semantics { contentDescription = reaction.accessibilityLabel() },
             ) {
                 Row(
-                    Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                    Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(reaction.emoji, style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        reaction.emoji,
+                        fontSize = REACTION_CHIP_EMOJI_SIZE,
+                        // Emoji at this size are what somebody is actually reading, so the line
+                        // box is pinned to them rather than to the body text metrics around it.
+                        lineHeight = REACTION_CHIP_EMOJI_SIZE,
+                    )
                     if (reaction.count > 1) {
-                        Spacer(Modifier.width(3.dp))
+                        Spacer(Modifier.width(4.dp))
                         Text(
                             reaction.count.toString(),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
                         )
                     }
                 }
@@ -174,9 +204,9 @@ internal fun QuickReactionPalette(
 ) {
     Row(
         modifier
-            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .padding(horizontal = 8.dp, vertical = 6.dp)
             .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         QUICK_REACTIONS.forEach { emoji ->
@@ -186,19 +216,23 @@ internal fun QuickReactionPalette(
                 selected = isSelected,
                 label = if (isSelected) "Remove the $emoji reaction" else "React with $emoji",
                 onClick = { onPick(emoji) },
+                // The palette is the one place these are the whole point of the row rather than
+                // an annotation on somebody's sentence, so they are drawn at their full size.
+                emojiSize = 26.sp,
             )
         }
         Box(
             Modifier
                 .size(44.dp)
                 .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.surfaceVariant)
                 .clickable(onClick = onMore)
                 .semantics { contentDescription = "More reactions" },
             contentAlignment = Alignment.Center,
         ) {
             Text(
                 "＋",
-                style = MaterialTheme.typography.titleMedium,
+                style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -284,13 +318,19 @@ internal fun ReactionReactorsDialog(
     )
 }
 
-/** One round emoji tap target, shared by the quick palette and the full picker. */
+/**
+ * One round emoji tap target, shared by the quick palette and the full picker.
+ *
+ * The target stays 44.dp whatever [emojiSize] is: that is the smallest thing a finger can be
+ * asked to hit reliably, and it is a floor rather than a look.
+ */
 @Composable
 private fun EmojiTarget(
     emoji: String,
     selected: Boolean,
     label: String,
     onClick: () -> Unit,
+    emojiSize: TextUnit = 22.sp,
 ) {
     Box(
         Modifier
@@ -298,7 +338,7 @@ private fun EmojiTarget(
             .clip(CircleShape)
             .background(
                 if (selected) {
-                    MaterialTheme.colorScheme.secondary.copy(alpha = 0.22f)
+                    MaterialTheme.colorScheme.secondaryContainer
                 } else {
                     Color.Transparent
                 },
@@ -307,6 +347,6 @@ private fun EmojiTarget(
             .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
     ) {
-        Text(emoji, style = MaterialTheme.typography.titleMedium)
+        Text(emoji, fontSize = emojiSize, lineHeight = emojiSize)
     }
 }

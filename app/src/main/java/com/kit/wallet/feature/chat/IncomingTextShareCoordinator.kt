@@ -33,15 +33,19 @@ import androidx.compose.ui.unit.dp
 @Composable
 internal fun IncomingTextShareCoordinator(
     request: IncomingTextShareRequest,
+    ownerMatchesCurrentSession: Boolean,
     signedIn: Boolean,
     accountSetupRequired: Boolean,
     signInFlowActive: Boolean,
     capabilitiesLoaded: Boolean,
     capabilityLoadFailed: Boolean,
-    secureMessagingUsable: Boolean,
+    secureMessagingServerCompatible: Boolean,
+    groupMessagingEnabled: Boolean,
+    localOutboxAvailable: Boolean,
     onSignIn: () -> Unit,
     onRetryCapabilities: () -> Unit,
     onConsumed: () -> Unit,
+    onDeferred: () -> Unit,
     onSendingChanged: (Boolean) -> Unit,
 ) {
     when (val payload = request.payload) {
@@ -55,16 +59,20 @@ internal fun IncomingTextShareCoordinator(
 
         is IncomingTextShare.Accepted -> AcceptedTextShareCoordinator(
             request = request,
-            text = payload.text,
+            batch = payload.batch,
+            ownerMatchesCurrentSession = ownerMatchesCurrentSession,
             signedIn = signedIn,
             accountSetupRequired = accountSetupRequired,
             signInFlowActive = signInFlowActive,
             capabilitiesLoaded = capabilitiesLoaded,
             capabilityLoadFailed = capabilityLoadFailed,
-            secureMessagingUsable = secureMessagingUsable,
+            secureMessagingServerCompatible = secureMessagingServerCompatible,
+            groupMessagingEnabled = groupMessagingEnabled,
+            localOutboxAvailable = localOutboxAvailable,
             onSignIn = onSignIn,
             onRetryCapabilities = onRetryCapabilities,
             onConsumed = onConsumed,
+            onDeferred = onDeferred,
             onSendingChanged = onSendingChanged,
         )
     }
@@ -73,16 +81,20 @@ internal fun IncomingTextShareCoordinator(
 @Composable
 private fun AcceptedTextShareCoordinator(
     request: IncomingTextShareRequest,
-    text: String,
+    batch: SharedInboxBatch,
+    ownerMatchesCurrentSession: Boolean,
     signedIn: Boolean,
     accountSetupRequired: Boolean,
     signInFlowActive: Boolean,
     capabilitiesLoaded: Boolean,
     capabilityLoadFailed: Boolean,
-    secureMessagingUsable: Boolean,
+    secureMessagingServerCompatible: Boolean,
+    groupMessagingEnabled: Boolean,
+    localOutboxAvailable: Boolean,
     onSignIn: () -> Unit,
     onRetryCapabilities: () -> Unit,
     onConsumed: () -> Unit,
+    onDeferred: () -> Unit,
     onSendingChanged: (Boolean) -> Unit,
 ) {
     var continuingToSignIn by remember(request.token) { mutableStateOf(false) }
@@ -97,7 +109,22 @@ private fun AcceptedTextShareCoordinator(
         }
     }
 
+    val access = incomingShareAccess(
+        capabilitiesLoaded = capabilitiesLoaded,
+        capabilityLoadFailed = capabilityLoadFailed,
+        secureMessagingServerCompatible = secureMessagingServerCompatible,
+        localOutboxAvailable = localOutboxAvailable,
+    )
+    val closePendingShare = if (batch.pinnedConversationId == null) onConsumed else onDeferred
     when {
+        !ownerMatchesCurrentSession -> ShareStatusDialog(
+            title = "This share belongs to another session",
+            message = "For your privacy, content prepared under a different Kit Pay login cannot be opened here.",
+            confirmLabel = "Close",
+            onConfirm = onConsumed,
+            onDismiss = onConsumed,
+        )
+
         !signedIn && !continuingToSignIn -> ShareStatusDialog(
             title = "Sign in to share securely",
             message = "Sign in to choose a recipient and review your message. Nothing will be sent automatically.",
@@ -116,33 +143,62 @@ private fun AcceptedTextShareCoordinator(
         // will resume automatically once the signed-in account is ready.
         accountSetupRequired -> Unit
 
-        !capabilitiesLoaded && !capabilityLoadFailed -> ShareLoadingDialog(onDismiss = onConsumed)
+        access == IncomingShareAccess.CHECKING ->
+            ShareLoadingDialog(onDismiss = closePendingShare)
 
-        capabilityLoadFailed -> ShareStatusDialog(
-            title = "Couldn't verify secure messaging",
-            message = "Kit Pay must verify secure messaging before it can open shared text.",
+        access == IncomingShareAccess.RETRY_CAPABILITIES -> ShareStatusDialog(
+            title = "Couldn't open secure sharing",
+            message = "Kit Pay could not open your encrypted conversations on this device.",
             confirmLabel = "Try again",
             dismissLabel = "Cancel",
             onConfirm = onRetryCapabilities,
-            onDismiss = onConsumed,
+            onDismiss = closePendingShare,
         )
 
-        !secureMessagingUsable -> ShareStatusDialog(
+        access == IncomingShareAccess.UNAVAILABLE -> ShareStatusDialog(
             title = "Secure sharing isn't available",
-            message = "Kit Pay will not send this text without reviewed end-to-end encryption. Nothing has been shared.",
+            message = "Kit Pay will not send this without reviewed end-to-end encryption. Nothing has been shared.",
             confirmLabel = "Close",
-            onConfirm = onConsumed,
-            onDismiss = onConsumed,
+            onConfirm = closePendingShare,
+            onDismiss = closePendingShare,
         )
 
         else -> SharedTextShareDialog(
             request = request,
-            text = text,
+            batch = batch,
+            groupMessagingEnabled = groupMessagingEnabled,
             onDismiss = onConsumed,
+            onDeferred = onDeferred,
             onSent = onConsumed,
             onSendingChanged = onSendingChanged,
         )
     }
+}
+
+internal enum class IncomingShareAccess {
+    CHECKING,
+    RETRY_CAPABILITIES,
+    UNAVAILABLE,
+    RECIPIENT_PICKER,
+}
+
+/**
+ * A network failure cannot close an already-open encrypted outbox: the repository can publish the
+ * selected content locally and send it after connectivity returns. A positive server response is
+ * still checked normally, and a device with no local activation cannot accept an offline share.
+ */
+internal fun incomingShareAccess(
+    capabilitiesLoaded: Boolean,
+    capabilityLoadFailed: Boolean,
+    secureMessagingServerCompatible: Boolean,
+    localOutboxAvailable: Boolean,
+): IncomingShareAccess = when {
+    capabilityLoadFailed && localOutboxAvailable -> IncomingShareAccess.RECIPIENT_PICKER
+    capabilityLoadFailed -> IncomingShareAccess.RETRY_CAPABILITIES
+    !capabilitiesLoaded -> IncomingShareAccess.CHECKING
+    !secureMessagingServerCompatible -> IncomingShareAccess.UNAVAILABLE
+    !localOutboxAvailable -> IncomingShareAccess.CHECKING
+    else -> IncomingShareAccess.RECIPIENT_PICKER
 }
 
 @Composable
@@ -185,7 +241,7 @@ private fun ShareStatusDialog(
                 Text(message)
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Shared text is held only in memory while this request is open.",
+                    "A share is held only until you send it or close this.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

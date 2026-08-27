@@ -48,9 +48,11 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -615,10 +617,12 @@ class RemoteCallRepository @Inject constructor(
     private val apiCalls: ApiCallExecutor,
     private val contacts: ContactRepository,
     private val sessions: SessionStore,
-    @ApplicationScope scope: CoroutineScope,
+    @ApplicationScope private val scope: CoroutineScope,
 ) : CallRepository {
     private val mutableCalls = MutableStateFlow<List<CallEntry>>(emptyList())
     override val calls: StateFlow<List<CallEntry>> = mutableCalls.asStateFlow()
+    private val historyRefresh = AtomicReference<Job?>(null)
+    private val historyGate = CallHistoryRefreshGate()
 
     init {
         scope.launch {
@@ -634,7 +638,29 @@ class RemoteCallRepository @Inject constructor(
         refreshCallList()
     }
 
-    private suspend fun refreshCallList() {
+    /**
+     * Brings the call log up to date without making anyone wait for it.
+     *
+     * The log is paginated to exhaustion, so on an account with real history it is several
+     * round trips. Answering and placing calls used to await that before handing back the
+     * room credentials, which put the whole history walk between the tap and the first
+     * audio packet. Nothing on the call screen reads this list, so it runs on the
+     * application scope instead, cancel-and-replace so a redial does not stack walks.
+     */
+    private fun refreshHistoryInBackground() {
+        // The generation is claimed here, on the thread that asked for the refresh, rather
+        // than inside the coroutine. Two background walks dispatched at once could otherwise
+        // begin in the opposite order to the calls that requested them, handing the older
+        // walk the newer token — the exact inversion the gate exists to prevent.
+        val token = historyGate.begin()
+        historyRefresh.getAndSet(scope.launch { runCatching { refreshCallList(token) } })?.cancel()
+    }
+
+    /**
+     * [token] defaults to a generation claimed at the call site, which is what every direct
+     * caller wants; the background walk claims its own before launching and passes it in.
+     */
+    private suspend fun refreshCallList(token: Long = historyGate.begin()) {
         val active = sessions.current() ?: return
         val fence = active.fence()
         val pages = CallHistoryPageAccumulator()
@@ -680,6 +706,7 @@ class RemoteCallRepository @Inject constructor(
                 avatarUrl = presentation.avatarUrl,
             )
         }
+        if (!historyGate.admits(token)) return
         sessions.withCurrentSession(fence) { mutableCalls.value = mapped }
     }
 
@@ -736,7 +763,7 @@ class RemoteCallRepository @Inject constructor(
         // for every redial, even though starting calls themselves is intentionally unthrottled.
         // Reuse the current presentation and leave explicit contact/history refreshes responsible
         // for discovering address-book changes.
-        runCatching { refreshCallList() }
+        refreshHistoryInBackground()
         return session.toConnection(recipientUserId)
     }
 
@@ -762,7 +789,7 @@ class RemoteCallRepository @Inject constructor(
 
     override suspend fun accept(callId: String): CallConnection {
         val session = apiCalls.execute { api.acceptCall(callId) }
-        runCatching { refreshCallList() }
+        refreshHistoryInBackground()
         return session.toConnection()
     }
 
@@ -796,6 +823,8 @@ class RemoteCallRepository @Inject constructor(
             token = rtc.token,
             room = rtc.room,
             ringExpiresAt = call.ringExpiresAt,
+            answeredAt = call.answeredAt,
+            serverTime = serverTime,
         )
     }
 

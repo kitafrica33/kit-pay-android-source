@@ -106,6 +106,7 @@ class ConversationDraftLifecycleTest {
         override suspend fun sendMessage(
             chatId: String,
             text: String,
+            replyToMessageId: String?,
             onDurablyCommitted: (clientMessageId: String) -> Unit,
         ) {
             if (failSends) throw java.io.IOException("offline before commit")

@@ -128,6 +128,8 @@ internal class ConversationRosterStore @Inject constructor(
             data.writeUTF(conversation.title.orEmpty())
             data.writeUTF(conversation.viewerUserId)
             data.writeUTF(conversation.currentUserRole)
+            data.writeUTF(conversation.description.orEmpty())
+            data.writeUTF(conversation.photoUrl.orEmpty())
             data.writeInt(conversation.members.size)
             conversation.members.forEach { member ->
                 data.writeUTF(member.userId)
@@ -143,7 +145,10 @@ internal class ConversationRosterStore @Inject constructor(
             null
         } else {
             DataInputStream(ByteArrayInputStream(bytes)).use { data ->
-                if (data.readByte() != VERSION) {
+                // A record written before group identity existed still names its chat offline;
+                // it simply has no description or photo until the next authenticated load.
+                val version = data.readByte()
+                if (version != VERSION && version != LEGACY_VERSION) {
                     null
                 } else {
                     val id = data.readUTF()
@@ -151,6 +156,16 @@ internal class ConversationRosterStore @Inject constructor(
                     val title = data.readUTF().takeIf(String::isNotEmpty)
                     val viewerUserId = data.readUTF()
                     val currentUserRole = data.readUTF()
+                    val description = if (version == VERSION) {
+                        data.readUTF().takeIf(String::isNotEmpty)
+                    } else {
+                        null
+                    }
+                    val photoUrl = if (version == VERSION) {
+                        data.readUTF().takeIf(String::isNotEmpty)
+                    } else {
+                        null
+                    }
                     val count = data.readInt()
                     if (count !in 0..MAX_MEMBERS) {
                         null
@@ -168,6 +183,8 @@ internal class ConversationRosterStore @Inject constructor(
                                     role = data.readUTF(),
                                 )
                             },
+                            description = description,
+                            photoUrl = photoUrl,
                         ).takeIf { it.members.any { member -> member.userId == viewerUserId } }
                     }
                 }
@@ -187,7 +204,8 @@ internal class ConversationRosterStore @Inject constructor(
 
     private companion object {
         const val NAMESPACE = "conversation-roster-v1"
-        const val VERSION: Byte = 0x01
+        const val VERSION: Byte = 0x02
+        const val LEGACY_VERSION: Byte = 0x01
 
         /** Matches the chat list's own display bound, so the cache can never outgrow the screen. */
         const val PAGE_SIZE = 100

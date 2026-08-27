@@ -63,6 +63,24 @@ internal sealed interface KitRealtimeFrame {
         val user: String,
         val active: Boolean,
     ) : KitRealtimeFrame
+
+    /**
+     * `kit.call.answered` — someone on a call this account is in picked up.
+     *
+     * Unlike the nudge this does carry content, because the whole point is the pair of
+     * timestamps: [answeredAt] is the instant the server recorded the answer and
+     * [serverTime] is its clock when it sent this, and the difference between them is
+     * the only drift-free way for a caller to know how long the call has been up. The
+     * server addresses this to exactly the accounts the `call.answered` push reaches,
+     * so nothing here is disclosed that the push did not already carry.
+     */
+    data class CallAnswered(
+        val channel: String,
+        val callId: String,
+        val answeredAt: String,
+        val answeredBy: String,
+        val serverTime: String,
+    ) : KitRealtimeFrame
 }
 
 /** What a `pusher:error` code obliges the connection to do next. */

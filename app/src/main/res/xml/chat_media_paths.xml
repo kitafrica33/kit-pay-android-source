@@ -3,4 +3,6 @@
     <!-- Short-lived decrypted chat media for external viewers and camera capture handoff. -->
     <cache-path name="chat-media" path="chat-media/" />
     <cache-path name="chat-capture" path="chat-capture/" />
+    <!-- User-requested, short-lived branded bank-deposit instruction PDFs. -->
+    <cache-path name="bank-deposit-documents" path="bank-deposit-documents/" />
 </paths>

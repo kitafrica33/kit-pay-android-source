@@ -1,7 +1,9 @@
 package com.kit.wallet.screenshots
 
+import android.content.Context
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.model.ChatPreview
@@ -17,6 +19,7 @@ import com.kit.wallet.ui.model.TransferClaimStatus
 import com.kit.wallet.ui.model.TxStatus
 import com.kit.wallet.ui.model.TxType
 import com.kit.wallet.ui.model.UserProfile
+import java.io.File
 
 /**
  * Fictional conversation and wallet data used only to render the Play Store listing screenshots.
@@ -309,12 +312,22 @@ internal object StoreScreenshotData {
         ),
     )
 
-    /** Decrypted payloads for [mediaConversation], keyed the way the conversation keys them. */
-    val mediaBytes: Map<String, ByteArray> by lazy {
-        mapOf(
+    /**
+     * Opened attachments for [mediaConversation], keyed the way the conversation keys them.
+     *
+     * The screen reads attachments as files, so the shot writes these into the same kind of
+     * app-private scratch the real media cache uses rather than pretending bytes will do.
+     */
+    fun mediaFiles(context: Context): Map<String, SecureMediaFile> {
+        val directory = File(context.cacheDir, "screenshot-media").apply { mkdirs() }
+        return mapOf(
             "n3" to StoreScreenshotImages.lakeSunset,
             "n4" to StoreScreenshotImages.greenHills,
             "n5" to StoreScreenshotImages.cityDusk,
-        )
+        ).mapValues { (id, bytes) ->
+            val file = File(directory, "$id.jpg")
+            file.writeBytes(bytes)
+            SecureMediaFile(file, "image/jpeg", file.length())
+        }
     }
 }

@@ -33,6 +33,7 @@ class EncryptedMessagingUnavailableRepository @Inject constructor() : ChatReposi
     override suspend fun sendMessage(
         chatId: String,
         text: String,
+        replyToMessageId: String?,
         onDurablyCommitted: (clientMessageId: String) -> Unit,
     ): Nothing =
         error("Secure messaging is unavailable until end-to-end encryption is provisioned")

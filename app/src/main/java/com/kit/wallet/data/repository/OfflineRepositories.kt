@@ -793,6 +793,16 @@ class OfflineWalletRepository @Inject constructor(
             }
         }
 
+    override suspend fun spendingSource(): WalletSpendingSource {
+        val wallet = requireSelectedWallet()
+        return WalletSpendingSource(
+            walletId = wallet.uuid,
+            currencyCode = wallet.currencyCode,
+            currencyScale = wallet.currencyScale,
+            availableBalanceMinor = wallet.availableBalanceMinor,
+        )
+    }
+
     private data class OwnedSelectedWallet(
         val ownerScopeId: String,
         val wallet: com.kit.wallet.data.local.WalletEntity,

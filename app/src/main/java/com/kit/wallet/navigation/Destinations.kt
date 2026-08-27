@@ -40,6 +40,7 @@ object Dest {
     const val NEW_GROUP = "groups/new"
     const val GROUP_PROFILE = "chat/{chatId}/group"
     const val GROUP_ADD = "chat/{chatId}/group/add"
+    const val GROUP_DESCRIPTION = "chat/{chatId}/group/description"
     const val VOICE_CALL = "call/voice/{name}"
     const val VIDEO_CALL = "call/video/{name}"
     const val INCOMING_CALL = "call/incoming/{callId}?accept={accept}"
@@ -56,6 +57,7 @@ object Dest {
     fun conversation(chatId: String) = "chat/${Uri.encode(chatId)}"
     fun groupProfile(chatId: String) = "chat/${Uri.encode(chatId)}/group"
     fun groupAdd(chatId: String) = "chat/${Uri.encode(chatId)}/group/add"
+    fun groupDescription(chatId: String) = "chat/${Uri.encode(chatId)}/group/description"
     fun voiceCall(name: String) = "call/voice/${Uri.encode(name)}"
     fun videoCall(name: String) = "call/video/${Uri.encode(name)}"
     fun incomingCall(callId: String, accept: Boolean = false) =

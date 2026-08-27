@@ -42,10 +42,14 @@ internal class ImmediateSendDispatcher @Inject constructor(
             // in this queue, so every remaining RETRY_REQUIRED item is a real head-of-line stop.
             for (original in conversation) {
                 if (original.state == ImmediateSendState.RETRY_REQUIRED) {
-                    // Older builds and non-capability failures could leave a reaction in this state.
-                    // Reactions have no standalone retry bubble, so such an item can never receive a
-                    // user retry decision and must not strand every later message in the thread.
-                    if (original.kind == ImmediateSendKind.REACTION) {
+                    // Older builds and non-capability failures could leave a reaction or an edit
+                    // in this state. Neither has a standalone retry bubble, so such an item can
+                    // never receive a user retry decision and must not strand every later message
+                    // in the thread.
+                    if (
+                        original.kind == ImmediateSendKind.REACTION ||
+                        original.kind == ImmediateSendKind.EDIT
+                    ) {
                         store.removeForOwner(owner, original.id)
                         continue
                     }
@@ -96,14 +100,14 @@ internal class ImmediateSendDispatcher @Inject constructor(
         var current = store.itemsForOwner(owner).firstOrNull { it.id == original.id }
             ?: return DispatchOneResult.GONE
         var encryptedOutboxOwnsSend = false
-        var mediaCiphertext: ByteArray? = null
         val failure = try {
             if (current.kind == ImmediateSendKind.MEDIA && current.preparedMediaDescriptor == null) {
-                mediaCiphertext = mediaSpool.readCiphertext(current)
+                // The spool verifies the blob is still the one the queue recorded and hands back
+                // the file itself, so the upload streams off disk rather than through heap.
                 val descriptor = chats.prepareImmediateMediaDescriptor(
                     owner = owner,
                     intent = current,
-                    ciphertext = checkNotNull(mediaCiphertext),
+                    ciphertext = mediaSpool.ciphertextFile(current),
                 )
                 val prepared = current.copy(preparedMediaDescriptor = descriptor)
                 if (!store.replaceForOwner(owner, current, prepared)) {
@@ -123,8 +127,6 @@ internal class ImmediateSendDispatcher @Inject constructor(
             throw cryptographic
         } catch (error: Exception) {
             error
-        } finally {
-            mediaCiphertext?.fill(0)
         }
 
         if (encryptedOutboxOwnsSend) {
@@ -153,7 +155,10 @@ internal class ImmediateSendDispatcher @Inject constructor(
         }
 
         if (
-            current.kind == ImmediateSendKind.REACTION &&
+            (
+                current.kind == ImmediateSendKind.REACTION ||
+                    current.kind == ImmediateSendKind.EDIT
+                ) &&
             failure is SecureMessagingConversationCapabilityUnavailableException
         ) {
             withContext(NonCancellable) { store.removeForOwner(owner, current.id) }

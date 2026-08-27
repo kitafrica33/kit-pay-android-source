@@ -69,28 +69,41 @@ class MessagingRichMediaCapabilityTest {
         assertEquals(10L * MB, capability.maximumSendableBytes())
     }
 
-    // A future backend may advertise 200 MB, but the compiled cap stays the binding side of
-    // min(compiled, advertised): the send/receive pipeline holds plaintext + ciphertext fully in
-    // heap, so nothing above 10 MB may pass until a streaming/file-backed pipeline exists.
+    // The send and receive paths stream through a file now, so the compiled cap matches what the
+    // service advertises and min(compiled, advertised) stops being the clamp it once was.
     @Test
-    fun `a 200 MB advertisement still clamps sends to the compiled 10 MB cap`() = runTest {
+    fun `a 200 MB advertisement is honoured in full`() = runTest {
         server.enqueue(capabilitiesResponse(richMediaJson(maximumPlaintextBytes = 200L * MB)))
 
         val rejection = assertThrows(IllegalStateException::class.java) {
-            runBlocking { capability.requireSendable("video/mp4", 15L * MB) }
+            runBlocking { capability.requireSendable("video/mp4", 200L * MB + 1L) }
         }
 
-        assertTrue(rejection.message.orEmpty().contains("10 MB"))
-        assertEquals(10L * MB, capability.maximumSendableBytes())
+        assertTrue(rejection.message.orEmpty().contains("200 MB"))
+        assertEquals(200L * MB, capability.maximumSendableBytes())
     }
 
     @Test
-    fun `a 9 MB video passes under a 200 MB advertisement`() = runTest {
+    fun `a 150 MB video passes under a 200 MB advertisement`() = runTest {
         server.enqueue(capabilitiesResponse(richMediaJson(maximumPlaintextBytes = 200L * MB)))
 
-        capability.requireSendable("video/mp4", 9L * MB)
+        capability.requireSendable("video/mp4", 150L * MB)
 
-        assertEquals(10L * MB, capability.maximumSendableBytes())
+        assertEquals(200L * MB, capability.maximumSendableBytes())
+    }
+
+    // An advertisement above what this build can actually handle is still clamped: the compiled
+    // cap remains the binding side whenever it is the smaller of the two.
+    @Test
+    fun `an advertisement above the compiled cap is clamped to it`() = runTest {
+        server.enqueue(capabilitiesResponse(richMediaJson(maximumPlaintextBytes = 512L * MB)))
+
+        val rejection = assertThrows(IllegalStateException::class.java) {
+            runBlocking { capability.requireSendable("video/mp4", 300L * MB) }
+        }
+
+        assertTrue(rejection.message.orEmpty().contains("200 MB"))
+        assertEquals(200L * MB, capability.maximumSendableBytes())
     }
 
     @Test

@@ -119,6 +119,19 @@ enum class MessageKind {
      * the conversation so money that came back says so, and says why, instead of disappearing.
      */
     PAYMENT_EVENT,
+    /**
+     * A payment shared out among a group's members, shown as one golden card. Each member claims
+     * their own share from it, and sees only their own share — never the whole pot when the sender
+     * chose the amounts individually.
+     */
+    GROUP_PAYMENT,
+
+    /**
+     * One member answering a group payment — taking their share, declining it, or the sender
+     * pulling back what nobody claimed. Centred like [PAYMENT_EVENT], and only ever about the
+     * member who wrote it.
+     */
+    GROUP_PAYMENT_EVENT,
     VOICE_NOTE,
     IMAGE,
     VIDEO,
@@ -193,6 +206,35 @@ data class MessageReaction(
     val count: Int get() = reactorNames.size
 }
 
+/**
+ * One person a message was addressed to, and how far it got with them.
+ *
+ * Zero moments mean the server has not witnessed that step, which is not the same as it having
+ * failed — the same reading [Message.editedAtEpochMillis] gets.
+ */
+data class MessageDeliveryPerson(
+    val userId: String,
+    val name: String,
+    val avatarUrl: String? = null,
+    val deliveredAtEpochMillis: Long = 0,
+    val readAtEpochMillis: Long = 0,
+)
+
+/**
+ * When a message this account sent was accepted, and when it reached each of its recipients.
+ *
+ * A group lists everyone rather than averaging them, because "delivered to 30 people" answers a
+ * question nobody asked: the question is always *who*.
+ */
+data class MessageDeliveryInfo(
+    val messageId: String,
+    val sentAtEpochMillis: Long,
+    val recipients: List<MessageDeliveryPerson>,
+) {
+    val readCount: Int get() = recipients.count { it.readAtEpochMillis > 0 }
+    val deliveredCount: Int get() = recipients.count { it.deliveredAtEpochMillis > 0 }
+}
+
 data class Message(
     val id: String,
     val text: String,
@@ -223,6 +265,10 @@ data class Message(
     /** For payment messages: the descriptor's authoritative currency and minor-unit scale. */
     val paymentCurrencyCode: String = "UGX",
     val paymentCurrencyScale: Int = Money.SCALE,
+    /** For group-payment entries: the backend payment every member's share hangs off. */
+    val groupPaymentId: String? = null,
+    /** For group-payment entries: what the descriptor records happening. */
+    val groupPaymentEvent: GroupPaymentEventKind? = null,
     /** Epoch millis used to interleave messages with call-log entries in a conversation. */
     val sortEpochMillis: Long = 0,
     /**
@@ -238,10 +284,30 @@ data class Message(
     val callDurationSeconds: Long = 0,
     /** Emoji reactions on this message, most-reacted first, then by first appearance. */
     val reactions: List<MessageReaction> = emptyList(),
+    /** The message this one answers, when it answers one. */
+    val replyToMessageId: String? = null,
+    /**
+     * The quoted line, resolved from the thread this device has already decrypted.
+     *
+     * Null while [replyToMessageId] names something not held locally — an answer to a message
+     * from before this installation, say. The quote is then simply not drawn: inventing a
+     * placeholder for words nobody here can read would put text in someone else's mouth.
+     */
     val replyToText: String? = null,
+    /** Who wrote the quoted message, for the heading above it. */
+    val replyToSenderName: String? = null,
+    /** Whether the quoted message is this account's own, which the heading says as "You". */
+    val replyToFromMe: Boolean = false,
     val durationSec: Int = 0,
     /** Authenticated public sender ID; required to bind group-message safety actions. */
     val senderUserId: String? = null,
+    /**
+     * When this message's author last replaced its wording; zero when it still reads as sent.
+     *
+     * The bubble says so rather than showing both versions: a reader is owed the knowledge that
+     * the words changed, but the withdrawn wording is precisely what the sender took back.
+     */
+    val editedAtEpochMillis: Long = 0,
 )
 
 /**
@@ -250,12 +316,15 @@ data class Message(
  * A reaction pins its target's message ID, and a send that has not been acknowledged is still
  * identified by its local client ID — the server ID replaces it once the send lands, which would
  * strand a reaction authored in between. Calls, settled payment outcomes and membership lines are
- * centred timeline records rather than bubbles, so they have nothing to attach a chip to.
+ * centred timeline records rather than bubbles, so they have nothing to attach a chip to — and so
+ * is a group payment, whose card belongs to the whole group and spans the thread.
  */
 val Message.acceptsReactions: Boolean
     get() = when {
         kind == MessageKind.CALL ||
             kind == MessageKind.PAYMENT_EVENT ||
+            kind == MessageKind.GROUP_PAYMENT ||
+            kind == MessageKind.GROUP_PAYMENT_EVENT ||
             kind == MessageKind.SYSTEM -> false
         else -> when (state) {
             DeliveryState.SENDING,
@@ -269,6 +338,79 @@ val Message.acceptsReactions: Boolean
             DeliveryState.SENT, DeliveryState.DELIVERED, DeliveryState.READ -> true
         }
     }
+
+/**
+ * Whether this entry can be quoted in an answer.
+ *
+ * The rule is [acceptsReactions]' rule, for [acceptsReactions]' reason: a reply pins its target's
+ * message ID, and an entry that has no server-minted one yet — or is a centred timeline record
+ * rather than anybody's words — has nothing an answer could point at on the other end.
+ */
+val Message.acceptsReplies: Boolean get() = acceptsReactions
+
+/**
+ * Whether this account may still replace this message's wording.
+ *
+ * Only your own words, only the kinds that have wording of their own, and only for fifteen
+ * minutes — the same window the server enforces, so the menu never offers something the send
+ * would refuse. Past it the message stands, and saying otherwise takes a new one.
+ *
+ * Payment and membership entries are records of something that happened rather than anybody's
+ * phrasing, so there is nothing in them an author could honestly correct. Neither is a photo, a
+ * voice note or a document: replacing a media descriptor with a sentence would strand the media
+ * its recipients have already downloaded, so those are excluded here and on iOS alike.
+ */
+fun Message.acceptsEdits(nowEpochMillis: Long): Boolean = fromMe &&
+    acceptsReactions &&
+    kind != MessageKind.CALL &&
+    mediaDescriptor == null &&
+    editWindowRemainingMillis(nowEpochMillis) > 0
+
+/**
+ * Whether this account can ask what became of this message.
+ *
+ * Only your own, and only once the server has minted an ID for it: the record is answered to the
+ * sender alone, so offering it anywhere else would promise an answer that is always a refusal.
+ */
+val Message.acceptsDeliveryInfo: Boolean get() = fromMe && acceptsReactions
+
+/** How much of the edit window is left, in millis; zero once it has closed. */
+fun Message.editWindowRemainingMillis(nowEpochMillis: Long): Long {
+    if (sortEpochMillis <= 0) return 0
+    return (sortEpochMillis + MESSAGE_EDIT_WINDOW_MILLIS - nowEpochMillis).coerceAtLeast(0)
+}
+
+/**
+ * How long after sending an author may still replace the wording.
+ *
+ * The same figure the server enforces and the same one the other platform shows, so "fifteen
+ * minutes to edit" means one thing on the screen and another nowhere.
+ */
+const val MESSAGE_EDIT_WINDOW_MILLIS = 15L * 60L * 1_000L
+
+/**
+ * The one line a quoted message shows above the answer.
+ *
+ * Media says what it is rather than nothing, because a bare "Photo" placed above a reply is
+ * exactly what the person swiped at, while an empty strip would read as a broken quote.
+ */
+fun Message.replyPreviewLabel(): String = when (kind) {
+    MessageKind.VOICE_NOTE -> text.takeIf(String::isNotBlank) ?: "Voice note"
+    MessageKind.IMAGE -> text.takeIf(String::isNotBlank) ?: "Photo"
+    MessageKind.VIDEO -> text.takeIf(String::isNotBlank) ?: "Video"
+    MessageKind.DOCUMENT -> text.takeIf(String::isNotBlank) ?: "Document"
+    MessageKind.PAYMENT,
+    MessageKind.PAYMENT_REQUEST,
+    MessageKind.PAYMENT_TRANSFER,
+    -> paymentNote?.takeIf(String::isNotBlank) ?: "Payment"
+    MessageKind.TEXT,
+    MessageKind.PAYMENT_EVENT,
+    MessageKind.GROUP_PAYMENT,
+    MessageKind.GROUP_PAYMENT_EVENT,
+    MessageKind.CALL,
+    MessageKind.SYSTEM,
+    -> text
+}
 
 data class ChatPreview(
     val id: String,
@@ -292,8 +434,13 @@ data class ChatPreview(
     val muted: Boolean = false,
     val lastFromMe: Boolean = false,
     val lastState: DeliveryState = DeliveryState.READ,
-    /** The peer's profile photo URL, resolved from the local address book. */
+    /**
+     * The photo drawn on this row: the peer's profile photo for a direct chat, resolved from
+     * the local address book, or the group's own photo for a group.
+     */
     val avatarUrl: String? = null,
+    /** The group's server-visible description; null for direct chats and undescribed groups. */
+    val description: String? = null,
 )
 
 /** What a group grants a member. Anything the server sends that is not one of these reads as a

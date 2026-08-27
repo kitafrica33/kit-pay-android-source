@@ -46,6 +46,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.data.demo.DemoData
+import com.kit.wallet.data.repository.BankDeposit
+import com.kit.wallet.data.repository.BankFundingAccount
 import com.kit.wallet.feature.auth.PaymentApproval
 import com.kit.wallet.feature.auth.rememberBiometricApprovalAvailable
 import com.kit.wallet.feature.funding.TopUpSheetContent
@@ -71,12 +73,17 @@ import com.kit.wallet.ui.theme.KitWalletTheme
 @Composable
 fun BankScreen(
     onBack: () -> Unit,
+    depositsEnabled: Boolean = true,
+    outboundEnabled: Boolean = true,
     viewModel: BankViewModel = hiltViewModel(),
     topUp: TopUpViewModel = hiltViewModel(),
 ) {
     val beneficiaries by viewModel.beneficiaries.collectAsStateWithLifecycle()
     val transfers by viewModel.bankTransfers.collectAsStateWithLifecycle()
     val banks by viewModel.banks.collectAsStateWithLifecycle()
+    val fundingAccounts by viewModel.fundingAccounts.collectAsStateWithLifecycle()
+    val deposits by viewModel.deposits.collectAsStateWithLifecycle()
+    val walletCurrency by viewModel.walletCurrency.collectAsStateWithLifecycle()
     val busy by viewModel.busy.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
     val quote by viewModel.quote.collectAsStateWithLifecycle()
@@ -87,12 +94,13 @@ fun BankScreen(
     val biometricsAvailable = rememberBiometricApprovalAvailable()
     var operation by remember { mutableStateOf<BankOperationKind?>(null) }
     var addingAccount by remember { mutableStateOf(false) }
-    val linkableBanks = banks.filter { it.supports(BankCapability.ACCOUNT_VERIFICATION) }
-    val depositBeneficiaries = eligibleBankBeneficiaries(
-        BankOperationKind.DEPOSIT,
-        banks,
-        beneficiaries,
-    )
+    var depositScreenOpen by remember { mutableStateOf(false) }
+    var selectedDepositId by remember { mutableStateOf<String?>(null) }
+    val linkableBanks = if (outboundEnabled) {
+        banks.filter { it.supports(BankCapability.ACCOUNT_VERIFICATION) }
+    } else {
+        emptyList()
+    }
     val withdrawalBeneficiaries = eligibleBankBeneficiaries(
         BankOperationKind.WITHDRAWAL,
         banks,
@@ -107,6 +115,8 @@ fun BankScreen(
         eligibleBankBeneficiaries(selected, banks, beneficiaries)
     }.orEmpty()
 
+    LaunchedEffect(depositsEnabled) { viewModel.refreshDeposits(depositsEnabled) }
+
     LaunchedEffect(addingAccount, linkableBanks) {
         if (addingAccount && linkableBanks.isEmpty()) addingAccount = false
     }
@@ -119,15 +129,49 @@ fun BankScreen(
     LaunchedEffect(operation, selectedBeneficiaries) {
         if (operation != null && selectedBeneficiaries.isEmpty()) operation = null
     }
+    if (depositScreenOpen) {
+        BankDepositScreen(
+            fundingAccounts = fundingAccounts,
+            deposits = deposits,
+            initialDepositId = selectedDepositId,
+            currency = walletCurrency,
+            busy = busy,
+            error = error,
+            onDismiss = {
+                if (!busy) {
+                    viewModel.observeDeposit(null)
+                    depositScreenOpen = false
+                    selectedDepositId = null
+                }
+            },
+            onCreate = viewModel::createDeposit,
+            onUpload = viewModel::uploadDepositProof,
+            onRefresh = viewModel::refreshDeposit,
+            onObserve = viewModel::observeDeposit,
+        )
+        return
+    }
+
     BankContent(
         beneficiaries,
         transfers,
+        fundingAccounts,
+        deposits,
         onBack,
-        depositAvailable = depositBeneficiaries.isNotEmpty(),
-        withdrawalAvailable = withdrawalBeneficiaries.isNotEmpty(),
-        transferAvailable = transferBeneficiaries.isNotEmpty(),
+        depositAvailable = depositsEnabled,
+        withdrawalAvailable = outboundEnabled && withdrawalBeneficiaries.isNotEmpty(),
+        transferAvailable = outboundEnabled && transferBeneficiaries.isNotEmpty(),
         accountLinkingAvailable = linkableBanks.isNotEmpty(),
-        onDeposit = { viewModel.clearError(); viewModel.clearQuote(); operation = BankOperationKind.DEPOSIT },
+        onDeposit = {
+            viewModel.clearError()
+            selectedDepositId = null
+            depositScreenOpen = true
+        },
+        onDepositDetails = {
+            viewModel.clearError()
+            selectedDepositId = it
+            depositScreenOpen = true
+        },
         onWithdraw = { viewModel.clearError(); viewModel.clearQuote(); operation = BankOperationKind.WITHDRAWAL },
         onTransfer = { viewModel.clearError(); viewModel.clearQuote(); operation = BankOperationKind.TRANSFER },
         onAdd = { viewModel.clearError(); addingAccount = true },
@@ -190,12 +234,15 @@ fun BankScreen(
 private fun BankContent(
     beneficiaries: List<Beneficiary>,
     transfers: List<Transaction>,
+    fundingAccounts: List<BankFundingAccount>,
+    deposits: List<BankDeposit>,
     onBack: () -> Unit,
     depositAvailable: Boolean,
     withdrawalAvailable: Boolean,
     transferAvailable: Boolean,
     accountLinkingAvailable: Boolean,
     onDeposit: () -> Unit,
+    onDepositDetails: (String) -> Unit,
     onWithdraw: () -> Unit,
     onTransfer: () -> Unit,
     onAdd: () -> Unit,
@@ -224,7 +271,11 @@ private fun BankContent(
                             BankAction(
                                 Icons.Rounded.SouthWest,
                                 "Deposit",
-                                "From bank to Kit Pay",
+                                if (fundingAccounts.isEmpty()) {
+                                    "Receiving account loading"
+                                } else {
+                                    "From bank to Kit Pay"
+                                },
                                 Modifier.weight(1f),
                                 onDeposit,
                             )
@@ -265,9 +316,28 @@ private fun BankContent(
                     )
                 }
             }
+            if (depositAvailable) {
+                item { SectionHeader("Recent deposits", Modifier.padding(top = 8.dp)) }
+                if (deposits.isEmpty()) {
+                    item {
+                        Text(
+                            "Deposits will appear here from reference generation through wallet credit.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                        )
+                    }
+                } else {
+                    items(deposits.size) { index ->
+                        BankDepositRow(deposits[index]) {
+                            onDepositDetails(deposits[index].id)
+                        }
+                    }
+                }
+            }
             item {
                 SectionHeader(
-                    "Linked accounts",
+                    "Bank beneficiaries",
                     actionLabel = if (accountLinkingAvailable) "+ Add" else null,
                     onAction = if (accountLinkingAvailable) onAdd else null,
                     modifier = Modifier.padding(top = 8.dp),
@@ -366,6 +436,53 @@ private fun BankAction(
                 subtitle,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BankDepositRow(deposit: BankDeposit, onClick: () -> Unit) {
+    val status = depositStatus(deposit.status)
+    Surface(
+        onClick = onClick,
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surface,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 6.dp),
+    ) {
+        Row(
+            Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier
+                    .size(44.dp)
+                    .background(status.container, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(status.icon, contentDescription = null, tint = status.content)
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(deposit.fundingAccount.bankName, style = MaterialTheme.typography.titleSmall)
+                Text(
+                    deposit.reference,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(status.title, style = MaterialTheme.typography.labelSmall, color = status.content)
+            }
+            Text(
+                Money.format(
+                    deposit.amountMinor,
+                    deposit.currencyCode,
+                    deposit.currencyScale,
+                ),
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
             )
         }
     }
@@ -592,12 +709,15 @@ private fun BankPreview() {
             transfers = DemoData.transactions.filter {
                 it.type == TxType.BANK_IN || it.type == TxType.BANK_OUT
             },
+            fundingAccounts = emptyList(),
+            deposits = emptyList(),
             onBack = {},
             depositAvailable = true,
             withdrawalAvailable = true,
             transferAvailable = true,
             accountLinkingAvailable = true,
             onDeposit = {},
+            onDepositDetails = {},
             onWithdraw = {},
             onTransfer = {},
             onAdd = {},

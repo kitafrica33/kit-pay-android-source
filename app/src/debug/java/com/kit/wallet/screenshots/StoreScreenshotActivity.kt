@@ -6,6 +6,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
 import com.kit.wallet.data.remote.KitFeature
 import com.kit.wallet.feature.calls.CallsContent
 import com.kit.wallet.feature.chat.ChatsContent
@@ -171,7 +172,7 @@ class StoreScreenshotActivity : ComponentActivity() {
             onSend = { _, onSent -> onSent() },
             onRetry = { _, onRetried -> onRetried() },
             mediaEnabled = true,
-            mediaBytes = StoreScreenshotData.mediaBytes,
+            mediaFiles = StoreScreenshotData.mediaFiles(LocalContext.current),
         )
     }
 

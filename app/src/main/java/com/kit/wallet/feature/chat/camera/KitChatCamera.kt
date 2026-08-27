@@ -77,8 +77,10 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.kit.wallet.data.media.compressUploadJpeg
 import com.kit.wallet.data.media.uploadSampleSize
+import android.net.Uri
 import com.kit.wallet.data.messaging.KitChatMediaLimits
-import com.kit.wallet.data.messaging.readBoundedMedia
+import com.kit.wallet.data.messaging.SecureMediaSource
+import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.feature.chat.CHAT_IMAGE_MAX_DIMENSION
 import java.io.File
 import java.util.UUID
@@ -114,14 +116,15 @@ internal sealed interface CameraCaptureDraft {
 /**
  * The full in-app capture journey: full-screen camera (tap for a photo, hold for a video),
  * then the draft editor (filters, drawing, text, stickers, crop for photos; trim, mute and
- * caption for videos), then encoding on a worker dispatcher. The caller receives finished
- * plaintext bytes exactly like the platform picker paths and owns nothing else.
+ * caption for videos), then encoding on a worker dispatcher. The caller receives a way to open
+ * the finished capture, exactly like the platform picker paths, and releases it when the send
+ * path is done with it.
  */
 @Composable
 internal fun KitChatCameraFlow(
     maxTransferBytes: Long,
     onDismiss: () -> Unit,
-    onSendMedia: (ByteArray, String, String?) -> Unit,
+    onSendMedia: (EncodedCaptureMedia) -> Unit,
     onError: (String) -> Unit,
 ) {
     val context = LocalContext.current
@@ -188,7 +191,7 @@ internal fun KitChatCameraFlow(
                             if (encoded == null) {
                                 onError("That capture could not be prepared")
                             } else {
-                                onSendMedia(encoded.bytes, encoded.mediaType, encoded.caption)
+                                onSendMedia(encoded)
                                 current.release()
                                 draft = null
                                 onDismiss()
@@ -214,10 +217,147 @@ internal fun KitChatCameraFlow(
     }
 }
 
+/** A library video staged into the capture cache so the trim editor can seek and cut it. */
+internal class LibraryVideoDraft(val file: File, val mediaType: String)
+
+/**
+ * Copies a picked library video into the capture cache. The copy is what makes trimming
+ * possible at all — MediaExtractor needs a seekable file, not a one-shot content stream —
+ * and it is bounded by [MAX_LIBRARY_VIDEO_SOURCE_BYTES] so a pathological pick cannot fill
+ * the disk. Runs on a worker dispatcher; throws with a customer-readable message.
+ */
+internal fun stageLibraryVideoForEditing(
+    context: Context,
+    uri: Uri,
+    resolvedMediaType: String,
+): LibraryVideoDraft {
+    val directory = File(context.cacheDir, "chat-capture").apply { mkdirs() }
+    val staged = File(directory, "library-${UUID.randomUUID()}.video")
+    try {
+        val input = context.contentResolver.openInputStream(uri)
+            ?: error("The selected video could not be opened")
+        input.use { source ->
+            staged.outputStream().use { sink ->
+                val buffer = ByteArray(1 shl 16)
+                var total = 0L
+                while (true) {
+                    val read = source.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    check(total <= MAX_LIBRARY_VIDEO_SOURCE_BYTES) {
+                        "That video is too large to edit here. Choose a shorter video."
+                    }
+                    sink.write(buffer, 0, read)
+                }
+                check(total > 0L) { "The selected video could not be opened" }
+            }
+        }
+        check(ChatVideoTranscoder.durationMillis(staged) >= MIN_CLIP_MILLIS) {
+            "That video is too short to send"
+        }
+        return LibraryVideoDraft(
+            file = staged,
+            mediaType = KitMediaMessage.normalizeMediaType(resolvedMediaType) ?: "video/mp4",
+        )
+    } catch (error: Exception) {
+        staged.delete()
+        throw error
+    }
+}
+
+/**
+ * The capture editor alone, for a video that arrived from the photo library rather than the
+ * lens. Same trim, mute, and caption; same encoder; the only difference is that there is no
+ * camera to fall back to, so discarding the draft closes the flow.
+ */
+@Composable
+internal fun KitChatVideoEditorFlow(
+    draft: LibraryVideoDraft,
+    maxTransferBytes: Long,
+    onDismiss: () -> Unit,
+    onSendMedia: (EncodedCaptureMedia) -> Unit,
+    onError: (String) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var preparing by remember { mutableStateOf(false) }
+    val captureDraft = remember(draft) { CameraCaptureDraft.Video(draft.file) }
+    fun closeFlow() {
+        if (preparing) return
+        captureDraft.release()
+        onDismiss()
+    }
+    DisposableEffect(Unit) {
+        onDispose { captureDraft.release() }
+    }
+    Dialog(
+        onDismissRequest = ::closeFlow,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black),
+        ) {
+            CaptureDraftEditor(
+                draft = captureDraft,
+                busy = preparing,
+                onDiscard = ::closeFlow,
+                onSend = { spec ->
+                    scope.launch {
+                        preparing = true
+                        val encoded = withContext(Dispatchers.Default) {
+                            runCatching {
+                                encodeCaptureDraft(
+                                    context,
+                                    captureDraft,
+                                    spec,
+                                    maxTransferBytes,
+                                    sourceMediaType = draft.mediaType,
+                                )
+                            }.getOrNull()
+                        }
+                        preparing = false
+                        if (encoded == null) {
+                            onError(
+                                "That video could not be prepared. Trim it to a shorter clip " +
+                                    "and try again.",
+                            )
+                        } else {
+                            onSendMedia(encoded)
+                            captureDraft.release()
+                            onDismiss()
+                        }
+                    }
+                },
+            )
+            if (preparing) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.55f))
+                        // The scrim must own hit-testing while encoding runs, exactly as in
+                        // the camera flow: a tap underneath could release the file mid-read.
+                        .pointerInput(Unit) { detectTapGestures { } },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(color = Color.White)
+                }
+            }
+        }
+    }
+}
+
 internal class EncodedCaptureMedia(
-    val bytes: ByteArray,
+    val source: SecureMediaSource,
     val mediaType: String,
     val caption: String?,
+    /**
+     * Drops whatever the encoder wrote for this capture. Called once the send path has finished
+     * reading the source — a recorded video is handed over as a file rather than copied into
+     * heap, so somebody has to own the moment it stops being needed.
+     */
+    val release: () -> Unit = {},
 )
 
 /** Bakes the edited draft into wire-ready plaintext. Runs on a worker dispatcher. */
@@ -226,6 +366,7 @@ internal fun encodeCaptureDraft(
     draft: CameraCaptureDraft,
     spec: CaptureSendSpec,
     maxTransferBytes: Long,
+    sourceMediaType: String = "video/mp4",
 ): EncodedCaptureMedia? = when {
     draft is CameraCaptureDraft.Photo && spec is CaptureSendSpec.Photo -> {
         val baked = bakePhotoDraft(spec)
@@ -234,13 +375,13 @@ internal fun encodeCaptureDraft(
                 baked,
                 maxTransferBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                 CAPTURE_JPEG_QUALITIES,
-            )?.let { EncodedCaptureMedia(it, "image/jpeg", spec.caption) }
+            )?.let { EncodedCaptureMedia(SecureMediaSource.ofBytes(it), "image/jpeg", spec.caption) }
         } finally {
             if (baked !== spec.bitmap) baked.recycle()
         }
     }
     draft is CameraCaptureDraft.Video && spec is CaptureSendSpec.Video -> {
-        encodeVideoDraft(context, draft.file, spec, maxTransferBytes)
+        encodeVideoDraft(context, draft.file, spec, maxTransferBytes, sourceMediaType)
     }
     else -> null
 }
@@ -250,16 +391,22 @@ private fun encodeVideoDraft(
     source: File,
     spec: CaptureSendSpec.Video,
     maxTransferBytes: Long,
+    sourceMediaType: String,
 ): EncodedCaptureMedia? {
     val durationMillis = ChatVideoTranscoder.durationMillis(source)
     if (durationMillis <= 0L) return null
     val untouched = spec.startMillis <= 0L && spec.endMillis >= durationMillis && !spec.muted
+    val directory = File(context.cacheDir, "chat-capture").apply { mkdirs() }
+    // Whether it was trimmed or not, the clip that goes to the wire becomes this encoder's own
+    // file. An untouched recording is *moved* rather than copied, which costs nothing and takes it
+    // out of the draft's hands: the draft is released the moment the editor closes, while the send
+    // is still streaming the file through the cipher.
     val payload = if (untouched) {
-        source
+        File(directory, "send-${UUID.randomUUID()}.mp4").takeIf { source.renameTo(it) }
+            ?: return null
     } else {
         val plan = planVideoTrim(spec.startMillis, spec.endMillis, durationMillis, keepAudio = !spec.muted)
             ?: return null
-        val directory = File(context.cacheDir, "chat-capture").apply { mkdirs() }
         val trimmed = File(directory, "trim-${UUID.randomUUID()}.mp4")
         if (!ChatVideoTranscoder.trim(source, trimmed, plan)) {
             trimmed.delete()
@@ -267,16 +414,18 @@ private fun encodeVideoDraft(
         }
         trimmed
     }
-    return try {
-        val bytes = payload.inputStream().use {
-            it.readBoundedMedia(maxTransferBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
-        }
-        EncodedCaptureMedia(bytes, "video/mp4", spec.caption)
-    } catch (_: Exception) {
-        null
-    } finally {
-        if (payload !== source) payload.delete()
+    // The recording is sent as the file it already is. Reading it into heap first would put a
+    // whole 200 MB clip on the heap for no reason, and the cipher streams anyway.
+    if (!payload.isFile || payload.length() <= 0 || payload.length() > maxTransferBytes) {
+        payload.delete()
+        return null
     }
+    return EncodedCaptureMedia(
+        source = SecureMediaSource.ofFile(payload),
+        mediaType = videoSendMediaType(edited = !untouched, sourceMediaType = sourceMediaType),
+        caption = spec.caption,
+        release = { payload.delete() },
+    )
 }
 
 private val CAPTURE_JPEG_QUALITIES = intArrayOf(90, 80, 70, 60, 50)

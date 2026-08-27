@@ -298,6 +298,46 @@ interface KitWalletApi {
         @Body request: TransferClaimResolutionRequest,
     ): ApiEnvelope<TransferClaimDto>
 
+    /**
+     * Sends into a conversation. The step-up proof covers the whole intent — recipients and their
+     * amounts included — so an approval cannot be replayed against a different split.
+     */
+    @POST("api/kit-wallet/v1/conversations/{conversationId}/group-payments")
+    suspend fun createGroupPayment(
+        @Path("conversationId") conversationId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: CreateGroupPaymentRequest,
+    ): ApiEnvelope<GroupPaymentDto>
+
+    @GET("api/kit-wallet/v1/group-payments/{groupPaymentId}")
+    suspend fun groupPayment(
+        @Path("groupPaymentId") groupPaymentId: String,
+    ): ApiEnvelope<GroupPaymentDto>
+
+    /**
+     * Takes your own share. No step-up: this releases money that is already held for you. There is
+     * deliberately no accept-by-claim-id here — money sent into a group is answered in the group.
+     */
+    @POST("api/kit-wallet/v1/group-payments/{groupPaymentId}/accept")
+    suspend fun acceptGroupPaymentShare(
+        @Path("groupPaymentId") groupPaymentId: String,
+    ): ApiEnvelope<GroupPaymentDto>
+
+    @POST("api/kit-wallet/v1/group-payments/{groupPaymentId}/reject")
+    suspend fun rejectGroupPaymentShare(
+        @Path("groupPaymentId") groupPaymentId: String,
+        @Body request: GroupPaymentResolutionRequest,
+    ): ApiEnvelope<GroupPaymentDto>
+
+    /** The sender pulls back every share nobody has taken yet. Accepted shares are untouched. */
+    @POST("api/kit-wallet/v1/group-payments/{groupPaymentId}/reverse-unclaimed")
+    suspend fun reverseUnclaimedGroupPayment(
+        @Path("groupPaymentId") groupPaymentId: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: GroupPaymentResolutionRequest,
+    ): ApiEnvelope<GroupPaymentDto>
+
     @POST("api/kit-wallet/v1/payments/requests")
     suspend fun createPaymentRequest(
         @Header("Idempotency-Key") idempotencyKey: String,
@@ -376,6 +416,29 @@ interface KitWalletApi {
 
     @GET("api/kit-wallet/v1/banking/operations")
     suspend fun bankingOperations(): ApiEnvelope<BankingOperationListDto>
+
+    @GET("api/kit-wallet/v1/banking/funding-accounts")
+    suspend fun bankFundingAccounts(): ApiEnvelope<BankFundingAccountListDto>
+
+    @GET("api/kit-wallet/v1/banking/deposit-requests")
+    suspend fun bankDepositRequests(): ApiEnvelope<BankDepositRequestListDto>
+
+    @GET("api/kit-wallet/v1/banking/deposit-requests/{depositId}")
+    suspend fun bankDepositRequest(
+        @Path("depositId") depositId: String,
+    ): ApiEnvelope<BankDepositRequestDto>
+
+    @POST("api/kit-wallet/v1/banking/deposit-requests")
+    suspend fun createBankDepositRequest(
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Body request: CreateBankDepositRequest,
+    ): ApiEnvelope<BankDepositRequestDto>
+
+    @POST("api/kit-wallet/v1/banking/deposit-requests/{depositId}/proof")
+    suspend fun attachBankDepositProof(
+        @Path("depositId") depositId: String,
+        @Body request: AttachBankDepositProofRequest,
+    ): ApiEnvelope<BankDepositRequestDto>
 
     @GET("api/kit-wallet/v1/banking/banks")
     suspend fun banks(): ApiEnvelope<BankListDto>

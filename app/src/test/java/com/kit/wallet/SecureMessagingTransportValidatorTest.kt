@@ -11,6 +11,8 @@ import com.kit.wallet.data.remote.MessageDeliveryReceiptDto
 import com.kit.wallet.data.remote.MessagingConversationDto
 import com.kit.wallet.data.remote.MessagingConversationListDto
 import com.kit.wallet.data.remote.MessagingConversationMemberDto
+import com.kit.wallet.data.remote.MessagingMessageInfoDto
+import com.kit.wallet.data.remote.MessagingMessageInfoRecipientDto
 import com.kit.wallet.data.remote.MessagingReadReceiptDto
 import com.kit.wallet.data.remote.MessagingSyncDto
 import com.kit.wallet.data.remote.MessagingSyncEventDataDto
@@ -123,6 +125,96 @@ class SecureMessagingTransportValidatorTest {
         ).single()
 
         assertEquals("Weekend savings", validated.title)
+    }
+
+    @Test
+    fun `group identity fields are canonicalized and absent ones stay absent`() {
+        val bare = SecureMessagingTransportValidator.validateConversations(
+            MessagingConversationListDto(listOf(groupConversation())),
+            CURRENT_USER_ID,
+        ).single()
+        assertNull(bare.description)
+        assertNull(bare.photoUrl)
+
+        val photoUrl = "https://pay.kit.africa/conversations/$GROUP_ID/photo/$THIRD_USER_ID"
+        val validated = SecureMessagingTransportValidator.validateConversations(
+            MessagingConversationListDto(
+                listOf(
+                    groupConversation().copy(
+                        description = "\u3000What we ship\nand when\u00a0",
+                        photoUrl = " $photoUrl ",
+                    ),
+                ),
+            ),
+            CURRENT_USER_ID,
+        ).single()
+        // Edge padding canonicalizes exactly as the server stores it; the interior newline is
+        // the one control character a description keeps.
+        assertEquals("What we ship\nand when", validated.description)
+        assertEquals(photoUrl, validated.photoUrl)
+
+        val overridden = SecureMessagingTransportValidator.validateConversations(
+            MessagingConversationListDto(
+                listOf(groupConversation().copy(description = "safe\u202etxt.exe")),
+            ),
+            CURRENT_USER_ID,
+        ).single()
+        assertEquals("safetxt.exe", overridden.description)
+    }
+
+    @Test
+    fun `malformed group identity fields fail closed`() {
+        val valid = groupConversation()
+        val invalidResponses = listOf(
+            // Scalar cap, then the tighter UTF-8 byte cap.
+            MessagingConversationListDto(listOf(valid.copy(description = "d".repeat(513)))),
+            MessagingConversationListDto(
+                listOf(valid.copy(description = "\u20ac".repeat(400))),
+            ),
+            MessagingConversationListDto(
+                listOf(valid.copy(description = "Bad\uD800description")),
+            ),
+            // A photo address must be HTTPS with a host and free of whitespace and controls.
+            MessagingConversationListDto(
+                listOf(valid.copy(photoUrl = "http://pay.kit.africa/conversations/photo")),
+            ),
+            MessagingConversationListDto(listOf(valid.copy(photoUrl = "https://"))),
+            MessagingConversationListDto(
+                listOf(valid.copy(photoUrl = "https://pay.kit.africa/a photo")),
+            ),
+            MessagingConversationListDto(
+                listOf(valid.copy(photoUrl = "https://pay.kit.africa/${"a".repeat(2_048)}")),
+            ),
+            MessagingConversationListDto(
+                listOf(valid.copy(photoUrl = "javascript:alert(1)")),
+            ),
+        )
+
+        invalidResponses.forEach { response ->
+            assertRejected {
+                SecureMessagingTransportValidator.validateConversations(
+                    response,
+                    CURRENT_USER_ID,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `direct conversations may carry no identity fields`() {
+        listOf(
+            directConversation().copy(description = "a purpose"),
+            directConversation().copy(
+                photoUrl = "https://pay.kit.africa/conversations/photo",
+            ),
+        ).forEach { conversation ->
+            assertRejected {
+                SecureMessagingTransportValidator.validateConversations(
+                    MessagingConversationListDto(listOf(conversation)),
+                    CURRENT_USER_ID,
+                )
+            }
+        }
     }
 
     @Test
@@ -724,6 +816,178 @@ class SecureMessagingTransportValidatorTest {
         }
     }
 
+    @Test
+    fun `a message info record reports every moment the server witnessed`() {
+        val validated = SecureMessagingTransportValidator.validateMessageInfo(
+            response = messageInfo(
+                recipients = listOf(
+                    infoRecipient(OTHER_USER_ID, deliveredAt = DELIVERED_AT, readAt = READ_AT),
+                    infoRecipient(THIRD_USER_ID, deliveredAt = DELIVERED_AT, readAt = null),
+                ),
+            ),
+            expectedConversationId = CONVERSATION_ID,
+            expectedMessageId = MESSAGE_ID,
+        )
+
+        assertEquals(Instant.parse(SENT_AT), validated.sentAt)
+        assertEquals(listOf(OTHER_USER_ID, THIRD_USER_ID), validated.recipients.map { it.userId })
+        // A moment nobody witnessed arrives absent, which is an answer rather than a gap.
+        assertNull(validated.recipients[1].readAt)
+        assertEquals(Instant.parse(READ_AT), validated.recipients[0].readAt)
+    }
+
+    @Test
+    fun `a message info record nobody was addressed by is refused`() {
+        // "Read by 0 of 0" states an absence as though it were a finding. A message this account
+        // sent went to somebody, so an empty list is the server declining to say.
+        assertRejected {
+            SecureMessagingTransportValidator.validateMessageInfo(
+                response = messageInfo(recipients = emptyList()),
+                expectedConversationId = CONVERSATION_ID,
+                expectedMessageId = MESSAGE_ID,
+            )
+        }
+    }
+
+    @Test
+    fun `a message info record that cannot have happened is refused whole`() {
+        listOf(
+            messageInfo(recipients = listOf(infoRecipient(OTHER_USER_ID))).copy(
+                conversationId = GROUP_ID,
+            ),
+            messageInfo(recipients = listOf(infoRecipient(OTHER_USER_ID))).copy(
+                messageId = OTHER_MESSAGE_ID,
+            ),
+            messageInfo(recipients = listOf(infoRecipient(OTHER_USER_ID))).copy(sentAt = null),
+            messageInfo(recipients = null),
+            // The same person twice: whichever row is believed, the other is a lie.
+            messageInfo(
+                recipients = listOf(infoRecipient(OTHER_USER_ID), infoRecipient(OTHER_USER_ID)),
+            ),
+            messageInfo(recipients = listOf(infoRecipient("not-a-user-id"))),
+            messageInfo(recipients = listOf(infoRecipient(OTHER_USER_ID, name = "   "))),
+            messageInfo(
+                recipients = listOf(infoRecipient(OTHER_USER_ID, name = "n".repeat(257))),
+            ),
+            // Delivered, or read, before the message itself was accepted.
+            messageInfo(
+                recipients = listOf(infoRecipient(OTHER_USER_ID, deliveredAt = BEFORE_SENT_AT)),
+            ),
+            messageInfo(
+                recipients = listOf(
+                    infoRecipient(
+                        OTHER_USER_ID,
+                        deliveredAt = BEFORE_SENT_AT,
+                        readAt = BEFORE_SENT_AT,
+                    ),
+                ),
+            ),
+            // Opened but never delivered, and opened before it arrived: both impossible.
+            messageInfo(
+                recipients = listOf(
+                    infoRecipient(OTHER_USER_ID, deliveredAt = null, readAt = READ_AT),
+                ),
+            ),
+            messageInfo(
+                recipients = listOf(
+                    infoRecipient(OTHER_USER_ID, deliveredAt = READ_AT, readAt = DELIVERED_AT),
+                ),
+            ),
+            messageInfo(recipients = listOf(infoRecipient(OTHER_USER_ID, deliveredAt = "soon"))),
+        ).forEach { malformed ->
+            assertRejected {
+                SecureMessagingTransportValidator.validateMessageInfo(
+                    response = malformed,
+                    expectedConversationId = CONVERSATION_ID,
+                    expectedMessageId = MESSAGE_ID,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `a message info record larger than a group can hold is refused`() {
+        val tooMany = (0..32).map { index ->
+            infoRecipient(String.format("10000000-0000-4000-8000-%012x", index))
+        }
+        assertRejected {
+            SecureMessagingTransportValidator.validateMessageInfo(
+                response = messageInfo(recipients = tooMany),
+                expectedConversationId = CONVERSATION_ID,
+                expectedMessageId = MESSAGE_ID,
+            )
+        }
+    }
+
+    @Test
+    fun `a direct message info record is pinned to the one person it could have gone to`() {
+        val response = messageInfo(recipients = listOf(infoRecipient(OTHER_USER_ID)))
+
+        val validated = SecureMessagingTransportValidator.validateMessageInfo(
+            response = response,
+            expectedConversationId = CONVERSATION_ID,
+            expectedMessageId = MESSAGE_ID,
+            expectedRecipientIds = setOf(OTHER_USER_ID),
+        )
+        assertEquals(listOf(OTHER_USER_ID), validated.recipients.map { it.userId })
+
+        listOf(
+            // Somebody the conversation never had.
+            messageInfo(recipients = listOf(infoRecipient(THIRD_USER_ID))),
+            // The right person plus an invented one.
+            messageInfo(
+                recipients = listOf(infoRecipient(OTHER_USER_ID), infoRecipient(THIRD_USER_ID)),
+            ),
+        ).forEach { malformed ->
+            assertRejected {
+                SecureMessagingTransportValidator.validateMessageInfo(
+                    response = malformed,
+                    expectedConversationId = CONVERSATION_ID,
+                    expectedMessageId = MESSAGE_ID,
+                    expectedRecipientIds = setOf(OTHER_USER_ID),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `a group message info record is not measured against today's roster`() {
+        // Deliberately unpinned. The record is historical to the message: somebody who has since
+        // left is rightly still named, and somebody who joined afterwards is rightly absent.
+        // Checking a group against the roster as it stands now would reject both truths.
+        val validated = SecureMessagingTransportValidator.validateMessageInfo(
+            response = messageInfo(
+                recipients = listOf(infoRecipient(OTHER_USER_ID), infoRecipient(THIRD_USER_ID)),
+            ),
+            expectedConversationId = CONVERSATION_ID,
+            expectedMessageId = MESSAGE_ID,
+            expectedRecipientIds = null,
+        )
+
+        assertEquals(2, validated.recipients.size)
+    }
+
+    private fun messageInfo(
+        recipients: List<MessagingMessageInfoRecipientDto?>?,
+    ) = MessagingMessageInfoDto(
+        messageId = MESSAGE_ID,
+        conversationId = CONVERSATION_ID,
+        sentAt = SENT_AT,
+        recipients = recipients,
+    )
+
+    private fun infoRecipient(
+        userId: String,
+        name: String = "Grace",
+        deliveredAt: String? = DELIVERED_AT,
+        readAt: String? = null,
+    ) = MessagingMessageInfoRecipientDto(
+        userId = userId,
+        name = name,
+        deliveredAt = deliveredAt,
+        readAt = readAt,
+    )
+
     private fun device(id: String, isCurrent: Boolean) = DeviceDto(
         id = id,
         name = "Android phone",
@@ -934,6 +1198,8 @@ class SecureMessagingTransportValidatorTest {
         const val UPDATED_AT = "2026-07-19T12:01:00Z"
         const val SENT_AT = "2026-07-19T12:02:00Z"
         const val READ_AT = "2026-07-19T12:03:00Z"
+        const val DELIVERED_AT = "2026-07-19T12:02:30Z"
+        const val BEFORE_SENT_AT = "2026-07-19T12:01:00Z"
         const val TRUST_EXPIRES_AT = "2026-08-19T12:00:00Z"
     }
 }

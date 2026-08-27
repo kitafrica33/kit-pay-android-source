@@ -2,6 +2,7 @@ package com.kit.wallet.feature.calls
 
 import android.content.Context
 import android.content.Intent
+import android.os.SystemClock
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -27,6 +28,7 @@ import com.kit.wallet.ui.model.Contact
 import com.twilio.audioswitch.AudioDevice
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import io.livekit.android.ConnectOptions
 import io.livekit.android.LiveKit
 import io.livekit.android.RoomOptions
 import io.livekit.android.audio.AudioSwitchHandler
@@ -296,6 +298,16 @@ class ActiveCallViewModel @Inject constructor(
     private var cleanupJob: Job? = null
     private var terminationJob: Job? = null
     private var timerJob: Job? = null
+    private var durationAnchor: CallDurationAnchor? = null
+    /**
+     * The call this screen has seen a validated answer for, whichever route carried it.
+     * Only ever compared against the call id an authenticated response just handed this
+     * attempt — a server-issued UUID unique across accounts and attempts — so an answer
+     * held over from another session can never satisfy the comparison. Cleared before
+     * each attempt and on teardown so not even the id itself outlives the call it names.
+     */
+    private var answeredCallId: String? = null
+    private val pendingAnswers = PendingCallAnswers()
     private val pendingTerminations = CallTerminationQueue()
     private var localTelecomTermination = DeferredCallTermination(
         finish = telecom::finish,
@@ -478,12 +490,19 @@ class ActiveCallViewModel @Inject constructor(
             localTelecomTermination = DeferredCallTermination(finish = telecom::finish)
         }
         terminated = false
+        // A retry places a new call, so nothing the previous attempt counted applies to it.
+        durationAnchor = null
+        answeredCallId = null
+        // Cleared before the request goes out, so only an answer to the call this attempt
+        // is about to place can ever be claimed by it.
+        pendingAnswers.clear()
         startJob = viewModelScope.launch {
             mutableState.value = mutableState.value.copy(
                 video = requestedVideo,
                 cameraEnabled = requestedVideo,
                 speakerEnabled = requestedVideo,
                 phase = CallPhase.CONNECTING,
+                durationSeconds = 0,
                 error = null,
             )
             try {
@@ -496,6 +515,14 @@ class ActiveCallViewModel @Inject constructor(
                     ).also { outgoingAttemptResolved = true }
                 }
                 connection = session
+                // The accept response already carries the authoritative answer, so an
+                // answerer never waits for a socket frame or a push to know where its
+                // timer starts. For a caller this is null until somebody picks up.
+                applyAnswerAnchor(session.callId, session.answeredAt, session.serverTime)
+                // And this is the answer that arrived while the request above was still in
+                // flight, if there was one. Claimed by exact call id, so a signal about any
+                // other call is never applied to this one.
+                pendingAnswers.claim(session.callId)?.let(::applyLifecycleEvent)
                 offlineStartRetryJob?.cancel()
                 offlineStartRetryJob = null
                 offlineStartRetryAttempt = 0
@@ -509,11 +536,16 @@ class ActiveCallViewModel @Inject constructor(
                 // flight, this atomically turns the just-tracked call into a terminal tombstone.
                 localTelecomTermination.resolveCallId(session.callId)
                 if (terminated) return@launch
-                if (incomingCallId == null) {
+                if (CallAnswerRouting.armsRingDeadline(
+                        incoming = incomingCallId != null,
+                        alreadyAnswered = answeredCallId.equals(session.callId, ignoreCase = true),
+                    )
+                ) {
                     ringDeadlines.schedule(session.callId, session.ringExpiresAt)
                 } else {
                     // A successful answer response ends the incoming ringing window even if media
-                    // connection takes longer than the original deadline.
+                    // connection takes longer than the original deadline — and so does an answer
+                    // that overtook this response on the way here.
                     ringDeadlines.cancel(session.callId)
                 }
                 mutableState.value = mutableState.value.copy(
@@ -523,22 +555,36 @@ class ActiveCallViewModel @Inject constructor(
                 )
                 applyContactPresentation(contacts.contacts.value)
                 CallForegroundService.start(context, mutableState.value.name, session.video)
-                room.connect(url = session.url, token = session.token)
+                room.connect(
+                    url = session.url,
+                    token = session.token,
+                    // Publishing the microphone as part of the connect handshake instead of
+                    // as a separate round trip after it. Enabling it afterwards costs another
+                    // negotiation before the first audio packet can flow, which is exactly
+                    // the gap an answerer hears as silence right after they pick up.
+                    options = ConnectOptions(audio = true, video = session.video),
+                )
                 if (terminated) {
                     room.disconnect()
                     return@launch
                 }
+                // Routing before the local tracks, because the handler only enumerates
+                // devices once connect() has started it, and the first remote audio must
+                // not arrive with the route still on its default.
+                selectSpeaker(session.video)
+                // Idempotent: the handshake above normally published these already. Kept so
+                // a server or SDK path that declined to publish during connect still ends up
+                // with two-way media rather than a silent call.
                 room.localParticipant.setMicrophoneEnabled(true)
                 if (session.video) room.localParticipant.setCameraEnabled(true)
-                selectSpeaker(session.video)
                 val localTrack = room.localParticipant
                     .getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
                 mutableState.value = mutableState.value.copy(
-                    phase = when {
-                        room.remoteParticipants.isNotEmpty() -> CallPhase.CONNECTED
-                        incomingCallId != null -> CallPhase.CONNECTING
-                        else -> CallPhase.RINGING
-                    },
+                    phase = CallAnswerRouting.phaseAfterConnect(
+                        hasRemoteParticipants = room.remoteParticipants.isNotEmpty(),
+                        incoming = incomingCallId != null,
+                        alreadyAnswered = answeredCallId.equals(session.callId, ignoreCase = true),
+                    ),
                     localVideoTrack = localTrack,
                 )
                 syncRemoteParticipants()
@@ -974,6 +1020,7 @@ class ActiveCallViewModel @Inject constructor(
             drainPendingTerminations()
             connection = null
             startJob = null
+            answeredCallId = null
             mutableState.value = mutableState.value.copy(phase = CallPhase.ENDED)
         }
     }
@@ -981,6 +1028,14 @@ class ActiveCallViewModel @Inject constructor(
     private fun markConnected() {
         (connection?.callId ?: incomingCallId)?.let(ringDeadlines::cancel)
         mutableState.value = mutableState.value.copy(phase = CallPhase.CONNECTED)
+        // Media is up, so the call is running whether or not anything authoritative has
+        // reached us yet. Anchoring here is never earlier than the real answer, so a
+        // signal that arrives later can still correct the timer forward.
+        (connection?.callId ?: incomingCallId)?.let { callId ->
+            if (!durationAnchor?.callId.equals(callId, ignoreCase = true)) {
+                durationAnchor = CallDurationAnchorPolicy.anchorOnConnect(callId, elapsedRealtime())
+            }
+        }
         (connection?.callId ?: incomingCallId)?.let(telecom::markActive)
         // Mark this device busy so a second incoming call is surfaced as call-waiting, not a
         // full-screen ring over the active call.
@@ -990,18 +1045,61 @@ class ActiveCallViewModel @Inject constructor(
 
     private fun handleLifecycleEvent(event: CallLifecycleEvent) {
         // A waiting call that ends, is missed or is declined elsewhere dismisses its banner.
-        if (event.callId == mutableState.value.waitingCall?.callId) {
+        // Ignoring case throughout: a validated event carries the canonical lowercase id,
+        // while ids taken verbatim from REST responses keep whatever case the server used,
+        // and the same call must never fail to match itself over that difference.
+        if (event.callId.equals(mutableState.value.waitingCall?.callId, ignoreCase = true)) {
             if (event.kind != CallLifecycleKind.ANSWERED) clearWaitingCall()
             return
         }
 
         val activeCallId = connection?.callId ?: incomingCallId
-        if (event.callId != activeCallId) return
+        if (!event.callId.equals(activeCallId, ignoreCase = true)) {
+            // An outgoing call has no id until `POST /calls` answers, and on a slow uplink
+            // the person called can pick up before it does. Holding the answer lets that
+            // response claim it a moment later instead of dropping it for not matching a
+            // call this screen could not yet name.
+            if (activeCallId == null) pendingAnswers.remember(event)
+            return
+        }
 
+        applyLifecycleEvent(event)
+    }
+
+    private fun applyLifecycleEvent(event: CallLifecycleEvent) {
         when (event.kind) {
-            CallLifecycleKind.ANSWERED -> if (mutableState.value.phase == CallPhase.RINGING) {
-                ringDeadlines.cancel(event.callId)
-                mutableState.value = mutableState.value.copy(phase = CallPhase.CONNECTING)
+            CallLifecycleKind.ANSWERED -> {
+                // Recorded before the action is chosen, so a start response that is still
+                // in flight finds it when it decides whether the ring window is armed.
+                // Every event reaching here already matched this attempt's call id, either
+                // directly or by being claimed from the buffer with the id the response
+                // named — that exact-id match is the session fence at this layer.
+                answeredCallId = event.callId
+                // Whatever else the answer means for this screen, it ends the ring window.
+                // An armed deadline left ticking over an answered call — the answer can
+                // land while `room.connect` is still in flight, after the deadline was
+                // armed — would expire mid-call, finish Telecom as MISSED, and tear down a
+                // call both sides are on. Cancelled under this screen's own id, the exact
+                // string the deadline was scheduled with.
+                (connection?.callId ?: incomingCallId)?.let(ringDeadlines::cancel)
+                // Applied on every answer signal, not only the one that moves the phase.
+                // The socket frame, the push and the accept response all carry the same
+                // instant, and taking each of them is what lets the earliest — and so the
+                // least delayed — one set where the caller's timer counts from.
+                applyAnswerAnchor(event.callId, event.answeredAt, event.serverTime)
+                when (answerAction()) {
+                    // The server sends the answer to the answering account as well as to
+                    // the caller, precisely so this account's *other* devices stop ringing.
+                    // Without this they keep ringing until the invite expires, and the user
+                    // is left declining a call they are already on.
+                    CallAnswerAction.SUPERSEDE_LOCAL_RING ->
+                        finishFromRemote(event.callId, KitTelecomDisconnect.ANSWERED_ELSEWHERE)
+
+                    CallAnswerAction.ADVANCE_TO_CONNECTING ->
+                        mutableState.value = mutableState.value.copy(phase = CallPhase.CONNECTING)
+
+                    CallAnswerAction.ANCHOR_ONLY -> Unit
+                }
             }
             CallLifecycleKind.DECLINED -> if (event.terminal) {
                 finishFromRemote(event.callId, KitTelecomDisconnect.REJECTED)
@@ -1010,6 +1108,13 @@ class ActiveCallViewModel @Inject constructor(
             CallLifecycleKind.MISSED -> finishFromRemote(event.callId, KitTelecomDisconnect.MISSED)
         }
     }
+
+    /** Reads this screen's live state into the pure rule that decides what an answer does. */
+    private fun answerAction(): CallAnswerAction = CallAnswerRouting.actionFor(
+        phase = mutableState.value.phase,
+        hasConnection = connection != null,
+        starting = startJob?.isActive == true,
+    )
 
     private fun finishFromRemote(callId: String, disconnect: KitTelecomDisconnect) {
         if (terminationJob?.isActive == true ||
@@ -1038,21 +1143,52 @@ class ActiveCallViewModel @Inject constructor(
             pendingTerminations.completed(callId)
             connection = null
             startJob = null
+            answeredCallId = null
             mutableState.value = mutableState.value.copy(phase = CallPhase.ENDED)
         }
+    }
+
+    /**
+     * Records where the call's timer counts from, from whatever answer signal just arrived.
+     *
+     * Called from every route the answer can take. The policy keeps the earliest anchor it
+     * has been offered for the call, so repeated signals converge on the least-delayed one
+     * and the displayed duration only ever moves forward.
+     */
+    private fun applyAnswerAnchor(callId: String, answeredAt: String?, serverTime: String?) {
+        durationAnchor = CallDurationAnchorPolicy.anchor(
+            callId = callId,
+            answeredAt = answeredAt,
+            serverTime = serverTime,
+            elapsedRealtimeMillis = elapsedRealtime(),
+            previous = durationAnchor,
+        )
+        if (timerJob?.isActive == true) publishDuration()
     }
 
     private fun startTimer() {
         if (timerJob?.isActive == true) return
         timerJob = viewModelScope.launch {
             while (true) {
+                publishDuration()
                 delay(1_000)
-                mutableState.value = mutableState.value.copy(
-                    durationSeconds = mutableState.value.durationSeconds + 1,
-                )
             }
         }
     }
+
+    /**
+     * Derived from the anchor rather than accumulated. A counter that adds one per tick
+     * drifts by every scheduling delay the call survives — a doze window, a busy main
+     * thread — and after a few minutes shows visibly less time than has passed.
+     */
+    private fun publishDuration() {
+        val seconds = CallDurationAnchorPolicy.seconds(durationAnchor, elapsedRealtime())
+        if (seconds != mutableState.value.durationSeconds) {
+            mutableState.value = mutableState.value.copy(durationSeconds = seconds)
+        }
+    }
+
+    private fun elapsedRealtime(): Long = SystemClock.elapsedRealtime()
 
     private fun retryPendingTerminations() {
         if (cleanupJob?.isActive == true) return

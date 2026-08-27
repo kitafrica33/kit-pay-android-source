@@ -773,6 +773,10 @@ object SecureMessagingWireValidator {
             "encrypted reaction reply target",
         )
         requireWire(
+            kind != ENCRYPTED_EDIT_MESSAGE_KIND || replyToMessageId != null,
+            "encrypted edit reply target",
+        )
+        requireWire(
             required(message.reactions, "encrypted message reactions").isEmpty(),
             "v2 encrypted text messages cannot contain reactions",
         )

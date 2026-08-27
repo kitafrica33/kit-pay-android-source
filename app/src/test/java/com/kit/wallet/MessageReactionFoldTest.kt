@@ -234,6 +234,10 @@ class MessageReactionFoldTest {
         val centredRecords = setOf(
             MessageKind.CALL,
             MessageKind.PAYMENT_EVENT,
+            // A group payment's card spans the thread and belongs to everybody in it; its outcome
+            // lines are records the group states about itself. Neither is a bubble.
+            MessageKind.GROUP_PAYMENT,
+            MessageKind.GROUP_PAYMENT_EVENT,
             MessageKind.SYSTEM,
         )
         MessageKind.entries.forEach { kind ->

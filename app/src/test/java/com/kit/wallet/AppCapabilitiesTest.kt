@@ -200,6 +200,27 @@ class AppCapabilitiesTest {
     }
 
     @Test
+    fun `bank route remains available for deposits when outbound transfers are off`() {
+        val depositsOnly = AppCapabilities(
+            features = mapOf(
+                KitFeature.WALLETS to true,
+                KitFeature.BANK_DEPOSITS to true,
+                KitFeature.BANK_TRANSFERS to false,
+            ),
+            loaded = true,
+        )
+
+        assertTrue(depositsOnly.bankDepositsUsable)
+        assertFalse(depositsOnly.bankTransfersUsable)
+        assertTrue(depositsOnly.bankUsable)
+        assertTrue(depositsOnly.routeUsable(Dest.BANK))
+        assertFalse(
+            depositsOnly.copy(features = depositsOnly.features - KitFeature.WALLETS)
+                .routeUsable(Dest.BANK),
+        )
+    }
+
+    @Test
     fun `scanner stays closed without a client or wallet while receive opens for wallets`() {
         val serverOnly = AppCapabilities(
             features = mapOf(

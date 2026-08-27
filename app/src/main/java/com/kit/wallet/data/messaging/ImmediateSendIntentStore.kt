@@ -74,6 +74,12 @@ internal class ImmediateSendIntentStore @Inject constructor(
 
     fun find(id: String): ImmediateSendIntent? = items.value.firstOrNull { it.id == id }
 
+    suspend fun findForOwner(expectedOwner: SessionFence, id: String): ImmediateSendIntent? =
+        withOwner(expectedOwner) {
+            loadLocked()
+            live[id]
+        }
+
     fun isCurrentOwner(expectedOwner: SessionFence): Boolean =
         sessions.current()?.fence() == expectedOwner && mutableSnapshot.value.owner == expectedOwner
 
@@ -88,6 +94,35 @@ internal class ImmediateSendIntentStore @Inject constructor(
             loadLocked()
             check(live[intent.id] == null) { "An immediate send already uses this identity" }
             writeLocked(intent)
+            publishLocked()
+        }
+    }
+
+    /**
+     * Inserts a caller-owned intent once, or acknowledges the identical intent already on disk.
+     *
+     * External share batches retain their identity across process death and partial retries. A
+     * repeated enqueue must therefore be a no-op for the same content, while an ID reused for any
+     * different content is corruption and fails closed. A retry-required copy is rearmed because
+     * the customer's second tap is an explicit request to try that same send again.
+     */
+    suspend fun enqueueIdempotentForOwner(
+        expectedOwner: SessionFence,
+        intent: ImmediateSendIntent,
+    ) {
+        withOwner(expectedOwner) {
+            loadLocked()
+            val existing = live[intent.id]
+            if (existing == null) {
+                writeLocked(intent)
+            } else {
+                check(existing.sameUserIntentAs(intent)) {
+                    "An immediate-send identity belongs to different content"
+                }
+                if (existing.state == ImmediateSendState.RETRY_REQUIRED) {
+                    writeLocked(existing.copy(state = ImmediateSendState.WAITING))
+                }
+            }
             publishLocked()
         }
     }
@@ -239,6 +274,17 @@ internal class ImmediateSendIntentStore @Inject constructor(
         const val PAGE_SIZE = 100
     }
 }
+
+/** Fields chosen by the caller; excludes retry state, timestamps and worker-produced metadata. */
+private fun ImmediateSendIntent.sameUserIntentAs(other: ImmediateSendIntent): Boolean =
+    id == other.id &&
+        conversationId == other.conversationId &&
+        kind == other.kind &&
+        text == other.text &&
+        mediaType == other.mediaType &&
+        caption == other.caption &&
+        mediaPlaintextBytes == other.mediaPlaintextBytes &&
+        replyToMessageId == other.replyToMessageId
 
 private data class ImmediateSendOwnerSnapshot(
     val owner: SessionFence?,

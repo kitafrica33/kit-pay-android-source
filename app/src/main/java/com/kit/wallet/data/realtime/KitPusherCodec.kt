@@ -50,9 +50,13 @@ internal object KitPusherCodec {
     const val EVENT_SYNC_NUDGE: String = "kit.sync.nudge"
     const val EVENT_TYPING: String = "kit.typing"
     const val EVENT_TYPING_STOP: String = "kit.typing.stop"
+    const val EVENT_CALL_ANSWERED: String = "kit.call.answered"
 
     /** The frame schema version this build speaks. Anything else is dropped. */
     private const val FRAME_VERSION = 1
+
+    /** The only call state `kit.call.answered` may announce. */
+    private const val CALL_STATE_ACTIVE = "active"
 
     private val UNDERSTOOD = setOf(
         EVENT_ESTABLISHED,
@@ -66,6 +70,7 @@ internal object KitPusherCodec {
         EVENT_SYNC_NUDGE,
         EVENT_TYPING,
         EVENT_TYPING_STOP,
+        EVENT_CALL_ANSWERED,
     )
 
     /**
@@ -145,6 +150,22 @@ internal object KitPusherCodec {
                     channel = channel ?: return null,
                     user = data.string("user")?.takeIf { it.isNotBlank() } ?: return null,
                     active = event == EVENT_TYPING,
+                )
+            }
+
+            // Every member is required and every member is checked. This frame moves a
+            // call's state and sets the anchor its timer counts from, so a partial or
+            // mislabelled one is dropped rather than half-applied: the `call.answered`
+            // push carries the same answer and will arrive regardless.
+            EVENT_CALL_ANSWERED -> {
+                if (data.int("v") != FRAME_VERSION) return null
+                if (data.string("state") != CALL_STATE_ACTIVE) return null
+                KitRealtimeFrame.CallAnswered(
+                    channel = channel ?: return null,
+                    callId = data.string("call_id")?.takeIf { it.isNotBlank() } ?: return null,
+                    answeredAt = data.string("answered_at")?.takeIf { it.isNotBlank() } ?: return null,
+                    answeredBy = data.string("answered_by")?.takeIf { it.isNotBlank() } ?: return null,
+                    serverTime = data.string("server_time")?.takeIf { it.isNotBlank() } ?: return null,
                 )
             }
 

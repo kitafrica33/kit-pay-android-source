@@ -1,6 +1,7 @@
 package com.kit.wallet.data.messaging
 
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
+import com.kit.wallet.data.remote.ENCRYPTED_EDIT_MESSAGE_KIND
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
 import com.kit.wallet.data.remote.ENCRYPTED_REACTION_MESSAGE_KIND
 import com.kit.wallet.data.remote.SECURE_MESSAGE_KINDS
@@ -350,11 +351,31 @@ internal object SecureMessagingHistoryBackfillCodec {
     )
 }
 
-private fun authenticatedMessageKind(text: String): String = when {
+/**
+ * The outer kind a piece of authenticated plaintext binds itself to.
+ *
+ * One function, used by every path that sends, receives, replays or donates a message, so the
+ * envelope a device writes and the envelope it will accept back can never be derived by two
+ * different rules.
+ */
+internal fun authenticatedMessageKind(text: String): String = when {
     KitMediaMessage.attachmentsFor(text).isNotEmpty() -> ENCRYPTED_ATTACHMENT_MESSAGE_KIND
     KitReactionMessage.parse(text) != null -> ENCRYPTED_REACTION_MESSAGE_KIND
+    KitEditMessage.parse(text) != null -> ENCRYPTED_EDIT_MESSAGE_KIND
     else -> ENCRYPTED_MESSAGE_KIND
 }
+
+/**
+ * The kind an outbound request carries *before* its attachment metadata is attached.
+ *
+ * The same rule as [authenticatedMessageKind] with one exception: a media descriptor still reads
+ * as ordinary text here. The transport is the single place that pairs `encrypted_attachment` with
+ * the attachment list it must travel with, because the wire model refuses either one without the
+ * other — so announcing that kind any earlier would build a request that cannot be constructed.
+ */
+internal fun authenticatedOutboundMessageKind(text: String): String =
+    authenticatedMessageKind(text).takeUnless { it == ENCRYPTED_ATTACHMENT_MESSAGE_KIND }
+        ?: ENCRYPTED_MESSAGE_KIND
 
 /** Durable, non-secret work item that lets history transfer resume without holding sync back. */
 internal data class SecureMessagingHistoryBackfillTask(

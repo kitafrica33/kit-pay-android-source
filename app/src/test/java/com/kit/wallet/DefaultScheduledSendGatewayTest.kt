@@ -155,6 +155,7 @@ class DefaultScheduledSendGatewayTest {
         override suspend fun sendMessage(
             chatId: String,
             text: String,
+            replyToMessageId: String?,
             onDurablyCommitted: (clientMessageId: String) -> Unit,
         ): Unit = error("Scheduled text must use the owner-aware send boundary")
 
