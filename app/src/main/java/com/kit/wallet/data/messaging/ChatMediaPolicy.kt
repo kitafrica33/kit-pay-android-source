@@ -48,6 +48,45 @@ internal object KitChatMediaLimits {
     fun fits(byteCount: Long): Boolean = byteCount in 1..MAX_TRANSFER_BYTES.toLong()
 }
 
+/**
+ * Placeholder label for reserved media-family text this build cannot strictly parse — an unknown
+ * future `KITMEDIA` generation or a malformed descriptor. Such text can embed attachment key
+ * material, so every surface shows this label and never the text itself.
+ */
+internal const val UNSUPPORTED_ATTACHMENT_LABEL = "Attachment"
+
+/**
+ * Plural preview label for a media-v2 album, shared by caption-less bubbles, chat rows,
+ * notifications and accessibility copy: "3 Photos" when every item is one kind, mixed kinds
+ * "3 Attachments" — identical copy to iOS (media-v2 §8).
+ */
+internal fun mediaAlbumPreviewLabel(mediaTypes: List<String>): String {
+    val kinds = mediaTypes.mapTo(mutableSetOf(), KitChatMediaKind::fromMediaType)
+    val label = kinds.singleOrNull()?.previewLabel ?: UNSUPPORTED_ATTACHMENT_LABEL
+    return "${mediaTypes.size} ${label}s"
+}
+
+/** TalkBack copy for one album bubble: plural kind first, then the exact validated caption. */
+internal fun mediaAlbumAccessibilityLabel(mediaTypes: List<String>, caption: String?): String =
+    if (caption == null) {
+        mediaAlbumPreviewLabel(mediaTypes)
+    } else {
+        "${mediaAlbumPreviewLabel(mediaTypes)} · $caption"
+    }
+
+/**
+ * Reply-quote label for a media-v2 album: the first item's kind label, "+N" for the rest, then
+ * the caption in the shared " · " style — never descriptor text (media-v2 §8). Caption presence
+ * is null/non-null only: a validated caption is byte-exact and may consist entirely of
+ * codepoints a platform trim would call blank, and it is still the caption.
+ */
+internal fun mediaAlbumQuoteLabel(mediaTypes: List<String>, caption: String?): String {
+    val firstType = mediaTypes.firstOrNull() ?: return UNSUPPORTED_ATTACHMENT_LABEL
+    val first = KitChatMediaKind.fromMediaType(firstType).previewLabel
+    val label = if (mediaTypes.size > 1) "$first +${mediaTypes.size - 1}" else first
+    return if (caption == null) label else "$label · $caption"
+}
+
 /** File extension for share/open targets, mirroring iOS `ChatMediaTempFiles.fileExtension`. */
 internal fun chatMediaFileExtension(mediaType: String): String = when (mediaType) {
     "image/jpeg" -> "jpg"

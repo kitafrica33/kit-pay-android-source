@@ -3,6 +3,8 @@ package com.kit.wallet
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -29,6 +31,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -46,8 +49,17 @@ import com.kit.wallet.data.messaging.SecureMessagingProtocolUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
-import com.kit.wallet.data.notifications.IncomingCallPayload
+import com.kit.wallet.data.notifications.ActiveCallReturnLink
+import com.kit.wallet.data.notifications.ACTION_OPEN_AUTHORIZED_INCOMING_CALL
+import com.kit.wallet.data.notifications.AuthorizedIncomingCallLaunch
+import com.kit.wallet.data.notifications.EXTRA_INCOMING_CALL_AUTHORIZATION
+import com.kit.wallet.data.notifications.IncomingCallLaunchAuthorizer
+import com.kit.wallet.data.notifications.IncomingCallLaunchPurpose
+import com.kit.wallet.data.notifications.IncomingCallReplayLedger
+import com.kit.wallet.data.notifications.PaymentClaimAlert
+import com.kit.wallet.data.notifications.PaymentClaimLink
 import com.kit.wallet.data.notifications.PushTokenCoordinator
+import com.kit.wallet.data.notifications.canonicalIncomingCallId
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.session.SessionFence
@@ -66,6 +78,8 @@ import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import com.kit.wallet.worker.scheduleAuthenticatedMessagingCatchUp
 import dagger.hilt.android.AndroidEntryPoint
 import java.io.IOException
+import java.time.Duration
+import java.time.Instant
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -86,11 +100,18 @@ class MainActivity : FragmentActivity() {
     @Inject lateinit var messagingSyncScheduler: SecureMessagingSyncScheduler
     @Inject lateinit var messagingSyncEngine: SecureMessagingSyncEngine
     @Inject lateinit var secureMessageAuthorizer: SecureMessageNavigationAuthorizer
+    @Inject internal lateinit var incomingCallAuthorizer: IncomingCallLaunchAuthorizer
+    @Inject lateinit var incomingCallReplayLedger: IncomingCallReplayLedger
     @Inject lateinit var pushTokens: PushTokenCoordinator
     @Inject lateinit var walletRefresh: WalletRefreshTrigger
     private val foregroundStartMutex = Mutex()
     private var foregroundStartJob: Job? = null
     private var pendingDeepLink by mutableStateOf<String?>(null)
+    private var pendingAuthorizedIncomingCall by
+        mutableStateOf<AuthorizedIncomingCallLaunch?>(null)
+    private var authorizedIncomingCallLease by
+        mutableStateOf<AuthorizedIncomingCallLaunch?>(null)
+    private var incomingCallLeaseExpiryJob: Job? = null
     private var pendingSecureMessage by mutableStateOf<PendingSecureMessageRoute?>(null)
     private var pendingTextShare by mutableStateOf<IncomingTextShareRequest?>(null)
     private val queuedTextShares = ArrayDeque<IncomingTextShareRequest>()
@@ -103,6 +124,20 @@ class MainActivity : FragmentActivity() {
         installSplashScreen()
         super.onCreate(savedInstanceState)
         pendingDeepLink = savedInstanceState?.getString(STATE_PENDING_DEEP_LINK)
+        savedInstanceState
+            ?.restoreAuthorizedIncomingCall(
+                currentSession = sessions.current()?.fence(),
+                now = Instant.now(),
+            )
+            ?.takeIf { restored ->
+                incomingCallReplayLedger.authorizesLaunch(
+                    restored.launch.callId,
+                    restored.launch.ringExpiresAt,
+                )
+            }
+            ?.let { restored ->
+                installAuthorizedIncomingCall(restored.launch, restored.pendingNavigation)
+            }
         // A share nobody ever delivered is plaintext the user has forgotten about — including
         // anything a previous process left staged. It goes before this one reads its own intent.
         lifecycleScope.launch(Dispatchers.IO) {
@@ -122,6 +157,13 @@ class MainActivity : FragmentActivity() {
             LaunchedEffect(activeSession?.sessionId, pendingSecureMessage?.sessionEpoch) {
                 if (pendingSecureMessage?.sessionEpoch != activeSession?.sessionId) {
                     pendingSecureMessage = null
+                }
+            }
+            LaunchedEffect(activeSession?.fence(), authorizedIncomingCallLease) {
+                val lease = authorizedIncomingCallLease ?: return@LaunchedEffect
+                if (lease.session != activeSession?.fence()) {
+                    incomingCallAuthorizer.revokeAll()
+                    clearAuthorizedIncomingCall(lease.callId)
                 }
             }
             LaunchedEffect(sessionRestorationPending) {
@@ -147,32 +189,57 @@ class MainActivity : FragmentActivity() {
                         onConfirmSignInAgain = ::discardRetainedSessionFromUi,
                     )
                 } else {
-                    KitApp(
-                        deepLinkUri = pendingDeepLink,
-                        onDeepLinkConsumed = { pendingDeepLink = null },
-                        secureMessageConversationId = pendingSecureMessage
-                            ?.takeIf { it.sessionEpoch == activeSession?.sessionId }
-                            ?.conversationId,
-                        onSecureMessageRouteConsumed = { pendingSecureMessage = null },
-                        incomingTextShare = pendingTextShare,
-                        incomingTextShareOwnerMatches = pendingTextShare?.let { request ->
-                            val batch = (request.payload as? com.kit.wallet.feature.chat.IncomingTextShare.Accepted)
-                                ?.batch
-                            batch?.owner?.matches(activeSession?.fence()) ?: true
-                        } ?: true,
-                        onTextShareConsumed = { token ->
-                            consumeTextShare(token)
-                        },
-                        onTextShareDeferred = { token ->
-                            deferTextShare(token)
-                        },
-                        onTextShareSendingChanged = { token, sending ->
-                            if (pendingTextShare?.token == token) {
-                                pendingTextShareSending = sending
-                            }
-                        },
-                        onNotificationCapabilityChanged = { pushTokens.capabilityPolicyChanged() },
-                    )
+                    Box(Modifier.fillMaxSize()) {
+                        KitApp(
+                            deepLinkUri = pendingDeepLink,
+                            onDeepLinkConsumed = { pendingDeepLink = null },
+                            authorizedIncomingCall = pendingAuthorizedIncomingCall,
+                            activeAuthorizedIncomingCall = authorizedIncomingCallLease,
+                            onAuthorizedIncomingCallRejected = ::clearAuthorizedIncomingCall,
+                            onAuthorizedIncomingCallSurfaceChanged = { callId, visible ->
+                                if (visible && authorizedIncomingCallLease?.callId == callId) {
+                                    if (pendingAuthorizedIncomingCall?.callId == callId) {
+                                        pendingAuthorizedIncomingCall = null
+                                    }
+                                    setIncomingCallKeyguardVisibility(true)
+                                } else if (!visible) {
+                                    clearAuthorizedIncomingCall(callId)
+                                }
+                            },
+                            secureMessageConversationId = pendingSecureMessage
+                                ?.takeIf { it.sessionEpoch == activeSession?.sessionId }
+                                ?.conversationId,
+                            onSecureMessageRouteConsumed = { pendingSecureMessage = null },
+                            incomingTextShare = pendingTextShare,
+                            incomingTextShareOwnerMatches = pendingTextShare?.let { request ->
+                                val batch = (request.payload as? com.kit.wallet.feature.chat.IncomingTextShare.Accepted)
+                                    ?.batch
+                                batch?.owner?.matches(activeSession?.fence()) ?: true
+                            } ?: true,
+                            onTextShareConsumed = { token ->
+                                consumeTextShare(token)
+                            },
+                            onTextShareDeferred = { token ->
+                                deferTextShare(token)
+                            },
+                            onTextShareSendingChanged = { token, sending ->
+                                if (pendingTextShare?.token == token) {
+                                    pendingTextShareSending = sending
+                                }
+                            },
+                            onNotificationCapabilityChanged = { pushTokens.capabilityPolicyChanged() },
+                        )
+                        pendingAuthorizedIncomingCall?.let { launch ->
+                            IncomingCallPrivacyCover(
+                                callId = launch.callId,
+                                onFirstOpaqueFrame = {
+                                    if (authorizedIncomingCallLease?.callId == launch.callId) {
+                                        setIncomingCallKeyguardVisibility(true)
+                                    }
+                                },
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -190,6 +257,12 @@ class MainActivity : FragmentActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         pendingDeepLink?.let { outState.putString(STATE_PENDING_DEEP_LINK, it) }
+        authorizedIncomingCallLease?.let { lease ->
+            outState.saveAuthorizedIncomingCall(
+                lease,
+                pendingNavigation = pendingAuthorizedIncomingCall?.callId == lease.callId,
+            )
+        }
         super.onSaveInstanceState(outState)
     }
 
@@ -256,6 +329,15 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun handleIntent(intent: Intent?) {
+        intent?.takeAuthorizedIncomingCallLaunch(
+            authorizer = incomingCallAuthorizer,
+            currentSession = sessions.current()?.fence(),
+        )?.takeIf { launch ->
+            incomingCallReplayLedger.authorizesLaunch(launch.callId, launch.ringExpiresAt)
+        }?.let { launch ->
+            if (launch.acceptRequested) incomingCallReplayLedger.retire(launch.callId)
+            installAuthorizedIncomingCall(launch, pendingNavigation = true)
+        }
         intent?.takeAuthorizedSecureMessageRoute(
             authorizer = secureMessageAuthorizer,
             currentSessionEpoch = sessions.current()?.sessionId,
@@ -263,6 +345,44 @@ class MainActivity : FragmentActivity() {
         intent?.takeKitDeepLink()?.let { pendingDeepLink = it }
         val incomingTextShare = intent?.takeIncomingTextShare(applicationContext) ?: return
         installIncomingTextShare(incomingTextShare)
+    }
+
+    private fun installAuthorizedIncomingCall(
+        launch: AuthorizedIncomingCallLaunch,
+        pendingNavigation: Boolean,
+    ) {
+        authorizedIncomingCallLease = launch
+        pendingAuthorizedIncomingCall = launch.takeIf { pendingNavigation }
+        setIncomingCallKeyguardVisibility(false)
+        incomingCallLeaseExpiryJob?.cancel()
+        incomingCallLeaseExpiryJob = lifecycleScope.launch {
+            val remaining = runCatching {
+                Duration.between(Instant.now(), launch.expiresAt).toMillis()
+            }.getOrDefault(0L)
+            if (remaining > 0L) delay(remaining)
+            clearAuthorizedIncomingCall(launch.callId)
+        }
+    }
+
+    private fun clearAuthorizedIncomingCall(callId: String) {
+        if (authorizedIncomingCallLease?.callId != callId) return
+        incomingCallLeaseExpiryJob?.cancel()
+        incomingCallLeaseExpiryJob = null
+        pendingAuthorizedIncomingCall = null
+        authorizedIncomingCallLease = null
+        setIncomingCallKeyguardVisibility(false)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun setIncomingCallKeyguardVisibility(visible: Boolean) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(visible)
+            setTurnScreenOn(visible)
+        } else {
+            val legacyFlags = WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            if (visible) window.addFlags(legacyFlags) else window.clearFlags(legacyFlags)
+        }
     }
 
     private fun installIncomingTextShare(incomingTextShare: IncomingTextShareRequest) {
@@ -343,6 +463,58 @@ class MainActivity : FragmentActivity() {
 private fun IncomingTextShareRequest.hasPinnedDestination(): Boolean =
     ((payload as? com.kit.wallet.feature.chat.IncomingTextShare.Accepted)
         ?.batch?.pinnedConversationId != null)
+
+@Composable
+private fun IncomingCallPrivacyCover(
+    callId: String,
+    onFirstOpaqueFrame: () -> Unit,
+) {
+    // Wait across composition and the following draw before allowing this window above the
+    // keyguard. The first frame callback precedes drawing; the second cannot run until after that
+    // opaque frame was submitted, so a warm wallet/chat frame is never exposed.
+    LaunchedEffect(callId) {
+        withFrameNanos { }
+        withFrameNanos { }
+        onFirstOpaqueFrame()
+    }
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(horizontal = 32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Spacer(Modifier.weight(1f))
+            Surface(
+                modifier = Modifier.size(72.dp),
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primaryContainer,
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Rounded.Lock,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                    )
+                }
+            }
+            Spacer(Modifier.height(24.dp))
+            Text("Incoming Kit Pay call", style = MaterialTheme.typography.headlineSmall)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Checking the call securely…",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.weight(1f))
+        }
+    }
+}
 
 @Composable
 private fun SessionRestorationGate(
@@ -610,6 +782,20 @@ private data class PendingSecureMessageRoute(
     val sessionEpoch: String,
 )
 
+private fun Intent.takeAuthorizedIncomingCallLaunch(
+    authorizer: IncomingCallLaunchAuthorizer,
+    currentSession: SessionFence?,
+): AuthorizedIncomingCallLaunch? {
+    if (action != ACTION_OPEN_AUTHORIZED_INCOMING_CALL) return null
+    val token = getStringExtra(EXTRA_INCOMING_CALL_AUTHORIZATION)
+    // Consume the entire private hand-off before validating it. Neither a rejected token nor any
+    // attacker-supplied companion extras may remain available to another routing branch.
+    replaceExtras(null as Bundle?)
+    data = null
+    action = null
+    return authorizer.consume(token, currentSession)
+}
+
 private fun Intent.takeAuthorizedSecureMessageRoute(
     authorizer: SecureMessageNavigationAuthorizer,
     currentSessionEpoch: String?,
@@ -641,9 +827,6 @@ private fun Intent.takeIncomingTextShare(context: android.content.Context): Inco
 /**
  * Takes one validated external navigation route from this Activity Intent.
  *
- * Provider-delivered notification taps can carry call data as activity extras rather than as an
- * Intent data URI.
- *
  * MainActivity is single-top for call notifications. Leaving the route on its retained Intent
  * lets a later Activity recreation replay an already-consumed call over whatever screen the user
  * opened next. Clear the source before navigation; [MainActivity.onSaveInstanceState] retains only
@@ -651,8 +834,18 @@ private fun Intent.takeIncomingTextShare(context: android.content.Context): Inco
  */
 @VisibleForTesting
 internal fun Intent.takeKitDeepLink(): String? {
+    val suppliedCallExtras = CALL_PAYLOAD_KEYS.any(::hasExtra)
+    CALL_PAYLOAD_KEYS.forEach(::removeExtra)
     dataString?.let { raw ->
         val uri = runCatching { Uri.parse(raw) }.getOrNull()
+        val isUntrustedCallRoute = uri?.let {
+            it.scheme == "kitwallet" && it.host == "call" && it.path == "/incoming"
+        } == true
+        if (isUntrustedCallRoute) {
+            data = null
+            action = null
+            return null
+        }
         val isKycReturn = uri?.let {
             it.scheme == "kitwallet" &&
                 it.host == "kyc" &&
@@ -660,27 +853,30 @@ internal fun Intent.takeKitDeepLink(): String? {
                 it.query == null &&
                 it.fragment == null
         } == true
-        val callPayload = IncomingCallPayload.fromDeepLink(raw)
+        val returnLink = ActiveCallReturnLink.fromDeepLink(raw)
+        val claimLink = PaymentClaimLink.fromDeepLink(raw)
         val canonicalRoute = when {
             isKycReturn -> KYC_STATUS_DEEP_LINK
-            callPayload != null -> callPayload.deepLinkUri(callPayload.acceptRequested)
+            // The ongoing-call notification: return to the call the app is already in.
+            returnLink != null -> returnLink.deepLinkUri()
+            // A claim alert: the link is the locally reconstructed one and the group hints ride
+            // as extras this app itself validated; a hint that no longer parses drops the route.
+            claimLink != null -> claimLink.withExtraHints(
+                conversationId = getStringExtra(PaymentClaimAlert.EXTRA_CONVERSATION_HINT),
+                groupPaymentId = getStringExtra(PaymentClaimAlert.EXTRA_GROUP_PAYMENT_HINT),
+            )?.deepLinkUri()
             else -> null
         }
         if (canonicalRoute != null) {
             data = null
-            CALL_PAYLOAD_KEYS.forEach(::removeExtra)
+            CLAIM_HINT_KEYS.forEach(::removeExtra)
             action = null
             return canonicalRoute
         }
         return null
     }
-    val payloadData = CALL_PAYLOAD_KEYS.mapNotNull { key ->
-        getStringExtra(key)?.let { value -> key to value }
-    }.toMap()
-    val route = IncomingCallPayload.fromData(payloadData)?.deepLinkUri() ?: return null
-    CALL_PAYLOAD_KEYS.forEach(::removeExtra)
-    action = null
-    return route
+    if (suppliedCallExtras) action = null
+    return null
 }
 
 private val CALL_PAYLOAD_KEYS = listOf(
@@ -693,5 +889,72 @@ private val CALL_PAYLOAD_KEYS = listOf(
     "ring_expires_at",
 )
 
+private val CLAIM_HINT_KEYS = listOf(
+    PaymentClaimAlert.EXTRA_CONVERSATION_HINT,
+    PaymentClaimAlert.EXTRA_GROUP_PAYMENT_HINT,
+)
+
 private const val STATE_PENDING_DEEP_LINK = "kit.pending_deep_link"
 private const val KYC_STATUS_DEEP_LINK = "kitwallet://kyc/status"
+
+private const val STATE_CALL_ID = "kit.incoming_call.id"
+private const val STATE_CALL_PURPOSE = "kit.incoming_call.purpose"
+private const val STATE_CALL_SESSION_ID = "kit.incoming_call.session_id"
+private const val STATE_CALL_CACHE_SCOPE = "kit.incoming_call.cache_scope"
+private const val STATE_CALL_ACCOUNT_ID = "kit.incoming_call.account_id"
+private const val STATE_CALL_EXPIRES_AT = "kit.incoming_call.expires_at"
+private const val STATE_CALL_RING_EXPIRES_AT = "kit.incoming_call.ring_expires_at"
+private const val STATE_CALL_PENDING_NAVIGATION = "kit.incoming_call.pending_navigation"
+
+private data class RestoredIncomingCallLaunch(
+    val launch: AuthorizedIncomingCallLaunch,
+    val pendingNavigation: Boolean,
+)
+
+private fun Bundle.saveAuthorizedIncomingCall(
+    launch: AuthorizedIncomingCallLaunch,
+    pendingNavigation: Boolean,
+) {
+    putString(STATE_CALL_ID, launch.callId)
+    putString(STATE_CALL_PURPOSE, launch.purpose.name)
+    putString(STATE_CALL_SESSION_ID, launch.session.sessionId)
+    putString(STATE_CALL_CACHE_SCOPE, launch.session.cacheScopeId)
+    putString(STATE_CALL_ACCOUNT_ID, launch.session.accountId)
+    putString(STATE_CALL_EXPIRES_AT, launch.expiresAt.toString())
+    putString(STATE_CALL_RING_EXPIRES_AT, launch.ringExpiresAt.toString())
+    putBoolean(STATE_CALL_PENDING_NAVIGATION, pendingNavigation)
+}
+
+private fun Bundle.restoreAuthorizedIncomingCall(
+    currentSession: SessionFence?,
+    now: Instant,
+): RestoredIncomingCallLaunch? {
+    val callId = canonicalIncomingCallId(getString(STATE_CALL_ID)) ?: return null
+    val purpose = runCatching {
+        IncomingCallLaunchPurpose.valueOf(getString(STATE_CALL_PURPOSE).orEmpty())
+    }.getOrNull() ?: return null
+    val expectedSession = SessionFence(
+        sessionId = getString(STATE_CALL_SESSION_ID).orEmpty(),
+        cacheScopeId = getString(STATE_CALL_CACHE_SCOPE).orEmpty(),
+        accountId = getString(STATE_CALL_ACCOUNT_ID),
+    )
+    if (currentSession == null || currentSession != expectedSession) return null
+    val expiresAt = getString(STATE_CALL_EXPIRES_AT)
+        ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+        ?: return null
+    if (!expiresAt.isAfter(now) || expiresAt.isAfter(now.plus(Duration.ofMinutes(1)))) return null
+    val ringExpiresAt = getString(STATE_CALL_RING_EXPIRES_AT)
+        ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+        ?.takeIf { it.isAfter(now) }
+        ?: return null
+    return RestoredIncomingCallLaunch(
+        launch = AuthorizedIncomingCallLaunch(
+            callId,
+            purpose,
+            expectedSession,
+            ringExpiresAt,
+            expiresAt,
+        ),
+        pendingNavigation = getBoolean(STATE_CALL_PENDING_NAVIGATION, false),
+    )
+}

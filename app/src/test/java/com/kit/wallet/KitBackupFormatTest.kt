@@ -8,6 +8,10 @@ import com.kit.wallet.data.backup.KitBackupKeyEnvelope
 import com.kit.wallet.data.backup.KitBackupManifest
 import com.kit.wallet.data.backup.KitBackupPayload
 import com.kit.wallet.data.messaging.AccountArchivedMessage
+import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitMediaMessageV2
+import com.kit.wallet.data.messaging.KitMediaMessageV2Item
+import com.kit.wallet.data.messaging.MediaAttachmentCipher
 import com.kit.wallet.data.messaging.SecureMessagingCryptoAddress
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
 import java.io.ByteArrayInputStream
@@ -17,10 +21,12 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.security.SecureRandom
 import java.time.Instant
+import java.util.Base64
 import java.util.Random
 import java.util.UUID
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
@@ -226,7 +232,7 @@ class KitBackupFormatTest {
         val source = KitBackupArchive.decryptingStream(ByteArrayInputStream(file.toByteArray()), key)
         val readManifest = source.use {
             val opened = KitBackupPayload.open(it)
-            KitBackupPayload.readMessages(it, restored::add)
+            KitBackupPayload.readMessages(it, opened, restored::add)
             opened
         }
 
@@ -247,10 +253,10 @@ class KitBackupFormatTest {
         val payload = payload(messages = (1..20).map(::message))
         val restored = mutableListOf<AccountArchivedMessage>()
         val source = ByteArrayInputStream(payload.copyOf(payload.size - 40))
-        KitBackupPayload.open(source)
+        val manifest = KitBackupPayload.open(source)
 
         assertThrows(IOException::class.java) {
-            KitBackupPayload.readMessages(source, restored::add)
+            KitBackupPayload.readMessages(source, manifest, restored::add)
         }
     }
 
@@ -259,10 +265,10 @@ class KitBackupFormatTest {
         // The terminator is the last four bytes: claim a message that is not there.
         ByteBuffer.wrap(payload).putInt(payload.size - 4, 4)
         val source = ByteArrayInputStream(payload)
-        KitBackupPayload.open(source)
+        val manifest = KitBackupPayload.open(source)
 
         assertThrows(KitBackupIntegrityException::class.java) {
-            KitBackupPayload.readMessages(source) { }
+            KitBackupPayload.readMessages(source, manifest) { }
         }
     }
 
@@ -279,15 +285,101 @@ class KitBackupFormatTest {
 
         val restored = mutableListOf<AccountArchivedMessage>()
         val source = ByteArrayInputStream(spliced)
-        KitBackupPayload.open(source)
+        val manifest = KitBackupPayload.open(source)
 
-        assertEquals(3, KitBackupPayload.readMessages(source, restored::add))
+        assertEquals(3, KitBackupPayload.readMessages(source, manifest, restored::add))
         assertEquals(messages, restored)
     }
 
     @Test fun `a payload that is not one says so`() {
         assertThrows(KitBackupFormatException::class.java) {
             KitBackupPayload.open(ByteArrayInputStream(ByteArray(64)))
+        }
+    }
+
+    @Test fun `validation provenance rides a schema bump and round-trips exactly`() {
+        // The marker says "this device proved the media binding for exactly this text". Losing it
+        // in Drive would demote proven history to a spoofable text-kind claim on restore, so it
+        // must survive byte-for-byte — and it must move the schema, so a build that would have
+        // skipped it refuses the whole file up front instead.
+        val messages = listOf(
+            message(1).copy(text = MEDIA_V2_TEXT, mediaValidated = true),
+            message(2),
+        )
+        val payload = payload(messages, withMediaProvenance = true)
+
+        val restored = mutableListOf<AccountArchivedMessage>()
+        val source = ByteArrayInputStream(payload)
+        val manifest = KitBackupPayload.open(source)
+        KitBackupPayload.readMessages(source, manifest, restored::add)
+
+        assertTrue(manifest.carriesMediaProvenance)
+        assertEquals(messages, restored)
+        assertEquals(2, ByteBuffer.wrap(payload).getInt(PAYLOAD_SCHEMA_AT))
+    }
+
+    @Test fun `a v1-only backup keeps the schema older builds accept`() {
+        val payload = payload(listOf(message(1).copy(text = MEDIA_V1_TEXT)))
+
+        assertEquals(1, ByteBuffer.wrap(payload).getInt(PAYLOAD_SCHEMA_AT))
+        assertFalse(KitBackupPayload.open(ByteArrayInputStream(payload)).carriesMediaProvenance)
+    }
+
+    @Test fun `an unvalidated v2 message still requires the whole-backup schema fence`() {
+        val message = message(1).copy(text = MEDIA_V2_TEXT, mediaValidated = false)
+
+        // The payload header is already committed before its lazy records are consumed, so a
+        // caller that forgot the content-based fence is rejected rather than emitting schema 1.
+        assertThrows(IllegalArgumentException::class.java) {
+            payload(listOf(message))
+        }
+
+        val fenced = payload(listOf(message), withMediaProvenance = true)
+        val source = ByteArrayInputStream(fenced)
+        val manifest = KitBackupPayload.open(source)
+        val restored = mutableListOf<AccountArchivedMessage>()
+        KitBackupPayload.readMessages(source, manifest, restored::add)
+
+        assertEquals(2, ByteBuffer.wrap(fenced).getInt(PAYLOAD_SCHEMA_AT))
+        assertTrue(manifest.carriesMediaProvenance)
+        assertEquals(listOf(message), restored)
+        assertFalse(restored.single().mediaValidated)
+    }
+
+    @Test fun `a validated message cannot slip into a provenance-free payload`() {
+        // Silently stripping the flag is exactly the demotion the schema bump exists to prevent.
+        // A writer that has not declared provenance must fail loudly, not launder the verdict.
+        assertThrows(IllegalArgumentException::class.java) {
+            payload(listOf(message(1).copy(mediaValidated = true)))
+        }
+    }
+
+    @Test fun `a tampered provenance marker is refused, not guessed at`() {
+        val payload = payload(
+            messages = listOf(message(1).copy(mediaValidated = true)),
+            withMediaProvenance = true,
+        )
+        // The marker is the last byte of the first record's body: tag(1) + length(4) + body.
+        val bodyLength = ByteBuffer.wrap(payload).getInt(manifestLength() + 1)
+        payload[manifestLength() + 1 + 4 + bodyLength - 1] = 7
+
+        val source = ByteArrayInputStream(payload)
+        val manifest = KitBackupPayload.open(source)
+
+        assertThrows(KitBackupFormatException::class.java) {
+            KitBackupPayload.readMessages(source, manifest) { }
+        }
+    }
+
+    @Test fun `a schema from a future build is refused before a single message is read`() {
+        // This is the same fence, seen from the other side: today's build meeting tomorrow's
+        // schema behaves exactly as yesterday's build meeting the provenance schema — a whole-file
+        // refusal at open, never a partial import that quietly dropped what it did not understand.
+        val payload = payload(listOf(message(1)))
+        ByteBuffer.wrap(payload).putInt(PAYLOAD_SCHEMA_AT, 3)
+
+        assertThrows(KitBackupFormatException::class.java) {
+            KitBackupPayload.open(ByteArrayInputStream(payload))
         }
     }
 
@@ -306,9 +398,12 @@ class KitBackupFormatTest {
         KitBackupArchive.decryptingStream(ByteArrayInputStream(sealed), with)
             .use { it.readBytes() }
 
-    private fun payload(messages: List<AccountArchivedMessage>): ByteArray {
+    private fun payload(
+        messages: List<AccountArchivedMessage>,
+        withMediaProvenance: Boolean = false,
+    ): ByteArray {
         val sink = ByteArrayOutputStream()
-        KitBackupPayload.write(sink, MANIFEST, messages.asSequence())
+        KitBackupPayload.write(sink, MANIFEST, messages.asSequence(), withMediaProvenance)
         return sink.toByteArray()
     }
 
@@ -350,10 +445,48 @@ class KitBackupFormatTest {
     private companion object {
         const val ARCHIVE_HEADER_BYTES = 44
         const val TERMINATOR_BYTES = 9
+
+        /** The schema integer sits immediately after the 18-byte payload magic. */
+        const val PAYLOAD_SCHEMA_AT = 18
         val OWNER: String = uuid(1)
         val DEVICE: String = uuid(2)
         val CONVERSATION: String = uuid(3)
         val MANIFEST = KitBackupManifest(OWNER, Instant.ofEpochMilli(1_724_000_000_000L), "0.2.24")
+        val MEDIA_KEY_MATERIAL: String = Base64.getEncoder()
+            .encodeToString(ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES))
+        val MEDIA_V1_TEXT: String = KitMediaMessage(
+            attachmentId = "11111111-1111-4111-8111-111111111111",
+            storageKey = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            mediaType = "image/jpeg",
+            ciphertextByteSize = 1_088,
+            ciphertextSha256 = "1".repeat(64),
+            keyMaterialBase64 = MEDIA_KEY_MATERIAL,
+            plaintextByteSize = 1_024,
+            caption = null,
+        ).encode()
+        val MEDIA_V2_TEXT: String = KitMediaMessageV2(
+            items = listOf(
+                KitMediaMessageV2Item(
+                    attachmentId = "11111111-1111-4111-8111-111111111111",
+                    storageKey = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    mediaType = "image/jpeg",
+                    ciphertextByteSize = 1_088,
+                    ciphertextSha256 = "1".repeat(64),
+                    keyMaterialBase64 = MEDIA_KEY_MATERIAL,
+                    plaintextByteSize = 1_024,
+                ),
+                KitMediaMessageV2Item(
+                    attachmentId = "22222222-2222-4222-8222-222222222222",
+                    storageKey = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    mediaType = "video/mp4",
+                    ciphertextByteSize = 5_242_944,
+                    ciphertextSha256 = "2".repeat(64),
+                    keyMaterialBase64 = MEDIA_KEY_MATERIAL,
+                    plaintextByteSize = 5_242_880,
+                ),
+            ),
+            caption = "Family photos",
+        ).encode()
 
         fun uuid(seed: Int): String = UUID(seed.toLong(), seed.toLong() * 31 + 7).toString()
     }

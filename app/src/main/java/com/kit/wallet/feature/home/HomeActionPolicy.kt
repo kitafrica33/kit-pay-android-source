@@ -14,6 +14,7 @@ internal enum class HomeAction(
     RECEIVE_MONEY("Receive money", Dest.RECEIVE),
     REQUEST_MONEY("Request money", Dest.REQUEST),
     VERIFY_IDENTITY("Identity verification", Dest.KYC),
+    START_FIRST_CHAT("Start a chat", Dest.CONTACTS),
     PAY_BILLS("Bill payments", Dest.BILLS),
     BUY_AIRTIME("Airtime", Dest.AIRTIME),
     BANK("Bank services", Dest.BANK),

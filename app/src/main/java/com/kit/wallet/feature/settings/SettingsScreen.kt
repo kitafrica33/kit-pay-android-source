@@ -303,7 +303,10 @@ fun SettingsScreen(
         capabilities = capabilities,
         onEditProfile = onEditProfile,
         onEmail = {
-            if (!profile.emailVerified && capabilities.enabled(KitFeature.EMAIL_REGISTRATION)) {
+            // Attaching an email to a signed-in account is setup for later email sign-in
+            // and recovery, so it follows the email_recovery capability — not the retired
+            // anonymous email-registration gate.
+            if (!profile.emailVerified && capabilities.enabled(KitFeature.EMAIL_RECOVERY)) {
                 viewModel.beginEmailFlow(profile.email)
                 showEmailDialog = true
             }
@@ -396,7 +399,9 @@ private fun SettingsContent(
     val identityVerification = identityVerificationPresentation(profile.kycLabel)
     val emailPresentation = profileEmailPresentation(
         profile,
-        attachmentAvailable = capabilities.enabled(KitFeature.EMAIL_REGISTRATION),
+        // Coordinated with email_recovery: the attachment exists to enable later email
+        // sign-in and recovery, and must survive the retirement of email registration.
+        attachmentAvailable = capabilities.enabled(KitFeature.EMAIL_RECOVERY),
     )
     val privacyPolicy = privacyPolicyPresentation()
     val accountDeletion = accountDeletionPresentation(

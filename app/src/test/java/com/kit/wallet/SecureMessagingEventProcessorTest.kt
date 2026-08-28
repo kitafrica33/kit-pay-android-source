@@ -5,6 +5,8 @@ import com.kit.wallet.data.messaging.AccountMessageHistoryAccess
 import com.kit.wallet.data.messaging.CapturedAccountMessageHistory
 import com.kit.wallet.data.messaging.FailClosedSecureMessagingCryptoTransaction
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitMediaMessageV2
+import com.kit.wallet.data.messaging.KitMediaMessageV2Item
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.KitReactionAction
@@ -40,6 +42,7 @@ import com.kit.wallet.data.messaging.SecureMessagingHistoryBackfillCodec
 import com.kit.wallet.data.messaging.SecureMessagingHistoryContinuationScheduler
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGate
+import com.kit.wallet.data.messaging.SecureMessagingMediaDisposition
 import com.kit.wallet.data.messaging.SecureMessagingNotificationPublicationException
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
@@ -556,6 +559,108 @@ class SecureMessagingEventProcessorTest {
             acknowledgement.path,
         )
         assertTrue(acknowledgement.body.readUtf8().contains(INCOMING_MESSAGE_ID))
+    }
+
+    @Test
+    fun `history backfill binds a v2 album and restores its positive provenance`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        recordCurrentIdentity(session)
+        val roster = historyTransferRoster()
+        val transferId = SecureMessagingHistoryBackfillCodec.deterministicTransferId(
+            messageId = INCOMING_MESSAGE_ID,
+            targetDeviceId = CURRENT_DEVICE_ID,
+            targetEnrollmentEpoch = 1,
+            donorDeviceId = OWN_DONOR_DEVICE_ID,
+            donorEnrollmentEpoch = 5,
+            transferRosterRevision = checkNotNull(roster.rosterRevision),
+        )
+        val media = mediaV2Descriptor()
+        val descriptor = historyDescriptor(
+            transferId = transferId,
+            transferRoster = checkNotNull(roster.rosterRevision),
+            text = media.encode(),
+            kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+        )
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore, authenticatedText = descriptor),
+            projections = projections,
+        )
+        enqueueSync(
+            events = listOf(
+                historyIncomingEvent(
+                    roster = roster,
+                    transferId = transferId,
+                    kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+                    attachments = mediaV2Attachments(media),
+                ),
+            ),
+            nextCursor = "history_media_v2_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+
+        processor.synchronize(session)
+
+        val projected = projections.readPage(limit = 10).messages().single()
+        assertEquals(media.encode(), projected.durableRecord.authenticatedText)
+        assertEquals(SecureMessagingMediaDisposition.VALIDATED, projected.mediaDisposition)
+        assertFalse(projected.unsupportedMedia)
+        assertNotNull(projections.readHistoryInbound(transferId))
+    }
+
+    @Test
+    fun `history backfill preserves valid v1 media without an unsupported pin`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        recordCurrentIdentity(session)
+        val roster = historyTransferRoster()
+        val transferId = SecureMessagingHistoryBackfillCodec.deterministicTransferId(
+            messageId = INCOMING_MESSAGE_ID,
+            targetDeviceId = CURRENT_DEVICE_ID,
+            targetEnrollmentEpoch = 1,
+            donorDeviceId = OWN_DONOR_DEVICE_ID,
+            donorEnrollmentEpoch = 5,
+            transferRosterRevision = checkNotNull(roster.rosterRevision),
+        )
+        val media = mediaDescriptor()
+        val descriptor = historyDescriptor(
+            transferId = transferId,
+            transferRoster = checkNotNull(roster.rosterRevision),
+            text = media.encode(),
+            kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+        )
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore, authenticatedText = descriptor),
+            projections = projections,
+        )
+        enqueueSync(
+            events = listOf(
+                historyIncomingEvent(
+                    roster = roster,
+                    transferId = transferId,
+                    kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+                    attachments = listOf(mediaAttachment(media)),
+                ),
+            ),
+            nextCursor = "history_media_v1_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+
+        processor.synchronize(session)
+
+        val projected = projections.readPage(limit = 10).messages().single()
+        assertEquals(media.encode(), projected.durableRecord.authenticatedText)
+        assertEquals(SecureMessagingMediaDisposition.NONE, projected.mediaDisposition)
+        assertFalse(projected.unsupportedMedia)
+        assertNotNull(projections.readHistoryInbound(transferId))
     }
 
     @Test
@@ -1610,11 +1715,134 @@ class SecureMessagingEventProcessorTest {
             projections.readPage(limit = 10).messages().single().deliveryState,
         )
         assertEquals(
+            SecureMessagingMediaDisposition.NONE,
+            projections.readPage(limit = 10).messages().single().mediaDisposition,
+        )
+        assertEquals(
             "media_cursor" to 10L,
             requireSecureMessagingSyncResumePosition(
                 checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
             ),
         )
+    }
+
+    @Test
+    fun `matching authenticated v2 album receives positive provenance`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val media = mediaV2Descriptor()
+        val processor = processor(
+            stateStore,
+            PersistingDecryptionEngine(stateStore, authenticatedText = media.encode()),
+            projections,
+        )
+        val roster = authoritativeRoster()
+        enqueueSync(
+            listOf(
+                incomingEvent(
+                    roster = roster,
+                    eventId = 10,
+                    kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+                    attachments = mediaV2Attachments(media),
+                ),
+            ),
+            "media_v2_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+
+        processor.synchronize(session)
+
+        val projected = projections.readPage(limit = 10).messages().single()
+        assertEquals(media.encode(), projected.durableRecord.authenticatedText)
+        assertEquals(SecureMessagingMediaDisposition.VALIDATED, projected.mediaDisposition)
+        assertFalse(projected.unsupportedMedia)
+        assertEquals(
+            "media_v2_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(
+                checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+            ),
+        )
+    }
+
+    @Test
+    fun `v2 binding mismatch is visible before a sanitized notification is published`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val media = mediaV2Descriptor()
+        val notifications = mutableListOf<SecureMessagingIncomingNotification>()
+        val projectionRevisionsAtPublish = mutableListOf<Long>()
+        val processor = processor(
+            stateStore,
+            PersistingDecryptionEngine(stateStore, authenticatedText = media.encode()),
+            projections,
+            SecureMessagingIncomingNotificationSink { notification ->
+                projectionRevisionsAtPublish += projections.changes.value
+                notifications += notification
+            },
+        )
+        val roster = authoritativeRoster()
+        val mismatched = mediaV2Attachments(media).mapIndexed { index, row ->
+            if (index == 0) row.copy(ciphertextSha256 = "f".repeat(64)) else row
+        }
+        enqueueSync(
+            listOf(
+                incomingEvent(
+                    roster = roster,
+                    eventId = 10,
+                    kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+                    attachments = mismatched,
+                ),
+            ),
+            "media_v2_mismatch_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+
+        processor.synchronize(session)
+
+        val projected = projections.readPage(limit = 10).messages().single()
+        assertEquals(SecureMessagingMediaDisposition.UNSUPPORTED, projected.mediaDisposition)
+        assertTrue(projected.unsupportedMedia)
+        assertTrue(projectionRevisionsAtPublish.single() > 0L)
+        assertEquals(KitMediaMessageV2.PREFIX, notifications.single().authenticatedText)
+        assertFalse(notifications.single().authenticatedText.contains(media.items.first().keyMaterialBase64))
+        assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
+    }
+
+    @Test
+    fun `malformed v2 text projects and notifies only as a generic placeholder`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val raw = "${KitMediaMessageV2.PREFIX}v=2&n=2&key0=secret-key-material"
+        val notifications = mutableListOf<SecureMessagingIncomingNotification>()
+        val processor = processor(
+            stateStore,
+            PersistingDecryptionEngine(stateStore, authenticatedText = raw),
+            projections,
+            SecureMessagingIncomingNotificationSink(notifications::add),
+        )
+        val roster = authoritativeRoster()
+        enqueueSync(listOf(incomingEvent(roster, 10)), "malformed_media_v2_cursor")
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+
+        processor.synchronize(session)
+
+        val projected = projections.readPage(limit = 10).messages().single()
+        assertEquals(SecureMessagingMediaDisposition.UNSUPPORTED, projected.mediaDisposition)
+        assertTrue(projected.unsupportedMedia)
+        assertEquals(KitMediaMessageV2.PREFIX, notifications.single().authenticatedText)
+        assertFalse(notifications.single().authenticatedText.contains("secret-key-material"))
+        assertEquals(SecureMessagingRuntimeStage.READY, lifecycle.snapshot().stage)
     }
 
     @Test
@@ -2519,6 +2747,176 @@ class SecureMessagingEventProcessorTest {
     }
 
     @Test
+    fun `a v2 album over a structural limit retires while an upgrade requirement parks`() =
+        runTest {
+            val (session, lifecycle, fence) = openSyncingSession()
+            lifecycle.finishActivation(fence)
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val processor =
+                processor(stateStore, PersistingDecryptionEngine(stateStore), projections)
+            val roster = authoritativeRoster()
+            val limitBlocked = stateStore.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = OUTBOUND_CLIENT_ID,
+                clientMessageId = OUTBOUND_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = encodedMediaV2Descriptor('1'),
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        PEER,
+                        SecureMessagingEnvelopeKind.SESSION,
+                        byteArrayOf(1, 2, 3),
+                    ),
+                ),
+            )
+            val upgradeBlocked = stateStore.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(
+                    SECOND_OUTBOUND_CLIENT_ID,
+                ),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = SECOND_OUTBOUND_CLIENT_ID,
+                clientMessageId = SECOND_OUTBOUND_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = encodedMediaV2Descriptor('2'),
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        PEER,
+                        SecureMessagingEnvelopeKind.SESSION,
+                        byteArrayOf(4, 5, 6),
+                    ),
+                ),
+            )
+            val laterText = stateStore.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(
+                    THIRD_OUTBOUND_CLIENT_ID,
+                ),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = THIRD_OUTBOUND_CLIENT_ID,
+                clientMessageId = THIRD_OUTBOUND_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = "send after blocked album",
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        PEER,
+                        SecureMessagingEnvelopeKind.SESSION,
+                        byteArrayOf(7, 8, 9),
+                    ),
+                ),
+            )
+            projections.recordOutboundPending(limitBlocked, Instant.parse(TIMESTAMP))
+            projections.recordOutboundPending(upgradeBlocked, Instant.parse(TIMESTAMP))
+            projections.recordOutboundPending(laterText, Instant.parse(TIMESTAMP))
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            enqueueRoster(roster)
+            server.enqueue(
+                apiErrorResponse(422, "MESSAGING_MEDIA_MESSAGE_V2_ATTACHMENT_LIMIT_EXCEEDED"),
+            )
+            server.enqueue(
+                apiErrorResponse(409, "MESSAGING_MEDIA_MESSAGE_V2_CLIENT_UPGRADE_REQUIRED"),
+            )
+            enqueueOutboundReceipt(roster, THIRD_OUTBOUND_CLIENT_ID)
+
+            processor.recoverPendingOutbox(session)
+
+            val projected = projections.readPage(limit = 10).messages()
+                .associateBy { it.durableRecord.clientMessageId }
+            assertEquals(
+                SecureMessagingProjectionDeliveryState.OUTBOUND_PERMANENT_FAILURE,
+                projected.getValue(OUTBOUND_CLIENT_ID).deliveryState,
+            )
+            assertEquals(
+                SecureMessagingProjectionDeliveryState.OUTBOUND_RETRY_REQUIRED,
+                projected.getValue(SECOND_OUTBOUND_CLIENT_ID).deliveryState,
+            )
+            assertEquals(
+                SecureMessagingProjectionDeliveryState.OUTBOUND_SENT,
+                projected.getValue(THIRD_OUTBOUND_CLIENT_ID).deliveryState,
+            )
+        }
+
+    @Test
+    fun `every v2 structural limit code condemns the exact fanout`() = runTest {
+        val (session, lifecycle, fence) = openSyncingSession()
+        lifecycle.finishActivation(fence)
+        val stateStore = TestSecureMessagingStateStore()
+        val projections = projectionStore(stateStore)
+        val processor = processor(stateStore, PersistingDecryptionEngine(stateStore), projections)
+        val roster = authoritativeRoster()
+        val aggregateBlocked = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = OUTBOUND_CLIENT_ID,
+            clientMessageId = OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = encodedMediaV2Descriptor('3'),
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(1, 2, 3),
+                ),
+            ),
+        )
+        val orderBlocked = stateStore.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.outboundRecordKey(
+                SECOND_OUTBOUND_CLIENT_ID,
+            ),
+            direction = LibSignalCompanionDirection.OUTBOUND,
+            messageId = SECOND_OUTBOUND_CLIENT_ID,
+            clientMessageId = SECOND_OUTBOUND_CLIENT_ID,
+            conversationId = CONVERSATION_ID,
+            rosterRevision = checkNotNull(roster.rosterRevision),
+            sender = CURRENT,
+            text = encodedMediaV2Descriptor('4'),
+            envelopes = listOf(
+                PersistedCompanionEnvelopeFixture(
+                    PEER,
+                    SecureMessagingEnvelopeKind.SESSION,
+                    byteArrayOf(4, 5, 6),
+                ),
+            ),
+        )
+        projections.recordOutboundPending(aggregateBlocked, Instant.parse(TIMESTAMP))
+        projections.recordOutboundPending(orderBlocked, Instant.parse(TIMESTAMP))
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        server.enqueue(
+            apiErrorResponse(422, "MESSAGING_MEDIA_MESSAGE_V2_AGGREGATE_LIMIT_EXCEEDED"),
+        )
+        server.enqueue(
+            apiErrorResponse(422, "MESSAGING_MEDIA_MESSAGE_V2_ATTACHMENT_ORDER_INVALID"),
+        )
+
+        processor.recoverPendingOutbox(session)
+
+        val projected = projections.readPage(limit = 10).messages()
+            .associateBy { it.durableRecord.clientMessageId }
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_PERMANENT_FAILURE,
+            projected.getValue(OUTBOUND_CLIENT_ID).deliveryState,
+        )
+        assertEquals(
+            SecureMessagingProjectionDeliveryState.OUTBOUND_PERMANENT_FAILURE,
+            projected.getValue(SECOND_OUTBOUND_CLIENT_ID).deliveryState,
+        )
+    }
+
+    @Test
     fun `an incompatible pending reaction does not starve later encrypted text`() = runTest {
         val (session, lifecycle, fence) = openSyncingSession()
         lifecycle.finishActivation(fence)
@@ -3103,6 +3501,46 @@ class SecureMessagingEventProcessorTest {
         encryptionMetadataCiphertext = null,
     )
 
+    private fun mediaV2Descriptor() = KitMediaMessageV2(
+        items = listOf(
+            KitMediaMessageV2Item(
+                attachmentId = "11111111-1111-4111-8111-111111111111",
+                storageKey = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                mediaType = "image/jpeg",
+                ciphertextByteSize = 1_088,
+                ciphertextSha256 = "1".repeat(64),
+                keyMaterialBase64 = Base64.getEncoder().encodeToString(
+                    ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES),
+                ),
+                plaintextByteSize = 1_024,
+            ),
+            KitMediaMessageV2Item(
+                attachmentId = "22222222-2222-4222-8222-222222222222",
+                storageKey = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                mediaType = "video/mp4",
+                ciphertextByteSize = 5_242_944,
+                ciphertextSha256 = "2".repeat(64),
+                keyMaterialBase64 = Base64.getEncoder().encodeToString(
+                    ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES) { 0xff.toByte() },
+                ),
+                plaintextByteSize = 5_242_880,
+            ),
+        ),
+        caption = "Family photos",
+    )
+
+    private fun mediaV2Attachments(media: KitMediaMessageV2): List<EncryptedAttachmentDto> =
+        media.toAttachmentRequests().map { row ->
+            EncryptedAttachmentDto(
+                id = row.id,
+                storageKey = row.storageKey,
+                mediaType = row.mediaType,
+                byteSize = row.byteSize,
+                ciphertextSha256 = row.ciphertextSha256,
+                encryptionMetadataCiphertext = null,
+            )
+        }
+
     private fun deviceLifecycleEvent(
         eventType: String,
         userId: String,
@@ -3179,6 +3617,40 @@ class SecureMessagingEventProcessorTest {
         caption = null,
     ).encode()
 
+    /**
+     * A canonical two-item KITMEDIA2 descriptor, seeded (lowercase hex only) so records in one
+     * test carry distinct identifiers and digests. It must strictly parse: recovery derives the
+     * attachment rows from this text, and an unparseable descriptor would never reach the
+     * failing send at all.
+     */
+    private fun encodedMediaV2Descriptor(seed: Char): String = KitMediaMessageV2(
+        items = listOf(
+            KitMediaMessageV2Item(
+                attachmentId = "${seed}1111111-1111-4111-8111-111111111111",
+                storageKey = "${seed}aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                mediaType = "image/jpeg",
+                ciphertextByteSize = 1_088,
+                ciphertextSha256 = "$seed" + "1".repeat(63),
+                keyMaterialBase64 = Base64.getEncoder().encodeToString(
+                    ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES) { it.toByte() },
+                ),
+                plaintextByteSize = 1_024,
+            ),
+            KitMediaMessageV2Item(
+                attachmentId = "${seed}2222222-2222-4222-8222-222222222222",
+                storageKey = "${seed}bbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                mediaType = "video/mp4",
+                ciphertextByteSize = 5_242_944,
+                ciphertextSha256 = "$seed" + "2".repeat(63),
+                keyMaterialBase64 = Base64.getEncoder().encodeToString(
+                    ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES) { it.toByte() },
+                ),
+                plaintextByteSize = 5_242_880,
+            ),
+        ),
+        caption = null,
+    ).encode()
+
     private fun incomingEvent(
         roster: MessagingDeviceRosterDto,
         eventId: Long,
@@ -3226,6 +3698,8 @@ class SecureMessagingEventProcessorTest {
         roster: MessagingDeviceRosterDto,
         transferId: String,
         eventId: Long = 10,
+        kind: String = ENCRYPTED_MESSAGE_KIND,
+        attachments: List<EncryptedAttachmentDto?> = emptyList(),
     ): MessagingSyncEventDto {
         val peer = roster.devices.orEmpty().filterNotNull()
             .single { it.deviceId == PEER_DEVICE_ID }
@@ -3251,7 +3725,7 @@ class SecureMessagingEventProcessorTest {
                 senderBundleVersion = peer.bundleVersion,
                 senderIdentityKeySha256 = peer.identityKeySha256,
                 rosterRevision = ORIGINAL_HISTORY_ROSTER,
-                kind = ENCRYPTED_MESSAGE_KIND,
+                kind = kind,
                 replyToMessageId = null,
                 envelope = EncryptedMessageEnvelopeDto(
                     recipientDeviceId = CURRENT_DEVICE_ID,
@@ -3273,7 +3747,7 @@ class SecureMessagingEventProcessorTest {
                         identityKeySha256 = donor.identityKeySha256,
                     ),
                 ),
-                attachments = emptyList(),
+                attachments = attachments,
                 reactions = emptyList(),
                 sentAt = TIMESTAMP,
                 revokedAt = null,
@@ -3308,7 +3782,12 @@ class SecureMessagingEventProcessorTest {
         )
     }
 
-    private fun historyDescriptor(transferId: String, transferRoster: String): String =
+    private fun historyDescriptor(
+        transferId: String,
+        transferRoster: String,
+        text: String = "restored only from authenticated ciphertext",
+        kind: String = ENCRYPTED_MESSAGE_KIND,
+    ): String =
         """{"schema":"kit.messaging.history.v1","type":"history_backfill",""" +
             "\"transfer_client_message_id\":\"$transferId\"," +
             "\"target_device_id\":\"$CURRENT_DEVICE_ID\"," +
@@ -3322,10 +3801,10 @@ class SecureMessagingEventProcessorTest {
             "\"sender_enrollment_epoch\":3," +
             "\"sender_signal_device_id\":2," +
             "\"original_roster_revision\":\"$ORIGINAL_HISTORY_ROSTER\"," +
-            "\"kind\":\"$ENCRYPTED_MESSAGE_KIND\"," +
+            "\"kind\":\"$kind\"," +
             "\"reply_to_message_id\":null," +
             "\"sent_at\":\"$TIMESTAMP\"," +
-            "\"text\":\"restored only from authenticated ciphertext\"}"
+            "\"text\":\"$text\"}"
 
     private fun outboundHistoryDescriptor(transferId: String, rosterRevision: String): String =
         """{"schema":"kit.messaging.history.v1","type":"history_backfill",""" +

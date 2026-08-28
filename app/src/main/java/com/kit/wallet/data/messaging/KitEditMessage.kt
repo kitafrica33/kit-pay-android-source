@@ -76,6 +76,11 @@ internal data class KitEditMessage(
                 MAX_DESCRIPTOR_LENGTH &&
                 KitPaymentMessage.allowsUserAuthoredText(body) &&
                 !KitGroupPaymentMessage.beginsWithReservedPrefix(body) &&
+                // No generation of the media namespace may arrive as a correction: a body of
+                // descriptor text would let an edit put attachment key material into a bubble
+                // the composer could never have produced. Checked with the contract's exact
+                // six-codepoint edge set, matching how receivers classify reserved text.
+                !KitMediaFamily.isFamilyText(body) &&
                 !KitReactionMessage.beginsWithReservedPrefix(body) &&
                 !beginsWithReservedPrefix(body)
 

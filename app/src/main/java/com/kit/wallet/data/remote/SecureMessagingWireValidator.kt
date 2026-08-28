@@ -1110,6 +1110,10 @@ object SecureMessagingWireValidator {
         attachments: List<EncryptedAttachmentDto>,
     ): List<EncryptedAttachmentRequest> {
         requireWire(attachments.size <= MAX_ATTACHMENTS, "encrypted attachment count")
+        // Multi-row sets exist only in the media-v2 family, whose receive contract normalizes
+        // outer digest case before descriptor set-matching. The single-row legacy shape keeps
+        // its strict lowercase-only digest rule, as does every outbound digest.
+        val normalizeDigestCase = attachments.size > 1
         val ids = mutableSetOf<String>()
         val storageKeys = mutableSetOf<String>()
         return attachments.mapIndexed { index, attachment ->
@@ -1127,6 +1131,7 @@ object SecureMessagingWireValidator {
             val ciphertextSha256 = requireSha256(
                 attachment.ciphertextSha256,
                 "$prefix ciphertext hash",
+                normalizeCase = normalizeDigestCase,
             )
             attachment.encryptionMetadataCiphertext?.let {
                 requireCanonicalBase64(
@@ -1257,8 +1262,15 @@ object SecureMessagingWireValidator {
         return expected
     }
 
-    private fun requireSha256(value: String?, field: String): String {
-        val hash = required(value, field)
+    private fun requireSha256(
+        value: String?,
+        field: String,
+        normalizeCase: Boolean = false,
+    ): String {
+        // Receive-side multi-row attachment digests are matched as a set against the
+        // authenticated descriptor, and that contract normalizes hex case before the
+        // comparison. Every other digest on this API stays lowercase-only.
+        val hash = if (normalizeCase) required(value, field).lowercase() else required(value, field)
         requireWire(SHA256_HEX.matches(hash), field)
         return hash
     }

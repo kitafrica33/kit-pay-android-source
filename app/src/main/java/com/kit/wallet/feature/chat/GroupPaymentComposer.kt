@@ -41,6 +41,7 @@ import com.kit.wallet.data.messaging.KitGroupPaymentMessage
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.repository.GroupPaymentDraftPolicy
 import com.kit.wallet.feature.auth.PaymentApproval
+import com.kit.wallet.ui.components.GroupedAmountTransformation
 import com.kit.wallet.ui.model.ChatMember
 import java.math.BigDecimal
 import java.util.UUID
@@ -145,6 +146,26 @@ private fun canonicalComposerAmount(value: String): String {
     val trimmed = value.trim()
     return runCatching { BigDecimal(trimmed).stripTrailingZeros().toPlainString() }
         .getOrDefault(trimmed)
+}
+
+/**
+ * Keeps editable group-payment amounts parseable while accepting grouped pasted values.
+ *
+ * The decimal point is deliberately retained, including a trailing point or zero, so typing
+ * `1.05` never collapses the intermediate `1.0`. Display grouping remains presentational and the
+ * committed amount is canonicalized by [canonicalComposerAmount].
+ */
+internal fun sanitizeGroupPaymentAmountInput(value: String): String = buildString(value.length) {
+    var hasDecimalPoint = false
+    value.forEach { character ->
+        when {
+            character.isDigit() -> append(character)
+            character == '.' && !hasDecimalPoint -> {
+                append(character)
+                hasDecimalPoint = true
+            }
+        }
+    }
 }
 
 /**
@@ -304,10 +325,14 @@ internal fun GroupPaymentComposerDialog(
                         if (checked && splitMode == GroupPaymentSplitMode.CUSTOM) {
                             OutlinedTextField(
                                 value = customAmounts[member.userId].orEmpty(),
-                                onValueChange = { customAmounts[member.userId] = it },
+                                onValueChange = {
+                                    customAmounts[member.userId] =
+                                        sanitizeGroupPaymentAmountInput(it)
+                                },
                                 enabled = !sending,
                                 singleLine = true,
                                 label = { Text("${member.name}'s share ($currencyCode)") },
+                                visualTransformation = GroupedAmountTransformation,
                                 keyboardOptions = KeyboardOptions(
                                     keyboardType = KeyboardType.Decimal,
                                 ),
@@ -322,10 +347,11 @@ internal fun GroupPaymentComposerDialog(
                 if (splitMode == GroupPaymentSplitMode.EVEN) {
                     OutlinedTextField(
                         value = total,
-                        onValueChange = { total = it },
+                        onValueChange = { total = sanitizeGroupPaymentAmountInput(it) },
                         enabled = !sending,
                         singleLine = true,
                         label = { Text("Total to divide ($currencyCode)") },
+                        visualTransformation = GroupedAmountTransformation,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         modifier = Modifier.fillMaxWidth(),
                     )

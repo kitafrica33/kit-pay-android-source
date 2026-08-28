@@ -192,6 +192,11 @@ fun WalletTransactionEntity.toUiModel(
         reference = reference,
         currencyCode = currencyCode,
         currencyScale = currencyScale,
+        // The unmapped backend words survive beside the display kind: reversal and refund
+        // types collapse into SEND/RECEIVE for rendering, and credits share display kinds
+        // with debits, so the starter checklist reads the originals to refuse them.
+        rawType = type,
+        rawDirection = direction,
     )
 }
 
@@ -214,21 +219,23 @@ private fun String?.toKycLabel(): String = when (kycVerificationStateOf(this)) {
     KycVerificationState.UNKNOWN -> "KYC status unavailable"
 }
 
-private fun String.toUiType(direction: String): TxType = when (lowercase()) {
+// Trimmed and lowercased before matching: a server value with stray whitespace or
+// casing must normalize to the same kind, never fall through to a default.
+private fun String.toUiType(direction: String): TxType = when (trim().lowercase()) {
     "bill", "bill_payment", "utility" -> TxType.BILL
     "airtime", "data" -> TxType.AIRTIME
     "bank_deposit", "bank_in" -> TxType.BANK_IN
     "bank_withdrawal", "bank_out" -> TxType.BANK_OUT
     "merchant", "merchant_payment", "collection" -> TxType.MERCHANT
     "request", "payment_request" -> TxType.REQUEST
-    else -> if (direction.lowercase() in setOf("credit", "in", "incoming", "receive")) {
+    else -> if (direction.trim().lowercase() in setOf("credit", "in", "incoming", "receive")) {
         TxType.RECEIVE
     } else {
         TxType.SEND
     }
 }
 
-private fun String.toUiStatus(): TxStatus = when (lowercase()) {
+private fun String.toUiStatus(): TxStatus = when (trim().lowercase()) {
     "completed", "successful", "success", "posted" -> TxStatus.COMPLETED
     "failed", "rejected", "cancelled", "canceled", "reversed" -> TxStatus.FAILED
     else -> TxStatus.PENDING

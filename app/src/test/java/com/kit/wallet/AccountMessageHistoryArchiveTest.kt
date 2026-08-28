@@ -10,18 +10,24 @@ import com.kit.wallet.data.messaging.AccountMessageArchiveRecord
 import com.kit.wallet.data.messaging.AccountMessageArchiveStore
 import com.kit.wallet.data.messaging.AccountMessageHistoryArchive
 import com.kit.wallet.data.messaging.AccountMessageHistoryCoordinator
+import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitMediaMessageV2
+import com.kit.wallet.data.messaging.KitMediaMessageV2Item
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
+import com.kit.wallet.data.messaging.MediaAttachmentCipher
 import com.kit.wallet.data.messaging.PendingAccountMessageArchivePurge
 import com.kit.wallet.data.messaging.SecureMessagingActivationCapability
 import com.kit.wallet.data.messaging.SecureMessagingCryptoAddress
 import com.kit.wallet.data.messaging.SecureMessagingEnvelopeKind
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
+import com.kit.wallet.data.messaging.SecureMessagingMediaDisposition
 import com.kit.wallet.data.messaging.SecureMessagingProjectedMessage
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
 import com.kit.wallet.data.messaging.SecureMessagingStateStore
+import com.kit.wallet.data.messaging.selectArchivedMessageUpdate
 import com.kit.wallet.data.remote.DeviceRegistrationDto
 import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.CoroutineOwnedMutex
@@ -31,7 +37,9 @@ import com.kit.wallet.data.session.SessionSnapshot
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
 import java.lang.reflect.Modifier
+import java.nio.ByteBuffer
 import java.time.Instant
+import java.util.Base64
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
@@ -573,6 +581,278 @@ class AccountMessageHistoryArchiveTest {
     }
 
     @Test
+    fun `validated media provenance survives archive and restore as actionable`() = runTest {
+        val records = InMemoryAccountMessageArchiveStore()
+        val sessions = MutableSessionStore(session(ACCOUNT_A, "session-a-one"))
+        val archiveAccess = AccountMessageHistoryArchive(sessions, DEVICE_IDENTITY, records)
+        archiveAccess.capture(ACCOUNT_A).archive(
+            acceptedInboundProjection(
+                CONVERSATION_A,
+                SERVER_MESSAGE_A,
+                CLIENT_MESSAGE_A,
+                text = MEDIA_V2_TEXT,
+                mediaDisposition = SecureMessagingMediaDisposition.VALIDATED,
+            ),
+        )
+        assertTrue(archiveAccess.capture(ACCOUNT_A).readAll().single().mediaValidated)
+
+        sessions.save(session(ACCOUNT_A, "session-a-two"))
+        val restoredState = TestSecureMessagingStateStore()
+        val restored = SecureMessagingProjectionStore(
+            restoredState,
+            LibSignalCompanionStateReader(restoredState),
+            archiveAccess,
+        )
+        restored.restoreArchivedHistory(
+            activation = readyActivation(sessions.current()!!),
+            currentUserId = ACCOUNT_A,
+            allowedConversationIds = setOf(CONVERSATION_A),
+        )
+
+        // The verdict this device proved before logout comes back as a verdict, not as an
+        // unproven text-kind claim, so the album stays actionable instead of a placeholder.
+        val projected = restored.readPage(limit = 10).messages().single()
+        assertEquals(SecureMessagingMediaDisposition.VALIDATED, projected.mediaDisposition)
+        assertFalse(projected.unsupportedMedia)
+        assertEquals(MEDIA_V2_TEXT, projected.durableRecord.authenticatedText)
+    }
+
+    @Test
+    fun `restore promotes none to validated while unsupported remains absorbing`() = runTest {
+        val records = InMemoryAccountMessageArchiveStore()
+        val sessions = MutableSessionStore(session(ACCOUNT_A, "session-a"))
+        val archiveAccess = AccountMessageHistoryArchive(sessions, DEVICE_IDENTITY, records)
+        val archive = archiveAccess.capture(ACCOUNT_A)
+        archive.restore(
+            archivedMessage(
+                SERVER_MESSAGE_A,
+                CLIENT_MESSAGE_A,
+                text = MEDIA_V2_TEXT,
+                mediaValidated = true,
+            ),
+        )
+        archive.restore(
+            archivedMessage(
+                SERVER_MESSAGE_B,
+                CLIENT_MESSAGE_B,
+                text = MEDIA_V2_TEXT,
+                mediaValidated = true,
+            ),
+        )
+
+        val state = TestSecureMessagingStateStore()
+        val projections = SecureMessagingProjectionStore(
+            state,
+            LibSignalCompanionStateReader(state),
+            archiveAccess,
+        )
+        val unpinned = state.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.inboundRecordKey(SERVER_MESSAGE_A),
+            direction = LibSignalCompanionDirection.INBOUND,
+            messageId = SERVER_MESSAGE_A,
+            clientMessageId = CLIENT_MESSAGE_A,
+            conversationId = CONVERSATION_A,
+            rosterRevision = ROSTER_REVISION,
+            sender = ACCOUNT_B_ADDRESS,
+            text = MEDIA_V2_TEXT,
+        )
+        val rejected = state.persistCompanionRecordForTest(
+            namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+            recordKey = SecureMessagingProjectionStore.inboundRecordKey(SERVER_MESSAGE_B),
+            direction = LibSignalCompanionDirection.INBOUND,
+            messageId = SERVER_MESSAGE_B,
+            clientMessageId = CLIENT_MESSAGE_B,
+            conversationId = CONVERSATION_A,
+            rosterRevision = ROSTER_REVISION,
+            sender = ACCOUNT_B_ADDRESS,
+            text = MEDIA_V2_TEXT,
+        )
+        projections.recordInbound(unpinned, SENT_AT)
+        projections.recordInboundUnsupportedMedia(rejected, SENT_AT)
+
+        projections.restoreArchivedHistory(
+            activation = readyActivation(sessions.current()!!),
+            currentUserId = ACCOUNT_A,
+            allowedConversationIds = setOf(CONVERSATION_A),
+        )
+
+        val byId = projections.readPage(limit = 10).messages().associateBy { it.serverMessageId }
+        assertEquals(
+            SecureMessagingMediaDisposition.VALIDATED,
+            byId.getValue(SERVER_MESSAGE_A).mediaDisposition,
+        )
+        assertFalse(byId.getValue(SERVER_MESSAGE_A).unsupportedMedia)
+        assertEquals(
+            SecureMessagingMediaDisposition.UNSUPPORTED,
+            byId.getValue(SERVER_MESSAGE_B).mediaDisposition,
+        )
+        assertTrue(byId.getValue(SERVER_MESSAGE_B).unsupportedMedia)
+    }
+
+    @Test
+    fun `outbound v2 requires its explicit send-time pin before archive capture`() = runTest {
+        val records = InMemoryAccountMessageArchiveStore()
+        val sessions = MutableSessionStore(session(ACCOUNT_A, "session-a"))
+        val archive = AccountMessageHistoryArchive(sessions, DEVICE_IDENTITY, records)
+            .capture(ACCOUNT_A)
+
+        archive.archive(
+            acceptedOutboundProjection(
+                CONVERSATION_A,
+                SERVER_MESSAGE_A,
+                CLIENT_MESSAGE_A,
+                text = MEDIA_V2_TEXT,
+            ),
+        )
+        assertTrue(archive.readAll().isEmpty())
+
+        archive.archive(
+            acceptedOutboundProjection(
+                CONVERSATION_A,
+                SERVER_MESSAGE_B,
+                CLIENT_MESSAGE_B,
+                text = MEDIA_V2_TEXT,
+                mediaDisposition = SecureMessagingMediaDisposition.VALIDATED,
+            ),
+        )
+        val captured = archive.readAll().single()
+        assertEquals(SERVER_MESSAGE_B, captured.serverMessageId)
+        assertTrue(captured.mediaValidated)
+    }
+
+    @Test
+    fun `restored media text without provenance stays a fail-closed placeholder`() = runTest {
+        val records = InMemoryAccountMessageArchiveStore()
+        val sessions = MutableSessionStore(session(ACCOUNT_A, "session-a"))
+        val archiveAccess = AccountMessageHistoryArchive(sessions, DEVICE_IDENTITY, records)
+        val archive = archiveAccess.capture(ACCOUNT_A)
+        // What a provenance-free backup, or a hostile text-kind message, hands the merge: a
+        // byte-exact strict descriptor with no proof any device validated its envelope binding.
+        archive.restore(archivedMessage(SERVER_MESSAGE_A, CLIENT_MESSAGE_A, text = MEDIA_V2_TEXT))
+        // Provenance smuggled onto ordinary text is inert rather than trusted.
+        archive.restore(
+            archivedMessage(
+                SERVER_MESSAGE_B,
+                CLIENT_MESSAGE_B,
+                text = "plain text wearing a stolen flag",
+                mediaValidated = true,
+            ),
+        )
+        // Legacy single-attachment history keeps its original trust without any flag.
+        archive.restore(archivedMessage(SERVER_MESSAGE_C, CLIENT_MESSAGE_C, text = MEDIA_V1_TEXT))
+
+        val restoredState = TestSecureMessagingStateStore()
+        val restored = SecureMessagingProjectionStore(
+            restoredState,
+            LibSignalCompanionStateReader(restoredState),
+            archiveAccess,
+        )
+        restored.restoreArchivedHistory(
+            activation = readyActivation(sessions.current()!!),
+            currentUserId = ACCOUNT_A,
+            allowedConversationIds = setOf(CONVERSATION_A),
+        )
+
+        val byId = restored.readPage(limit = 10).messages().associateBy { it.serverMessageId }
+        val spoofed = byId.getValue(SERVER_MESSAGE_A)
+        assertEquals(SecureMessagingMediaDisposition.NONE, spoofed.mediaDisposition)
+        assertTrue(spoofed.unsupportedMedia)
+        val flaggedPlain = byId.getValue(SERVER_MESSAGE_B)
+        assertEquals(SecureMessagingMediaDisposition.NONE, flaggedPlain.mediaDisposition)
+        assertFalse(flaggedPlain.unsupportedMedia)
+        val legacy = byId.getValue(SERVER_MESSAGE_C)
+        assertEquals(SecureMessagingMediaDisposition.NONE, legacy.mediaDisposition)
+        assertFalse(legacy.unsupportedMedia)
+    }
+
+    @Test
+    fun `archive codec fences unvalidated v2 while canonical v1 stays schema one`() = runTest {
+        val records = InMemoryAccountMessageArchiveStore()
+        val sessions = MutableSessionStore(session(ACCOUNT_A, "session-a"))
+        val archive = AccountMessageHistoryArchive(sessions, DEVICE_IDENTITY, records)
+            .capture(ACCOUNT_A)
+        archive.restore(
+            archivedMessage(SERVER_MESSAGE_A, CLIENT_MESSAGE_A, text = MEDIA_V2_TEXT),
+        )
+        archive.restore(
+            archivedMessage(SERVER_MESSAGE_C, CLIENT_MESSAGE_C, text = MEDIA_V1_TEXT),
+        )
+
+        val schemas = records.messageSchemas()
+        assertEquals(2, schemas.getValue(SERVER_MESSAGE_A))
+        assertEquals(1, schemas.getValue(SERVER_MESSAGE_C))
+        val restored = archive.readAll().associateBy(AccountArchivedMessage::serverMessageId)
+        assertFalse(restored.getValue(SERVER_MESSAGE_A).mediaValidated)
+        assertFalse(restored.getValue(SERVER_MESSAGE_C).mediaValidated)
+    }
+
+    @Test
+    fun `unsupported media placeholders are excluded from archive capture`() = runTest {
+        val records = InMemoryAccountMessageArchiveStore()
+        val sessions = MutableSessionStore(session(ACCOUNT_A, "session-a"))
+        val archive = AccountMessageHistoryArchive(sessions, DEVICE_IDENTITY, records)
+            .capture(ACCOUNT_A)
+        // Both rejected shapes are refused: a pinned verdict on strict text that failed its
+        // binding, and a pre-verdict row whose reserved text has no strict rows at all.
+        archive.archive(
+            acceptedInboundProjection(
+                CONVERSATION_A,
+                SERVER_MESSAGE_A,
+                CLIENT_MESSAGE_A,
+                text = MEDIA_V2_TEXT,
+                mediaDisposition = SecureMessagingMediaDisposition.UNSUPPORTED,
+            ),
+        )
+        archive.archive(
+            acceptedInboundProjection(
+                CONVERSATION_A,
+                SERVER_MESSAGE_B,
+                CLIENT_MESSAGE_B,
+                text = "KITMEDIA2:v=2&n=2&malformed",
+            ),
+        )
+
+        assertTrue(archive.readAll().isEmpty())
+    }
+
+    @Test
+    fun `validation provenance merges monotonically without rewriting history`() {
+        val flagged = archivedMessage(
+            SERVER_MESSAGE_A,
+            CLIENT_MESSAGE_A,
+            text = MEDIA_V2_TEXT,
+            mediaValidated = true,
+        )
+        val unflaggedRead = flagged.copy(
+            deliveryState = SecureMessagingProjectionDeliveryState.INBOUND_READ,
+            mediaValidated = false,
+        )
+
+        // A receipt advance written by a build that predates the flag must not erase it.
+        assertEquals(
+            unflaggedRead.copy(mediaValidated = true),
+            selectArchivedMessageUpdate(existing = flagged, incoming = unflaggedRead),
+        )
+        // A verdict arriving without a receipt advance still becomes durable — only the verdict.
+        assertEquals(
+            unflaggedRead.copy(mediaValidated = true),
+            selectArchivedMessageUpdate(existing = unflaggedRead, incoming = flagged),
+        )
+        // Nothing new on either axis writes nothing.
+        assertNull(selectArchivedMessageUpdate(existing = flagged, incoming = flagged))
+        // The flag never excuses a rewrite of immutable history.
+        assertTrue(
+            runCatching {
+                selectArchivedMessageUpdate(
+                    existing = flagged,
+                    incoming = flagged.copy(text = "rewritten"),
+                )
+            }.isFailure,
+        )
+    }
+
+    @Test
     fun `sanitized archive type has no protocol fanout ratchet retry or notification fields`() {
         val fields = AccountArchivedMessage::class.java.declaredFields
             .filterNot { Modifier.isStatic(it.modifiers) }
@@ -597,6 +877,8 @@ class AccountMessageHistoryArchiveTest {
         conversationId: String,
         serverMessageId: String,
         clientMessageId: String,
+        text: String = "received before logout",
+        mediaDisposition: SecureMessagingMediaDisposition = SecureMessagingMediaDisposition.NONE,
     ): SecureMessagingProjectedMessage {
         val state = TestSecureMessagingStateStore()
         val durable = state.persistCompanionRecordForTest(
@@ -608,13 +890,14 @@ class AccountMessageHistoryArchiveTest {
             conversationId = conversationId,
             rosterRevision = ROSTER_REVISION,
             sender = ACCOUNT_B_ADDRESS,
-            text = "received before logout",
+            text = text,
         )
         return SecureMessagingProjectedMessage(
             durableRecord = durable,
             serverMessageId = serverMessageId,
             sentAt = SENT_AT,
             deliveryState = SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED,
+            mediaDisposition = mediaDisposition,
         )
     }
 
@@ -622,6 +905,8 @@ class AccountMessageHistoryArchiveTest {
         conversationId: String,
         serverMessageId: String,
         clientMessageId: String,
+        text: String = "sent before logout",
+        mediaDisposition: SecureMessagingMediaDisposition = SecureMessagingMediaDisposition.NONE,
     ): SecureMessagingProjectedMessage {
         val state = TestSecureMessagingStateStore()
         val durable = state.persistCompanionRecordForTest(
@@ -633,7 +918,7 @@ class AccountMessageHistoryArchiveTest {
             conversationId = conversationId,
             rosterRevision = ROSTER_REVISION,
             sender = ACCOUNT_A_ADDRESS,
-            text = "sent before logout",
+            text = text,
             envelopes = outboundFanout(),
         )
         return SecureMessagingProjectedMessage(
@@ -641,6 +926,7 @@ class AccountMessageHistoryArchiveTest {
             serverMessageId = serverMessageId,
             sentAt = SENT_AT,
             deliveryState = SecureMessagingProjectionDeliveryState.OUTBOUND_SENT,
+            mediaDisposition = mediaDisposition,
         )
     }
 
@@ -650,6 +936,25 @@ class AccountMessageHistoryArchiveTest {
             kind = SecureMessagingEnvelopeKind.SESSION,
             ciphertext = byteArrayOf(1, 2, 3),
         ),
+    )
+
+    /** A peer-authored row shaped the way a restored portable backup hands it to the merge. */
+    private fun archivedMessage(
+        serverMessageId: String,
+        clientMessageId: String,
+        text: String,
+        mediaValidated: Boolean = false,
+    ) = AccountArchivedMessage(
+        serverMessageId = serverMessageId,
+        clientMessageId = clientMessageId,
+        conversationId = CONVERSATION_A,
+        sender = ACCOUNT_B_ADDRESS,
+        rosterRevision = ROSTER_REVISION,
+        replyToMessageId = null,
+        sentAt = SENT_AT,
+        text = text,
+        deliveryState = SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED,
+        mediaValidated = mediaValidated,
     )
 
     private data class ReadyActivation(
@@ -830,6 +1135,14 @@ class AccountMessageHistoryArchiveTest {
         var beforeReadPage: (() -> Unit)? = null
         var beforeWrite: (() -> Unit)? = null
 
+        fun messageSchemas(): Map<String, Int> = records.mapNotNull { (address, stored) ->
+            val recordKey = address.second
+            if (!recordKey.startsWith("message:")) return@mapNotNull null
+            val schemaOffset = "kit.account-message-history".toByteArray(Charsets.US_ASCII).size
+            recordKey.removePrefix("message:") to
+                ByteBuffer.wrap(stored.bytes).getInt(schemaOffset)
+        }.toMap()
+
         override suspend fun read(
             owner: AccountMessageArchiveOwner,
             recordKey: String,
@@ -936,13 +1249,54 @@ class AccountMessageHistoryArchiveTest {
         const val CONVERSATION_B = "44444444-4444-4444-8444-444444444444"
         const val SERVER_MESSAGE_A = "55555555-5555-4555-8555-555555555555"
         const val SERVER_MESSAGE_B = "66666666-6666-4666-8666-666666666666"
+        const val SERVER_MESSAGE_C = "99999999-9999-4999-8999-999999999999"
         const val CLIENT_MESSAGE_A = "77777777-7777-4777-8777-777777777777"
         const val CLIENT_MESSAGE_B = "88888888-8888-4888-8888-888888888888"
+        const val CLIENT_MESSAGE_C = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
         const val ROSTER_REVISION =
             "v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         val SENT_AT: Instant = Instant.parse("2026-07-23T12:00:00Z")
         val ACCOUNT_A_ADDRESS = SecureMessagingCryptoAddress(ACCOUNT_A, DEVICE_A, 1)
         val ACCOUNT_B_ADDRESS = SecureMessagingCryptoAddress(ACCOUNT_B, DEVICE_B, 2)
+        val MEDIA_KEY_MATERIAL: String = Base64.getEncoder()
+            .encodeToString(ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES))
+
+        /** Strict multi-attachment media text; encoding it keeps validity by construction. */
+        val MEDIA_V2_TEXT: String = KitMediaMessageV2(
+            items = listOf(
+                KitMediaMessageV2Item(
+                    attachmentId = "11111111-1111-4111-8111-111111111111",
+                    storageKey = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    mediaType = "image/jpeg",
+                    ciphertextByteSize = 1_088,
+                    ciphertextSha256 = "1".repeat(64),
+                    keyMaterialBase64 = MEDIA_KEY_MATERIAL,
+                    plaintextByteSize = 1_024,
+                ),
+                KitMediaMessageV2Item(
+                    attachmentId = "22222222-2222-4222-8222-222222222222",
+                    storageKey = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    mediaType = "video/mp4",
+                    ciphertextByteSize = 5_242_944,
+                    ciphertextSha256 = "2".repeat(64),
+                    keyMaterialBase64 = MEDIA_KEY_MATERIAL,
+                    plaintextByteSize = 5_242_880,
+                ),
+            ),
+            caption = "Family photos",
+        ).encode()
+
+        /** Legacy single-attachment media text, which keeps its pre-verdict trust unflagged. */
+        val MEDIA_V1_TEXT: String = KitMediaMessage(
+            attachmentId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            storageKey = "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            mediaType = "image/jpeg",
+            ciphertextByteSize = 4_096,
+            ciphertextSha256 = "6".repeat(64),
+            keyMaterialBase64 = MEDIA_KEY_MATERIAL,
+            plaintextByteSize = 4_000,
+            caption = null,
+        ).encode()
         val DEVICE_IDENTITY = object : DeviceIdentityProvider {
             override fun registration() = DeviceRegistrationDto(
                 installationId = INSTALLATION_ID,

@@ -6,6 +6,7 @@ import com.kit.wallet.feature.chat.IncomingTextShare
 import com.kit.wallet.feature.chat.SharedInboxBatch
 import com.kit.wallet.feature.chat.SharedInboxOwner
 import com.kit.wallet.feature.chat.SharedInboxPolicy
+import java.io.DataOutputStream
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -63,20 +64,26 @@ class IncomingShareRequestPersistenceTest {
         val first = IncomingShareRequestPersistence(root)
         first.publish(original)
 
-        val pinned = first.pinDestination(original, DIRECT_ONE, nowMillis = NOW)
+        val pinned = first.pinDestination(original, DIRECT_ONE, albumDelivery = false, nowMillis = NOW)
         assertEquals(DIRECT_ONE, pinned.pinnedConversationId)
+        assertEquals(false, pinned.albumDelivery)
 
         val recreated = IncomingShareRequestPersistence(root)
         assertEquals(
             DIRECT_ONE,
             accepted(recreated.claim(original.id, nowMillis = NOW)).pinnedConversationId,
         )
-        assertEquals(
+        // Repeating the choice is safe, and a flipped shape preference cannot re-shape the batch.
+        val repinned = recreated.pinDestination(
+            original,
             DIRECT_ONE,
-            recreated.pinDestination(original, DIRECT_ONE, nowMillis = NOW).pinnedConversationId,
+            albumDelivery = true,
+            nowMillis = NOW,
         )
+        assertEquals(DIRECT_ONE, repinned.pinnedConversationId)
+        assertEquals(false, repinned.albumDelivery)
         assertThrows(IllegalStateException::class.java) {
-            recreated.pinDestination(original, DIRECT_TWO, nowMillis = NOW)
+            recreated.pinDestination(original, DIRECT_TWO, albumDelivery = false, nowMillis = NOW)
         }
         assertEquals(
             DIRECT_ONE,
@@ -112,7 +119,9 @@ class IncomingShareRequestPersistenceTest {
             val current = batch(id, receivedAtMillis = NOW + index)
             store.publish(current, nowMillis = NOW + index)
             assertEquals(current, accepted(store.claim(id, nowMillis = NOW + index)))
-            if (index == 0) store.pinDestination(current, DIRECT_ONE, nowMillis = NOW + index)
+            if (index == 0) {
+                store.pinDestination(current, DIRECT_ONE, albumDelivery = false, nowMillis = NOW + index)
+            }
         }
 
         val fifth = batch(BATCH_FIVE, receivedAtMillis = NOW + 10)
@@ -127,6 +136,96 @@ class IncomingShareRequestPersistenceTest {
             accepted(store.claim(BATCH_ONE, nowMillis = NOW + 10)).pinnedConversationId,
         )
         assertEquals(4, store.restore(nowMillis = NOW + 10).size)
+    }
+
+    @Test
+    fun `the delivery shape pins durably with the destination and outlives restarts`() {
+        val root = temporary.newFolder("shape")
+        val original = batch(BATCH_ONE)
+        val store = IncomingShareRequestPersistence(root)
+        store.publish(original)
+
+        val pinned = store.pinDestination(original, DIRECT_ONE, albumDelivery = true, nowMillis = NOW)
+        assertEquals(true, pinned.albumDelivery)
+
+        val recreated = IncomingShareRequestPersistence(root)
+        val restored = accepted(recreated.claim(original.id, nowMillis = NOW))
+        assertEquals(DIRECT_ONE, restored.pinnedConversationId)
+        assertEquals(true, restored.albumDelivery)
+        // The capability reading false after a restart cannot flip the recorded shape back.
+        assertEquals(
+            true,
+            recreated.pinDestination(
+                restored,
+                DIRECT_ONE,
+                albumDelivery = false,
+                nowMillis = NOW,
+            ).albumDelivery,
+        )
+    }
+
+    @Test
+    fun `a pinned legacy manifest reads back shapeless and keeps per-item delivery`() {
+        val root = temporary.newFolder("legacy-pinned")
+        writeVersionThreeManifest(root, BATCH_ONE, pinnedConversationId = DIRECT_ONE)
+
+        val store = IncomingShareRequestPersistence(root)
+        val restored = accepted(store.claim(BATCH_ONE, nowMillis = NOW))
+        assertEquals(DIRECT_ONE, restored.pinnedConversationId)
+        assertNull(restored.albumDelivery)
+
+        // A retry after the update may prefer albums, but a batch that may already have queued
+        // per-item components must finish per-item.
+        val repinned = store.pinDestination(restored, DIRECT_ONE, albumDelivery = true, nowMillis = NOW)
+        assertNull(repinned.albumDelivery)
+    }
+
+    @Test
+    fun `an unpinned legacy manifest accepts a fresh shape on its first pin`() {
+        val root = temporary.newFolder("legacy-unpinned")
+        writeVersionThreeManifest(root, BATCH_TWO, pinnedConversationId = null)
+
+        val store = IncomingShareRequestPersistence(root)
+        val restored = accepted(store.claim(BATCH_TWO, nowMillis = NOW))
+        assertNull(restored.pinnedConversationId)
+        assertNull(restored.albumDelivery)
+
+        val pinned = store.pinDestination(restored, DIRECT_ONE, albumDelivery = true, nowMillis = NOW)
+        assertEquals(true, pinned.albumDelivery)
+        assertEquals(
+            true,
+            accepted(
+                IncomingShareRequestPersistence(root).claim(BATCH_TWO, nowMillis = NOW),
+            ).albumDelivery,
+        )
+    }
+
+    /** Byte-for-byte what the store wrote before [SharedInboxBatch.albumDelivery] existed. */
+    private fun writeVersionThreeManifest(root: File, id: String, pinnedConversationId: String?) {
+        val directory = File(root, id)
+        assertTrue(directory.mkdirs())
+        File(directory, ".request-v1").outputStream().use { stream ->
+            DataOutputStream(stream).use { output ->
+                output.writeByte(3)
+                output.writeVersionThreeString(id)
+                output.writeLong(NOW)
+                output.writeVersionThreeString("session-a")
+                output.writeVersionThreeString("scope-a")
+                output.writeBoolean(true)
+                output.writeVersionThreeString(OWNER)
+                output.writeBoolean(pinnedConversationId != null)
+                pinnedConversationId?.let { output.writeVersionThreeString(it) }
+                output.writeInt(0)
+                output.writeBoolean(true)
+                output.writeVersionThreeString("Private text")
+            }
+        }
+    }
+
+    private fun DataOutputStream.writeVersionThreeString(value: String) {
+        val bytes = value.toByteArray(Charsets.UTF_8)
+        writeInt(bytes.size)
+        write(bytes)
     }
 
     private fun batch(

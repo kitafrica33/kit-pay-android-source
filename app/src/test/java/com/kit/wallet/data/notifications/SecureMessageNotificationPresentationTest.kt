@@ -1,6 +1,8 @@
 package com.kit.wallet.data.notifications
 
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitMediaMessageV2
+import com.kit.wallet.data.messaging.KitMediaMessageV2Item
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.KitReactionAction
@@ -53,6 +55,52 @@ class SecureMessageNotificationPresentationTest {
         val presentation = presentation(text = "${KitMediaMessage.PREFIX}key=private-material")
 
         assertEquals("📷 Photo", presentation.preview)
+        assertFalse(presentation.preview.contains("private-material"))
+    }
+
+    @Test
+    fun `album notification uses plural kind and caption without descriptor secrets`() {
+        val key = Base64.getEncoder().encodeToString(
+            ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES) { 9 },
+        )
+        val descriptor = KitMediaMessageV2(
+            items = listOf(
+                KitMediaMessageV2Item(
+                    attachmentId = "11111111-1111-4111-8111-111111111111",
+                    storageKey = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    mediaType = "image/jpeg",
+                    ciphertextByteSize = 80,
+                    ciphertextSha256 = "1".repeat(64),
+                    keyMaterialBase64 = key,
+                    plaintextByteSize = 16,
+                ),
+                KitMediaMessageV2Item(
+                    attachmentId = "22222222-2222-4222-8222-222222222222",
+                    storageKey = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    mediaType = "image/png",
+                    ciphertextByteSize = 80,
+                    ciphertextSha256 = "2".repeat(64),
+                    keyMaterialBase64 = key,
+                    plaintextByteSize = 16,
+                ),
+            ),
+            caption = "Family photos",
+        )
+
+        val presentation = presentation(text = descriptor.encode())
+
+        assertEquals("2 Photos · Family photos", presentation.preview)
+        assertFalse(presentation.preview.contains(key))
+        assertFalse(presentation.preview.contains(descriptor.items.first().storageKey))
+    }
+
+    @Test
+    fun `malformed album descriptor fails closed to the generic attachment label`() {
+        val presentation = presentation(
+            text = "${KitMediaMessageV2.PREFIX}v=2&n=2&key0=private-material",
+        )
+
+        assertEquals("Attachment", presentation.preview)
         assertFalse(presentation.preview.contains("private-material"))
     }
 

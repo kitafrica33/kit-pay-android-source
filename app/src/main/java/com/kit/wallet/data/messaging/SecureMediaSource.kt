@@ -37,3 +37,9 @@ class SecureMediaSource(
             SecureMediaSource(file.length()) { file.inputStream() }
     }
 }
+
+/** One attachment of a media album: where its plaintext comes from and what it is. */
+data class SecureMediaAlbumSource(
+    val source: SecureMediaSource,
+    val mediaType: String,
+)

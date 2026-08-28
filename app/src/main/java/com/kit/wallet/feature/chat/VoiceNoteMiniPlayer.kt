@@ -1,6 +1,7 @@
 package com.kit.wallet.feature.chat
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -63,7 +64,14 @@ internal fun ProvideVoiceNoteChatContext(
  * as long as the note's own bubble is on screen, because that bubble is already the control.
  */
 @Composable
-internal fun VoiceNoteMiniBar(modifier: Modifier = Modifier) {
+internal fun VoiceNoteMiniBar(
+    modifier: Modifier = Modifier,
+    /**
+     * Opens the conversation the playing note belongs to, landing on its exact message. Only the
+     * bar's naming body takes this tap; pause, stop and the scrubber keep working playback alone.
+     */
+    onOpenSource: ((VoiceNotePlayingNote) -> Unit)? = null,
+) {
     val state by VoiceNotePlayer.state.collectAsStateWithLifecycle()
     val playing = state.playing ?: return
     if (!VoiceNoteMiniBarPolicy.isVisible(
@@ -87,6 +95,15 @@ internal fun VoiceNoteMiniBar(modifier: Modifier = Modifier) {
                     .padding(horizontal = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                Row(
+                    Modifier
+                        .weight(1f)
+                        .clickable(
+                            enabled = onOpenSource != null &&
+                                playing.context.conversationId.isNotBlank(),
+                        ) { onOpenSource?.invoke(playing) },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                 Icon(
                     Icons.Rounded.GraphicEq,
                     contentDescription = null,
@@ -108,6 +125,7 @@ internal fun VoiceNoteMiniBar(modifier: Modifier = Modifier) {
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                }
                 }
                 Text(
                     formatVoiceNoteTime(state.positionMillis),

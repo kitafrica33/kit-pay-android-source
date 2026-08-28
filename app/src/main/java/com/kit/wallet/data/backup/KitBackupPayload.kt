@@ -3,6 +3,7 @@ package com.kit.wallet.data.backup
 import com.kit.wallet.data.messaging.AccountArchivedMessage
 import com.kit.wallet.data.messaging.SecureMessagingCryptoAddress
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
+import com.kit.wallet.data.messaging.requiresModernMediaSchemaFence
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -33,10 +34,18 @@ import java.time.Instant
  * Records are length-prefixed and tagged, so a build that meets a record kind it has never heard of
  * skips it and keeps the messages it does understand. [SCHEMA] therefore only moves when the
  * framing itself changes, not when a new kind of record is added.
+ *
+ * [SCHEMA_MEDIA_PROVENANCE] is that framing move: every message body gains a trailing marker that
+ * says whether this device proved the message's strict-v2 envelope binding. It is a schema bump
+ * rather than a new record kind precisely so an older build refuses the whole backup up front —
+ * skipping the marker would strip proven provenance and restore reserved-format text as an
+ * unproven text-kind claim. Every backup containing v2/future-family text uses this fence even
+ * when its marker is false; v1-only and ordinary histories keep schema 1 for older builds.
  */
 internal object KitBackupPayload {
     private val MAGIC = "kit.backup.payload".toByteArray(Charsets.US_ASCII)
     private const val SCHEMA = 1
+    private const val SCHEMA_MEDIA_PROVENANCE = 2
 
     private const val RECORD_END = 0
     private const val RECORD_MESSAGE = 1
@@ -59,16 +68,26 @@ internal object KitBackupPayload {
         sink: OutputStream,
         manifest: KitBackupManifest,
         messages: Sequence<AccountArchivedMessage>,
+        withMediaProvenance: Boolean = false,
     ): Int {
         val data = DataOutputStream(sink)
         data.write(MAGIC)
-        data.writeInt(SCHEMA)
+        // The schema is committed before the lazy sequence is consumed, so the caller declares up
+        // front whether any message carries a validation verdict. Undeclared verdicts fail the
+        // write below instead of being silently stripped.
+        data.writeInt(if (withMediaProvenance) SCHEMA_MEDIA_PROVENANCE else SCHEMA)
         data.writeBounded(manifest.ownerAccountId, MAX_IDENTIFIER_BYTES)
         data.writeLong(manifest.createdAt.toEpochMilli())
         data.writeBounded(manifest.writerVersion, MAX_VERSION_BYTES)
         var written = 0
         messages.forEach { message ->
-            val body = encodeMessage(message)
+            require(
+                withMediaProvenance ||
+                    (!message.mediaValidated && !requiresModernMediaSchemaFence(message.text)),
+            ) {
+                "A modern media-family message cannot enter a provenance-free backup"
+            }
+            val body = encodeMessage(message, withMediaProvenance)
             try {
                 data.writeByte(RECORD_MESSAGE)
                 data.writeInt(body.size)
@@ -99,13 +118,14 @@ internal object KitBackupPayload {
             throw KitBackupFormatException("This backup does not contain Kit Pay message history")
         }
         val schema = data.readInt()
-        if (schema != SCHEMA) {
+        if (schema != SCHEMA && schema != SCHEMA_MEDIA_PROVENANCE) {
             throw KitBackupFormatException("This backup was written by a newer version of Kit Pay")
         }
         return KitBackupManifest(
             ownerAccountId = data.readBounded(MAX_IDENTIFIER_BYTES),
             createdAt = Instant.ofEpochMilli(data.readLong()),
             writerVersion = data.readBounded(MAX_VERSION_BYTES),
+            carriesMediaProvenance = schema == SCHEMA_MEDIA_PROVENANCE,
         )
     }
 
@@ -113,11 +133,16 @@ internal object KitBackupPayload {
      * Hands every message in the payload to [onMessage], in the order it was written, and returns
      * how many there were.
      *
-     * [source] must be positioned where [open] left it. A record that does not decode, or a count
-     * that disagrees with the terminator, fails the whole restore rather than delivering part of a
-     * conversation.
+     * [source] must be positioned where [open] left it, and [manifest] must be what [open]
+     * returned there: its schema fixes how each message body decodes. A record that does not
+     * decode, or a count that disagrees with the terminator, fails the whole restore rather than
+     * delivering part of a conversation.
      */
-    fun readMessages(source: InputStream, onMessage: (AccountArchivedMessage) -> Unit): Int {
+    fun readMessages(
+        source: InputStream,
+        manifest: KitBackupManifest,
+        onMessage: (AccountArchivedMessage) -> Unit,
+    ): Int {
         val data = DataInputStream(source)
         var read = 0
         while (true) {
@@ -132,7 +157,7 @@ internal object KitBackupPayload {
             try {
                 when (kind) {
                     RECORD_MESSAGE -> {
-                        onMessage(decodeMessage(body))
+                        onMessage(decodeMessage(body, manifest.carriesMediaProvenance))
                         read++
                     }
                     RECORD_END -> {
@@ -154,7 +179,10 @@ internal object KitBackupPayload {
         }
     }
 
-    private fun encodeMessage(message: AccountArchivedMessage): ByteArray {
+    private fun encodeMessage(
+        message: AccountArchivedMessage,
+        withMediaProvenance: Boolean,
+    ): ByteArray {
         val output = WipingByteArrayOutputStream()
         DataOutputStream(output).use { data ->
             data.writeBounded(message.serverMessageId, MAX_IDENTIFIER_BYTES)
@@ -170,11 +198,16 @@ internal object KitBackupPayload {
             data.writeLong(message.sentAt.toEpochMilli())
             data.writeByte(deliveryCode(message.deliveryState))
             data.writeBounded(message.text, MAX_TEXT_BYTES)
+            // Every schema-2 body carries the marker so the framing stays strictly positional.
+            if (withMediaProvenance) data.writeBoolean(message.mediaValidated)
         }
         return output.toByteArray().also { output.wipe() }
     }
 
-    private fun decodeMessage(body: ByteArray): AccountArchivedMessage =
+    private fun decodeMessage(
+        body: ByteArray,
+        withMediaProvenance: Boolean,
+    ): AccountArchivedMessage =
         DataInputStream(ByteArrayInputStream(body)).use { data ->
             // AccountArchivedMessage validates every field itself on construction, so a backup
             // cannot smuggle in a malformed identifier or a state that carries send authority.
@@ -196,6 +229,17 @@ internal object KitBackupPayload {
                 sentAt = Instant.ofEpochMilli(data.readLong()),
                 deliveryState = deliveryState(data.readUnsignedByte()),
                 text = data.readBounded(MAX_TEXT_BYTES),
+                mediaValidated = if (withMediaProvenance) {
+                    when (data.read()) {
+                        0 -> false
+                        1 -> true
+                        else -> throw KitBackupFormatException(
+                            "A backed-up message has an invalid media-validation marker",
+                        )
+                    }
+                } else {
+                    false
+                },
             )
             if (data.read() >= 0) {
                 throw KitBackupFormatException("A backed-up message carries trailing data")
@@ -225,6 +269,12 @@ internal data class KitBackupManifest(
     val ownerAccountId: String,
     val createdAt: Instant,
     val writerVersion: String,
+    /**
+     * True when the payload schema carries a per-message media-validation marker. Set from the
+     * schema [KitBackupPayload.open] read, never chosen by callers, and required by
+     * [KitBackupPayload.readMessages] so bodies decode under the schema they were written with.
+     */
+    val carriesMediaProvenance: Boolean = false,
 )
 
 /** A plaintext message must not linger in a buffer the collector may hand to something else. */

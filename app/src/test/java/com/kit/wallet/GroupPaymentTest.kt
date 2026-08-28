@@ -16,6 +16,7 @@ import com.kit.wallet.feature.chat.GroupPaymentSubmissionLatch
 import com.kit.wallet.feature.chat.groupPaymentDescriptor
 import com.kit.wallet.feature.chat.groupPaymentSubmissionIntent
 import com.kit.wallet.feature.chat.projectedGroupPaymentMessages
+import com.kit.wallet.feature.chat.sanitizeGroupPaymentAmountInput
 import com.kit.wallet.feature.chat.senderNamedMessageIds
 import com.kit.wallet.ui.model.GroupPaymentShareStatus
 import com.kit.wallet.ui.model.GroupPaymentSummary
@@ -38,6 +39,15 @@ import org.junit.Test
  * with members on both platforms has to read one conversation rather than two.
  */
 class GroupPaymentTest {
+    @Test
+    fun `group payment amounts accept grouped paste without breaking decimal editing`() {
+        assertEquals("1856.84", sanitizeGroupPaymentAmountInput("1,856.84"))
+        assertEquals("1768.8", sanitizeGroupPaymentAmountInput("1 768.8"))
+        assertEquals("1000", sanitizeGroupPaymentAmountInput("UGX 1,000"))
+        assertEquals("1.0", sanitizeGroupPaymentAmountInput("1.0"))
+        assertEquals("1.05", sanitizeGroupPaymentAmountInput("1.0.5"))
+    }
+
     @Test
     fun `one composer admits one submission and completes only once`() {
         val latch = GroupPaymentSubmissionLatch("stable-key")

@@ -1,5 +1,6 @@
 package com.kit.wallet.data.repository
 
+import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.ui.model.Beneficiary
@@ -10,7 +11,9 @@ import com.kit.wallet.ui.model.ChatMember
 import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
+import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
+import com.kit.wallet.ui.model.MessageKind
 import com.kit.wallet.ui.model.MessageDeliveryInfo
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.model.Transaction
@@ -121,6 +124,17 @@ interface WalletRepository {
     suspend fun spendingSource(): WalletSpendingSource = error("No active wallet is selected")
 
     val transactions: StateFlow<List<Transaction>>
+
+    /**
+     * The synced transaction cache across all of the account's wallets, newest first, each
+     * emission carrying the account that owns it. Wider than [transactions] but still only
+     * what sync has fetched — session-scoped, page-replaced, cleared on logout — so a
+     * durable "has this account ever moved money" answer needs the recorded milestone on
+     * top of it. Fails closed to an unowned empty emission by default.
+     */
+    val accountTransactions: StateFlow<OwnedTransactions>
+        get() = UNOWNED_TRANSACTIONS
+
     val beneficiaries: StateFlow<List<Beneficiary>>
 
     fun transaction(id: String): Transaction?
@@ -276,6 +290,55 @@ interface ContactRepository {
  * the fallback sees a stable flow instead of a new one on every read.
  */
 private val MESSAGE_EDITS_UNAVAILABLE: StateFlow<Boolean> = MutableStateFlow(false)
+private val MEDIA_ALBUMS_UNAVAILABLE: StateFlow<Boolean> = MutableStateFlow(false)
+
+/** A boolean fact bound to the account whose store produced it, in one emission. */
+data class OwnedFlag(val ownerAccountId: String?, val value: Boolean)
+
+/** Transactions bound to the account whose cache produced them, in one emission. */
+data class OwnedTransactions(
+    val ownerAccountId: String?,
+    val transactions: List<Transaction>,
+)
+
+/** Same rationale: the fail-closed "no evidence" answers are single stable instances. */
+private val NO_SENT_MESSAGE: StateFlow<OwnedFlag> =
+    MutableStateFlow(OwnedFlag(ownerAccountId = null, value = false))
+private val UNOWNED_TRANSACTIONS: StateFlow<OwnedTransactions> =
+    MutableStateFlow(OwnedTransactions(ownerAccountId = null, transactions = emptyList()))
+
+/**
+ * Delivery states that prove a message really left this device. A draft still sending, a
+ * failure, and a scheduled send that has not happened yet are not evidence of anything.
+ */
+internal fun DeliveryState.provesSentMessage(): Boolean = when (this) {
+    DeliveryState.SENT, DeliveryState.DELIVERED, DeliveryState.READ -> true
+    DeliveryState.SENDING, DeliveryState.RETRY_REQUIRED, DeliveryState.FAILED,
+    DeliveryState.SCHEDULED, DeliveryState.UNCONFIRMED,
+    -> false
+}
+
+/**
+ * Whether this message is first-message evidence: content its author actually said —
+ * an explicit allowlist of text, voice note, image, video, document and multi-item
+ * media album — that really left the device. Money bubbles, call rows and system lines
+ * are not the user talking, and a payment request in particular moved nothing at all.
+ * An unsupported-attachment placeholder is never evidence: it stands for reserved
+ * content nothing validated, so it can prove nothing about what its author said.
+ */
+internal fun Message.provesFirstMessage(): Boolean =
+    fromMe &&
+        state.provesSentMessage() &&
+        kind in FIRST_MESSAGE_KINDS
+
+private val FIRST_MESSAGE_KINDS = setOf(
+    MessageKind.TEXT,
+    MessageKind.VOICE_NOTE,
+    MessageKind.IMAGE,
+    MessageKind.VIDEO,
+    MessageKind.DOCUMENT,
+    MessageKind.MEDIA_ALBUM,
+)
 
 interface ChatRepository {
     /** Reacts to the current authentication epoch's READY secure-messaging session. */
@@ -303,6 +366,28 @@ interface ChatRepository {
      */
     val messageEditsAvailable: StateFlow<Boolean>
         get() = MESSAGE_EDITS_UNAVAILABLE
+
+    /**
+     * Whether the authenticated account may send several attachments as one `KITMEDIA2` album.
+     *
+     * Fail closed exactly like [messageEditsAvailable]: false until the server advertises the
+     * feature with a coherent protocol block, and false again the moment no session can prove
+     * it. This gates only the multi-select affordance — the send path re-proves the full
+     * account-and-roster gate before any upload, and once more at encryption.
+     */
+    val mediaAlbumsAvailable: StateFlow<Boolean>
+        get() = MEDIA_ALBUMS_UNAVAILABLE
+
+    /**
+     * Whether the local store holds at least one message this account authored that really
+     * left the device — the "sent your first message" fact for the home starter checklist,
+     * carrying the owning account in the same emission so an account switch can never pair
+     * one account's evidence with another's session. Fail closed: unowned and false until
+     * an authenticated projection proves otherwise, and reset the moment the published
+     * state is cleared for another account.
+     */
+    val sentMessageEvidence: StateFlow<OwnedFlag>
+        get() = NO_SENT_MESSAGE
 
     val chats: StateFlow<List<ChatPreview>>
     fun chat(chatId: String): ChatPreview?
@@ -430,6 +515,30 @@ interface ChatRepository {
         caption: String? = null,
     ): Unit = error("Idempotent owner-pinned secure media messaging is unavailable")
 
+    /**
+     * Sends several attachments and an optional caption as ONE end-to-end encrypted message.
+     *
+     * Accepted offline-first: the album appears immediately as a single bubble under one stable
+     * message id, and is uploaded and sent as a single `KITMEDIA2` wire message once the
+     * conversation's capability admission passes. A one-attachment list is simply the classic
+     * single-media message — the album profile begins at two.
+     */
+    suspend fun sendMediaAlbumMessage(
+        chatId: String,
+        attachments: List<SecureMediaAlbumSource>,
+        caption: String? = null,
+        replyToMessageId: String? = null,
+    ): Unit = error("This chat repository does not support media albums")
+
+    /** Album equivalent of [sendIdempotentMediaMessageForOwner]. */
+    suspend fun sendIdempotentMediaAlbumMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        attachments: List<SecureMediaAlbumSource>,
+        clientMessageId: String,
+        caption: String? = null,
+    ): Unit = error("Idempotent owner-pinned media albums are unavailable")
+
     /** Convenience for plaintext that genuinely is already in heap, such as a re-encoded photo. */
     suspend fun sendImageMessage(
         chatId: String,
@@ -451,6 +560,18 @@ interface ChatRepository {
      */
     suspend fun openImageMessage(chatId: String, mediaDescriptor: String): SecureMediaFile {
         error("This chat repository does not support secure media messages")
+    }
+
+    /**
+     * [openImageMessage] for one attachment of a `KITMEDIA2` album message: downloads and
+     * decrypts exactly the item [attachmentId] names, authenticated by the item's own metadata.
+     */
+    suspend fun openAlbumItemMessage(
+        chatId: String,
+        mediaDescriptor: String,
+        attachmentId: String,
+    ): SecureMediaFile {
+        error("This chat repository does not support media albums")
     }
 
     /**
@@ -617,6 +738,8 @@ data class CallConnection(
     val answeredAt: String? = null,
     /** The server's own clock when it built this response, to age [answeredAt] against. */
     val serverTime: String? = null,
+    /** Server-reported conversation the call belongs to; null when it reported none. */
+    val conversationId: String? = null,
 )
 
 interface BillsRepository {

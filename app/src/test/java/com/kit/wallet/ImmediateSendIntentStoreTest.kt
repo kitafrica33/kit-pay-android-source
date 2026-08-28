@@ -6,6 +6,7 @@ import com.kit.wallet.data.messaging.ImmediateSendIntent
 import com.kit.wallet.data.messaging.ImmediateSendIntentCodec
 import com.kit.wallet.data.messaging.ImmediateSendIntentStore
 import com.kit.wallet.data.messaging.ImmediateSendKind
+import com.kit.wallet.data.messaging.ImmediateSendMediaItem
 import com.kit.wallet.data.messaging.ImmediateSendState
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
@@ -13,6 +14,8 @@ import com.kit.wallet.data.messaging.KitReactionAction
 import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
 import com.kit.wallet.data.session.SessionInvalidatedException
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.nio.file.Files
 import java.util.Base64
 import kotlinx.coroutines.test.runTest
@@ -53,6 +56,64 @@ class ImmediateSendIntentStoreTest {
             encoded.fill(0)
         }
         assertEquals(null, ImmediateSendIntentCodec.decode(byteArrayOf(99)))
+    }
+
+    @Test fun `a queued album round trips every field including its terminal state`() {
+        val key = Base64.getEncoder().encodeToString(
+            ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES),
+        )
+        // The mid-upload shape process death must restore exactly: the first item's storage key
+        // is already confirmed, the second still has none.
+        val partial = ImmediateSendIntent(
+            id = ID_ONE,
+            conversationId = CONVERSATION_ID,
+            kind = ImmediateSendKind.MEDIA_V2,
+            createdAtEpochMillis = NOW,
+            caption = "Two for you",
+            replyToMessageId = TARGET_ID,
+            mediaItems = listOf(
+                ImmediateSendMediaItem(
+                    attachmentId = ATTACHMENT_ONE,
+                    mediaType = "image/jpeg",
+                    plaintextBytes = 1_024,
+                    ciphertextBytes = 1_088,
+                    keyBase64 = key,
+                    ciphertextSha256Hex = "1".repeat(64),
+                    storageKey = STORAGE_ONE,
+                ),
+                ImmediateSendMediaItem(
+                    attachmentId = ATTACHMENT_TWO,
+                    mediaType = "video/mp4",
+                    plaintextBytes = 2_048,
+                    ciphertextBytes = 2_112,
+                    keyBase64 = key,
+                    ciphertextSha256Hex = "2".repeat(64),
+                ),
+            ),
+        )
+        val uploaded = partial.copy(
+            mediaItems = partial.mediaItems.map {
+                it.copy(storageKey = it.storageKey ?: STORAGE_TWO)
+            },
+        )
+        val sealed = uploaded.copy(preparedMediaDescriptor = uploaded.buildAlbumDescriptor())
+
+        listOf(
+            partial,
+            partial.copy(state = ImmediateSendState.RETRY_REQUIRED),
+            partial.copy(state = ImmediateSendState.FAILED),
+            sealed,
+        ).forEach { intent ->
+            val encoded = ImmediateSendIntentCodec.encode(intent)
+            assertEquals(intent, ImmediateSendIntentCodec.decode(encoded))
+            encoded.fill(0)
+        }
+    }
+
+    @Test fun `pre-album queue records are still read exactly as written`() {
+        val withReply = textIntent().copy(replyToMessageId = TARGET_ID)
+        assertEquals(withReply, ImmediateSendIntentCodec.decode(legacyRecord(2, TARGET_ID)))
+        assertEquals(textIntent(), ImmediateSendIntentCodec.decode(legacyRecord(1, null)))
     }
 
     @Test fun `queued text enforces the exact encrypted wire scalar policy`() {
@@ -245,6 +306,38 @@ class ImmediateSendIntentStoreTest {
         text = "queued before roster work",
     )
 
+    /** Byte-for-byte what the codec wrote for a text send before the album (and reply) fields. */
+    private fun legacyRecord(version: Int, replyToMessageId: String?): ByteArray {
+        val output = ByteArrayOutputStream()
+        DataOutputStream(output).use { data ->
+            data.writeByte(version)
+            data.writeByte(ImmediateSendKind.TEXT.ordinal)
+            data.writeByte(ImmediateSendState.WAITING.ordinal)
+            data.writeLegacyString(ID_ONE)
+            data.writeLegacyString(CONVERSATION_ID)
+            data.writeLong(NOW)
+            data.writeLegacyString("queued before roster work")
+            data.writeBoolean(false) // mediaType
+            data.writeBoolean(false) // caption
+            data.writeInt(0)
+            data.writeInt(0)
+            data.writeBoolean(false) // mediaKeyBase64
+            data.writeBoolean(false) // mediaSha256Base64
+            data.writeBoolean(false) // preparedMediaDescriptor
+            if (version >= 2) {
+                data.writeBoolean(replyToMessageId != null)
+                replyToMessageId?.let { data.writeLegacyString(it) }
+            }
+        }
+        return output.toByteArray()
+    }
+
+    private fun DataOutputStream.writeLegacyString(value: String) {
+        val bytes = value.toByteArray(Charsets.UTF_8)
+        writeInt(bytes.size)
+        write(bytes)
+    }
+
     private companion object {
         const val OWNER_A = "owner-a"
         const val OWNER_B = "owner-b"
@@ -255,5 +348,9 @@ class ImmediateSendIntentStoreTest {
         const val CONVERSATION_ID = "20000000-0000-4000-8000-000000000001"
         const val TARGET_ID = "30000000-0000-4000-8000-000000000001"
         const val REFERENCE_ID = "40000000-0000-4000-8000-000000000001"
+        const val ATTACHMENT_ONE = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        const val ATTACHMENT_TWO = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        const val STORAGE_ONE = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        const val STORAGE_TWO = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
     }
 }

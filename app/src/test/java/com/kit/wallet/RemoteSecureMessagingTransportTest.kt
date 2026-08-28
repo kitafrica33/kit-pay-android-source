@@ -42,9 +42,11 @@ import com.kit.wallet.data.remote.MessagingKeyTransparencyDto
 import com.kit.wallet.data.remote.MessagingReadReceiptDto
 import com.kit.wallet.data.remote.MessagingOneTimePrekeyDto
 import com.kit.wallet.data.remote.MessagingPqPrekeyDto
+import com.kit.wallet.data.remote.MESSAGING_MEDIA_MESSAGE_V2_DEVICE_CAPABILITY
 import com.kit.wallet.data.remote.MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY
 import com.kit.wallet.data.remote.MESSAGING_REACTIONS_DEVICE_CAPABILITY
 import com.kit.wallet.data.remote.MessagingDeviceClientDto
+import com.kit.wallet.data.remote.MediaMessageProtocolDtoAdapter
 import com.kit.wallet.data.remote.MessagingDeviceRosterDto
 import com.kit.wallet.data.remote.MessagingDeviceRosterEntryDto
 import com.kit.wallet.data.remote.MessagingSignedPrekeyDto
@@ -84,7 +86,13 @@ class RemoteSecureMessagingTransportTest {
     @Before
     fun setUp() {
         server = MockWebServer().apply { start() }
-        moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+        // Registered ahead of the reflective factory, exactly as the app's Moshi is built: the
+        // `media_message` block must decode tolerantly here too, or a malformed advertisement
+        // would fail the whole capabilities document instead of turning one feature off.
+        moshi = Moshi.Builder()
+            .add(MediaMessageProtocolDtoAdapter())
+            .add(KotlinJsonAdapterFactory())
+            .build()
         val retrofit = Retrofit.Builder()
             .baseUrl(server.url("/"))
             .addConverterFactory(MoshiConverterFactory.create(moshi))
@@ -472,6 +480,246 @@ class RemoteSecureMessagingTransportTest {
         // Deciding costs nothing on the wire: the roster it reads was already fetched.
         assertEquals(before, server.requestCount)
     }
+
+    @Test
+    fun `a media album is refused while the account gate is off however capable the roster`() =
+        runTest {
+            val (lifecycle, fence) = newActivation()
+            enqueueActivation(EDITS_READY_CAPABILITIES)
+            val session = transport.openSession(lifecycle, fence)
+            assertActivationRequests()
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            val conversation = session.conversations().first()
+            server.takeRequest()
+            enqueueRoster(authoritativeRoster(EVERY_CAPABILITY))
+            val roster = session.roster(conversation)
+            server.takeRequest()
+            val before = server.requestCount
+
+            val failure = runCatching {
+                session.requireMediaMessageV2Capability(conversation, roster)
+            }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+            assertEquals(before, server.requestCount)
+            // Edits ride the same roster and the same account, and they are on. So the refusal
+            // above is this account's album gate rather than a roster that said nothing at all.
+            session.requireMessageEditCapability(conversation, roster)
+        }
+
+    @Test
+    fun `a media album is refused when the direct peer never attested the profile`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation(MEDIA_V2_READY_CAPABILITIES)
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        val conversation = session.conversations().first()
+        server.takeRequest()
+        enqueueRoster(authoritativeRoster(EVERY_CAPABILITY_BUT_MEDIA_V2))
+        val roster = session.roster(conversation)
+        server.takeRequest()
+        val before = server.requestCount
+
+        val failure = runCatching {
+            session.requireMediaMessageV2Capability(conversation, roster)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+        assertEquals(before, server.requestCount)
+        session.requireMessageEditCapability(conversation, roster)
+    }
+
+    @Test
+    fun `a media album is refused when a roster device says nothing about its capabilities`() =
+        runTest {
+            val (lifecycle, fence) = newActivation()
+            enqueueActivation(MEDIA_V2_READY_CAPABILITIES)
+            val session = transport.openSession(lifecycle, fence)
+            assertActivationRequests()
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            val conversation = session.conversations().first()
+            server.takeRequest()
+            // No client block at all — the shape every build that predates the attestation sends.
+            enqueueRoster(authoritativeRoster(peerCapabilities = null))
+            val roster = session.roster(conversation)
+            server.takeRequest()
+
+            val failure = runCatching {
+                session.requireMediaMessageV2Capability(conversation, roster)
+            }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+        }
+
+    @Test
+    fun `a media album is allowed once the account gate and every direct peer agree`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation(MEDIA_V2_READY_CAPABILITIES)
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        val conversation = session.conversations().first()
+        server.takeRequest()
+        enqueueRoster(authoritativeRoster(EVERY_CAPABILITY))
+        val roster = session.roster(conversation)
+        server.takeRequest()
+        val before = server.requestCount
+
+        session.requireMediaMessageV2Capability(conversation, roster)
+
+        // Deciding costs nothing on the wire: the roster it reads was already fetched.
+        assertEquals(before, server.requestCount)
+    }
+
+    @Test
+    fun `a media album is refused when the account flag arrives without the advertisement`() =
+        runTest {
+            val (lifecycle, fence) = newActivation()
+            // §5a violation: `messaging_media_message_v2` is true, but the server publishes no
+            // `protocols.messaging.media_message` block at all.
+            enqueueActivation(mediaV2Capabilities(mediaMessageBlock = null))
+            val session = transport.openSession(lifecycle, fence)
+            assertActivationRequests()
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            val conversation = session.conversations().first()
+            server.takeRequest()
+            enqueueRoster(authoritativeRoster(EVERY_CAPABILITY))
+            val roster = session.roster(conversation)
+            server.takeRequest()
+            val before = server.requestCount
+
+            val failure = runCatching {
+                session.requireMediaMessageV2Capability(conversation, roster)
+            }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+            // Nothing was uploaded and nothing was sent: the refusal never touched the wire.
+            assertEquals(before, server.requestCount)
+            // The rest of the session is healthy — only the album feature reads as off.
+            session.requireMessageEditCapability(conversation, roster)
+        }
+
+    @Test
+    fun `a media album is refused when the advertisement is malformed`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        // The block arrives as a bare string. The tolerant adapter decodes the document, keeps
+        // every other feature alive, and this one reads as off.
+        enqueueActivation(mediaV2Capabilities(mediaMessageBlock = "\"enabled\""))
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        val conversation = session.conversations().first()
+        server.takeRequest()
+        enqueueRoster(authoritativeRoster(EVERY_CAPABILITY))
+        val roster = session.roster(conversation)
+        server.takeRequest()
+        val before = server.requestCount
+
+        val failure = runCatching {
+            session.requireMediaMessageV2Capability(conversation, roster)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+        assertEquals(before, server.requestCount)
+        session.requireMessageEditCapability(conversation, roster)
+    }
+
+    @Test
+    fun `a media album is refused when the advertisement is incoherent`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        // Structurally exact but incapable: an advertisement whose attachment cap cannot carry
+        // even one minimal two-item album is a contract violation, not a small limit.
+        enqueueActivation(
+            mediaV2Capabilities(
+                COHERENT_MEDIA_MESSAGE_BLOCK.replace(
+                    "\"max_attachments\":8",
+                    "\"max_attachments\":1",
+                ),
+            ),
+        )
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        val conversation = session.conversations().first()
+        server.takeRequest()
+        enqueueRoster(authoritativeRoster(EVERY_CAPABILITY))
+        val roster = session.roster(conversation)
+        server.takeRequest()
+        val before = server.requestCount
+
+        val failure = runCatching {
+            session.requireMediaMessageV2Capability(conversation, roster)
+        }.exceptionOrNull()
+
+        assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+        assertEquals(before, server.requestCount)
+        session.requireMessageEditCapability(conversation, roster)
+    }
+
+    @Test
+    fun `a media album is refused when this device has not attested the profile itself`() =
+        runTest {
+            val (lifecycle, fence) = newActivation()
+            enqueueActivation(MEDIA_V2_READY_CAPABILITIES)
+            val session = transport.openSession(lifecycle, fence)
+            assertActivationRequests()
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            val conversation = session.conversations().first()
+            server.takeRequest()
+            // Every peer attests; this device's own roster row is the newest build that predates
+            // the profile. §6 reads that as "not yet", before a single attachment byte is spent.
+            enqueueRoster(
+                authoritativeRoster(
+                    peerCapabilities = EVERY_CAPABILITY,
+                    currentDeviceCapabilities = EVERY_CAPABILITY_BUT_MEDIA_V2,
+                ),
+            )
+            val roster = session.roster(conversation)
+            server.takeRequest()
+            val before = server.requestCount
+
+            val failure = runCatching {
+                session.requireMediaMessageV2Capability(conversation, roster)
+            }.exceptionOrNull()
+
+            assertTrue(failure is SecureMessagingConversationCapabilityUnavailableException)
+            assertEquals(before, server.requestCount)
+            // Corrections keep their sender-excluded reading: the same roster still allows them.
+            session.requireMessageEditCapability(conversation, roster)
+        }
+
+    @Test
+    fun `a media album is refused when this device's roster row says nothing about itself`() =
+        runTest {
+            val (lifecycle, fence) = newActivation()
+            enqueueActivation(MEDIA_V2_READY_CAPABILITIES)
+            val session = transport.openSession(lifecycle, fence)
+            assertActivationRequests()
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            val conversation = session.conversations().first()
+            server.takeRequest()
+            enqueueRoster(
+                authoritativeRoster(
+                    peerCapabilities = EVERY_CAPABILITY,
+                    currentDeviceCapabilities = null,
+                ),
+            )
+            val roster = session.roster(conversation)
+            server.takeRequest()
+
+            val albumFailure = runCatching {
+                session.requireMediaMessageV2Capability(conversation, roster)
+            }.exceptionOrNull()
+
+            assertTrue(
+                albumFailure is SecureMessagingConversationCapabilityUnavailableException,
+            )
+            // The sender exclusion still holds for reactions and corrections: a roster snapshot
+            // that lags this device's own enrollment withholds albums only.
+            session.requireMessageEditCapability(conversation, roster)
+            session.requireReactionCapability(conversation, roster)
+        }
 
     @Test
     fun `one stale device withholds edits from a mixed version group`() = runTest {
@@ -1204,8 +1452,9 @@ class RemoteSecureMessagingTransportTest {
 
     private fun authoritativeRoster(
         peerCapabilities: Map<String, Boolean?>? = null,
+        currentDeviceCapabilities: Map<String, Boolean?>? = EVERY_CAPABILITY,
     ): MessagingDeviceRosterDto = rosterOf(
-        rosterDevice(CURRENT_DEVICE_ID, CURRENT_USER_ID, 1, 42, 0x11, EVERY_CAPABILITY),
+        rosterDevice(CURRENT_DEVICE_ID, CURRENT_USER_ID, 1, 42, 0x11, currentDeviceCapabilities),
         rosterDevice(PEER_DEVICE_ID, PEER_USER_ID, 2, 43, 0x21, peerCapabilities),
     )
 
@@ -1477,10 +1726,11 @@ class RemoteSecureMessagingTransportTest {
             serverDeviceId = CURRENT_DEVICE_ID,
             installationId = "installation-1",
         )
-        /** A device new enough to render both reserved-prefix descriptors as what they are. */
+        /** A device new enough to render every reserved-prefix descriptor as what it is. */
         val EVERY_CAPABILITY: Map<String, Boolean?> = mapOf(
             MESSAGING_REACTIONS_DEVICE_CAPABILITY to true,
             MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY to true,
+            MESSAGING_MEDIA_MESSAGE_V2_DEVICE_CAPABILITY to true,
         )
 
         /**
@@ -1492,6 +1742,17 @@ class RemoteSecureMessagingTransportTest {
         val REACTIONS_ONLY_CAPABILITY: Map<String, Boolean?> = mapOf(
             MESSAGING_REACTIONS_DEVICE_CAPABILITY to true,
             MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY to false,
+        )
+
+        /**
+         * A device that shipped corrections but not multi-attachment albums — the newest build in
+         * the field on the day the KITMEDIA2 rollout starts, spelled explicitly false for the
+         * same reason as [REACTIONS_ONLY_CAPABILITY].
+         */
+        val EVERY_CAPABILITY_BUT_MEDIA_V2: Map<String, Boolean?> = mapOf(
+            MESSAGING_REACTIONS_DEVICE_CAPABILITY to true,
+            MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY to true,
+            MESSAGING_MEDIA_MESSAGE_V2_DEVICE_CAPABILITY to false,
         )
 
         const val READY_CAPABILITIES = """
@@ -1510,6 +1771,36 @@ class RemoteSecureMessagingTransportTest {
             "\"messaging_reactions_e2ee_v1\":true",
             "\"messaging_reactions_e2ee_v1\":true,\"messaging_message_edits_v1\":true",
         )
+
+        /**
+         * The §5a `media_message` advertisement exactly as the backend readiness predicate emits
+         * it: `kit-media-v2`, the 64-byte envelope floor, and the fixed capacity numbers.
+         */
+        const val COHERENT_MEDIA_MESSAGE_BLOCK = """{"ready":true,"profile":"kit-media-v2",
+            "max_attachments":8,"max_descriptor_bytes":7680,"max_caption_utf8_bytes":2048,
+            "min_attachment_ciphertext_bytes":64,"max_attachment_ciphertext_bytes":209715264,
+            "max_aggregate_ciphertext_bytes":268435456}"""
+
+        /**
+         * [EDITS_READY_CAPABILITIES] with the KITMEDIA2 account flag switched on and, when
+         * [mediaMessageBlock] is given, that JSON value advertised as
+         * `protocols.messaging.media_message`. A null block is the §5a violation the audit named:
+         * the flag alone, with no advertisement to make it usable.
+         */
+        fun mediaV2Capabilities(mediaMessageBlock: String?): String {
+            val withAccountFlag = EDITS_READY_CAPABILITIES.replace(
+                "\"messaging_message_edits_v1\":true",
+                "\"messaging_message_edits_v1\":true,\"messaging_media_message_v2\":true",
+            )
+            mediaMessageBlock ?: return withAccountFlag
+            return withAccountFlag.replace(
+                "\"post_quantum\":true",
+                "\"post_quantum\":true,\"media_message\":$mediaMessageBlock",
+            )
+        }
+
+        /** The account switched on for KITMEDIA2 albums with a coherent §5a advertisement. */
+        val MEDIA_V2_READY_CAPABILITIES: String = mediaV2Capabilities(COHERENT_MEDIA_MESSAGE_BLOCK)
 
         const val PROFILE = """
             {"ok":true,"data":{"id":"$CURRENT_USER_ID","name":"Kit User"}}

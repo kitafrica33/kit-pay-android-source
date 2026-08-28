@@ -11,12 +11,16 @@ import com.kit.wallet.data.messaging.ImmediateMediaSpool
 import com.kit.wallet.data.messaging.ImmediateSendIntent
 import com.kit.wallet.data.messaging.ImmediateSendIntentStore
 import com.kit.wallet.data.messaging.ImmediateSendKind
+import com.kit.wallet.data.messaging.ImmediateSendMediaItem
 import com.kit.wallet.data.messaging.ImmediateSendState
 import com.kit.wallet.data.messaging.KitChatMediaKind
 import com.kit.wallet.data.messaging.KitEditMessage
 import com.kit.wallet.data.messaging.KitGroupPaymentAction
 import com.kit.wallet.data.messaging.KitGroupPaymentMessage
+import com.kit.wallet.data.messaging.KitMediaFamily
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitMediaMessageV2
+import com.kit.wallet.data.messaging.KitMediaMessageV2Item
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.KitReactionAction
@@ -33,6 +37,7 @@ import com.kit.wallet.data.messaging.MediaAttachmentStreamCipher
 import com.kit.wallet.data.messaging.MessageReplyQuotes
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.ScheduledSendStore
+import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaCache
 import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.data.messaging.SecureMediaSource
@@ -57,10 +62,15 @@ import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
 import com.kit.wallet.data.messaging.SecureMessagingSyncCompletionSignal
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
+import com.kit.wallet.data.messaging.UNSUPPORTED_ATTACHMENT_LABEL
 import com.kit.wallet.data.messaging.authenticatedOutboundMessageKind
 import com.kit.wallet.data.messaging.isRecoverableSecureMessagingStateLoss
 import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
+import com.kit.wallet.data.messaging.kitMediaOutboundAttachmentsFor
+import com.kit.wallet.data.messaging.kitMediaProjectedText
+import com.kit.wallet.data.messaging.mediaAlbumPreviewLabel
 import com.kit.wallet.data.messaging.requireDurablyCommittedSessions
+import com.kit.wallet.data.messaging.spoolIds
 import com.kit.wallet.data.realtime.KitPresenceRegistry
 import com.kit.wallet.data.realtime.KitTypingRegistry
 import com.kit.wallet.data.remote.ADMIN_CONVERSATION_ROLE
@@ -88,6 +98,7 @@ import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageDeliveryInfo
 import com.kit.wallet.ui.model.MessageDeliveryPerson
 import com.kit.wallet.ui.model.MessageKind
+import com.kit.wallet.ui.model.MessageMediaItem
 import com.kit.wallet.ui.model.MessageReaction
 import com.kit.wallet.ui.model.PaymentEventKind
 import com.kit.wallet.ui.model.acceptsEdits
@@ -232,6 +243,22 @@ internal class SecureMessagingChatSession internal constructor(
      * with the activation it came from. Fail closed: a session that never said so cannot edit.
      */
     internal val messageEditsEnabled: Boolean = false,
+    /**
+     * Whether the server advertised usable `KITMEDIA2` media albums for this account: the
+     * feature flag and a coherent protocol block together, as decided once at session issuance.
+     * Same publication discipline as [messageEditsEnabled], and the same fail-closed default.
+     * This gates only the composer's multi-select affordance — the send path re-proves the full
+     * account-and-roster gate at upload admission and again at encryption.
+     */
+    internal val mediaAlbumsEnabled: Boolean = false,
+    /**
+     * The account this activation authenticated as, from its own crypto binding — never from
+     * whatever session happens to be signed in when a publication later commits. Evidence
+     * derived from a publication is labelled with this owner, so a projection that commits
+     * late, after an account switch, still names the account whose messages it holds.
+     * Fail closed: a session without one labels its evidence unowned, which qualifies nothing.
+     */
+    internal val ownerAccountId: String? = null,
 )
 
 /** A newer local intent must wait until this conversation's older ciphertext is reconciled. */
@@ -409,10 +436,11 @@ internal fun foldAuthenticatedEdits(
         // correction: chains of those would let one descriptor rewrite the meaning of a second.
         if (KitReactionMessage.isReactionText(target.text)) return@forEach
         if (KitEditMessage.isEditText(target.text)) return@forEach
-        // Nor to a photo, a voice note or a document. Its descriptor is what points recipients at
-        // the ciphertext they have already downloaded; replacing it with a sentence would strand
-        // that media with nothing left to name it.
-        if (KitMediaMessage.isMediaText(target.text)) return@forEach
+        // Nor to any generation of the media family, parsed or not. A media descriptor is what
+        // points recipients at the ciphertext they have already downloaded — replacing it with a
+        // sentence would strand that media — and media-v2 caption edits are ship-disabled on
+        // every platform, so an inbound edit aimed at one is dropped here, never folded.
+        if (KitMediaFamily.isFamilyText(target.text)) return@forEach
         applied[edit.targetMessageId] = AuthenticatedMessageEdit(
             text = edit.body,
             editedAtEpochMillis = projected.sentAt.toEpochMilli(),
@@ -580,6 +608,29 @@ internal interface SecureMessagingChatRuntime {
         caption: String?,
     ): String = error("This secure messaging runtime does not support queued media")
 
+    /**
+     * One `KITMEDIA2` §6 roster admission for a queued album, taken before any attachment byte
+     * is uploaded. Throws the same capability refusal the send itself would.
+     */
+    suspend fun assertMediaAlbumSendable(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        expectedOwner: SessionFence? = null,
+    ): Unit = error("This secure messaging runtime does not support media albums")
+
+    /**
+     * Uploads one already-encrypted album attachment and returns its canonical storage key,
+     * refusing a blob store whose recorded facts differ from the queued item's own metadata.
+     */
+    suspend fun uploadAlbumAttachment(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        ciphertext: File,
+        mediaType: String,
+        expectedCiphertextBytes: Long,
+        expectedCiphertextSha256Hex: String,
+    ): String = error("This secure messaging runtime does not support media albums")
+
     /** Encrypts, uploads and sends one attachment as an end-to-end encrypted media message. */
     suspend fun sendImage(
         session: SecureMessagingChatSession,
@@ -600,6 +651,20 @@ internal interface SecureMessagingChatRuntime {
         destination: File,
     ): Int =
         error("This secure messaging runtime does not support media messages")
+
+    /**
+     * [openMediaToFile] for one attachment of an authenticated `KITMEDIA2` album. The item's own
+     * storage key, sizes, key material and ciphertext digest gate the download and decryption,
+     * so no album item can ever be served another item's bytes.
+     */
+    suspend fun openAlbumItemToFile(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        descriptorText: String,
+        attachmentId: String,
+        destination: File,
+    ): Int =
+        error("This secure messaging runtime does not support media albums")
 }
 
 @Singleton
@@ -627,6 +692,8 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                     sessionEpoch = it.binding.sessionEpoch,
                     identity = it,
                     messageEditsEnabled = it.transport.messageEditsEnabled,
+                    mediaAlbumsEnabled = it.transport.mediaMessageV2Enabled,
+                    ownerAccountId = it.binding.userId,
                 )
             }
         }
@@ -1006,7 +1073,13 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 conversationId = durable.conversationId,
                 senderUserId = durable.sender.userId,
                 fromCurrentUser = fromCurrentUser,
-                text = durable.authenticatedText,
+                // Rows pinned as unsupported media (and any reserved-family text that fails
+                // strict parsing) surface only the sanitized marker: the durable record cannot
+                // be rewritten, so the substitution happens at projection assembly.
+                text = kitMediaProjectedText(
+                    durable.authenticatedText,
+                    projected.unsupportedMedia,
+                ),
                 sentAt = projected.sentAt,
                 deliveryState = projected.deliveryState.toAuthenticated(fromCurrentUser),
                 replyToMessageId = durable.replyToMessageId,
@@ -1106,12 +1179,25 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             }
         }
 
+        // Server-visible attachment metadata is derived from the descriptor text before any
+        // ciphertext is committed: reserved media-namespace text that fails strict parsing must
+        // never persist a durable outbox record, let alone degrade to an ordinary text send.
+        // Every later transport attempt reuses this same strict derivation, so the end-to-end
+        // content and the metadata rows can never disagree.
+        val outboundAttachments = kitMediaOutboundAttachmentsFor(text)
         val roster = active.transport.roster(conversation, expectedOwner)
         if (KitReactionMessage.parse(text) != null) {
             active.transport.requireReactionCapability(conversation, roster)
         }
         if (KitEditMessage.parse(text) != null) {
             active.transport.requireMessageEditCapability(conversation, roster)
+        }
+        // A queued album re-clears at promotion the same account-and-roster gate it passed
+        // before its uploads: the roster may have changed in between, and a peer that predates
+        // the profile would render the raw descriptor — every attachment key included — as chat
+        // text. Any other KITMEDIA2 arrival is defense in depth against a future composer path.
+        if (KitMediaMessageV2.parse(text) != null) {
+            active.transport.requireMediaMessageV2Capability(conversation, roster)
         }
         val plan = active.transport.encryptionPlan(conversation, roster)
         val pending = retry?.takeIf {
@@ -1188,12 +1274,10 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         // the transport can suspend or fail; no text/projection matching is needed at the UI edge.
         onDurablyCommitted(durable.clientMessageId)
         try {
-            // Server-visible attachment metadata is derived from the descriptor text on every send
-            // and retry, so the end-to-end content and the metadata rows can never disagree.
             val receipt = active.transport.send(
                 conversation,
                 encrypted,
-                KitMediaMessage.attachmentsFor(text),
+                outboundAttachments,
                 expectedOwner,
             )
             projections.withActivationLease(active.activation, readyRequired = true) {
@@ -1246,6 +1330,49 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             "The queued attachment metadata cannot be authenticated"
         }
         return descriptor
+    }
+
+    override suspend fun assertMediaAlbumSendable(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        expectedOwner: SessionFence?,
+    ) {
+        val active = requireCurrent(session)
+        expectedOwner?.let { requireAuthenticationOwner(active, it) }
+        val conversation = requireConversation(active, conversationId, expectedOwner)
+        val roster = active.transport.roster(conversation, expectedOwner)
+        active.transport.requireMediaMessageV2Capability(conversation, roster)
+    }
+
+    override suspend fun uploadAlbumAttachment(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        ciphertext: File,
+        mediaType: String,
+        expectedCiphertextBytes: Long,
+        expectedCiphertextSha256Hex: String,
+    ): String {
+        require(ciphertext.isFile && ciphertext.length() > 0) { "Attachment ciphertext is empty" }
+        val normalizedMediaType = requireNotNull(KitMediaMessage.normalizeMediaType(mediaType)) {
+            "Choose a supported photo, voice note, video or document"
+        }
+        val active = requireCurrent(session)
+        requireConversation(active, conversationId)
+        val uploaded = active.transport.uploadAttachment(normalizedMediaType, ciphertext)
+        check(sessions.currentOrNull() === active) {
+            "Secure messaging session changed while uploading encrypted media"
+        }
+        // The album descriptor is rebuilt from the queued item's own fields, so the store must
+        // have recorded exactly those facts — anything else would ship metadata the end-to-end
+        // claim no longer matches.
+        check(
+            uploaded.byteSize == expectedCiphertextBytes &&
+                uploaded.ciphertextSha256 == expectedCiphertextSha256Hex,
+        ) { "The attachment store recorded different ciphertext facts than the queued item" }
+        check(CANONICAL_UUID.matches(uploaded.storageKey)) {
+            "The attachment store returned a non-canonical storage key"
+        }
+        return uploaded.storageKey
     }
 
     private fun requireAuthenticationOwner(
@@ -1366,6 +1493,70 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             }
             coroutineContext.ensureActive()
             check(plaintextBytes == media.plaintextByteSize) {
+                "The decrypted media does not match its authenticated size"
+            }
+            check(sessions.publishIfCurrent(active) {}) {
+                "Secure messaging session changed while decrypting encrypted media"
+            }
+            return plaintextBytes
+        } finally {
+            keyMaterial?.fill(0)
+            expectedSha256?.fill(0)
+            ciphertext.delete()
+        }
+    }
+
+    override suspend fun openAlbumItemToFile(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        descriptorText: String,
+        attachmentId: String,
+        destination: File,
+    ): Int {
+        val album = requireNotNull(KitMediaMessageV2.parse(descriptorText)) {
+            "This message does not reference readable secure media"
+        }
+        val item = requireNotNull(album.items.firstOrNull { it.attachmentId == attachmentId }) {
+            "The requested attachment does not belong to this album"
+        }
+        val active = requireCurrent(session)
+        requireConversation(active, conversationId)
+        var keyMaterial: ByteArray? = null
+        var expectedSha256: ByteArray? = null
+        // Same discipline as [openMediaToFile]: ciphertext lands on app-private disk, and nothing
+        // is decrypted out of it until this item's authenticated digest and HMAC both check out.
+        val ciphertext = File.createTempFile("kit-media-", ".ciphertext", null)
+        try {
+            val downloadedBytes = withContext(Dispatchers.IO + NonCancellable) {
+                active.transport.downloadAttachmentToFile(
+                    storageKey = item.storageKey,
+                    maximumBytes = item.ciphertextByteSize,
+                    destination = ciphertext,
+                )
+            }
+            coroutineContext.ensureActive()
+            keyMaterial = item.keyMaterial()
+            expectedSha256 = item.ciphertextSha256Bytes()
+            val key = checkNotNull(keyMaterial)
+            val digest = checkNotNull(expectedSha256)
+            check(sessions.currentOrNull() === active) {
+                "Secure messaging session changed while downloading encrypted media"
+            }
+            check(downloadedBytes == item.ciphertextByteSize) {
+                "The encrypted media blob does not match its authenticated size"
+            }
+            val plaintextBytes = withContext(Dispatchers.IO + NonCancellable) {
+                destination.outputStream().buffered().use { output ->
+                    MediaAttachmentStreamCipher.decrypt(
+                        ciphertext = ciphertext,
+                        keyMaterial = key,
+                        expectedSha256 = digest,
+                        destination = output,
+                    )
+                }
+            }
+            coroutineContext.ensureActive()
+            check(plaintextBytes == item.plaintextByteSize) {
                 "The decrypted media does not match its authenticated size"
             }
             check(sessions.publishIfCurrent(active) {}) {
@@ -1559,10 +1750,13 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         expectedOwner: SessionFence?,
     ) {
         val encrypted = SecureMessagingCryptoWireMapper.retryEncryption(durable, plan)
+        // The same fail-closed family derivation as the initial send: a reissue must carry the
+        // identical row set, and reserved text without strict rows is refused rather than
+        // reissued as ordinary text.
         val receipt = active.transport.send(
             conversation,
             encrypted,
-            KitMediaMessage.attachmentsFor(durable.authenticatedText),
+            kitMediaOutboundAttachmentsFor(durable.authenticatedText),
             expectedOwner,
         )
         projections.withActivationLease(active.activation, readyRequired = true) {
@@ -1835,6 +2029,11 @@ class EncryptedChatRepository @Inject internal constructor(
     override val messageEditsAvailable: StateFlow<Boolean> =
         mutableMessageEditsAvailable.asStateFlow()
 
+    // Same publication discipline as the edit affordance, for the album multi-select.
+    private val mutableMediaAlbumsAvailable = MutableStateFlow(false)
+    override val mediaAlbumsAvailable: StateFlow<Boolean> =
+        mutableMediaAlbumsAvailable.asStateFlow()
+
     // Viewer-local pin/mute decoration happens synchronously at the publication edge so the
     // authenticated projection flow stays byte-derived from the encrypted store while readers
     // (including openDirectConversation's post-publication check) never observe a stale list.
@@ -1855,6 +2054,11 @@ class EncryptedChatRepository @Inject internal constructor(
     // typing rather than say that somebody, somewhere in it, is.
     private val presenceRosters = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
     private val typingRosters = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
+
+    private val mutableSentMessageEvidence =
+        MutableStateFlow(OwnedFlag(ownerAccountId = null, value = false))
+    override val sentMessageEvidence: StateFlow<OwnedFlag> =
+        mutableSentMessageEvidence.asStateFlow()
 
     private fun publishChats(previews: List<ChatPreview>) {
         rawChats.value = previews
@@ -1955,6 +2159,8 @@ class EncryptedChatRepository @Inject internal constructor(
         val caption: String?,
         val plaintextBytes: Int,
         val replyToMessageId: String? = null,
+        /** Two or more entries make this chip a whole album being encrypted, not one item. */
+        val albumMediaTypes: List<String> = emptyList(),
     )
 
     private val stagingMedia = MutableStateFlow<List<StagingMedia>>(emptyList())
@@ -2107,8 +2313,9 @@ class EncryptedChatRepository @Inject internal constructor(
                         synchronized(publicationLock) {
                             mutableReadiness.value = false
                             // The chats stay on screen through a lifecycle blip, but the edit
-                            // affordance does not: no session means no capability to prove.
+                            // and album affordances do not: no session, no capability to prove.
                             mutableMessageEditsAvailable.value = false
+                            mutableMediaAlbumsAvailable.value = false
                         }
                         delay(SIGNED_OUT_CLEAR_GRACE_MILLIS)
                         clearPublishedStateIfCurrent(null)
@@ -2200,7 +2407,10 @@ class EncryptedChatRepository @Inject internal constructor(
             if (mutableReadiness.value || publishedSession != null) {
                 false
             } else {
-                commitPublicationBodyLocked(publication)
+                // The local view's owner comes from the activation's own crypto binding — the
+                // account whose encrypted store these messages were read from — not from the
+                // session signed in at commit time, which an account switch may have replaced.
+                commitPublicationBodyLocked(publication, activation.binding.userId)
                 publishedLocalActivation = activation
                 mutableLocalHistoryReady.value = true
                 true
@@ -2951,6 +3161,211 @@ class EncryptedChatRepository @Inject internal constructor(
         }
     }
 
+    override suspend fun sendMediaAlbumMessage(
+        chatId: String,
+        attachments: List<SecureMediaAlbumSource>,
+        caption: String?,
+        replyToMessageId: String?,
+    ) = sendMediaAlbumMessageInternal(
+        chatId = chatId,
+        attachments = attachments,
+        caption = caption,
+        replyToMessageId = replyToMessageId,
+        expectedOwner = null,
+        idempotentClientMessageId = null,
+    )
+
+    override suspend fun sendIdempotentMediaAlbumMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        attachments: List<SecureMediaAlbumSource>,
+        clientMessageId: String,
+        caption: String?,
+    ) = idempotentMediaSendMutex.withLock {
+        sendMediaAlbumMessageInternal(
+            chatId = chatId,
+            attachments = attachments,
+            caption = caption,
+            replyToMessageId = null,
+            expectedOwner = owner,
+            idempotentClientMessageId = clientMessageId,
+        )
+    }
+
+    /**
+     * One `KITMEDIA2` album accepted offline-first: every item is encrypted into the spool under
+     * a fresh attachment id, and the whole batch — caption included — is committed as ONE durable
+     * intent under ONE stable message id before this function returns. The dispatcher later runs
+     * the single roster admission, the ordered uploads and the single send. A one-item batch is
+     * the classic `KITMEDIA1` message — the album profile starts at two attachments.
+     */
+    private suspend fun sendMediaAlbumMessageInternal(
+        chatId: String,
+        attachments: List<SecureMediaAlbumSource>,
+        caption: String?,
+        replyToMessageId: String?,
+        expectedOwner: SessionFence?,
+        idempotentClientMessageId: String?,
+    ) {
+        require(attachments.isNotEmpty()) { "Choose at least one attachment to send" }
+        if (attachments.size == 1) {
+            val single = attachments.single()
+            sendMediaMessageInternal(
+                chatId = chatId,
+                source = single.source,
+                mediaType = single.mediaType,
+                caption = caption,
+                replyToMessageId = replyToMessageId,
+                expectedOwner = expectedOwner,
+                idempotentClientMessageId = idempotentClientMessageId,
+            )
+            return
+        }
+        // Albums exist only on the durable outbox path. A single item has a legacy inline send to
+        // fall back to; an album deliberately does not, because nothing may ever split it.
+        val queue = checkNotNull(immediateSends) { "The durable secure-media outbox is unavailable" }
+        val spool = checkNotNull(immediateMediaSpool) {
+            "The durable secure-media outbox is unavailable"
+        }
+        val owner = expectedOwner ?: authenticationSessions?.current()?.fence()
+            ?: throw SessionInvalidatedException()
+        if (authenticationSessions?.current()?.fence() != owner) {
+            throw SessionInvalidatedException()
+        }
+        check(chat(chatId) != null) { "The secure conversation is no longer available" }
+        require(attachments.size <= KitMediaMessageV2.MAX_ATTACHMENTS) {
+            "Send at most ${KitMediaMessageV2.MAX_ATTACHMENTS} attachments in one message"
+        }
+        val mediaTypes = attachments.map {
+            requireNotNull(KitMediaMessage.normalizeMediaType(it.mediaType)) {
+                "Choose supported photos, voice notes, videos or documents"
+            }
+        }
+        // Refuse a hopeless batch before any encryption work. The declared counts are only a
+        // floor for the real ciphertext, whose exact sizes the queued intent re-proves per item.
+        require(
+            attachments.sumOf { maxOf(it.source.declaredByteCount, 0L) } <=
+                KitMediaMessageV2.MAX_AGGREGATE_CIPHERTEXT_BYTES,
+        ) { "These attachments are too large to send in one message" }
+        // An invalid caption fails the whole send here, in front of the person and with their
+        // draft intact — a caption is never truncated and never split into a separate message.
+        val normalizedCaption = KitMediaMessageV2.normalizeCaption(caption)
+        require(normalizedCaption == null || KitMediaMessageV2.isValidCaption(normalizedCaption)) {
+            "This caption is too long to send with these attachments"
+        }
+        idempotentClientMessageId?.let {
+            require(ImmediateSendIntent.CANONICAL_UUID.matches(it)) {
+                "Invalid idempotent secure-media ID"
+            }
+        }
+        val replyTarget = resolvedReplyTarget(chatId, replyToMessageId)
+        val id = idempotentClientMessageId ?: UUID.randomUUID().toString()
+        if (idempotentClientMessageId != null) {
+            queue.findForOwner(owner, id)?.let { existing ->
+                check(
+                    existing.kind == ImmediateSendKind.MEDIA_V2 &&
+                        existing.conversationId == chatId &&
+                        existing.caption == normalizedCaption &&
+                        existing.replyToMessageId == replyTarget &&
+                        existing.mediaItems.size == attachments.size &&
+                        existing.mediaItems.withIndex().all { (index, item) ->
+                            item.mediaType == mediaTypes[index] &&
+                                item.plaintextBytes.toLong() ==
+                                attachments[index].source.declaredByteCount
+                        },
+                ) { "An immediate-send identity belongs to different media" }
+                if (existing.state != ImmediateSendState.FAILED) {
+                    if (existing.state == ImmediateSendState.RETRY_REQUIRED) {
+                        queue.rearmForOwner(owner, existing.id)
+                    }
+                    immediateSendScheduler?.schedule()
+                    return
+                }
+                // A failed record's ciphertext is gone for good: fall through and stage this
+                // batch afresh under the same stable identity — the store swaps it wholesale.
+            }
+        }
+        val createdAt = clock.instant().toEpochMilli()
+        stagingMedia.update { current ->
+            current + StagingMedia(
+                id = id,
+                owner = owner,
+                conversationId = chatId,
+                createdAtEpochMillis = createdAt,
+                mediaType = mediaTypes.first(),
+                caption = normalizedCaption,
+                plaintextBytes = 0,
+                replyToMessageId = replyTarget,
+                albumMediaTypes = mediaTypes,
+            )
+        }
+        val stagedIds = mutableListOf<String>()
+        try {
+            val items = attachments.mapIndexed { index, attachment ->
+                val attachmentId = UUID.randomUUID().toString()
+                stagedIds += attachmentId
+                val material = spool.stage(attachmentId, attachment.source)
+                ImmediateSendMediaItem(
+                    attachmentId = attachmentId,
+                    mediaType = mediaTypes[index],
+                    plaintextBytes = material.plaintextBytes,
+                    ciphertextBytes = material.ciphertextBytes.toLong(),
+                    keyBase64 = material.keyBase64,
+                    ciphertextSha256Hex = base64ToLowercaseHex(material.sha256Base64),
+                )
+            }
+            normalizedCaption?.let { validCaption ->
+                // Storage keys are canonical UUIDs — exactly as long as the attachment-id
+                // placeholders standing in for them here — so this measurement is byte-exact
+                // against the descriptor the dispatcher will seal after the uploads.
+                val probe = items.map {
+                    KitMediaMessageV2Item(
+                        attachmentId = it.attachmentId,
+                        storageKey = it.attachmentId,
+                        mediaType = it.mediaType,
+                        ciphertextByteSize = it.ciphertextBytes,
+                        ciphertextSha256 = it.ciphertextSha256Hex,
+                        keyMaterialBase64 = it.keyBase64,
+                        plaintextByteSize = it.plaintextBytes,
+                    )
+                }
+                require(
+                    KitMediaMessageV2.encodedCaptionBytes(validCaption) <=
+                        KitMediaMessageV2.remainingEncodedCaptionBudgetBytes(probe),
+                ) { "This caption is too long to send with these attachments" }
+            }
+            val intent = ImmediateSendIntent(
+                id = id,
+                conversationId = chatId,
+                kind = ImmediateSendKind.MEDIA_V2,
+                createdAtEpochMillis = createdAt,
+                caption = normalizedCaption,
+                mediaItems = items,
+                replyToMessageId = replyTarget,
+            )
+            if (idempotentClientMessageId == null) {
+                queue.enqueueForOwner(owner, intent)
+            } else {
+                queue.enqueueIdempotentForOwner(owner, intent)
+                // The identical record may already be on disk from an earlier attempt at this
+                // same identity; whatever this call staged beyond what the retained record
+                // references is an orphan ciphertext.
+                val retained = queue.findForOwner(owner, id)?.spoolIds().orEmpty().toSet()
+                stagedIds.filterNot { it in retained }.forEach { spool.discard(it) }
+            }
+        } catch (error: Throwable) {
+            stagedIds.forEach { spool.discard(it) }
+            throw error
+        } finally {
+            stagingMedia.update { current -> current.filterNot { it.id == id } }
+        }
+        immediateSendScheduler?.schedule()
+    }
+
+    /** The spool reports digests in Base64; `KITMEDIA2` descriptors carry lowercase hex. */
+    private fun base64ToLowercaseHex(base64: String): String =
+        Base64.getDecoder().decode(base64).joinToString("") { "%02x".format(it) }
+
     override suspend fun openImageMessage(
         chatId: String,
         mediaDescriptor: String,
@@ -2965,6 +3380,9 @@ class EncryptedChatRepository @Inject internal constructor(
             ) {
                 error("This secure attachment is still being prepared")
             }
+            // MEDIA only, deliberately: an album is opened one attachment at a time through
+            // [openAlbumItemMessage], so an album id here fails closed rather than guessing
+            // which of its spool files was meant.
             check(intent != null && intent.conversationId == chatId && intent.kind == ImmediateSendKind.MEDIA) {
                 "The queued secure attachment is no longer available"
             }
@@ -2996,6 +3414,65 @@ class EncryptedChatRepository @Inject internal constructor(
         }
     }
 
+    override suspend fun openAlbumItemMessage(
+        chatId: String,
+        mediaDescriptor: String,
+        attachmentId: String,
+    ): SecureMediaFile {
+        // The cache hashes its keys, so the composite key may safely embed the descriptor; the
+        // attachment id in front keeps every item of one album a distinct cache entry.
+        val cacheKey = "$attachmentId@$mediaDescriptor"
+        if (mediaDescriptor.startsWith(LOCAL_MEDIA_DESCRIPTOR_PREFIX)) {
+            val id = mediaDescriptor.removePrefix(LOCAL_MEDIA_DESCRIPTOR_PREFIX)
+            val intent = immediateSends?.find(id)
+            if (
+                intent == null && currentStagingMedia().any {
+                    it.id == id && it.conversationId == chatId
+                }
+            ) {
+                error("This secure attachment is still being prepared")
+            }
+            check(
+                intent != null &&
+                    intent.conversationId == chatId &&
+                    intent.kind == ImmediateSendKind.MEDIA_V2,
+            ) {
+                "The queued secure attachment is no longer available"
+            }
+            val item = checkNotNull(intent.mediaItems.firstOrNull { it.attachmentId == attachmentId }) {
+                "The requested attachment does not belong to this album"
+            }
+            val cache = requireSecureMediaCache()
+            cache.cached(cacheKey, item.mediaType)?.let { return it }
+            val ciphertext = checkNotNull(immediateMediaSpool)
+                .albumItemCiphertextFile(intent, attachmentId)
+            return cache.store(cacheKey, item.mediaType) { destination ->
+                val key = item.keyMaterial()
+                val digest = item.ciphertextSha256()
+                try {
+                    destination.outputStream().buffered().use { output ->
+                        MediaAttachmentStreamCipher.decrypt(ciphertext, key, digest, output)
+                    }
+                } finally {
+                    key.fill(0)
+                    digest.fill(0)
+                }
+            }
+        }
+        val album = requireNotNull(KitMediaMessageV2.parse(mediaDescriptor)) {
+            "This message does not reference readable secure media"
+        }
+        val item = requireNotNull(album.items.firstOrNull { it.attachmentId == attachmentId }) {
+            "The requested attachment does not belong to this album"
+        }
+        val cache = requireSecureMediaCache()
+        cache.cached(cacheKey, item.mediaType)?.let { return it }
+        val session = requireReadySession()
+        return cache.store(cacheKey, item.mediaType) { destination ->
+            runtime.openAlbumItemToFile(session, chatId, mediaDescriptor, attachmentId, destination)
+        }
+    }
+
     // Asked for only once the descriptor has been judged openable at all. A missing cache is a
     // wiring fault, and reporting it ahead of "still being prepared" would hide the real answer
     // behind an internal one.
@@ -3024,6 +3501,46 @@ class EncryptedChatRepository @Inject internal constructor(
             keyMaterialBase64 = checkNotNull(intent.mediaKeyBase64),
             plaintextBytes = intent.mediaPlaintextBytes,
             caption = intent.caption,
+        )
+    }
+
+    /** Worker-only §6 admission for a queued album, taken once before any upload is spent. */
+    internal suspend fun assertImmediateAlbumAdmission(
+        owner: SessionFence,
+        intent: ImmediateSendIntent,
+    ) {
+        require(intent.kind == ImmediateSendKind.MEDIA_V2)
+        val session = requireReadySession()
+        if (
+            authenticationSessions?.current()?.fence() != owner ||
+            session.sessionEpoch != owner.sessionId
+        ) throw SessionInvalidatedException()
+        runtime.assertMediaAlbumSendable(session, intent.conversationId, owner)
+    }
+
+    /** Worker-only upload of one album attachment; returns its canonical storage key. */
+    internal suspend fun uploadImmediateAlbumItem(
+        owner: SessionFence,
+        intent: ImmediateSendIntent,
+        attachmentId: String,
+        ciphertext: File,
+    ): String {
+        require(intent.kind == ImmediateSendKind.MEDIA_V2)
+        val item = requireNotNull(
+            intent.mediaItems.firstOrNull { it.attachmentId == attachmentId },
+        ) { "The uploaded attachment does not belong to this album" }
+        val session = requireReadySession()
+        if (
+            authenticationSessions?.current()?.fence() != owner ||
+            session.sessionEpoch != owner.sessionId
+        ) throw SessionInvalidatedException()
+        return runtime.uploadAlbumAttachment(
+            session = session,
+            conversationId = intent.conversationId,
+            ciphertext = ciphertext,
+            mediaType = item.mediaType,
+            expectedCiphertextBytes = item.ciphertextBytes,
+            expectedCiphertextSha256Hex = item.ciphertextSha256Hex,
         )
     }
 
@@ -3228,6 +3745,8 @@ class EncryptedChatRepository @Inject internal constructor(
                         ImmediateSendState.WAITING -> AuthenticatedTextDeliveryState.PENDING
                         ImmediateSendState.RETRY_REQUIRED ->
                             AuthenticatedTextDeliveryState.RETRY_REQUIRED
+                        ImmediateSendState.FAILED ->
+                            AuthenticatedTextDeliveryState.PERMANENT_FAILURE
                     },
                     replyToMessageId = intent.replyToMessageId,
                 )
@@ -3304,11 +3823,15 @@ class EncryptedChatRepository @Inject internal constructor(
                 }
             val localMedia = visiblePending.asSequence()
                 .filter {
-                    it.conversationId == conversationId &&
-                        it.kind == ImmediateSendKind.MEDIA &&
-                        it.preparedMediaDescriptor == null
+                    it.conversationId == conversationId && it.preparedMediaDescriptor == null
                 }
-                .map(::toPendingMediaMessage)
+                .mapNotNull {
+                    when (it.kind) {
+                        ImmediateSendKind.MEDIA -> toPendingMediaMessage(it)
+                        ImmediateSendKind.MEDIA_V2 -> toPendingAlbumMessage(it)
+                        else -> null
+                    }
+                }
                 .toList()
             val preparingMedia = visibleStaging.asSequence()
                 .filter { it.conversationId == conversationId }
@@ -3446,12 +3969,13 @@ class EncryptedChatRepository @Inject internal constructor(
         session: SecureMessagingChatSession,
         publication: ProjectionPublication,
     ) {
-        commitPublicationBodyLocked(publication)
+        commitPublicationBodyLocked(publication, session.ownerAccountId)
         // The exchange path owns the screen from here; the interim local view is superseded
         // rather than cleared, so nothing blanks between the two.
         publishedLocalActivation = null
         publishedSession = session
         mutableMessageEditsAvailable.value = session.messageEditsEnabled
+        mutableMediaAlbumsAvailable.value = session.mediaAlbumsEnabled
         // Publish readiness last: observing true implies this activation's chats/messages were
         // already committed under the same repository publication lock.
         mutableReadiness.value = true
@@ -3459,7 +3983,10 @@ class EncryptedChatRepository @Inject internal constructor(
     }
 
     /** The observable half of a commit, shared by the local and message-ready publications. */
-    private fun commitPublicationBodyLocked(publication: ProjectionPublication) {
+    private fun commitPublicationBodyLocked(
+        publication: ProjectionPublication,
+        ownerAccountId: String?,
+    ) {
         synchronized(conversationLock) {
             // Replace each conversation atomically: a collector never observes an empty list
             // between commits. Only conversations absent from the new publication are erased
@@ -3477,6 +4004,18 @@ class EncryptedChatRepository @Inject internal constructor(
         }
         rawMembers.value = publication.membersByConversation
         republishMembers()
+        // Evidence for the home starter checklist, read from the same authenticated
+        // projection the chat list shows: content this account authored that really left
+        // the device. The owner arrives with the publication — captured from the exact
+        // activation that produced it, never sampled from the current session here — so a
+        // commit that lands after an account switch still names the account it belongs to,
+        // and can never pair one account's evidence with another's session.
+        mutableSentMessageEvidence.value = OwnedFlag(
+            ownerAccountId = ownerAccountId,
+            value = publication.messagesByConversation.values.any { messages ->
+                messages.any { it.provesFirstMessage() }
+            },
+        )
         publishChats(publication.chats)
     }
 
@@ -3510,19 +4049,34 @@ class EncryptedChatRepository @Inject internal constructor(
     ): Message {
         val media = KitMediaMessage.parse(projected.text)
         val mediaKind = media?.let { KitChatMediaKind.fromMediaType(it.mediaType) }
-        val payment = if (media == null) KitPaymentMessage.parse(projected.text) else null
-        val groupPayment = if (media == null && payment == null) {
-            KitGroupPaymentMessage.parse(projected.text)
-        } else {
+        val mediaAlbum = if (media == null) KitMediaMessageV2.parse(projected.text) else null
+        // Any remaining reserved-prefix text — an unknown future generation or a malformed
+        // descriptor — is a placeholder from here on, regardless of any capability flag. Its raw
+        // text can embed attachment keys, so it reaches no field of the UI model: not the text,
+        // and not the descriptor handle.
+        val unsupportedMedia = media == null && mediaAlbum == null &&
+            KitMediaFamily.isFamilyText(projected.text)
+        val mediaFamily = media != null || mediaAlbum != null || unsupportedMedia
+        val payment = if (mediaFamily) null else KitPaymentMessage.parse(projected.text)
+        val groupPayment = if (mediaFamily || payment != null) {
             null
+        } else {
+            KitGroupPaymentMessage.parse(projected.text)
         }
         return Message(
             id = projected.messageId,
             text = when {
-                // A correction replaces the visible wording and nothing else: a photo stays the
-                // photo it was, and only the caption under it reads differently.
-                edit != null && payment == null && groupPayment == null -> edit.text
+                // Media stays media whatever was said about it afterwards: corrections aimed at
+                // any media generation are dropped in [foldAuthenticatedEdits], and these branches
+                // sit ahead of the edit one so a regression there still could not put a sentence
+                // where a descriptor's label belongs.
                 media != null -> media.caption ?: mediaKind!!.previewLabel
+                mediaAlbum != null -> mediaAlbum.caption ?: mediaAlbumPreviewLabel(
+                    mediaAlbum.items.map(KitMediaMessageV2Item::mediaType),
+                )
+                unsupportedMedia -> UNSUPPORTED_ATTACHMENT_LABEL
+                // A correction replaces the visible wording and nothing else.
+                edit != null && payment == null && groupPayment == null -> edit.text
                 payment != null -> payment.note.orEmpty()
                 // The announcement's own line is built in the chat, where the members' names are
                 // known; the note is all of it that survives this layer.
@@ -3539,18 +4093,33 @@ class EncryptedChatRepository @Inject internal constructor(
                 mediaKind == KitChatMediaKind.VIDEO -> MessageKind.VIDEO
                 mediaKind == KitChatMediaKind.DOCUMENT -> MessageKind.DOCUMENT
                 mediaKind == KitChatMediaKind.IMAGE -> MessageKind.IMAGE
+                mediaAlbum != null -> MessageKind.MEDIA_ALBUM
+                unsupportedMedia -> MessageKind.UNSUPPORTED_ATTACHMENT
                 groupPayment != null -> groupPayment.action.toMessageKind()
                 payment == null -> MessageKind.TEXT
                 else -> payment.action.toMessageKind()
             },
             // The opaque authenticated descriptor; the UI passes it back for follow-up actions.
-            mediaDescriptor = if (media != null || payment != null || groupPayment != null) {
-                projected.text
-            } else {
-                null
+            // Deliberately null for UNSUPPORTED_ATTACHMENT: unparsed reserved text has no
+            // follow-up action, and withholding the handle confines the raw bytes to this layer.
+            mediaDescriptor = when {
+                unsupportedMedia -> null
+                media != null || mediaAlbum != null || payment != null || groupPayment != null ->
+                    projected.text
+                else -> null
             },
             mediaType = media?.mediaType,
             mediaPlaintextBytes = media?.plaintextByteSize ?: 0,
+            mediaItems = mediaAlbum?.items.orEmpty().map {
+                MessageMediaItem(
+                    attachmentId = it.attachmentId,
+                    mediaType = it.mediaType,
+                    plaintextBytes = it.plaintextByteSize,
+                )
+            },
+            // Byte-exact and nullable: presence of a caption is a descriptor fact the UI must
+            // never re-derive by comparing display strings.
+            mediaCaption = media?.caption ?: mediaAlbum?.caption,
             amountMinor = when {
                 payment == null -> 0
                 payment.moneyLeavesCurrentUser(projected.fromCurrentUser) -> -payment.amountMinor
@@ -3567,7 +4136,9 @@ class EncryptedChatRepository @Inject internal constructor(
             sortEpochMillis = projected.sentAt.toEpochMilli(),
             reactions = reactions,
             replyToMessageId = projected.replyToMessageId,
-            editedAtEpochMillis = edit?.editedAtEpochMillis ?: 0L,
+            // A bubble that says "edited" must have had wording an author replaced; media-family
+            // entries never do (their corrections are dropped), so the moment stays unset.
+            editedAtEpochMillis = if (mediaFamily) 0L else edit?.editedAtEpochMillis ?: 0L,
         )
     }
 
@@ -3582,6 +4153,7 @@ class EncryptedChatRepository @Inject internal constructor(
             state = when (intent.state) {
                 ImmediateSendState.WAITING -> DeliveryState.SENDING
                 ImmediateSendState.RETRY_REQUIRED -> DeliveryState.RETRY_REQUIRED
+                ImmediateSendState.FAILED -> DeliveryState.FAILED
             },
             kind = when (mediaKind) {
                 KitChatMediaKind.VOICE -> MessageKind.VOICE_NOTE
@@ -3597,12 +4169,69 @@ class EncryptedChatRepository @Inject internal constructor(
         )
     }
 
+    /**
+     * The offline-first projection of a queued album: one `MEDIA_ALBUM` bubble under the
+     * intent's stable message id, from the moment of acceptance until the encrypted outbox —
+     * or a terminal failure — takes over.
+     */
+    private fun toPendingAlbumMessage(intent: ImmediateSendIntent): Message = Message(
+        id = intent.id,
+        text = intent.caption ?: mediaAlbumPreviewLabel(
+            intent.mediaItems.map(ImmediateSendMediaItem::mediaType),
+        ),
+        time = formatChatTime(Instant.ofEpochMilli(intent.createdAtEpochMillis)),
+        fromMe = true,
+        state = when (intent.state) {
+            ImmediateSendState.WAITING -> DeliveryState.SENDING
+            ImmediateSendState.RETRY_REQUIRED -> DeliveryState.RETRY_REQUIRED
+            ImmediateSendState.FAILED -> DeliveryState.FAILED
+        },
+        kind = MessageKind.MEDIA_ALBUM,
+        mediaDescriptor = LOCAL_MEDIA_DESCRIPTOR_PREFIX + intent.id,
+        mediaItems = intent.mediaItems.map {
+            MessageMediaItem(
+                attachmentId = it.attachmentId,
+                mediaType = it.mediaType,
+                plaintextBytes = it.plaintextBytes,
+            )
+        },
+        // Byte-exact caption presence, matching what the sent descriptor will carry.
+        mediaCaption = intent.caption,
+        sortEpochMillis = intent.createdAtEpochMillis,
+        replyToMessageId = intent.replyToMessageId,
+    )
+
     private fun currentStagingMedia(): List<StagingMedia> {
         val owner = authenticationSessions?.current()?.fence() ?: return emptyList()
         return stagingMedia.value.filter { it.owner == owner }
     }
 
     private fun toStagingMediaMessage(staging: StagingMedia): Message {
+        if (staging.albumMediaTypes.size >= 2) {
+            // The whole batch is one bubble from the first frame: encryption of a several-item
+            // album can take a while, and the person must never watch it as separate messages.
+            return Message(
+                id = staging.id,
+                text = staging.caption ?: mediaAlbumPreviewLabel(staging.albumMediaTypes),
+                time = formatChatTime(Instant.ofEpochMilli(staging.createdAtEpochMillis)),
+                fromMe = true,
+                state = DeliveryState.SENDING,
+                kind = MessageKind.MEDIA_ALBUM,
+                mediaDescriptor = LOCAL_MEDIA_DESCRIPTOR_PREFIX + staging.id,
+                mediaItems = staging.albumMediaTypes.mapIndexed { index, mediaType ->
+                    // Positional placeholder identities: real attachment ids exist only once the
+                    // spool has encrypted each item, and these never leave the local projection.
+                    MessageMediaItem(
+                        attachmentId = "staging:$index",
+                        mediaType = mediaType,
+                        plaintextBytes = 0,
+                    )
+                },
+                mediaCaption = staging.caption,
+                sortEpochMillis = staging.createdAtEpochMillis,
+                replyToMessageId = staging.replyToMessageId,
+            )
+        }
         val mediaKind = KitChatMediaKind.fromMediaType(staging.mediaType)
         return Message(
             id = staging.id,
@@ -3631,6 +4260,15 @@ class EncryptedChatRepository @Inject internal constructor(
         MessageKind.VIDEO -> text.takeIf { it != "Video" }?.let { "Video · $it" } ?: "Video"
         MessageKind.DOCUMENT -> text.takeIf { it != "Document" }?.let { "Document · $it" }
             ?: "Document"
+        MessageKind.MEDIA_ALBUM -> {
+            val album = mediaAlbumPreviewLabel(mediaItems.map(MessageMediaItem::mediaType))
+            // The row appends the validated caption itself — never inferred from the bubble
+            // text, which may legitimately equal the generated plural label.
+            mediaCaption?.let { "$album · $it" } ?: album
+        }
+        // Structural, not an `else` fall-through to `text`: the row label for unparsed reserved
+        // text must never depend on what any other layer put in the text field.
+        MessageKind.UNSUPPORTED_ATTACHMENT -> UNSUPPORTED_ATTACHMENT_LABEL
         MessageKind.PAYMENT,
         MessageKind.PAYMENT_REQUEST,
         MessageKind.PAYMENT_TRANSFER,
@@ -3747,6 +4385,10 @@ class EncryptedChatRepository @Inject internal constructor(
         mutableReadiness.value = false
         mutableLocalHistoryReady.value = false
         mutableMessageEditsAvailable.value = false
+        mutableMediaAlbumsAvailable.value = false
+        // Fail closed across accounts: the next signer-in starts with no first-message
+        // evidence until their own projection proves it.
+        mutableSentMessageEvidence.value = OwnedFlag(ownerAccountId = null, value = false)
         publishedSession = owner
         publishedLocalActivation = null
         publishChats(emptyList())

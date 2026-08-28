@@ -138,6 +138,8 @@ private val MessageKind.interruptsSenderRun: Boolean
         MessageKind.IMAGE,
         MessageKind.VIDEO,
         MessageKind.DOCUMENT,
+        MessageKind.MEDIA_ALBUM,
+        MessageKind.UNSUPPORTED_ATTACHMENT,
         -> false
         MessageKind.PAYMENT,
         MessageKind.PAYMENT_REQUEST,

@@ -33,6 +33,7 @@ internal class IncomingShareRequestPersistence(private val root: File) {
     ): IncomingTextShareRequest {
         requireValid(batch)
         require(batch.pinnedConversationId == null) { "A new share cannot already be routed" }
+        require(batch.albumDelivery == null) { "A new share cannot already be shaped" }
         val directory = directory(batch.id)
         check(!manifest(directory).exists()) { "That shared batch already exists" }
         try {
@@ -93,6 +94,7 @@ internal class IncomingShareRequestPersistence(private val root: File) {
     fun pinDestination(
         expected: SharedInboxBatch,
         conversationId: String,
+        albumDelivery: Boolean,
         nowMillis: Long = System.currentTimeMillis(),
     ): SharedInboxBatch {
         val canonicalConversationId = SharedInboxPolicy.canonicalConversationId(conversationId)
@@ -103,16 +105,27 @@ internal class IncomingShareRequestPersistence(private val root: File) {
         val current = checkNotNull(readBatch(directory, nowMillis)) {
             "That shared content is no longer available"
         }
-        check(current.copy(pinnedConversationId = expected.pinnedConversationId) == expected) {
+        check(
+            current.copy(
+                pinnedConversationId = expected.pinnedConversationId,
+                albumDelivery = expected.albumDelivery,
+            ) == expected,
+        ) {
             "The shared content changed before it could be queued"
         }
         current.pinnedConversationId?.let { pinned ->
             check(pinned == canonicalConversationId) {
                 "This share is already assigned to another conversation"
             }
+            // The recorded shape wins over the caller's fresh preference: a batch that already
+            // queued components under one shape must never re-decide it, and a manifest written
+            // before shapes existed reads back null, which the send path treats as per-item.
             return current
         }
-        return current.copy(pinnedConversationId = canonicalConversationId).also {
+        return current.copy(
+            pinnedConversationId = canonicalConversationId,
+            albumDelivery = albumDelivery,
+        ).also {
             writeManifest(directory, it)
         }
     }
@@ -257,6 +270,8 @@ internal class IncomingShareRequestPersistence(private val root: File) {
         output.writeString(batch.owner.cacheScopeId)
         output.writeNullableString(batch.owner.accountId)
         output.writeNullableString(batch.pinnedConversationId)
+        output.writeBoolean(batch.albumDelivery != null)
+        batch.albumDelivery?.let(output::writeBoolean)
         output.writeInt(batch.items.size)
         batch.items.forEach { item ->
             output.writeString(item.id)
@@ -270,7 +285,10 @@ internal class IncomingShareRequestPersistence(private val root: File) {
 
     private fun decode(input: java.io.InputStream): SharedInboxBatch {
         DataInputStream(BufferedInputStream(input)).use { data ->
-            check(data.readUnsignedByte() == VERSION) { "Unsupported share manifest" }
+            val version = data.readUnsignedByte()
+            check(version == VERSION || version == LEGACY_VERSION_WITHOUT_SHAPE) {
+                "Unsupported share manifest"
+            }
             val id = data.readString(MAX_IDENTIFIER_BYTES)
             val receivedAt = data.readLong()
             val owner = SharedInboxOwner(
@@ -279,6 +297,15 @@ internal class IncomingShareRequestPersistence(private val root: File) {
                 accountId = data.readNullableString(MAX_OWNER_VALUE_BYTES),
             )
             val pinnedConversationId = data.readNullableString(MAX_IDENTIFIER_BYTES)
+            // A manifest from before delivery shapes existed reads back with no shape; the send
+            // path takes null as the per-item delivery those batches may already have started.
+            val albumDelivery = if (version == LEGACY_VERSION_WITHOUT_SHAPE) {
+                null
+            } else if (data.readBoolean()) {
+                data.readBoolean()
+            } else {
+                null
+            }
             val itemCount = data.readInt()
             check(itemCount in 0..SharedInboxPolicy.MAXIMUM_ITEMS)
             val items = List(itemCount) {
@@ -292,7 +319,15 @@ internal class IncomingShareRequestPersistence(private val root: File) {
             }
             val text = data.readNullableString(MAX_TEXT_BYTES)
             check(data.read() == -1) { "Trailing share manifest bytes" }
-            return SharedInboxBatch(id, receivedAt, items, text, owner, pinnedConversationId)
+            return SharedInboxBatch(
+                id = id,
+                receivedAtMillis = receivedAt,
+                items = items,
+                text = text,
+                owner = owner,
+                pinnedConversationId = pinnedConversationId,
+                albumDelivery = albumDelivery,
+            )
         }
     }
 
@@ -335,7 +370,14 @@ internal class IncomingShareRequestPersistence(private val root: File) {
         runCatching { UUID.fromString(raw).toString() }.getOrNull()
 
     private companion object {
-        const val VERSION = 3
+        const val VERSION = 4
+
+        /**
+         * Manifests written before [SharedInboxBatch.albumDelivery] existed. Still readable —
+         * deleting a claimed batch mid-flight would orphan a partially queued send — but every
+         * write is the current version.
+         */
+        const val LEGACY_VERSION_WITHOUT_SHAPE = 3
         const val CLAIM_MARKER_VERSION: Byte = 1
         const val MANIFEST = ".request-v1"
         const val MANIFEST_TEMP = ".request-v1.tmp"
@@ -391,7 +433,8 @@ internal object IncomingTextShareStore {
         context: Context,
         batch: SharedInboxBatch,
         conversationId: String,
-    ): SharedInboxBatch = persistence(context).pinDestination(batch, conversationId)
+        albumDelivery: Boolean,
+    ): SharedInboxBatch = persistence(context).pinDestination(batch, conversationId, albumDelivery)
 
     private fun persistence(context: Context) = IncomingShareRequestPersistence(
         SharedInboxStore.root(context),

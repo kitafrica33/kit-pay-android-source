@@ -19,9 +19,15 @@ object KitFeature {
     const val NOTIFICATIONS = "notifications"
     const val ABUSE_REPORTING = "abuse_reporting"
     const val KYC = "kyc"
-    const val EMAIL_REGISTRATION = "email_registration"
     const val EMAIL_RECOVERY = "email_recovery"
     const val ACCOUNT_DELETION = "account_deletion"
+
+    /**
+     * Server-owned starter checklist (onboarding milestones). Until the backend advertises
+     * this key as exactly `true`, the client never calls the onboarding route and starter
+     * milestones rest on device-local evidence alone.
+     */
+    const val STARTER_CHECKLIST = "starter_checklist"
 }
 
 /** Held-transfer actions require their wallet and send dependencies as well as the rollout flag. */

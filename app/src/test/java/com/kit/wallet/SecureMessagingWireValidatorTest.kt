@@ -377,6 +377,61 @@ class SecureMessagingWireValidatorTest {
     }
 
     @Test
+    fun `multi-row digest case normalizes while a single legacy row stays lowercase-only`() {
+        val first = EncryptedAttachmentDto(
+            id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            storageKey = "0f0e0d0c-0b0a-4a0b-8c0d-0e0f10111213",
+            mediaType = "image/jpeg",
+            byteSize = 1_088,
+            ciphertextSha256 = "AB".repeat(32),
+        )
+        val second = EncryptedAttachmentDto(
+            id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            storageKey = "1f1e1d1c-1b1a-4a1b-8c1d-1e1f20212223",
+            mediaType = "video/mp4",
+            byteSize = 5_242_944,
+            ciphertextSha256 = "cd".repeat(32),
+        )
+        val message = incomingMessage().copy(
+            kind = ENCRYPTED_ATTACHMENT_MESSAGE_KIND,
+            attachments = listOf(first, second),
+        )
+
+        // Multi-row sets exist only in the media-v2 family, whose receive contract set-matches
+        // outer digests against the authenticated descriptor after case normalization — an
+        // uppercase wire digest arrives lowercase, never as a spurious mismatch.
+        val validated = SecureMessagingWireValidator.validateIncomingEncryptedMessage(
+            message,
+            CONVERSATION_ID,
+            CURRENT_DEVICE_ID,
+        )
+        assertEquals(
+            listOf("ab".repeat(32), "cd".repeat(32)),
+            validated.attachments().map { it.ciphertextSha256 },
+        )
+
+        // Normalization is not laxness: a value that is not hex at all still fails.
+        assertRejected {
+            SecureMessagingWireValidator.validateIncomingEncryptedMessage(
+                message.copy(
+                    attachments = listOf(first.copy(ciphertextSha256 = "zz".repeat(32)), second),
+                ),
+                CONVERSATION_ID,
+                CURRENT_DEVICE_ID,
+            )
+        }
+
+        // The single-row legacy shape keeps its strict lowercase-only digest rule.
+        assertRejected {
+            SecureMessagingWireValidator.validateIncomingEncryptedMessage(
+                message.copy(attachments = listOf(first)),
+                CONVERSATION_ID,
+                CURRENT_DEVICE_ID,
+            )
+        }
+    }
+
+    @Test
     fun `incoming encrypted reaction requires and preserves its target`() {
         val reaction = incomingMessage().copy(
             kind = ENCRYPTED_REACTION_MESSAGE_KIND,

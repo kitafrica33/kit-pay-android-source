@@ -12,10 +12,16 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material3.CircularProgressIndicator
@@ -28,6 +34,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -35,9 +42,32 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.autofill.AutofillNode
+import androidx.compose.ui.autofill.AutofillType
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.InterceptPlatformTextInput
+import androidx.compose.ui.platform.LocalAutofill
+import androidx.compose.ui.platform.LocalAutofillTree
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.kit.wallet.data.auth.AuthChallengeKind
@@ -47,11 +77,12 @@ import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.KitKeypad
 import com.kit.wallet.ui.security.SecureScreen
 import com.kit.wallet.ui.theme.KitWalletTheme
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 
 private const val OTP_LENGTH = 6
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
 @Composable
 fun OtpScreen(
     destination: String,
@@ -151,9 +182,13 @@ fun OtpScreen(
     }
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
                 title = {},
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                ),
                 navigationIcon = {
                     IconButton(onClick = onBack, enabled = !loading) {
                         Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back")
@@ -162,14 +197,25 @@ fun OtpScreen(
             )
         },
     ) { padding ->
+        // Two regions: everything above the keypad scrolls when a compact phone, a large
+        // font scale, or the recovery keyboard leaves it short of room, while the keypad
+        // itself stays pinned and whole at the bottom. Nothing clips; the top gives way.
         Column(
             Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(horizontal = 24.dp)
+                .imePadding()
                 .navigationBarsPadding(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            Column(
+                Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
             Spacer(Modifier.height(12.dp))
             Text(
                 when {
@@ -232,33 +278,123 @@ fun OtpScreen(
                     Text("Use an authenticator code")
                 }
             } else {
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    repeat(OTP_LENGTH) { index ->
-                        val filled = index < code.length
-                        val isNext = index == code.length
-                        Box(
-                            Modifier
-                                .size(46.dp, 56.dp)
-                                .background(
-                                    MaterialTheme.colorScheme.surfaceContainerHigh,
-                                    MaterialTheme.shapes.small,
-                                )
-                                .border(
-                                    width = if (isNext) 2.dp else 0.dp,
-                                    color = if (isNext) MaterialTheme.colorScheme.secondary
-                                    else MaterialTheme.colorScheme.surfaceContainerHigh,
-                                    shape = MaterialTheme.shapes.small,
-                                ),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            if (filled) {
-                                Text(
-                                    code[index].toString(),
-                                    style = MaterialTheme.typography.headlineSmall,
-                                )
-                            }
-                        }
+                val autofill = LocalAutofill.current
+                val autofillTree = LocalAutofillTree.current
+                val focusRequester = remember { FocusRequester() }
+                // On this Compose version the autofill tree is the only channel through which
+                // the platform can offer an SMS one-time code, so the field advertises itself
+                // explicitly. A fill goes through the same digit normalization as typing, and
+                // the node is remade with the challenge so a fill can never land on a later one.
+                val autofillNode = remember(challengeId, challengeKind) {
+                    AutofillNode(
+                        autofillTypes = listOf(AutofillType.SmsOtpCode),
+                        onFill = { filled ->
+                            code = normalizedOtpDigits(filled, OTP_LENGTH)
+                        },
+                    )
+                }
+                autofillTree += autofillNode
+                LaunchedEffect(challengeUsable) {
+                    if (challengeUsable) {
+                        // One frame so the field is laid out — and its autofill bounds are
+                        // known — before focus asks the platform to offer a code for it.
+                        withFrameNanos { }
+                        focusRequester.requestFocus()
                     }
+                }
+                // A real focusable text field: SMS autofill, paste, and hardware keyboards
+                // (digits, backspace, Ctrl+V) all land here, while the interceptor keeps the
+                // soft keyboard away in favour of the pinned keypad below. The six boxes are
+                // its decoration, not the input surface.
+                InterceptPlatformTextInput(
+                    interceptor = { _, _ -> awaitCancellation() },
+                ) {
+                    BasicTextField(
+                        value = TextFieldValue(code, selection = TextRange(code.length)),
+                        onValueChange = { value ->
+                            code = normalizedOtpDigits(value.text, OTP_LENGTH)
+                        },
+                        modifier = Modifier
+                            .widthIn(max = 360.dp)
+                            .fillMaxWidth()
+                            .focusRequester(focusRequester)
+                            .onGloballyPositioned {
+                                autofillNode.boundingBox = it.boundsInWindow()
+                            }
+                            .onFocusChanged { state ->
+                                autofill?.apply {
+                                    // The platform API refuses a request before layout has
+                                    // reported bounds; a focus that early simply asks later.
+                                    if (autofillNode.boundingBox == null) return@apply
+                                    if (state.isFocused) requestAutofillForNode(autofillNode)
+                                    else cancelAutofillForNode(autofillNode)
+                                }
+                            }
+                            .semantics {
+                                contentDescription = "Verification code"
+                                stateDescription =
+                                    "${code.length} of $OTP_LENGTH digits entered"
+                            }
+                            .testTag("otp-code-field"),
+                        enabled = challengeUsable && !loading,
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = KeyboardType.Number,
+                            imeAction = ImeAction.Done,
+                        ),
+                        singleLine = true,
+                        decorationBox = { innerTextField ->
+                            Box {
+                                // The functional field is composed but not drawn; the boxes
+                                // are its visible form. Cleared semantics keep TalkBack on
+                                // the field's own description instead of six empty boxes.
+                                Box(Modifier.matchParentSize().alpha(0f)) { innerTextField() }
+                                // Width flexes with the screen and height with the font
+                                // scale: six boxes always fit a compact phone, and a large
+                                // accessibility font grows the box instead of being clipped.
+                                Row(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .clearAndSetSemantics { },
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    repeat(OTP_LENGTH) { index ->
+                                        val filled = index < code.length
+                                        val isNext = index == code.length
+                                        Box(
+                                            Modifier
+                                                .weight(1f)
+                                                .heightIn(min = 56.dp)
+                                                .background(
+                                                    MaterialTheme.colorScheme.surfaceContainerHigh,
+                                                    MaterialTheme.shapes.small,
+                                                )
+                                                .border(
+                                                    width = if (isNext) 2.dp else 0.dp,
+                                                    color = if (isNext) {
+                                                        MaterialTheme.colorScheme.secondary
+                                                    } else {
+                                                        MaterialTheme.colorScheme.surfaceContainerHigh
+                                                    },
+                                                    shape = MaterialTheme.shapes.small,
+                                                ),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            if (filled) {
+                                                Text(
+                                                    code[index].toString(),
+                                                    style = MaterialTheme.typography.headlineSmall,
+                                                    modifier = Modifier.padding(
+                                                        horizontal = 2.dp,
+                                                        vertical = 8.dp,
+                                                    ),
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    )
                 }
             }
 
@@ -266,7 +402,9 @@ fun OtpScreen(
             if (!challengeUsable) {
                 Text(
                     "This verification request is no longer available.",
-                    modifier = Modifier.padding(horizontal = 8.dp),
+                    modifier = Modifier
+                        .padding(horizontal = 8.dp)
+                        .semantics { liveRegion = LiveRegionMode.Polite },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
@@ -278,14 +416,20 @@ fun OtpScreen(
             } else if (error != null) {
                 Text(
                     error,
-                    modifier = Modifier.padding(horizontal = 8.dp),
+                    modifier = Modifier
+                        .padding(horizontal = 8.dp)
+                        // Assertive: the failure also cleared the entered code, and someone
+                        // not looking at the screen needs to know before re-typing.
+                        .semantics { liveRegion = LiveRegionMode.Assertive },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
             } else if (notice != null) {
                 Text(
                     notice,
-                    modifier = Modifier.padding(horizontal = 8.dp),
+                    modifier = Modifier
+                        .padding(horizontal = 8.dp)
+                        .semantics { liveRegion = LiveRegionMode.Polite },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -321,10 +465,13 @@ fun OtpScreen(
                 }
             }
 
-            Spacer(Modifier.weight(1f))
+            // Fixed spacing, not a weighted spacer: this inner column scrolls, and weights
+            // are meaningless under the unbounded height a scroll container measures with.
+            Spacer(Modifier.height(16.dp))
+            }
             if (!useRecoveryCode && challengeUsable) {
                 KitKeypad(
-                    onKey = { if (code.length < OTP_LENGTH && !loading) code += it },
+                    onKey = { if (!loading) code = normalizedOtpDigits(code + it, OTP_LENGTH) },
                     onBackspace = { if (!loading) code = code.dropLast(1) },
                 )
                 Spacer(Modifier.height(24.dp))
@@ -372,3 +519,18 @@ internal fun challengeSecondsRemaining(
 }
 
 internal fun formatChallengeCountdown(seconds: Long): String = formatResendCountdown(seconds)
+
+/**
+ * Reduces any entered text to at most [maxLength] ASCII digits, mapping every Unicode
+ * decimal digit to its `0`–`9` value. SMS autofill and paste can deliver localized digits
+ * (Arabic-Indic `٤`, Devanagari `४`, fullwidth `４`, …); storing those raw would render in
+ * the boxes yet never match the challenge the server issued, so each accepted character is
+ * normalized to the digit it denotes and everything else is dropped.
+ */
+internal fun normalizedOtpDigits(raw: String, maxLength: Int): String = buildString {
+    for (ch in raw) {
+        if (length == maxLength) break
+        val digit = ch.digitToIntOrNull() ?: continue
+        append('0' + digit)
+    }
+}

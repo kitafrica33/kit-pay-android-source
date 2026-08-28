@@ -1,5 +1,6 @@
 package com.kit.wallet.feature.auth
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -7,10 +8,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Lock
@@ -24,6 +29,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -32,14 +38,26 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.kit.wallet.R
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.KitOutlinedButton
 import com.kit.wallet.ui.theme.KitWalletTheme
 
+/**
+ * The one way into Kit Pay. A phone number handles both kinds of visitor by itself —
+ * a returning user signs in, a new one becomes an account — so the screen offers no
+ * "create account" affordance at all. Email sign-in stays available as a secondary path
+ * for accounts that already hold a password, with its recovery affordances following the
+ * `email_recovery` capability.
+ *
+ * Visually this is one cohesive full screen on the app background — the same canvas and
+ * canonical logo lockup as onboarding — never a floating card or partial dialog.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PhoneLoginScreen(
@@ -48,10 +66,8 @@ fun PhoneLoginScreen(
     error: String?,
     onPhoneContinue: (String) -> Unit,
     onEmailContinue: (String, String) -> Unit,
-    onCreateAccount: () -> Unit,
     onForgotPassword: (String) -> Unit,
     onVerifyEmail: (String) -> Unit,
-    emailRegistrationAvailable: Boolean,
     emailRecoveryAvailable: Boolean,
 ) {
     var phone by rememberSaveable { mutableStateOf("") }
@@ -59,11 +75,16 @@ fun PhoneLoginScreen(
     var email by rememberSaveable { mutableStateOf("") }
     // Passwords must not be written to saved-instance-state bundles.
     var password by remember { mutableStateOf("") }
+    val emailAffordances = AccountAccessPolicy.emailAffordances(emailRecoveryAvailable)
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
                 title = {},
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                ),
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back")
@@ -76,17 +97,32 @@ fun PhoneLoginScreen(
             Modifier
                 .fillMaxSize()
                 .padding(padding)
+                .imePadding()
+                .navigationBarsPadding()
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 24.dp),
         ) {
-            Spacer(Modifier.height(12.dp))
+            Image(
+                painter = painterResource(R.drawable.ic_kit_logo_lockup),
+                contentDescription = "Kit Pay",
+                modifier = Modifier
+                    .height(40.dp)
+                    .align(Alignment.CenterHorizontally),
+            )
+            Spacer(Modifier.height(32.dp))
             Text(
                 if (useEmail) "Sign in with email" else "What's your number?",
                 style = MaterialTheme.typography.headlineLarge,
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                if (useEmail) "Use the password for your existing Kit Pay account."
-                else "We'll text you a verification code. Standard rates may apply.",
+                // Deliberately silent about new-versus-returning: the backend decides what
+                // the number needs, and the person is never made to choose or told apart.
+                if (useEmail) {
+                    "For existing Kit Pay accounts that already use a password."
+                } else {
+                    "We'll text you a verification code. Standard rates may apply."
+                },
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -115,17 +151,19 @@ fun PhoneLoginScreen(
                     singleLine = true,
                     shape = MaterialTheme.shapes.medium,
                 )
-                if (emailRegistrationAvailable || emailRecoveryAvailable) {
+                if (emailAffordances.forgotPassword || emailAffordances.verificationTokenEntry) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        if (emailRegistrationAvailable) {
+                        if (emailAffordances.verificationTokenEntry) {
+                            // Completes a verification token that was already issued by
+                            // email, so nobody holding one is stranded.
                             TextButton(onClick = { onVerifyEmail(email) }, enabled = !loading) {
-                                Text("Verify email")
+                                Text("Have a verification token?")
                             }
                         }
-                        if (emailRecoveryAvailable) {
+                        if (emailAffordances.forgotPassword) {
                             TextButton(onClick = { onForgotPassword(email) }, enabled = !loading) {
                                 Text("Forgot password?")
                             }
@@ -180,24 +218,16 @@ fun PhoneLoginScreen(
             )
             Spacer(Modifier.height(12.dp))
             KitOutlinedButton(
-                text = if (useEmail) "Use phone number instead" else "Use email instead",
+                text = if (useEmail) "Use phone number instead" else "Sign in with email instead",
                 onClick = {
                     if (useEmail) password = ""
                     useEmail = !useEmail
                 },
                 enabled = !loading,
             )
-            Spacer(Modifier.height(8.dp))
-            if (emailRegistrationAvailable) {
-                TextButton(
-                    onClick = onCreateAccount,
-                    enabled = !loading,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("New to Kit Pay? Create an account")
-                }
-            }
-            Spacer(Modifier.weight(1f))
+            // Fixed spacing, not a weighted spacer: this column scrolls, and weights are
+            // meaningless under the unbounded height a scroll container measures with.
+            Spacer(Modifier.height(40.dp))
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -232,10 +262,8 @@ private fun PhoneLoginPreview() {
             error = null,
             onPhoneContinue = {},
             onEmailContinue = { _, _ -> },
-            onCreateAccount = {},
             onForgotPassword = {},
             onVerifyEmail = {},
-            emailRegistrationAvailable = true,
             emailRecoveryAvailable = true,
         )
     }

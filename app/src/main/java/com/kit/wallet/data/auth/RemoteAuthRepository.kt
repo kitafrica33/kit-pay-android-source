@@ -13,7 +13,6 @@ import com.kit.wallet.data.remote.AuthSessionRefreshCoordinator
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.EmailAddressRequest
 import com.kit.wallet.data.remote.EmailLoginRequest
-import com.kit.wallet.data.remote.EmailRegistrationRequest
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.LogoutRequest
@@ -43,7 +42,6 @@ import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.kit.wallet.di.ApplicationScope
 import java.time.Duration
 import java.time.Instant
-import java.time.ZoneId
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.ceil
@@ -103,35 +101,6 @@ class RemoteAuthRepository @Inject constructor(
         }
         currentCoroutineContext().ensureActive()
         return response.data.toOutcome(expected, response.meta?.serverTime)
-    }
-
-    override suspend fun registerWithEmail(
-        name: String,
-        tag: String,
-        email: String,
-        password: String,
-        passwordConfirmation: String,
-    ): RegistrationResult {
-        val result = apiCalls.execute {
-            api.registerWithEmail(
-                EmailRegistrationRequest(
-                    name = normalizeProfileName(name),
-                    tag = normalizeProfileTag(tag),
-                    email = email.trim(),
-                    password = password,
-                    passwordConfirmation = passwordConfirmation,
-                    timezone = ZoneId.systemDefault().id,
-                ),
-            )
-        }
-        check(result.state == "verification_required") {
-            "Registration did not return an email verification challenge"
-        }
-        return RegistrationResult(
-            email = result.user.email ?: email.trim(),
-            destination = result.challenge.destination,
-            expiresAt = result.challenge.expiresAt,
-        )
     }
 
     override suspend fun verifyEmail(token: String) {

@@ -170,11 +170,24 @@ internal object SecureMessagingHistoryBackfillCodec {
                 decoded.sentAt == envelope.sentAt,
         ) { "Authenticated history descriptor does not match original server metadata" }
         val authenticatedKind = authenticatedMessageKind(decoded.text)
-        check(authenticatedKind == decoded.kind) {
-            "Authenticated history content does not match its message kind"
-        }
-        check(KitMediaMessage.attachmentsFor(decoded.text) == envelope.attachments) {
-            "Authenticated history content does not match its server attachment metadata"
+        // Reserved-media history that can never be actionable is not discarded: the transcript
+        // slot is authentic, so it recovers as the bare sanitized generation marker, which every
+        // layer renders as the generic placeholder. This covers any family generation that fails
+        // strict parsing outright, and a strict v2 descriptor whose outer kind or row set does
+        // not bind. A strictly valid v1 descriptor keeps its historical strict rejection below,
+        // and ordinary text keeps today's checks unchanged.
+        val unsupportedMedia = KitMediaFamily.isFamilyText(decoded.text) &&
+            KitMediaMessage.parse(decoded.text) == null &&
+            (kitMediaAttachmentsFor(decoded.text).isEmpty() ||
+                authenticatedKind != decoded.kind ||
+                !kitMediaOuterAttachmentsMatch(decoded.text, envelope.attachments))
+        if (!unsupportedMedia) {
+            check(authenticatedKind == decoded.kind) {
+                "Authenticated history content does not match its message kind"
+            }
+            check(kitMediaOuterAttachmentsMatch(decoded.text, envelope.attachments)) {
+                "Authenticated history content does not match its server attachment metadata"
+            }
         }
         KitReactionMessage.parse(decoded.text)?.let { reaction ->
             check(reaction.targetMessageId == decoded.replyToMessageId) {
@@ -194,7 +207,13 @@ internal object SecureMessagingHistoryBackfillCodec {
             rosterRevision = decoded.originalRosterRevision,
             replyToMessageId = decoded.replyToMessageId,
             sentAt = decoded.sentAt,
-            text = decoded.text,
+            // The recovered durable record itself carries only the marker — descriptor bytes
+            // from unbindable reserved history never persist on the receiving device.
+            text = if (unsupportedMedia) {
+                KitMediaFamily.sanitizedFamilyMarker(decoded.text)
+            } else {
+                decoded.text
+            },
         )
     }
 
@@ -359,7 +378,10 @@ internal object SecureMessagingHistoryBackfillCodec {
  * different rules.
  */
 internal fun authenticatedMessageKind(text: String): String = when {
-    KitMediaMessage.attachmentsFor(text).isNotEmpty() -> ENCRYPTED_ATTACHMENT_MESSAGE_KIND
+    // Either media generation: one strict v1 row or 2–8 strict v2 rows. Family text that fails
+    // strict parsing yields no rows and deliberately reads as ordinary text here — binding then
+    // fails on the row set, never by accepting an almost-descriptor.
+    kitMediaAttachmentsFor(text).isNotEmpty() -> ENCRYPTED_ATTACHMENT_MESSAGE_KIND
     KitReactionMessage.parse(text) != null -> ENCRYPTED_REACTION_MESSAGE_KIND
     KitEditMessage.parse(text) != null -> ENCRYPTED_EDIT_MESSAGE_KIND
     else -> ENCRYPTED_MESSAGE_KIND

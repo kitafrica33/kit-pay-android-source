@@ -55,6 +55,8 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.messaging.ImmediateSendIntent
+import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.session.SessionInvalidatedException
@@ -300,46 +302,96 @@ internal class SharedTextShareViewModel @Inject constructor(
                     batch.pinnedConversationId == null ||
                         batch.pinnedConversationId == canonicalChatId,
                 ) { "This share is already assigned to another conversation" }
+                // The delivery shape is decided once, here, and pinned with the destination. A
+                // batch already pinned keeps its recorded shape whatever the capability reads
+                // now — re-deciding after a process death would queue the same content again
+                // under different component identities.
+                val requestedAlbumDelivery =
+                    prepared.size >= 2 && chatRepository.mediaAlbumsAvailable.value
                 val pinnedBatch = withContext(Dispatchers.IO) {
-                    sharedInbox.pinDestination(batch, canonicalChatId)
+                    sharedInbox.pinDestination(batch, canonicalChatId, requestedAlbumDelivery)
                 }
                 mutableSendState.value = mutableSendState.value.copy(
                     pinnedConversationId = canonicalChatId,
                 )
 
                 // This is the only send point. Reaching it requires both the capability gate and
-                // an explicit tap on the review screen's Send securely button. Files go first and
-                // text last so the words read as the thing said about the attachments.
-                for ((item, source) in prepared) {
-                    chatRepository.sendIdempotentMediaMessageForOwner(
+                // an explicit tap on the review screen's Send securely button.
+                if (pinnedBatch.albumDelivery == true && prepared.size >= 2) {
+                    // Album shape: every file and the shared text together as one message under
+                    // one stable identity. The text rides as the album's caption — never as a
+                    // separate send — so caption and attachments can neither split nor reorder.
+                    // A caption the wire cannot carry fails the whole review visibly, with the
+                    // batch retained; nothing is truncated or sent piecemeal instead.
+                    chatRepository.sendIdempotentMediaAlbumMessageForOwner(
                         owner = owner,
                         chatId = canonicalChatId,
-                        source = source,
-                        mediaType = item.mediaType,
+                        attachments = prepared.map { (item, source) ->
+                            SecureMediaAlbumSource(source, item.mediaType)
+                        },
                         clientMessageId = SharedInboxPolicy.deliveryMessageId(
                             pinnedBatch.id,
                             canonicalChatId,
-                            item.id,
+                            SharedInboxPolicy.ALBUM_COMPONENT,
                         ),
+                        caption = pinnedBatch.text?.takeIf(String::isNotBlank),
                     )
                     mutableSendState.value = mutableSendState.value.copy(
                         durablyQueuedComponents = mutableSendState.value.durablyQueuedComponents + 1,
                     )
-                }
-                pinnedBatch.text?.takeIf(String::isNotBlank)?.let { text ->
-                    chatRepository.sendIdempotentMessageForOwner(
-                        owner = owner,
-                        chatId = canonicalChatId,
-                        text = text,
-                        clientMessageId = SharedInboxPolicy.deliveryMessageId(
-                            pinnedBatch.id,
-                            canonicalChatId,
-                            SharedInboxPolicy.TEXT_COMPONENT,
-                        ),
-                    )
-                    mutableSendState.value = mutableSendState.value.copy(
-                        durablyQueuedComponents = mutableSendState.value.durablyQueuedComponents + 1,
-                    )
+                } else {
+                    // Per-item shape. A single file with words that fit the KITMEDIA1 caption
+                    // sends as one captioned media message — the same one-message reading the
+                    // album shape gives — instead of a file bubble chased by a text bubble.
+                    // The decision derives only from the pinned batch and a wire constant, so a
+                    // restarted send re-decides identically, and the caption joins the queued
+                    // send's idempotent identity, so a replay can never re-shape it. Words too
+                    // long for a caption keep the classic two-message shape, files first and
+                    // text last so the words read as the thing said about the attachments.
+                    val foldedCaption = pinnedBatch.text
+                        ?.trim()
+                        ?.takeIf(String::isNotBlank)
+                        ?.takeIf { prepared.size == 1 }
+                        ?.takeIf {
+                            it.toByteArray(Charsets.UTF_8).size <=
+                                ImmediateSendIntent.MAX_CAPTION_UTF8_BYTES
+                        }
+                    for ((item, source) in prepared) {
+                        chatRepository.sendIdempotentMediaMessageForOwner(
+                            owner = owner,
+                            chatId = canonicalChatId,
+                            source = source,
+                            mediaType = item.mediaType,
+                            clientMessageId = SharedInboxPolicy.deliveryMessageId(
+                                pinnedBatch.id,
+                                canonicalChatId,
+                                item.id,
+                            ),
+                            caption = foldedCaption,
+                        )
+                        mutableSendState.value = mutableSendState.value.copy(
+                            durablyQueuedComponents =
+                                mutableSendState.value.durablyQueuedComponents + 1,
+                        )
+                    }
+                    if (foldedCaption == null) {
+                        pinnedBatch.text?.takeIf(String::isNotBlank)?.let { text ->
+                            chatRepository.sendIdempotentMessageForOwner(
+                                owner = owner,
+                                chatId = canonicalChatId,
+                                text = text,
+                                clientMessageId = SharedInboxPolicy.deliveryMessageId(
+                                    pinnedBatch.id,
+                                    canonicalChatId,
+                                    SharedInboxPolicy.TEXT_COMPONENT,
+                                ),
+                            )
+                            mutableSendState.value = mutableSendState.value.copy(
+                                durablyQueuedComponents =
+                                    mutableSendState.value.durablyQueuedComponents + 1,
+                            )
+                        }
+                    }
                 }
                 discard(pinnedBatch)
                 mutableSendState.value = mutableSendState.value.copy(

@@ -22,7 +22,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -38,72 +37,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.KitOutlinedButton
-import com.kit.wallet.data.auth.normalizeProfileTag
 
-@Composable
-fun RegisterScreen(
-    onBack: () -> Unit,
-    onRegistered: () -> Unit,
-    viewModel: AccountAccessViewModel,
-) {
-    val state by viewModel.state.collectAsStateWithLifecycle()
-    var name by rememberSaveable { mutableStateOf("") }
-    var tag by rememberSaveable { mutableStateOf("") }
-    var email by rememberSaveable { mutableStateOf("") }
-    // Passwords must never be serialized into Android saved-instance-state bundles.
-    var password by remember { mutableStateOf("") }
-    var confirmation by remember { mutableStateOf("") }
-
-    AccountAccessScaffold(
-        title = "Create your Kit Pay account",
-        subtitle = "Choose a display name and username, then add an email address you can verify. " +
-            "Your legal name comes later, from your ID.",
-        onBack = onBack,
-        feedback = state,
-    ) {
-        AccountTextField(name, { name = it }, "Display name")
-        AccountTextField(
-            tag,
-            { value -> tag = normalizeProfileTag(value) },
-            "Username (without @)",
-        )
-        AccountTextField(
-            email,
-            { email = it },
-            "Email address",
-            keyboardType = KeyboardType.Email,
-        )
-        AccountTextField(
-            password,
-            { password = it },
-            "Password",
-            keyboardType = KeyboardType.Password,
-            password = true,
-        )
-        AccountTextField(
-            confirmation,
-            { confirmation = it },
-            "Confirm password",
-            keyboardType = KeyboardType.Password,
-            password = true,
-        )
-        Text(
-            "Use at least 12 characters with uppercase, lowercase and a number.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(8.dp))
-        KitGreenButton(
-            text = "Create account",
-            loading = state.loading,
-            enabled = name.isNotBlank() && tag.isNotBlank() &&
-                email.isNotBlank() && password.isNotBlank(),
-            onClick = {
-                viewModel.register(name, tag, email, password, confirmation, onRegistered)
-            },
-        )
-    }
-}
+// The anonymous email-registration screen is retired: phone OTP is the only way an
+// account is created, and entering a number signs in returning users and enrols new ones
+// alike. The token screens below stay — a verification or reset token that was already
+// issued by email must still have somewhere to be completed.
 
 @Composable
 fun VerifyEmailScreen(
@@ -118,9 +56,7 @@ fun VerifyEmailScreen(
 
     AccountAccessScaffold(
         title = "Verify your email",
-        subtitle = state.verificationDestination?.let {
-            "Paste the secure verification token sent to $it."
-        } ?: "Paste the secure verification token from your Kit Pay email.",
+        subtitle = "Paste the secure verification token from your Kit Pay email.",
         onBack = onBack,
         feedback = state,
     ) {

@@ -157,7 +157,11 @@ data class AppCapabilities(
             Dest.SCAN -> qrPaymentsUsable
             Dest.TRANSACTIONS, Dest.TX_DETAIL -> enabled(KitFeature.WALLETS)
             Dest.KYC -> enabled(KitFeature.KYC)
-            Dest.REGISTER -> enabled(KitFeature.EMAIL_REGISTRATION)
+            // Phone OTP is the only way an account is created. The registration screen is
+            // retired outright rather than capability-gated: a stale snapshot that still
+            // advertises email_registration must not resurrect it, so this is a constant,
+            // not a lookup.
+            Dest.REGISTER -> false
             Dest.FORGOT_PASSWORD -> enabled(KitFeature.EMAIL_RECOVERY)
             else -> true
         }

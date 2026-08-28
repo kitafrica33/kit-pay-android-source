@@ -3,6 +3,7 @@ package com.kit.wallet
 import com.kit.wallet.data.auth.AuthRepository
 import com.kit.wallet.data.repository.ProfileEmailChallenge
 import com.kit.wallet.data.repository.UserRepository
+import com.kit.wallet.feature.home.StarterMilestones
 import com.kit.wallet.feature.settings.SettingsViewModel
 import com.kit.wallet.feature.settings.isProfileEmailResendAllowed
 import com.kit.wallet.feature.settings.profileEmailResendDeadline
@@ -48,7 +49,16 @@ class SettingsEmailChallengeViewModelTest {
             resendAfterSeconds = 60L,
         )
         repository.requests += Result.success(challenge)
-        val viewModel = SettingsViewModel(repository, unusedAuthRepository(), clock)
+        val viewModel = SettingsViewModel(
+            repository,
+            unusedAuthRepository(),
+            MutableTestSessionStore(testSession("account-a")),
+            StarterMilestones(
+                prefsProvider = { FakeSharedPreferences() },
+                ioDispatcher = Dispatchers.Unconfined,
+            ),
+            clock,
+        )
         viewModel.beginEmailFlow(null)
 
         viewModel.requestEmailAttachment(" Amina@Example.Test ")

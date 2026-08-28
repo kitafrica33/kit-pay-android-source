@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
@@ -43,11 +44,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -66,7 +69,11 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import com.kit.wallet.data.auth.AuthChallengeKind
-import com.kit.wallet.data.notifications.IncomingCallPayload
+import com.kit.wallet.data.notifications.ActiveCallReturnLink
+import com.kit.wallet.data.notifications.AuthorizedIncomingCallLaunch
+import com.kit.wallet.data.notifications.CallReopenAction
+import com.kit.wallet.data.notifications.PaymentClaimLink
+import com.kit.wallet.data.notifications.callReopenDecision
 import com.kit.wallet.data.remote.KitFeature
 import com.kit.wallet.data.remote.MESSAGING_GROUPS_FEATURE
 import com.kit.wallet.feature.auth.AuthViewModel
@@ -75,7 +82,6 @@ import com.kit.wallet.feature.auth.ForgotPasswordScreen
 import com.kit.wallet.feature.auth.OtpScreen
 import com.kit.wallet.feature.auth.PhoneLoginScreen
 import com.kit.wallet.feature.auth.PinSetupScreen
-import com.kit.wallet.feature.auth.RegisterScreen
 import com.kit.wallet.feature.auth.ResetPasswordScreen
 import com.kit.wallet.feature.auth.SessionAssuranceViewModel
 import com.kit.wallet.feature.auth.SessionUnlockGate
@@ -90,6 +96,7 @@ import com.kit.wallet.feature.calls.ActiveCallScreen
 import com.kit.wallet.feature.calls.CallsScreen
 import com.kit.wallet.feature.chat.ChatsScreen
 import com.kit.wallet.feature.chat.ChatsViewModel
+import com.kit.wallet.feature.chat.ConversationFocusRequests
 import com.kit.wallet.feature.chat.ConversationScreen
 import com.kit.wallet.feature.chat.GroupAddParticipantsScreen
 import com.kit.wallet.feature.chat.GroupDescriptionScreen
@@ -132,6 +139,10 @@ private data class Tab(
 internal fun KitApp(
     deepLinkUri: String? = null,
     onDeepLinkConsumed: () -> Unit = {},
+    authorizedIncomingCall: AuthorizedIncomingCallLaunch? = null,
+    activeAuthorizedIncomingCall: AuthorizedIncomingCallLaunch? = null,
+    onAuthorizedIncomingCallRejected: (String) -> Unit = {},
+    onAuthorizedIncomingCallSurfaceChanged: (String, Boolean) -> Unit = { _, _ -> },
     secureMessageConversationId: String? = null,
     onSecureMessageRouteConsumed: () -> Unit = {},
     incomingTextShare: IncomingTextShareRequest? = null,
@@ -145,6 +156,7 @@ internal fun KitApp(
     capabilitiesViewModel: AppCapabilitiesViewModel = hiltViewModel(),
     sessionAssuranceViewModel: SessionAssuranceViewModel = hiltViewModel(),
     biometricApprovalViewModel: BiometricApprovalViewModel = hiltViewModel(),
+    paymentClaimNavigationViewModel: PaymentClaimNavigationViewModel = hiltViewModel(),
 ) {
     val navController = rememberNavController()
     val signedIn by authViewModel.signedIn.collectAsStateWithLifecycle()
@@ -199,9 +211,25 @@ internal fun KitApp(
         hasPlayback = voiceNotePlayback.playing != null,
         isSourceOnScreen = voiceNotePlayback.isSourceOnScreen,
     )
+    val activeCallPresence by chatsBadgeViewModel.activeCallPresence.collectAsStateWithLifecycle()
+    // Returning to the live call is always a pop back to the call entry already on the stack —
+    // never a navigate(): a fresh call route would scope a fresh ViewModel (whose later pop would
+    // end the call) or hit the incoming route's answerable-only gate. Anything but an exact match
+    // with the call this app is actually in does nothing; only explicit hang-up ends a call.
+    val returnToActiveCall: (String) -> Unit = { callId ->
+        val decision = callReopenDecision(
+            requestedCallId = callId,
+            activeCallId = activeCallPresence?.callId,
+            onCallRoute = currentRoute in CALL_ROUTES,
+        )
+        if (decision == CallReopenAction.POP_BACK_TO_CALL) {
+            CALL_ROUTES.any { route -> navController.popBackStack(route, inclusive = false) }
+        }
+    }
 
     LaunchedEffect(
         deepLinkUri,
+        authorizedIncomingCall,
         secureMessageConversationId,
         signedIn,
         capabilities.loaded,
@@ -211,24 +239,61 @@ internal fun KitApp(
         capabilities.secureMessagingClientReady,
     ) {
         val rawDeepLink = deepLinkUri
-        if (rawDeepLink == null && secureMessageConversationId == null) return@LaunchedEffect
-        val incomingCall = rawDeepLink?.let { IncomingCallPayload.fromDeepLink(it) }
+        if (
+            rawDeepLink == null &&
+            authorizedIncomingCall == null &&
+            secureMessageConversationId == null
+        ) return@LaunchedEffect
+        val callReturn = rawDeepLink?.let { ActiveCallReturnLink.fromDeepLink(it) }
+        val claimLink = rawDeepLink?.let { PaymentClaimLink.fromDeepLink(it) }
         val uri = rawDeepLink?.let { Uri.parse(it) }
         val isKycReturn = uri?.let {
             it.scheme == "kitwallet" && it.host == "kyc" && it.path == "/status"
         } == true
         when {
-            incomingCall != null -> {
-                if (!signedIn || !capabilities.loaded || capabilities.loadFailed) {
+            callReturn != null -> {
+                // The ongoing-call notification tap. The call it names lives (or died) in this
+                // process regardless of what happens here, so this consumes immediately and
+                // either pops back to the call's existing entry or does nothing at all — it
+                // never starts, answers, or ends a call.
+                onDeepLinkConsumed()
+                returnToActiveCall(callReturn.callId)
+            }
+            authorizedIncomingCall != null -> {
+                if (!signedIn || !capabilities.loaded) {
                     // Keep the call pending until session and fail-closed capability checks finish.
                     return@LaunchedEffect
                 }
-                if (capabilities.enabled(KitFeature.CALLS)) {
-                    navController.navigate(
-                        Dest.incomingCall(incomingCall.callId, incomingCall.acceptRequested),
-                    ) { launchSingleTop = true }
+                if (capabilities.loadFailed) {
+                    onAuthorizedIncomingCallRejected(authorizedIncomingCall.callId)
+                    return@LaunchedEffect
                 }
+                if (capabilities.enabled(KitFeature.CALLS)) {
+                    val routed = runCatching {
+                        navController.navigate(
+                            Dest.incomingCall(
+                                authorizedIncomingCall.callId,
+                                authorizedIncomingCall.acceptRequested,
+                            ),
+                        ) { launchSingleTop = true }
+                    }.isSuccess
+                    if (!routed) {
+                        onAuthorizedIncomingCallRejected(authorizedIncomingCall.callId)
+                    }
+                } else {
+                    onAuthorizedIncomingCallRejected(authorizedIncomingCall.callId)
+                }
+            }
+            claimLink != null -> {
+                if (!signedIn || !capabilities.loaded || capabilities.loadFailed) {
+                    // Keep the payment pending until session and fail-closed capability
+                    // checks finish. The push contributed nothing but the claim id.
+                    return@LaunchedEffect
+                }
+                // Consumed now: resolution refetches the claim asynchronously and owns its
+                // own wallet-history fallback, so the link must not replay on recomposition.
                 onDeepLinkConsumed()
+                paymentClaimNavigationViewModel.open(claimLink)
             }
             secureMessageConversationId != null -> {
                 if (!signedIn || !capabilities.loaded || capabilities.loadFailed) {
@@ -261,6 +326,35 @@ internal fun KitApp(
             }
             else -> onDeepLinkConsumed()
         }
+    }
+
+    // Where a tapped claim alert lands once the authoritative refetch and party checks are done.
+    // Always a plain forward navigation to an existing route. The floor mirrors iOS
+    // WalletClaimNavigationRequest: the target names the validated claim id as its one-shot
+    // identity and opens the account's own wallet activity, unfiltered — never a payload URL,
+    // never the claim's transaction. Nothing on this path settles or renders claim data itself.
+    val paymentClaimTarget by paymentClaimNavigationViewModel.target.collectAsStateWithLifecycle()
+    LaunchedEffect(paymentClaimTarget, signedIn) {
+        val target = paymentClaimTarget ?: return@LaunchedEffect
+        // Mirror of iOS's authenticated-context recheck before navigation: a target resolved
+        // for an account that signed out or switched since resolution dies unnavigated.
+        if (!signedIn || !paymentClaimNavigationViewModel.targetOwnerStillCurrent()) {
+            paymentClaimNavigationViewModel.consumed()
+            return@LaunchedEffect
+        }
+        when (target) {
+            is PaymentClaimNavigationTarget.Conversation -> {
+                target.focusMessageId?.let { messageId ->
+                    ConversationFocusRequests.request(target.chatId, messageId)
+                }
+                navController.navigate(Dest.conversation(target.chatId)) {
+                    launchSingleTop = true
+                }
+            }
+            is PaymentClaimNavigationTarget.WalletHistory ->
+                navController.navigate(Dest.TRANSACTIONS) { launchSingleTop = true }
+        }
+        paymentClaimNavigationViewModel.consumed()
     }
 
     LaunchedEffect(signedIn, currentRoute, capabilities) {
@@ -400,7 +494,25 @@ internal fun KitApp(
         // place a minimized call sits — until the note ends or the user dismisses it.
         Column {
             if (voiceNoteBarVisible) {
-                VoiceNoteMiniBar(Modifier.statusBarsPadding())
+                VoiceNoteMiniBar(
+                    Modifier.statusBarsPadding(),
+                    onOpenSource = { playing ->
+                        val conversationId = playing.context.conversationId
+                        // An album track's id is "messageId/attachmentId"; the thread lands on
+                        // the message. The request rides beside navigation because a single-top
+                        // navigate to the thread already on top re-delivers nothing.
+                        if (
+                            ConversationFocusRequests.request(
+                                conversationId = conversationId,
+                                messageId = playing.id.substringBefore('/'),
+                            )
+                        ) {
+                            navController.navigate(Dest.conversation(conversationId)) {
+                                launchSingleTop = true
+                            }
+                        }
+                    },
+                )
                 Spacer(Modifier.height(VoiceNoteMiniBarPolicy.CONTENT_GAP_DP.dp))
             }
             Box(
@@ -418,6 +530,11 @@ internal fun KitApp(
                     accountAccessViewModel = accountAccessViewModel,
                     authState = authState,
                     capabilities = capabilities,
+                    activeAuthorizedIncomingCall = activeAuthorizedIncomingCall,
+                    onAuthorizedIncomingCallRejected = onAuthorizedIncomingCallRejected,
+                    onAuthorizedIncomingCallSurfaceChanged =
+                        onAuthorizedIncomingCallSurfaceChanged,
+                    onReturnToActiveCall = returnToActiveCall,
                     modifier = if (showBottomBar) Modifier.padding(innerPadding) else Modifier,
                 )
             }
@@ -490,6 +607,9 @@ private val SIGN_IN_ROUTES = setOf(
 
 private val ACCOUNT_SETUP_ROUTES = setOf(Dest.PIN_SETUP, Dest.PROFILE_SETUP)
 
+/** Entries a live call can sit on; reopening one is always a pop back to one of these. */
+private val CALL_ROUTES = listOf(Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL)
+
 @Composable
 private fun KitNavHost(
     navController: NavHostController,
@@ -499,6 +619,10 @@ private fun KitNavHost(
     accountAccessViewModel: AccountAccessViewModel,
     authState: com.kit.wallet.feature.auth.AuthUiState,
     capabilities: AppCapabilities,
+    activeAuthorizedIncomingCall: AuthorizedIncomingCallLaunch? = null,
+    onAuthorizedIncomingCallRejected: (String) -> Unit = {},
+    onAuthorizedIncomingCallSurfaceChanged: (String, Boolean) -> Unit = { _, _ -> },
+    onReturnToActiveCall: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -562,7 +686,6 @@ private fun KitNavHost(
                         onAuthenticated = openAuthenticated,
                     )
                 },
-                onCreateAccount = { navController.navigate(Dest.REGISTER) },
                 onForgotPassword = { email ->
                     accountAccessViewModel.setEmail(email)
                     navController.navigate(Dest.FORGOT_PASSWORD)
@@ -571,17 +694,20 @@ private fun KitNavHost(
                     accountAccessViewModel.setEmail(email)
                     navController.navigate(Dest.VERIFY_EMAIL)
                 },
-                emailRegistrationAvailable = capabilities.enabled(KitFeature.EMAIL_REGISTRATION),
                 emailRecoveryAvailable = capabilities.enabled(KitFeature.EMAIL_RECOVERY),
             )
         }
         composable(Dest.REGISTER) {
-            FeatureRouteContent(!signedIn, capabilities, Dest.REGISTER) {
-                RegisterScreen(
-                    onBack = { navController.popBackStack() },
-                    onRegistered = { navController.navigate(Dest.VERIFY_EMAIL) },
-                    viewModel = accountAccessViewModel,
-                )
+            // Phone OTP is the only way an account is created. The route stays registered
+            // so a back stack restored from an older release cannot crash navigation, and
+            // anything that lands here is redirected without rendering — never parked on a
+            // blank screen — even when a stale capability snapshot still advertises
+            // email_registration. Nothing in the app navigates here any more.
+            LaunchedEffect(signedIn) {
+                val target = retiredRegisterRedirect(signedIn)
+                if (!navController.popBackStack(target, inclusive = false)) {
+                    navController.resetTo(target)
+                }
             }
         }
         composable(Dest.VERIFY_EMAIL) {
@@ -717,6 +843,7 @@ private fun KitNavHost(
                     onMobileMoney = { navController.navigate(Dest.MOBILE_MONEY) },
                     onRequest = { navController.navigate(Dest.REQUEST) },
                     onKyc = { navController.navigate(Dest.KYC) },
+                    onStartChat = { navController.navigate(Dest.CONTACTS) },
                     onAllTransactions = { navController.navigate(Dest.TRANSACTIONS) },
                     onTransaction = { navController.navigate(Dest.txDetail(it)) },
                     onFavorite = { navController.navigate(Dest.send(it)) },
@@ -729,6 +856,7 @@ private fun KitNavHost(
                     onChat = { navController.navigate(Dest.conversation(it)) },
                     onNewChat = { navController.navigate(Dest.CONTACTS) },
                     onNewGroup = { navController.navigate(Dest.NEW_GROUP) },
+                    onReturnToActiveCall = onReturnToActiveCall,
                 )
             }
         }
@@ -905,6 +1033,7 @@ private fun KitNavHost(
                     onVoiceCall = { navController.navigate(Dest.voiceCall(it)) },
                     onVideoCall = { navController.navigate(Dest.videoCall(it)) },
                     onOpenGroup = { navController.navigate(Dest.groupProfile(it)) },
+                    onReturnToActiveCall = onReturnToActiveCall,
                 )
             }
         }
@@ -987,14 +1116,44 @@ private fun KitNavHost(
                 },
             ),
         ) { entry ->
-            FeatureRouteContent(signedIn, capabilities, Dest.INCOMING_CALL) {
-                ActiveCallScreen(
-                    name = "Incoming Kit Pay call",
-                    video = false,
-                    onEnd = { navController.popBackStack() },
-                    onOpenChat = { navController.navigate(Dest.conversation(it)) },
-                    autoAccept = entry.arguments?.getString("accept") == "1",
-                )
+            val callId = entry.arguments?.getString("callId").orEmpty()
+            val authorization = activeAuthorizedIncomingCall?.takeIf { it.callId == callId }
+            if (authorization == null) {
+                LaunchedEffect(callId, authorization, signedIn, capabilities.features) {
+                    onAuthorizedIncomingCallRejected(callId)
+                    navController.popBackStack()
+                }
+            } else if (!signedIn || !capabilities.loaded) {
+                // The opaque call cover in MainActivity remains on top while authentication and
+                // capability restoration complete. Do not expose another app surface meanwhile.
+                Box(Modifier.fillMaxSize())
+            } else if (capabilities.loadFailed || !capabilities.enabled(KitFeature.CALLS)) {
+                LaunchedEffect(callId, capabilities.loadFailed, capabilities.features) {
+                    onAuthorizedIncomingCallRejected(callId)
+                    navController.popBackStack()
+                }
+            } else {
+                LaunchedEffect(callId, authorization.expiresAt) {
+                    // MainActivity's opaque call cover remains above this destination until the
+                    // route itself has crossed a complete draw boundary.
+                    withFrameNanos { }
+                    withFrameNanos { }
+                    onAuthorizedIncomingCallSurfaceChanged(callId, true)
+                }
+                DisposableEffect(callId, authorization.expiresAt) {
+                    onDispose {
+                        onAuthorizedIncomingCallSurfaceChanged(callId, false)
+                    }
+                }
+                FeatureRouteContent(signedIn, capabilities, Dest.INCOMING_CALL) {
+                    ActiveCallScreen(
+                        name = "Incoming Kit Pay call",
+                        video = false,
+                        onEnd = { navController.popBackStack() },
+                        onOpenChat = { navController.navigate(Dest.conversation(it)) },
+                        autoAccept = authorization.acceptRequested,
+                    )
+                }
             }
         }
 

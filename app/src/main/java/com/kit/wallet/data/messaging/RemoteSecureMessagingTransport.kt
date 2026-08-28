@@ -12,6 +12,8 @@ import com.kit.wallet.data.remote.GROUP_CONVERSATION_TYPE
 import com.kit.wallet.data.remote.MEMBER_CONVERSATION_ROLE
 import com.kit.wallet.data.remote.MESSAGING_GROUPS_DEVICE_CAPABILITY
 import com.kit.wallet.data.remote.MESSAGING_GROUPS_FEATURE
+import com.kit.wallet.data.remote.MESSAGING_MEDIA_MESSAGE_V2_DEVICE_CAPABILITY
+import com.kit.wallet.data.remote.MESSAGING_MEDIA_MESSAGE_V2_FEATURE
 import com.kit.wallet.data.remote.MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY
 import com.kit.wallet.data.remote.MESSAGING_MESSAGE_EDITS_FEATURE
 import com.kit.wallet.data.remote.MESSAGING_REACTIONS_DEVICE_CAPABILITY
@@ -111,6 +113,17 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
          * keeps a person from writing a correction nobody could have received.
          */
         val messageEditsEnabled: Boolean = false,
+        /**
+         * Whether this authenticated account may send `KITMEDIA2` media albums at all.
+         *
+         * Read once from the server's capability map, exactly like [messageEditsEnabled], and
+         * exposed for the same reason: the composer withdraws the multi-select affordance rather
+         * than offer an album the send path would then refuse. This is only the account half —
+         * [requireMediaMessageV2Capability] holds the fail-closed roster half, re-checked at
+         * upload admission and again at encryption, so a stale affordance still cannot leak a
+         * v2 descriptor to an incompatible conversation.
+         */
+        val mediaMessageV2Enabled: Boolean = false,
     ) {
         /**
          * Opaque authority for one exact, server-validated conversation.
@@ -1127,20 +1140,60 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             )
         }
 
+        /**
+         * Refuses a `KITMEDIA2` media album unless the account is enabled for it and every
+         * device in the conversation — this one included — says it understands the profile.
+         *
+         * Fail closed, exactly as reactions and corrections do — but with more at stake: a peer
+         * that predates the profile would render the raw descriptor as a chat bubble, and a v2
+         * descriptor carries the key material of every attachment. This gate is what makes that a
+         * capability refusal instead of a key disclosure.
+         *
+         * Unlike reactions and corrections, §6 requires the current device's own attestation as
+         * well: this gate runs before any attachment bytes are uploaded, and the server's
+         * unanimous admission includes the sender's row, so a roster snapshot that lags this
+         * device's own enrollment must park the album now rather than after the uploads.
+         */
+        fun requireMediaMessageV2Capability(
+            conversation: SecureConversation,
+            roster: AuthoritativeRoster,
+        ) {
+            if (!mediaMessageV2Enabled) {
+                throw SecureMessagingConversationCapabilityUnavailableException(
+                    "Multi-attachment media messages are not enabled",
+                )
+            }
+            requireRosterCapability(
+                requireConversation(conversation),
+                requireRoster(roster, conversation).validated,
+                MESSAGING_MEDIA_MESSAGE_V2_DEVICE_CAPABILITY,
+                requireCurrentDeviceAttestation = true,
+            )
+        }
+
         private fun requireRosterCapability(
             conversation: ValidatedConversation,
             roster: ValidatedMessagingDeviceRoster,
             capability: String,
+            requireCurrentDeviceAttestation: Boolean = false,
         ) {
             check(roster.memberUserIds() == conversation.memberUserIds()) {
                 "The capability roster does not cover every conversation member"
             }
-            if (!MessagingRosterCapabilityPolicy.everyPeerSupports(
+            val supported = if (requireCurrentDeviceAttestation) {
+                MessagingRosterCapabilityPolicy.everyDeviceSupports(
                     roster,
                     capability,
                     context.currentDeviceId,
                 )
-            ) {
+            } else {
+                MessagingRosterCapabilityPolicy.everyPeerSupports(
+                    roster,
+                    capability,
+                    context.currentDeviceId,
+                )
+            }
+            if (!supported) {
                 throw SecureMessagingConversationCapabilityUnavailableException(
                     "A conversation device does not support $capability",
                 )
@@ -2605,6 +2658,13 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 capabilities.features?.get(MESSAGING_REACTIONS_FEATURE) == true,
             messageEditsEnabled =
                 capabilities.features?.get(MESSAGING_MESSAGE_EDITS_FEATURE) == true,
+            // §5a: the account flag alone is not an advertisement. Sending KITMEDIA2 requires
+            // the server to also publish a coherent `media_message` protocol block; a flag with
+            // an absent, malformed, or incoherent block is a server-side contract violation and
+            // reads as "off". Both halves are decided here, once, at session issuance.
+            mediaMessageV2Enabled =
+                capabilities.features?.get(MESSAGING_MEDIA_MESSAGE_V2_FEATURE) == true &&
+                    MessagingMediaMessageV2Capability.isUsable(protocol?.mediaMessage),
         )
         issuedSessions[session] = issuanceIdentity
         return session

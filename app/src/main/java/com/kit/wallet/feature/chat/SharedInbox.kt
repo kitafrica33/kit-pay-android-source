@@ -41,6 +41,17 @@ internal data class SharedInboxBatch(
      * Persisting this choice prevents a restored remainder from being sent to another chat.
      */
     val pinnedConversationId: String? = null,
+    /**
+     * Immutable delivery shape, pinned together with the destination: true for one `KITMEDIA2`
+     * album carrying every item and the text as its caption, false for the per-item sends, null
+     * while unpinned (and for batches persisted before the field existed, which were per-item).
+     *
+     * This must be durable for the same reason the destination is. The album capability flips
+     * with session state, so a batch restored after process death could otherwise re-decide the
+     * shape and queue the same content again under different component message ids — a duplicate
+     * the server's idempotency could never catch.
+     */
+    val albumDelivery: Boolean? = null,
 ) {
     /** True when there is something for a chat to receive. */
     val isDeliverable: Boolean get() = items.isNotEmpty() || !text.isNullOrEmpty()
@@ -74,8 +85,16 @@ internal interface SharedInboxAccess {
     /** How to open the staged file, so a 200 MB share is never held in heap to be sent. */
     fun source(batch: SharedInboxBatch, item: SharedInboxItem): SecureMediaSource
 
-    /** Atomically fixes this batch to one validated conversation before any outbox write. */
-    fun pinDestination(batch: SharedInboxBatch, conversationId: String): SharedInboxBatch
+    /**
+     * Atomically fixes this batch to one validated conversation and one delivery shape before
+     * any outbox write. A batch already pinned keeps its recorded shape; [albumDelivery] is only
+     * the preference for a first pin.
+     */
+    fun pinDestination(
+        batch: SharedInboxBatch,
+        conversationId: String,
+        albumDelivery: Boolean,
+    ): SharedInboxBatch
 
     /** Destroys everything staged for [batch]. Safe to call for a batch that staged nothing. */
     fun discard(batch: SharedInboxBatch)
@@ -248,6 +267,7 @@ internal object SharedInboxPolicy {
         require(runCatching { UUID.fromString(batchId).toString() }.getOrNull() == batchId)
         require(canonicalConversationId(conversationId) == conversationId)
         require(componentId == TEXT_COMPONENT ||
+            componentId == ALBUM_COMPONENT ||
             runCatching { UUID.fromString(componentId).toString() }.getOrNull() == componentId
         )
         val seed = "kit-share-v1\u0000$batchId\u0000$conversationId\u0000$componentId"
@@ -255,6 +275,13 @@ internal object SharedInboxPolicy {
     }
 
     const val TEXT_COMPONENT = "text"
+
+    /**
+     * Component id for the single message an album-shaped batch becomes. Item ids are random
+     * UUIDs and [TEXT_COMPONENT] is taken, so this can never collide with a per-item identity —
+     * which matters if the same batch and conversation ever hold both shapes' queue records.
+     */
+    const val ALBUM_COMPONENT = "album"
 
     fun newId(): String = UUID.randomUUID().toString()
 }

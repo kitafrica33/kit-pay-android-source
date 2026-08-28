@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
@@ -14,6 +15,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.kit.wallet.MainActivity
 import com.kit.wallet.R
+import com.kit.wallet.data.notifications.ActiveCallReturnLink
 
 class CallForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -23,10 +25,21 @@ class CallForegroundService : Service() {
         )
         val name = intent?.getStringExtra(EXTRA_NAME).orEmpty().ifBlank { "Kit Pay contact" }
         val video = intent?.getBooleanExtra(EXTRA_VIDEO, false) == true
+        // The tap must land back on this exact call, so the content intent names it by id.
+        // The link is only ever matched against the call the app knows it is in — a stale
+        // notification does nothing. Without a valid id the tap just brings the app forward.
+        val returnLink = ActiveCallReturnLink.forCallId(intent?.getStringExtra(EXTRA_CALL_ID))
         val openCall = PendingIntent.getActivity(
             this,
             0,
-            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .apply {
+                    if (returnLink != null) {
+                        action = Intent.ACTION_VIEW
+                        data = Uri.parse(returnLink.deepLinkUri())
+                    }
+                },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -56,13 +69,15 @@ class CallForegroundService : Service() {
         private const val NOTIFICATION_ID = 4102
         private const val EXTRA_NAME = "name"
         private const val EXTRA_VIDEO = "video"
+        private const val EXTRA_CALL_ID = "call_id"
 
-        fun start(context: Context, name: String, video: Boolean) {
+        fun start(context: Context, name: String, video: Boolean, callId: String? = null) {
             ContextCompat.startForegroundService(
                 context,
                 Intent(context, CallForegroundService::class.java)
                     .putExtra(EXTRA_NAME, name)
-                    .putExtra(EXTRA_VIDEO, video),
+                    .putExtra(EXTRA_VIDEO, video)
+                    .putExtra(EXTRA_CALL_ID, callId),
             )
         }
 

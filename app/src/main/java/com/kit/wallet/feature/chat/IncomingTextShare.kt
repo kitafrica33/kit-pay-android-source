@@ -327,7 +327,9 @@ internal class CacheSharedInboxAccess @Inject constructor(
     override fun pinDestination(
         batch: SharedInboxBatch,
         conversationId: String,
-    ): SharedInboxBatch = IncomingTextShareStore.pinDestination(context, batch, conversationId)
+        albumDelivery: Boolean,
+    ): SharedInboxBatch =
+        IncomingTextShareStore.pinDestination(context, batch, conversationId, albumDelivery)
 
     override fun discard(batch: SharedInboxBatch) {
         if (batch.items.isEmpty()) return

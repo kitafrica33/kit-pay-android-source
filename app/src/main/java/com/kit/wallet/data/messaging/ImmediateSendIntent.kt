@@ -24,11 +24,81 @@ internal enum class ImmediateSendKind {
 
     /** Replacement wording for one of this account's own earlier messages. */
     EDIT,
+
+    /**
+     * A `KITMEDIA2` media album: two to eight ordered attachments and an optional caption that
+     * travel as one message under one idempotency identity. Appended after [EDIT] for the same
+     * ordinal-stability reason as [GROUP_PAYMENT_EVENT].
+     */
+    MEDIA_V2,
+}
+
+/**
+ * One attachment of a queued media album, in display order.
+ *
+ * [attachmentId] is the item's wire row id, its spool file name, and its retry identity all at
+ * once: it is minted fresh when the album is enqueued and never changes across retries, so a
+ * resumed upload can neither duplicate a finished item nor orphan its ciphertext. [storageKey]
+ * starts null and is persisted the moment the server confirms that item's upload, which is what
+ * lets a process death mid-album resume from the last finished item instead of re-uploading.
+ */
+internal data class ImmediateSendMediaItem(
+    val attachmentId: String,
+    val mediaType: String,
+    val plaintextBytes: Int,
+    val ciphertextBytes: Long,
+    val keyBase64: String,
+    val ciphertextSha256Hex: String,
+    val storageKey: String? = null,
+) {
+    init {
+        require(ImmediateSendIntent.CANONICAL_UUID.matches(attachmentId)) {
+            "Invalid queued album attachment ID"
+        }
+        require(KitMediaMessage.normalizeMediaType(mediaType) == mediaType) {
+            "Invalid queued album media type"
+        }
+        require(plaintextBytes in 1..MAX_IMAGE_PLAINTEXT_BYTES) {
+            "Invalid queued album item size"
+        }
+        // Cipher layout is IV(16) + CBC/PKCS7 + HMAC(32); a pair that disagrees describes a blob
+        // that cannot exist, exactly as the descriptor codec reads it.
+        require(
+            ciphertextBytes == plaintextBytes.toLong() + 64L - (plaintextBytes.toLong() % 16L),
+        ) { "Queued album item sizes disagree" }
+        require(
+            hasCanonicalBase64Size(keyBase64, MediaAttachmentCipher.KEY_MATERIAL_BYTES),
+        ) { "Invalid queued album key" }
+        require(SHA256_HEX.matches(ciphertextSha256Hex)) { "Invalid queued album digest" }
+        storageKey?.let {
+            require(ImmediateSendIntent.CANONICAL_UUID.matches(it)) {
+                "Invalid queued album storage key"
+            }
+        }
+    }
+
+    fun keyMaterial(): ByteArray = Base64.getDecoder().decode(keyBase64)
+
+    fun ciphertextSha256(): ByteArray = ByteArray(ciphertextSha256Hex.length / 2) { index ->
+        ciphertextSha256Hex.substring(index * 2, index * 2 + 2).toInt(16).toByte()
+    }
+
+    private companion object {
+        val SHA256_HEX = Regex("^[0-9a-f]{64}$")
+    }
 }
 
 internal enum class ImmediateSendState {
     WAITING,
     RETRY_REQUIRED,
+
+    /**
+     * Terminal and user-visible: the local ciphertext was lost before the send, so no retry can
+     * ever succeed. The record itself stays as the durable failed bubble — a `KITMEDIA2` album
+     * must fail visibly rather than vanish — and dispatch skips it, so it never holds up the
+     * conversation behind it. Appended last: persisted records store the ordinal.
+     */
+    FAILED,
 }
 
 /**
@@ -52,8 +122,13 @@ internal data class ImmediateSendIntent(
     val mediaCiphertextBytes: Int = 0,
     val mediaKeyBase64: String? = null,
     val mediaSha256Base64: String? = null,
-    /** Canonical KITMEDIA1 descriptor after upload; persisted before Signal encryption. */
+    /**
+     * Canonical media descriptor after upload — KITMEDIA1 for [ImmediateSendKind.MEDIA],
+     * KITMEDIA2 for [ImmediateSendKind.MEDIA_V2] — persisted before Signal encryption.
+     */
     val preparedMediaDescriptor: String? = null,
+    /** Ordered album attachments; non-empty exactly when [kind] is [ImmediateSendKind.MEDIA_V2]. */
+    val mediaItems: List<ImmediateSendMediaItem> = emptyList(),
     /**
      * The message this send is an answer to, when the sender picked one.
      *
@@ -107,6 +182,7 @@ internal data class ImmediateSendIntent(
             }
             ImmediateSendKind.MEDIA -> {
                 require(text.isEmpty())
+                require(mediaItems.isEmpty()) { "A single queued media send carries no item list" }
                 requireNotNull(KitMediaMessage.normalizeMediaType(mediaType.orEmpty())) {
                     "Invalid queued media type"
                 }
@@ -129,6 +205,51 @@ internal data class ImmediateSendIntent(
                     requireStandardSecureMessagingText(it)
                 }
             }
+            ImmediateSendKind.MEDIA_V2 -> {
+                require(text.isEmpty())
+                require(
+                    mediaType == null && mediaPlaintextBytes == 0 && mediaCiphertextBytes == 0 &&
+                        mediaKeyBase64 == null && mediaSha256Base64 == null,
+                ) { "A queued media album carries per-item fields only" }
+                require(
+                    mediaItems.size in
+                        KitMediaMessageV2.MIN_ATTACHMENTS..KitMediaMessageV2.MAX_ATTACHMENTS,
+                ) { "A queued media album carries two to eight attachments" }
+                require(
+                    mediaItems.mapTo(mutableSetOf(), ImmediateSendMediaItem::attachmentId).size ==
+                        mediaItems.size,
+                ) { "Queued album attachment ids must be unique" }
+                val storageKeys = mediaItems.mapNotNull(ImmediateSendMediaItem::storageKey)
+                require(storageKeys.size == storageKeys.toSet().size) {
+                    "Queued album storage keys must be unique"
+                }
+                require(
+                    mediaItems.sumOf(ImmediateSendMediaItem::ciphertextBytes) <=
+                        KitMediaMessageV2.MAX_AGGREGATE_CIPHERTEXT_BYTES,
+                ) { "Queued media album is too large" }
+                // Already in exact wire form: enqueue normalizes with the contract's
+                // six-codepoint strip, so a caption that decodes differently than it will be
+                // sent cannot sit in the queue.
+                require(caption == null || KitMediaMessageV2.isValidCaption(caption)) {
+                    "Queued album caption is not in canonical form"
+                }
+                preparedMediaDescriptor?.let { descriptor ->
+                    require(KitMediaMessageV2.parse(descriptor) != null) {
+                        "Invalid prepared queued-album descriptor"
+                    }
+                    requireStandardSecureMessagingText(descriptor)
+                    require(mediaItems.all { it.storageKey != null }) {
+                        "A prepared album descriptor requires every item to be uploaded"
+                    }
+                    // The descriptor must BE the canonical encoding of every persisted item
+                    // field plus the caption — id order alone is not enough. Anything less lets
+                    // a corrupt or mismatched checkpoint send different keys or metadata than
+                    // the items this record says it carries.
+                    require(descriptor == buildAlbumDescriptor()) {
+                        "Prepared album descriptor does not match its queued items"
+                    }
+                }
+            }
         }
     }
 
@@ -140,18 +261,62 @@ internal data class ImmediateSendIntent(
             ImmediateSendKind.GROUP_PAYMENT_EVENT,
             ImmediateSendKind.EDIT,
             -> text
-            ImmediateSendKind.MEDIA -> preparedMediaDescriptor
+            ImmediateSendKind.MEDIA,
+            ImmediateSendKind.MEDIA_V2,
+            -> preparedMediaDescriptor
         }
 
     fun mediaKeyMaterial(): ByteArray = checkNotNull(decodeBase64(mediaKeyBase64))
 
     fun mediaSha256(): ByteArray = checkNotNull(decodeBase64(mediaSha256Base64))
 
+    /**
+     * The canonical `KITMEDIA2` encoding of every persisted item field plus the caption; every
+     * item's upload must already be recorded. The seal step and the persisted-record invariant
+     * share this one construction, so what was validated is exactly what will be sent.
+     */
+    fun buildAlbumDescriptor(): String {
+        check(kind == ImmediateSendKind.MEDIA_V2) { "Only albums build KITMEDIA2 descriptors" }
+        return KitMediaMessageV2(
+            items = mediaItems.map { item ->
+                KitMediaMessageV2Item(
+                    attachmentId = item.attachmentId,
+                    storageKey = checkNotNull(item.storageKey) {
+                        "A queued album descriptor requires every item to be uploaded"
+                    },
+                    mediaType = item.mediaType,
+                    ciphertextByteSize = item.ciphertextBytes,
+                    ciphertextSha256 = item.ciphertextSha256Hex,
+                    keyMaterialBase64 = item.keyBase64,
+                    plaintextByteSize = item.plaintextBytes,
+                )
+            },
+            caption = caption,
+        ).encode()
+    }
+
+    /**
+     * This album with one item's confirmed upload recorded. Everything else — the id the item
+     * will be sent under, its key, its digests — is deliberately immutable across retries.
+     */
+    fun withAlbumItemStorageKey(attachmentId: String, storageKey: String): ImmediateSendIntent {
+        check(kind == ImmediateSendKind.MEDIA_V2) { "Only albums record per-item storage keys" }
+        check(mediaItems.any { it.attachmentId == attachmentId }) {
+            "The uploaded attachment does not belong to this album"
+        }
+        return copy(
+            mediaItems = mediaItems.map { item ->
+                if (item.attachmentId == attachmentId) item.copy(storageKey = storageKey) else item
+            },
+        )
+    }
+
     private fun requireMediaFieldsAbsent() {
         require(
             mediaType == null && caption == null && mediaPlaintextBytes == 0 &&
                 mediaCiphertextBytes == 0 && mediaKeyBase64 == null &&
-                mediaSha256Base64 == null && preparedMediaDescriptor == null,
+                mediaSha256Base64 == null && preparedMediaDescriptor == null &&
+                mediaItems.isEmpty(),
         ) { "A queued text event cannot carry media fields" }
     }
 
@@ -178,9 +343,23 @@ internal data class ImmediateSendIntent(
     }
 }
 
+/**
+ * Whether [value] is the canonical base64 of exactly [expectedBytes] bytes. Album keys must be
+ * canonical, not merely decodable: the descriptor codec proves canonicality by re-encoding, so a
+ * noncanonical spelling here would build a descriptor that fails its own parse.
+ */
+private fun hasCanonicalBase64Size(value: String, expectedBytes: Int): Boolean {
+    val decoded = runCatching { Base64.getDecoder().decode(value) }.getOrNull() ?: return false
+    return try {
+        decoded.size == expectedBytes && Base64.getEncoder().encodeToString(decoded) == value
+    } finally {
+        decoded.fill(0)
+    }
+}
+
 /** Strict, bounded binary codec; future versions fail closed rather than being half-understood. */
 internal object ImmediateSendIntentCodec {
-    private const val VERSION = 2
+    private const val VERSION = 3
 
     /**
      * Version 1 is still read, and only read.
@@ -188,6 +367,7 @@ internal object ImmediateSendIntentCodec {
      * A send already sitting in the queue when the app updated was written without a reply target,
      * and it is a message someone meant to send. Refusing it would silently drop their words at
      * exactly the moment they trusted the queue to hold them; the field it lacks is simply absent.
+     * Version 2 likewise: it predates media albums, so its item list is simply empty.
      */
     private const val OLDEST_READABLE_VERSION = 1
     private const val MAX_RECORD_BYTES = 64 * 1024
@@ -211,6 +391,16 @@ internal object ImmediateSendIntentCodec {
             data.writeNullableString(intent.mediaSha256Base64)
             data.writeNullableString(intent.preparedMediaDescriptor)
             data.writeNullableString(intent.replyToMessageId)
+            data.writeInt(intent.mediaItems.size)
+            intent.mediaItems.forEach { item ->
+                data.writeString(item.attachmentId)
+                data.writeString(item.mediaType)
+                data.writeInt(item.plaintextBytes)
+                data.writeLong(item.ciphertextBytes)
+                data.writeString(item.keyBase64)
+                data.writeString(item.ciphertextSha256Hex)
+                data.writeNullableString(item.storageKey)
+            }
         }
         return output.toByteArray().also {
             require(it.size <= MAX_RECORD_BYTES) { "Immediate-send record is too large" }
@@ -240,11 +430,30 @@ internal object ImmediateSendIntentCodec {
                     mediaSha256Base64 = data.readNullableString(),
                     preparedMediaDescriptor = data.readNullableString(),
                     replyToMessageId = if (version >= 2) data.readNullableString() else null,
+                    mediaItems = if (version >= 3) data.readMediaItems() else emptyList(),
                 )
                 if (data.available() != 0) return null
                 decoded
             }
         }.getOrNull()
+    }
+
+    private fun DataInputStream.readMediaItems(): List<ImmediateSendMediaItem> {
+        val count = readInt()
+        require(count in 0..KitMediaMessageV2.MAX_ATTACHMENTS) {
+            "Immediate-send album item count is out of range"
+        }
+        return List(count) {
+            ImmediateSendMediaItem(
+                attachmentId = readString(),
+                mediaType = readString(),
+                plaintextBytes = readInt(),
+                ciphertextBytes = readLong(),
+                keyBase64 = readString(),
+                ciphertextSha256Hex = readString(),
+                storageKey = readNullableString(),
+            )
+        }
     }
 
     private fun DataOutputStream.writeString(value: String) {

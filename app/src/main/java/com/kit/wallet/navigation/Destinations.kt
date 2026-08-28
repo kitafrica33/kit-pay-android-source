@@ -2,6 +2,14 @@ package com.kit.wallet.navigation
 
 import android.net.Uri
 
+/**
+ * Where a landing on the retired email-registration route continues. Phone OTP is the only
+ * way an account is created; a back stack restored from an older release must resume on a
+ * real screen — the phone screen when signed out, home when signed in — never sit blank.
+ */
+internal fun retiredRegisterRedirect(signedIn: Boolean): String =
+    if (signedIn) Dest.HOME else Dest.PHONE_LOGIN
+
 /** Route constants. Kept as plain strings until type-safe navigation lands. */
 object Dest {
     const val ONBOARDING = "onboarding"

@@ -102,27 +102,48 @@ internal class ImmediateMediaSpool internal constructor(
      */
     suspend fun ciphertextFile(intent: ImmediateSendIntent): File {
         require(intent.kind == ImmediateSendKind.MEDIA)
-        return withContext(Dispatchers.IO) {
-            fileMutex.withLock {
-                val source = file(intent.id)
-                if (!source.isFile || source.length() != intent.mediaCiphertextBytes.toLong()) {
+        return verifiedFile(intent.id, intent.mediaCiphertextBytes.toLong(), intent.mediaSha256())
+    }
+
+    /**
+     * [ciphertextFile] for one attachment of a queued album; each item is spooled under its own
+     * attachment id and verified against its own queue metadata.
+     */
+    suspend fun albumItemCiphertextFile(
+        intent: ImmediateSendIntent,
+        attachmentId: String,
+    ): File {
+        require(intent.kind == ImmediateSendKind.MEDIA_V2)
+        val item = requireNotNull(intent.mediaItems.firstOrNull { it.attachmentId == attachmentId }) {
+            "The requested attachment does not belong to this album"
+        }
+        return verifiedFile(item.attachmentId, item.ciphertextBytes, item.ciphertextSha256())
+    }
+
+    private suspend fun verifiedFile(
+        id: String,
+        expectedCiphertextBytes: Long,
+        expectedSha256: ByteArray,
+    ): File = withContext(Dispatchers.IO) {
+        fileMutex.withLock {
+            val source = file(id)
+            if (!source.isFile || source.length() != expectedCiphertextBytes) {
+                expectedSha256.fill(0)
+                throw ImmediateMediaSpoolUnavailableException(
+                    "The queued secure attachment is no longer available",
+                )
+            }
+            val actual = source.streamingSha256()
+            try {
+                if (!MessageDigest.isEqual(expectedSha256, actual)) {
                     throw ImmediateMediaSpoolUnavailableException(
-                        "The queued secure attachment is no longer available",
+                        "The queued secure attachment failed its integrity check",
                     )
                 }
-                val expected = intent.mediaSha256()
-                val actual = source.streamingSha256()
-                try {
-                    if (!MessageDigest.isEqual(expected, actual)) {
-                        throw ImmediateMediaSpoolUnavailableException(
-                            "The queued secure attachment failed its integrity check",
-                        )
-                    }
-                    source
-                } finally {
-                    expected.fill(0)
-                    actual.fill(0)
-                }
+                source
+            } finally {
+                expectedSha256.fill(0)
+                actual.fill(0)
             }
         }
     }
@@ -169,4 +190,15 @@ internal class ImmediateMediaSpool internal constructor(
         const val DIRECTORY_NAME = "secure-message-outbox"
         const val FILE_SUFFIX = ".ciphertext"
     }
+}
+
+/**
+ * The spool file ids this queued send owns: a single media send is spooled under its own id, an
+ * album under each item's attachment id. Prune retention and commit-time discard must both use
+ * this, or an album's ciphertext would be swept while its intent is still queued.
+ */
+internal fun ImmediateSendIntent.spoolIds(): List<String> = when (kind) {
+    ImmediateSendKind.MEDIA -> listOf(id)
+    ImmediateSendKind.MEDIA_V2 -> mediaItems.map(ImmediateSendMediaItem::attachmentId)
+    else -> emptyList()
 }

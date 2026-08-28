@@ -20,6 +20,7 @@ class HomeActionPolicyTest {
             HomeAction.RECEIVE_MONEY to Dest.RECEIVE,
             HomeAction.REQUEST_MONEY to Dest.REQUEST,
             HomeAction.VERIFY_IDENTITY to Dest.KYC,
+            HomeAction.START_FIRST_CHAT to Dest.CONTACTS,
             HomeAction.PAY_BILLS to Dest.BILLS,
             HomeAction.BUY_AIRTIME to Dest.AIRTIME,
             HomeAction.BANK to Dest.BANK,
@@ -112,8 +113,16 @@ class HomeActionPolicyTest {
             KitFeature.BANK_DEPOSITS to true,
             KitFeature.MOBILE_MONEY to true,
             KitFeature.KYC to true,
+            KitFeature.MESSAGING to true,
         ),
         loaded = true,
         qrScannerClientReady = true,
+        // Starting a chat exchanges keys, so the tile needs full messaging readiness: the
+        // reviewed client, and the exact server protocol advertisement it implements.
+        secureMessagingClientReady = true,
+        messagingProtocolReady = true,
+        messagingProtocolVersion = "v2",
+        messagingProtocolSuite = "signal-pqxdh-kyber1024-double-ratchet-v2",
+        messagingProtocolPostQuantum = true,
     )
 }

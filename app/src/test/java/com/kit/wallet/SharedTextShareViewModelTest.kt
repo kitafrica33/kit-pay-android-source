@@ -1,5 +1,6 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
@@ -9,6 +10,7 @@ import com.kit.wallet.feature.chat.SharedInboxAccess
 import com.kit.wallet.feature.chat.SharedInboxBatch
 import com.kit.wallet.feature.chat.SharedInboxItem
 import com.kit.wallet.feature.chat.SharedInboxOwner
+import com.kit.wallet.feature.chat.SharedInboxPolicy
 import com.kit.wallet.feature.chat.SharedRecipient
 import com.kit.wallet.feature.chat.SharedTextSendStart
 import com.kit.wallet.feature.chat.SharedTextShareViewModel
@@ -408,6 +410,252 @@ class SharedTextShareViewModelTest {
     }
 
     @Test
+    fun `a capable multi-file share coalesces into exactly one album message`() = runTest {
+        val repository = FakeChatRepository(listOf(chat(DIRECT_ID, "Grace")))
+            .apply { albumsAvailable.value = true }
+        val inbox = FakeSharedInbox()
+        val viewModel = viewModel(inbox, repository)
+        viewModel.begin("request")
+        val done = CompletableDeferred<Unit>()
+
+        val result = viewModel.send(
+            "request",
+            conversation(repository, DIRECT_ID),
+            batch(
+                text = "Here it is",
+                items = listOf(item("one", "image/jpeg"), item("two", "application/pdf")),
+            ),
+        ) { done.complete(Unit) }
+        done.await()
+
+        assertEquals(SharedTextSendStart.STARTED, result)
+        // One message: both files in shared order, the words as its caption — never a text send.
+        assertEquals(
+            listOf(Triple(DIRECT_ID, listOf("image/jpeg", "application/pdf"), "Here it is")),
+            repository.sentAlbums,
+        )
+        assertTrue(repository.sentMedia.isEmpty())
+        assertTrue(repository.sentMessages.isEmpty())
+        assertEquals(true, inbox.pinnedAlbumDelivery)
+        assertEquals(1, viewModel.sendState.value.durablyQueuedComponents)
+        assertEquals(listOf(BATCH_ID), inbox.discarded)
+        assertTrue(viewModel.sendState.value.sent)
+    }
+
+    @Test
+    fun `a single-file share folds its words into the one legacy media caption`() = runTest {
+        val repository = FakeChatRepository(listOf(chat(DIRECT_ID, "Grace")))
+            .apply { albumsAvailable.value = true }
+        val inbox = FakeSharedInbox()
+        val viewModel = viewModel(inbox, repository)
+        viewModel.begin("request")
+        val done = CompletableDeferred<Unit>()
+        val shared = item("one", "image/jpeg")
+
+        viewModel.send(
+            "request",
+            conversation(repository, DIRECT_ID),
+            batch(text = "Just this", items = listOf(shared)),
+        ) { done.complete(Unit) }
+        done.await()
+
+        // One `KITMEDIA1` message with the words as its caption: never an album for one file,
+        // and no longer a file bubble chased by a separate text bubble.
+        assertTrue(repository.sentAlbums.isEmpty())
+        assertEquals(
+            listOf(
+                Triple(
+                    DIRECT_ID,
+                    "image/jpeg",
+                    SharedInboxPolicy.deliveryMessageId(BATCH_ID, DIRECT_ID, shared.id),
+                ),
+            ),
+            repository.sentMedia,
+        )
+        assertEquals(listOf<String?>("Just this"), repository.mediaCaptionsById.values.toList())
+        assertTrue(repository.sentMessages.isEmpty())
+        assertEquals(false, inbox.pinnedAlbumDelivery)
+        assertEquals(1, viewModel.sendState.value.durablyQueuedComponents)
+        assertEquals(listOf(BATCH_ID), inbox.discarded)
+        assertTrue(viewModel.sendState.value.sent)
+    }
+
+    @Test
+    fun `words too large for a caption keep the classic two-message single-file shape`() = runTest {
+        val repository = FakeChatRepository(listOf(chat(DIRECT_ID, "Grace")))
+        val inbox = FakeSharedInbox()
+        val viewModel = viewModel(inbox, repository)
+        viewModel.begin("request")
+        val done = CompletableDeferred<Unit>()
+        // Well inside the shared-text limit, one byte past what a KITMEDIA1 caption may carry.
+        val words = "y".repeat(2_049)
+
+        viewModel.send(
+            "request",
+            conversation(repository, DIRECT_ID),
+            batch(text = words, items = listOf(item("one", "image/jpeg"))),
+        ) { done.complete(Unit) }
+        done.await()
+
+        // Nothing is truncated and nothing fails: the file goes captionless and the words
+        // follow whole as their own message, files first so the text reads as commentary.
+        assertEquals(listOf("image/jpeg"), repository.sentMedia.map { it.second })
+        assertEquals(listOf<String?>(null), repository.mediaCaptionsById.values.toList())
+        assertEquals(listOf(DIRECT_ID to words), repository.sentMessages)
+        assertEquals(2, viewModel.sendState.value.durablyQueuedComponents)
+        assertEquals(listOf(BATCH_ID), inbox.discarded)
+        assertTrue(viewModel.sendState.value.sent)
+    }
+
+    @Test
+    fun `a folded caption retries under the same identity without splitting`() = runTest {
+        val repository = FakeChatRepository(listOf(chat(DIRECT_ID, "Grace")))
+            .apply { failMediaAttempt = 1 }
+        val inbox = FakeSharedInbox()
+        val shared = batch(text = "Just this", items = listOf(item("one", "image/jpeg")))
+        val viewModel = viewModel(inbox, repository)
+        viewModel.begin("request")
+        val firstDone = CompletableDeferred<Unit>()
+
+        viewModel.send("request", conversation(repository, DIRECT_ID), shared) {
+            firstDone.complete(Unit)
+        }
+        firstDone.await()
+
+        assertEquals("simulated second component failure", viewModel.sendState.value.error)
+        assertTrue(repository.sentMedia.isEmpty())
+        assertTrue(inbox.discarded.isEmpty())
+
+        // The retry re-derives the identical fold from the same pinned words. The fake enforces
+        // what production enforces — one identity, one caption — so a re-shaped or re-worded
+        // replay would fail this send rather than pass silently.
+        val retryDone = CompletableDeferred<Unit>()
+        viewModel.send("request", conversation(repository, DIRECT_ID), shared) {
+            retryDone.complete(Unit)
+        }
+        retryDone.await()
+
+        assertEquals(listOf("image/jpeg"), repository.sentMedia.map { it.second })
+        assertEquals(listOf<String?>("Just this"), repository.mediaCaptionsById.values.toList())
+        assertTrue(repository.sentMessages.isEmpty())
+        assertEquals(listOf(BATCH_ID), inbox.discarded)
+        assertTrue(viewModel.sendState.value.sent)
+    }
+
+    @Test
+    fun `an album pin outlives the capability and a retry cannot split the message`() = runTest {
+        val repository = FakeChatRepository(listOf(chat(DIRECT_ID, "Grace")))
+            .apply {
+                albumsAvailable.value = true
+                albumFailure = "simulated album outage"
+            }
+        val inbox = FakeSharedInbox()
+        val shared = batch(
+            text = "Both files",
+            items = listOf(item("one", "image/jpeg"), item("two", "application/pdf")),
+        )
+        val viewModel = viewModel(inbox, repository)
+        viewModel.begin("request")
+        val firstDone = CompletableDeferred<Unit>()
+
+        viewModel.send("request", conversation(repository, DIRECT_ID), shared) {
+            firstDone.complete(Unit)
+        }
+        firstDone.await()
+
+        assertEquals("simulated album outage", viewModel.sendState.value.error)
+        assertEquals(true, inbox.pinnedAlbumDelivery)
+        assertTrue(inbox.discarded.isEmpty())
+
+        // The capability reads false on retry — a fresh session, say — but the pinned shape
+        // wins: the same content must never re-queue as per-item components.
+        repository.albumsAvailable.value = false
+        val retryDone = CompletableDeferred<Unit>()
+        viewModel.send("request", conversation(repository, DIRECT_ID), shared) {
+            retryDone.complete(Unit)
+        }
+        retryDone.await()
+
+        assertEquals(1, repository.sentAlbums.size)
+        assertTrue(repository.sentMedia.isEmpty())
+        assertTrue(repository.sentMessages.isEmpty())
+        assertEquals(listOf(BATCH_ID), inbox.discarded)
+        assertTrue(viewModel.sendState.value.sent)
+    }
+
+    @Test
+    fun `a share pinned per-item never becomes an album when the capability appears`() = runTest {
+        val repository = FakeChatRepository(listOf(chat(DIRECT_ID, "Grace")))
+            .apply { failMediaAttempt = 2 }
+        val inbox = FakeSharedInbox()
+        val shared = batch(
+            text = "Both files",
+            items = listOf(item("one", "image/jpeg"), item("two", "application/pdf")),
+        )
+        val viewModel = viewModel(inbox, repository)
+        viewModel.begin("request")
+        val firstDone = CompletableDeferred<Unit>()
+
+        viewModel.send("request", conversation(repository, DIRECT_ID), shared) {
+            firstDone.complete(Unit)
+        }
+        firstDone.await()
+
+        assertEquals(false, inbox.pinnedAlbumDelivery)
+        assertEquals(1, repository.sentMedia.size)
+
+        // The first component is already durably queued per-item. An album appearing now would
+        // duplicate that file inside a second message, so the recorded shape must win.
+        repository.albumsAvailable.value = true
+        val retryDone = CompletableDeferred<Unit>()
+        viewModel.send("request", conversation(repository, DIRECT_ID), shared) {
+            retryDone.complete(Unit)
+        }
+        retryDone.await()
+
+        assertTrue(repository.sentAlbums.isEmpty())
+        assertEquals(2, repository.sentMedia.size)
+        assertEquals(listOf(DIRECT_ID to "Both files"), repository.sentMessages)
+        assertEquals(listOf(BATCH_ID), inbox.discarded)
+        assertTrue(viewModel.sendState.value.sent)
+    }
+
+    @Test
+    fun `an album whose caption cannot be carried fails whole and keeps the share`() = runTest {
+        val repository = FakeChatRepository(listOf(chat(DIRECT_ID, "Grace")))
+            .apply {
+                albumsAvailable.value = true
+                albumFailure = "This caption is too long to send with these attachments"
+            }
+        val inbox = FakeSharedInbox()
+        val viewModel = viewModel(inbox, repository)
+        viewModel.begin("request")
+        val done = CompletableDeferred<Unit>()
+
+        viewModel.send(
+            "request",
+            conversation(repository, DIRECT_ID),
+            batch(
+                text = "y".repeat(4_000),
+                items = listOf(item("one", "image/jpeg"), item("two", "application/pdf")),
+            ),
+        ) { done.complete(Unit) }
+        done.await()
+
+        // Nothing was truncated or sent piecemeal instead: the whole review fails visibly and
+        // the staged share survives for the user to shorten or resend.
+        assertEquals(
+            "This caption is too long to send with these attachments",
+            viewModel.sendState.value.error,
+        )
+        assertTrue(!viewModel.sendState.value.sent)
+        assertTrue(repository.sentAlbums.isEmpty())
+        assertTrue(repository.sentMedia.isEmpty())
+        assertTrue(repository.sentMessages.isEmpty())
+        assertTrue(inbox.discarded.isEmpty())
+    }
+
+    @Test
     fun `a share from another authenticated session cannot enter the outbox`() = runTest {
         val original = testSession(OWNER_ID)
         val sessions = MutableTestSessionStore(original)
@@ -514,6 +762,7 @@ class SharedTextShareViewModelTest {
     private class FakeSharedInbox(private val readable: Boolean = true) : SharedInboxAccess {
         val discarded = mutableListOf<String>()
         var pinnedConversationId: String? = null
+        var pinnedAlbumDelivery: Boolean? = null
 
         override fun source(batch: SharedInboxBatch, item: SharedInboxItem): SecureMediaSource {
             require(readable) { "That shared file could no longer be read." }
@@ -523,10 +772,14 @@ class SharedTextShareViewModelTest {
         override fun pinDestination(
             batch: SharedInboxBatch,
             conversationId: String,
+            albumDelivery: Boolean,
         ): SharedInboxBatch {
             check(pinnedConversationId == null || pinnedConversationId == conversationId)
+            // Mirrors the durable store: the first pin records the shape, later pins keep it.
+            val shape = if (pinnedConversationId == null) albumDelivery else pinnedAlbumDelivery
             pinnedConversationId = conversationId
-            return batch.copy(pinnedConversationId = conversationId)
+            pinnedAlbumDelivery = shape
+            return batch.copy(pinnedConversationId = conversationId, albumDelivery = shape)
         }
 
         override fun discard(batch: SharedInboxBatch) {
@@ -542,12 +795,20 @@ class SharedTextShareViewModelTest {
         override val readiness: StateFlow<Boolean> = MutableStateFlow(ready)
         override val localHistoryReady: StateFlow<Boolean> = MutableStateFlow(localHistoryReady)
         override val chats: StateFlow<List<ChatPreview>> = MutableStateFlow(initialChats)
+        val albumsAvailable = MutableStateFlow(false)
+        override val mediaAlbumsAvailable: StateFlow<Boolean> get() = albumsAvailable
         val sentMessages = mutableListOf<Pair<String, String>>()
         val sentMedia = mutableListOf<Triple<String, String, String>>()
+        /** chatId, ordered media types, caption — one entry per distinct queued album. */
+        val sentAlbums = mutableListOf<Triple<String, List<String>, String?>>()
+        /** The caption each distinct media component was first queued under, by identity. */
+        val mediaCaptionsById = linkedMapOf<String, String?>()
         val openedContacts = mutableListOf<Contact>()
         private val mediaById = linkedMapOf<String, Triple<String, String, String>>()
         private val textById = linkedMapOf<String, Triple<String, String, String>>()
+        private val albumById = linkedMapOf<String, Triple<String, List<String>, String?>>()
         var failMediaAttempt: Int? = null
+        var albumFailure: String? = null
         private var mediaAttempt = 0
 
         override suspend fun sendMediaMessage(
@@ -576,7 +837,33 @@ class SharedTextShareViewModelTest {
             val record = Triple(chatId, mediaType, clientMessageId)
             val previous = mediaById.putIfAbsent(clientMessageId, record)
             check(previous == null || previous == record)
+            // Production folds the caption into the idempotent identity: a replay arriving with
+            // different words is the same fault as a replay arriving with different bytes.
+            if (mediaCaptionsById.containsKey(clientMessageId)) {
+                check(mediaCaptionsById[clientMessageId] == caption) {
+                    "An immediate-send identity belongs to different media"
+                }
+            } else {
+                mediaCaptionsById[clientMessageId] = caption
+            }
             if (previous == null) sentMedia += record
+        }
+
+        override suspend fun sendIdempotentMediaAlbumMessageForOwner(
+            owner: SessionFence,
+            chatId: String,
+            attachments: List<SecureMediaAlbumSource>,
+            clientMessageId: String,
+            caption: String?,
+        ) {
+            albumFailure?.let { failure ->
+                albumFailure = null
+                throw IllegalArgumentException(failure)
+            }
+            val record = Triple(chatId, attachments.map(SecureMediaAlbumSource::mediaType), caption)
+            val previous = albumById.putIfAbsent(clientMessageId, record)
+            check(previous == null || previous == record)
+            if (previous == null) sentAlbums += record
         }
 
         override suspend fun sendIdempotentMessageForOwner(

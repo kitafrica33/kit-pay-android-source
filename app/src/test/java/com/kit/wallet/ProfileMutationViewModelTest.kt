@@ -3,6 +3,7 @@ package com.kit.wallet
 import com.kit.wallet.data.auth.AuthRepository
 import com.kit.wallet.data.repository.ProfileEmailChallenge
 import com.kit.wallet.data.repository.UserRepository
+import com.kit.wallet.feature.home.StarterMilestones
 import com.kit.wallet.feature.settings.SettingsViewModel
 import com.kit.wallet.ui.model.UserProfile
 import java.lang.reflect.Proxy
@@ -35,7 +36,16 @@ class ProfileMutationViewModelTest {
     @Test
     fun `profile save and completion cannot race an avatar upload`() = runTest {
         val repository = BlockingUserRepository()
-        val viewModel = SettingsViewModel(repository, unusedAuthRepository(), Clock.systemUTC())
+        val viewModel = SettingsViewModel(
+            repository,
+            unusedAuthRepository(),
+            MutableTestSessionStore(testSession("account-a")),
+            StarterMilestones(
+                prefsProvider = { FakeSharedPreferences() },
+                ioDispatcher = Dispatchers.Unconfined,
+            ),
+            Clock.systemUTC(),
+        )
 
         viewModel.attachAvatar(byteArrayOf(1, 2, 3))
         repository.avatarStarted.await()

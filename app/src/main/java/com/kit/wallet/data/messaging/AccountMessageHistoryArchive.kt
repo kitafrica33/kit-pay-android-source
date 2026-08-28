@@ -33,6 +33,15 @@ internal data class AccountArchivedMessage(
     val text: String,
     /** Always an inbound-shaped display state; it never carries resend/fanout authority. */
     val deliveryState: SecureMessagingProjectionDeliveryState,
+    /**
+         * True only when this device proved the strict-v2 envelope binding for exactly this text —
+         * an inbound row whose outer attachment rows matched the authenticated descriptor, or an
+         * own-authored row whose descriptor was strictly derived before its send commit. Restoration
+         * maps it back to a VALIDATED disposition only when the text still strict-parses as v2,
+     * so a flag smuggled onto arbitrary text is inert. Without it, restored reserved-format text
+     * arrived as a plain text-kind claim and stays a fail-closed placeholder.
+     */
+    val mediaValidated: Boolean = false,
 ) {
     init {
         requireArchiveUuid(serverMessageId, "archived server message ID")
@@ -482,6 +491,10 @@ private fun SecureMessagingProjectedMessage.toArchived(
 ): AccountArchivedMessage? {
     requireArchiveUuid(ownerAccountId, "archive owner account ID")
     val serverId = serverMessageId ?: return null
+    // Callers already skip rejected media, but the archive layer protects itself too: a pinned or
+    // derived unsupported row is a placeholder whose durable descriptor bytes never leave the
+    // live projection, so it can never be captured into retained history.
+    if (unsupportedMedia) return null
     val durable = requireDurableLibSignalCompanionRecord(durableRecord)
     val fromCurrentUser = durable.sender.userId == ownerAccountId
     val archivedState = when (deliveryState) {
@@ -527,6 +540,11 @@ private fun SecureMessagingProjectedMessage.toArchived(
         sentAt = sentAt,
         text = durable.authenticatedText,
         deliveryState = archivedState,
+        // The explicit pin is required in both directions. This prevents a legacy outbound row
+        // containing user-authored KITMEDIA2-shaped text from gaining authority merely because it
+        // was sent by this account; new genuine v2 sends receive the pin before projection commit.
+        mediaValidated = mediaDisposition == SecureMessagingMediaDisposition.VALIDATED &&
+            KitMediaMessageV2.parse(durable.authenticatedText) != null,
     )
 }
 
@@ -536,12 +554,25 @@ internal fun selectArchivedMessageUpdate(
     incoming: AccountArchivedMessage,
 ): AccountArchivedMessage? {
     if (existing == null) return incoming
-    check(existing.copy(deliveryState = incoming.deliveryState) == incoming) {
+    check(
+        existing.copy(
+            deliveryState = incoming.deliveryState,
+            mediaValidated = incoming.mediaValidated,
+        ) == incoming,
+    ) {
         "Account message archive immutable history changed"
     }
+    // Validation provenance is monotone over the same immutable text: once either copy proved
+    // the envelope binding, a copy written before the verdict existed (an older backup, or a
+    // build that predates the flag) must not silently erase it.
+    val mediaValidated = existing.mediaValidated || incoming.mediaValidated
     val existingRank = archivedDeliveryRank(existing)
     val incomingRank = archivedDeliveryRank(incoming)
-    return if (incomingRank > existingRank) incoming else null
+    return when {
+        incomingRank > existingRank -> incoming.copy(mediaValidated = mediaValidated)
+        mediaValidated != existing.mediaValidated -> existing.copy(mediaValidated = mediaValidated)
+        else -> null
+    }
 }
 
 private fun archivedDeliveryRank(message: AccountArchivedMessage): Int {
@@ -572,7 +603,17 @@ private object AccountArchivedMessageCodec {
         return try {
             DataOutputStream(output).use { data ->
                 data.write(ARCHIVE_MESSAGE_MAGIC)
-                data.writeInt(ARCHIVE_MESSAGE_SCHEMA)
+                // Any v2/future-family-bearing record uses the fenced schema, even without a
+                // positive verdict. Otherwise an older build could decode its raw descriptor as
+                // ordinary text. Canonical v1 and plain text remain byte-identical to schema 1.
+                val fenced = requiresModernMediaSchemaFence(message.text) || message.mediaValidated
+                data.writeInt(
+                    if (fenced) {
+                        ARCHIVE_MESSAGE_SCHEMA_MEDIA_VALIDATED
+                    } else {
+                        ARCHIVE_MESSAGE_SCHEMA
+                    },
+                )
                 data.writeBounded(message.serverMessageId, MAX_ARCHIVE_IDENTIFIER_BYTES)
                 data.writeBounded(message.clientMessageId, MAX_ARCHIVE_IDENTIFIER_BYTES)
                 data.writeBounded(message.conversationId, MAX_ARCHIVE_IDENTIFIER_BYTES)
@@ -587,6 +628,7 @@ private object AccountArchivedMessageCodec {
                 data.writeLong(message.sentAt.toEpochMilli())
                 data.writeByte(archiveDeliveryCode(message.deliveryState))
                 data.writeBounded(message.text, MAX_ARCHIVED_TEXT_BYTES)
+                if (fenced) data.writeBoolean(message.mediaValidated)
             }
             output.toOwnedByteArray().also {
                 require(it.size in 1..MAX_ARCHIVE_MESSAGE_RECORD_BYTES) {
@@ -610,7 +652,11 @@ private object AccountArchivedMessageCodec {
                 require(magic.contentEquals(ARCHIVE_MESSAGE_MAGIC)) {
                     "Invalid archived message record header"
                 }
-                require(data.readInt() == ARCHIVE_MESSAGE_SCHEMA) {
+                val schema = data.readInt()
+                require(
+                    schema == ARCHIVE_MESSAGE_SCHEMA ||
+                        schema == ARCHIVE_MESSAGE_SCHEMA_MEDIA_VALIDATED,
+                ) {
                     "Unsupported archived message record schema"
                 }
                 val message = AccountArchivedMessage(
@@ -631,6 +677,19 @@ private object AccountArchivedMessageCodec {
                     sentAt = Instant.ofEpochMilli(data.readLong()),
                     deliveryState = archiveDeliveryState(data.readUnsignedByte()),
                     text = data.readBounded(MAX_ARCHIVED_TEXT_BYTES),
+                    // The fenced schema carries an explicit positive/negative verdict. Negative is
+                    // essential for unvalidated v2/future-family text: old readers reject the
+                    // record, while capable readers restore it fail-closed.
+                    mediaValidated = when (schema) {
+                        ARCHIVE_MESSAGE_SCHEMA_MEDIA_VALIDATED -> {
+                            when (data.readUnsignedByte()) {
+                                0 -> false
+                                1 -> true
+                                else -> error("Invalid archived media-validation marker")
+                            }
+                        }
+                        else -> false
+                    },
                 )
                 require(input.available() == 0) { "Archived message record contains trailing data" }
                 message
@@ -708,6 +767,9 @@ private val ARCHIVABLE_INBOUND_STATES = setOf(
 
 private val ARCHIVE_MESSAGE_MAGIC = "kit.account-message-history".toByteArray(Charsets.US_ASCII)
 private const val ARCHIVE_MESSAGE_SCHEMA = 1
+
+/** Schema for records carrying a positive media-validation verdict; older builds refuse it. */
+private const val ARCHIVE_MESSAGE_SCHEMA_MEDIA_VALIDATED = 2
 private const val MAX_ARCHIVE_IDENTIFIER_CHARS = 160
 private const val MAX_ARCHIVE_IDENTIFIER_BYTES = 640
 private const val MAX_ARCHIVED_TEXT_BYTES = 64 * 1024

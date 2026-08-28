@@ -39,15 +39,24 @@ internal fun shouldRepinAfterGroupPaymentHydration(
  * both settled. That delayed insertion must never pull somebody away from older messages they are
  * reading merely because this account authored the payment. It follows naturally when the reader
  * is already at the bottom, and otherwise leaves a new-message affordance like an incoming row.
+ *
+ * [focusPending] means this screen was opened to land on a specific message (a voice-note bar
+ * tap). The focus jump owns the thread's first positioning then, so the opening jump-to-newest
+ * stands down rather than racing it to the other end of the list.
  */
 internal fun conversationScrollDecision(
     previousMessageIds: Set<String>?,
     messages: List<Message>,
     nearBottom: Boolean,
+    focusPending: Boolean = false,
 ): ConversationScrollDecision {
     if (messages.isEmpty()) return ConversationScrollDecision(ConversationScrollAction.KEEP_POSITION)
     if (previousMessageIds == null) {
-        return ConversationScrollDecision(ConversationScrollAction.JUMP_TO_NEWEST)
+        return if (focusPending) {
+            ConversationScrollDecision(ConversationScrollAction.KEEP_POSITION)
+        } else {
+            ConversationScrollDecision(ConversationScrollAction.JUMP_TO_NEWEST)
+        }
     }
 
     val added = messages.filterNot { it.id in previousMessageIds }

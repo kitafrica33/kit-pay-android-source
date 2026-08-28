@@ -26,6 +26,7 @@ class CallRingDeadlineCoordinator @Inject constructor(
     @param:ApplicationContext private val context: Context,
     private val callEvents: CallLifecycleEventBus,
     private val telecom: KitTelecomBridge,
+    private val replayLedger: IncomingCallReplayLedger,
     @ApplicationScope scope: CoroutineScope,
     clock: Clock,
 ) {
@@ -40,7 +41,14 @@ class CallRingDeadlineCoordinator @Inject constructor(
 
     fun cancel(callId: String) = scheduler.cancel(callId)
 
+    /** Atomically fences future ring deliveries before cancelling the process-local deadline. */
+    fun retire(callId: String) {
+        replayLedger.retire(callId)
+        scheduler.cancel(callId)
+    }
+
     private fun expire(callId: String) {
+        replayLedger.retire(callId)
         dispatchRingDeadlineExpiry(
             callId = callId,
             cancelNotification = {

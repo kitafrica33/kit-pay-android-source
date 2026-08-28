@@ -15,6 +15,8 @@ import com.kit.wallet.data.local.WalletDao
 import com.kit.wallet.data.local.WalletTransactionDao
 import com.kit.wallet.data.media.ProfileAvatarByteStore
 import com.kit.wallet.data.media.ProfileAvatarImages
+import com.kit.wallet.data.remote.MediaMessageProtocolDtoAdapter
+import com.kit.wallet.data.remote.StarterChecklistMilestoneDtoAdapter
 import com.kit.wallet.data.remote.UpdateMessagingConversationRequestAdapter
 import com.kit.wallet.data.remote.UpdateProfileRequestAdapter
 import com.kit.wallet.data.repository.AndroidKeystoreBeneficiaryPhoneIdentity
@@ -140,6 +142,12 @@ object StorageModule {
         // explicit null that clears a username.
         .add(UpdateProfileRequestAdapter())
         .add(UpdateMessagingConversationRequestAdapter())
+        // Ahead of the reflective factory: reflection cannot enforce that a milestone row
+        // carries the contract-required `completed_at` key when its value is null.
+        .add(StarterChecklistMilestoneDtoAdapter())
+        // Ahead of the reflective factory: a malformed `media_message` capabilities block must
+        // turn one feature off, not fail the whole capabilities document.
+        .add(MediaMessageProtocolDtoAdapter())
         .add(KotlinJsonAdapterFactory())
         .build()
 

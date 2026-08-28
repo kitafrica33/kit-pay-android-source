@@ -251,13 +251,26 @@ class AppCapabilitiesTest {
         assertFalse(disabled.routeUsable(Dest.REGISTER))
         assertFalse(disabled.routeUsable(Dest.FORGOT_PASSWORD))
         assertTrue(
-            disabled.copy(features = mapOf(KitFeature.EMAIL_REGISTRATION to true))
-                .routeUsable(Dest.REGISTER),
-        )
-        assertTrue(
             disabled.copy(features = mapOf(KitFeature.EMAIL_RECOVERY to true))
                 .routeUsable(Dest.FORGOT_PASSWORD),
         )
+    }
+
+    @Test
+    fun `email registration stays retired whatever the server advertises`() {
+        // Phone OTP is the only way an account is created. A stale — or hostile —
+        // capability snapshot that still advertises email_registration must not reopen
+        // the retired screen through the central navigation guard.
+        // A raw string on purpose: the retired key is no longer a client concept, and this
+        // guard must hold even for capability words the client no longer names.
+        val advertised = AppCapabilities(
+            loaded = true,
+            features = mapOf("email_registration" to true),
+        )
+
+        assertFalse(advertised.routeUsable(Dest.REGISTER))
+        // And the recovery flows it used to travel with are unaffected by that key.
+        assertFalse(advertised.routeUsable(Dest.FORGOT_PASSWORD))
     }
 
     @Test
@@ -289,8 +302,8 @@ class AppCapabilitiesTest {
         assertEquals("notifications", KitFeature.NOTIFICATIONS)
         assertEquals("abuse_reporting", KitFeature.ABUSE_REPORTING)
         assertEquals("kyc", KitFeature.KYC)
-        assertEquals("email_registration", KitFeature.EMAIL_REGISTRATION)
         assertEquals("email_recovery", KitFeature.EMAIL_RECOVERY)
         assertEquals("account_deletion", KitFeature.ACCOUNT_DELETION)
+        assertEquals("starter_checklist", KitFeature.STARTER_CHECKLIST)
     }
 }

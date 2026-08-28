@@ -21,15 +21,16 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.CallMade
 import androidx.compose.material.icons.automirrored.rounded.CallReceived
 import androidx.compose.material.icons.rounded.AccountBalance
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.QrCodeScanner
+import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.Receipt
 import androidx.compose.material.icons.rounded.RequestPage
 import androidx.compose.material.icons.rounded.SimCard
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
-import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -86,6 +87,7 @@ fun HomeScreen(
     onMobileMoney: () -> Unit,
     onRequest: () -> Unit,
     onKyc: () -> Unit,
+    onStartChat: () -> Unit,
     onAllTransactions: () -> Unit,
     onTransaction: (String) -> Unit,
     onFavorite: (String) -> Unit,
@@ -96,6 +98,7 @@ fun HomeScreen(
     val recent by viewModel.recentTransactions.collectAsStateWithLifecycle()
     val favorites by viewModel.favorites.collectAsStateWithLifecycle()
     val refreshing by viewModel.refreshing.collectAsStateWithLifecycle()
+    val checklist by viewModel.starterChecklist.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
 
     DisposableEffect(Unit) {
@@ -109,6 +112,7 @@ fun HomeScreen(
         capabilities = capabilities,
         favorites = favorites,
         recent = recent,
+        checklist = checklist,
         refreshing = refreshing,
         onRefresh = viewModel::refresh,
         snackbarHostState = snackbarHostState,
@@ -121,6 +125,7 @@ fun HomeScreen(
         onMobileMoney = onMobileMoney,
         onRequest = onRequest,
         onKyc = onKyc,
+        onStartChat = onStartChat,
         onAllTransactions = onAllTransactions,
         onTransaction = onTransaction,
         onFavorite = onFavorite,
@@ -136,6 +141,12 @@ internal fun HomeDashboard(
     favorites: List<Contact>,
     recent: List<Transaction>,
     snackbarHostState: SnackbarHostState,
+    checklist: StarterChecklist = StarterChecklistPolicy.checklist(
+        liveKyc = null,
+        profileKycLabel = null,
+        hasSentMessage = false,
+        firstTransactionMade = false,
+    ),
     refreshing: Boolean = false,
     onRefresh: () -> Unit = {},
     onSend: () -> Unit,
@@ -147,6 +158,7 @@ internal fun HomeDashboard(
     onMobileMoney: () -> Unit,
     onRequest: () -> Unit,
     onKyc: () -> Unit,
+    onStartChat: () -> Unit = {},
     onAllTransactions: () -> Unit,
     onTransaction: (String) -> Unit,
     onFavorite: (String) -> Unit,
@@ -175,6 +187,8 @@ internal fun HomeDashboard(
             capabilities = capabilities,
             favorites = favorites,
             recent = recent,
+            checklist = checklist,
+            onStartChat = { dispatch(HomeAction.START_FIRST_CHAT, onStartChat) },
             onSend = { dispatch(HomeAction.SEND_MONEY, onSend) },
             onReceive = { dispatch(HomeAction.RECEIVE_MONEY, onReceive) },
             onScan = { dispatch(HomeAction.SCAN_QR, onScan) },
@@ -212,6 +226,8 @@ private fun HomeContent(
     capabilities: AppCapabilities,
     favorites: List<Contact>,
     recent: List<Transaction>,
+    checklist: StarterChecklist,
+    onStartChat: () -> Unit,
     onSend: () -> Unit,
     onReceive: () -> Unit,
     onScan: () -> Unit,
@@ -280,42 +296,9 @@ private fun HomeContent(
                 )
             }
 
-            identityPromptFor(profile.kycLabel)?.let { prompt ->
-                item {
-                    Surface(
-                        shape = MaterialTheme.shapes.large,
-                        color = MaterialTheme.colorScheme.secondaryContainer,
-                        modifier = Modifier
-                            .padding(horizontal = 20.dp, vertical = 12.dp)
-                            .fillMaxWidth()
-                            .testTag(HomeAction.VERIFY_IDENTITY.testTag)
-                            .clickable(onClick = onKyc),
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Icon(
-                                Icons.Rounded.VerifiedUser,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                            )
-                            Column(Modifier.padding(start = 12.dp).weight(1f)) {
-                                Text(
-                                    prompt.title,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                )
-                                Text(
-                                    prompt.detail,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
+            // Identity has exactly one home surface: the checklist row below. The old
+            // standalone card is gone — the checklist derives from live state, so an
+            // identity that later regresses simply brings the checklist itself back.
 
             item {
                 Row(
@@ -379,6 +362,65 @@ private fun HomeContent(
                 }
             }
 
+            // The new-account starter checklist sits immediately before Recent activity
+            // and retires itself the moment all three steps are done. Every step is read
+            // from real account state and fails closed, so an account still loading shows
+            // steps as not-yet-done rather than blocking home from rendering.
+            if (!checklist.allComplete) {
+                item {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp)
+                            .padding(top = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "Get started",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            StarterChecklistPolicy.progressLabel(checklist),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                items(StarterStep.entries.size) { index ->
+                    val step = StarterStep.entries[index]
+                    StarterChecklistRow(
+                        step = step,
+                        completed = checklist.completed(step),
+                        detail = when (step) {
+                            // The same anti-resubmission phrasing the identity card used:
+                            // a check already with a reviewer reads as "in review", never
+                            // as an invitation to submit again.
+                            StarterStep.VERIFY_IDENTITY ->
+                                identityPromptFor(checklist.identityState)?.detail
+                            StarterStep.SEND_FIRST_MESSAGE ->
+                                "Say hello over encrypted chat."
+                            StarterStep.MAKE_FIRST_TRANSACTION ->
+                                "Send money, or pay a bill or airtime."
+                        },
+                        // The identity row keeps the tag the standalone card carried, so
+                        // it is unmistakably the one identity surface home has.
+                        testTag = when (step) {
+                            StarterStep.VERIFY_IDENTITY -> HomeAction.VERIFY_IDENTITY.testTag
+                            StarterStep.SEND_FIRST_MESSAGE ->
+                                HomeAction.START_FIRST_CHAT.testTag
+                            StarterStep.MAKE_FIRST_TRANSACTION ->
+                                "home-starter-first-transaction"
+                        },
+                        onClick = when (step) {
+                            StarterStep.VERIFY_IDENTITY -> onKyc
+                            StarterStep.SEND_FIRST_MESSAGE -> onStartChat
+                            StarterStep.MAKE_FIRST_TRANSACTION -> onSend
+                        },
+                    )
+                }
+            }
+
             item {
                 SectionHeader(
                     "Recent activity",
@@ -403,6 +445,49 @@ private fun HomeContent(
     }
 }
 
+/**
+ * One row of the starter checklist. A completed step shows its check and stops being a
+ * button; an incomplete one navigates to the screen where it is actually done.
+ */
+@Composable
+private fun StarterChecklistRow(
+    step: StarterStep,
+    completed: Boolean,
+    detail: String?,
+    testTag: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(enabled = !completed, onClick = onClick)
+            .testTag(testTag)
+            .padding(horizontal = 20.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            if (completed) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+            contentDescription = if (completed) "Done" else "Not done yet",
+            tint = if (completed) {
+                MaterialTheme.colorScheme.secondary
+            } else {
+                MaterialTheme.colorScheme.outline
+            },
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(step.title, style = MaterialTheme.typography.bodyLarge)
+            if (!completed && detail != null) {
+                Text(
+                    detail,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
 /** What the home card should say about identity, or null when it should not be there at all. */
 internal data class IdentityPrompt(val title: String, val detail: String)
 
@@ -415,7 +500,10 @@ internal data class IdentityPrompt(val title: String, val detail: String)
  * only honest thing to say about it is nothing.
  */
 internal fun identityPromptFor(status: String): IdentityPrompt? =
-    when (kycVerificationStateOf(status)) {
+    identityPromptFor(kycVerificationStateOf(status))
+
+internal fun identityPromptFor(state: KycVerificationState): IdentityPrompt? =
+    when (state) {
         KycVerificationState.VERIFIED, KycVerificationState.UNKNOWN -> null
         KycVerificationState.IN_REVIEW -> IdentityPrompt(
             title = "Verification in review",

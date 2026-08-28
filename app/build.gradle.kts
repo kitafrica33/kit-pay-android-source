@@ -399,8 +399,8 @@ android {
         applicationId = kitPayApplicationId
         minSdk = 26
         targetSdk = 36
-        versionCode = 42
-        versionName = "0.2.31"
+        versionCode = 44
+        versionName = "0.2.33"
 
         if (kitPaySideloadAbi != null) {
             ndk { abiFilters += kitPaySideloadAbi }

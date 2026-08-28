@@ -1,5 +1,10 @@
 package com.kit.wallet.ui.model
 
+import com.kit.wallet.data.messaging.KitMediaFamily
+import com.kit.wallet.data.messaging.UNSUPPORTED_ATTACHMENT_LABEL
+import com.kit.wallet.data.messaging.mediaAlbumPreviewLabel
+import com.kit.wallet.data.messaging.mediaAlbumQuoteLabel
+
 /**
  * Presentation-shaped UI models populated by the Room/Retrofit repository layer.
  */
@@ -82,6 +87,18 @@ data class Transaction(
     val recipientAmountMinor: Long? = null,
     val customerDebitMinor: Long? = null,
     val feeMode: String? = null,
+    /**
+     * The backend's own type word, kept beside the display [type] because the display
+     * mapping collapses kinds the checklist must tell apart: a reversal or refund lands in
+     * SEND/RECEIVE for rendering, but must never count as the account's first transaction.
+     */
+    val rawType: String? = null,
+    /**
+     * The backend's own direction word — `debit` or `credit` from the signed ledger entry.
+     * Kept raw for the same reason as [rawType]: policy that must tell money the user moved
+     * from money that arrived reads the authoritative wire value, never the display kind.
+     */
+    val rawDirection: String? = null,
 )
 
 enum class DeliveryState {
@@ -144,6 +161,20 @@ enum class MessageKind {
      * conversation talking about itself rather than any member talking.
      */
     SYSTEM,
+
+    /**
+     * A media-v2 album: two to eight attachments and an optional caption, one message end to
+     * end. [Message.text] carries the caption when there is one and the plural kind label when
+     * there is not; the items ride in [Message.mediaItems] in the descriptor's display order.
+     */
+    MEDIA_ALBUM,
+
+    /**
+     * Reserved media-family text this build cannot strictly parse — an unknown future generation
+     * or a malformed descriptor. Rendered as a generic placeholder everywhere; the raw text can
+     * embed attachment keys, so it never reaches any field of the UI model.
+     */
+    UNSUPPORTED_ATTACHMENT,
 }
 
 /** What a payment bubble records. Mirrors the encrypted descriptor's action. */
@@ -235,6 +266,26 @@ data class MessageDeliveryInfo(
     val deliveredCount: Int get() = recipients.count { it.deliveredAtEpochMillis > 0 }
 }
 
+/**
+ * One attachment of a [MessageKind.MEDIA_ALBUM] message, in the album's authoritative display
+ * order. Carries only what a tile needs to render and request its item; the descriptor — which
+ * holds every attachment key — stays whole in [Message.mediaDescriptor] and is never taken apart
+ * into UI state.
+ */
+data class MessageMediaItem(
+    val attachmentId: String,
+    val mediaType: String,
+    val plaintextBytes: Int,
+)
+
+/**
+ * The key one album item's opened media, loading flag and error are held under, in the same maps
+ * that key whole messages by id. Attachment ids are canonical UUIDs, so the slash cannot make two
+ * distinct items collide — and no whole-message id ever contains this suffix shape.
+ */
+fun albumItemMediaKey(messageId: String, attachmentId: String): String =
+    "$messageId/$attachmentId"
+
 data class Message(
     val id: String,
     val text: String,
@@ -243,12 +294,26 @@ data class Message(
     val senderName: String? = null,
     val state: DeliveryState = DeliveryState.READ,
     val kind: MessageKind = MessageKind.TEXT,
-    /** For IMAGE and payment messages: the opaque end-to-end descriptor for follow-up actions. */
+    /**
+     * For media and payment messages: the opaque end-to-end descriptor for follow-up actions.
+     * A media descriptor embeds attachment key material, so it is never rendered, copied, spoken
+     * or shared — and an [MessageKind.UNSUPPORTED_ATTACHMENT] entry carries null here, keeping
+     * unparsed reserved text out of the UI model altogether.
+     */
     val mediaDescriptor: String? = null,
     /** For media messages: the authenticated MIME type (`mt`), the single kind source of truth. */
     val mediaType: String? = null,
     /** For media messages: the decrypted payload size, for placeholder byte labels. */
     val mediaPlaintextBytes: Int = 0,
+    /** For [MessageKind.MEDIA_ALBUM]: the items in the descriptor's order — the display order. */
+    val mediaItems: List<MessageMediaItem> = emptyList(),
+    /**
+     * For [MessageKind.MEDIA_ALBUM]: the validated caption exactly as authenticated, or null when
+     * the album has none. Kept apart from [text] because presence is a fact of the descriptor,
+     * never an inference: a caption may equal the generated plural label, or consist entirely of
+     * codepoints a platform trim would call blank, and it is still the caption.
+     */
+    val mediaCaption: String? = null,
     /** For PAYMENT messages: signed minor units. */
     val amountMinor: Long = 0,
     /**
@@ -358,11 +423,16 @@ val Message.acceptsReplies: Boolean get() = acceptsReactions
  * Payment and membership entries are records of something that happened rather than anybody's
  * phrasing, so there is nothing in them an author could honestly correct. Neither is a photo, a
  * voice note or a document: replacing a media descriptor with a sentence would strand the media
- * its recipients have already downloaded, so those are excluded here and on iOS alike.
+ * its recipients have already downloaded, so those are excluded here and on iOS alike. An album
+ * is excluded the same way — caption edits are ship-disabled contract-wide — and a reserved
+ * descriptor this build cannot parse has no wording of its own at all: its visible line is a
+ * placeholder, not the message.
  */
 fun Message.acceptsEdits(nowEpochMillis: Long): Boolean = fromMe &&
     acceptsReactions &&
     kind != MessageKind.CALL &&
+    kind != MessageKind.MEDIA_ALBUM &&
+    kind != MessageKind.UNSUPPORTED_ATTACHMENT &&
     mediaDescriptor == null &&
     editWindowRemainingMillis(nowEpochMillis) > 0
 
@@ -399,6 +469,14 @@ fun Message.replyPreviewLabel(): String = when (kind) {
     MessageKind.IMAGE -> text.takeIf(String::isNotBlank) ?: "Photo"
     MessageKind.VIDEO -> text.takeIf(String::isNotBlank) ?: "Video"
     MessageKind.DOCUMENT -> text.takeIf(String::isNotBlank) ?: "Document"
+    // The quote carries the validated caption itself — never inferred from [text], which may
+    // legitimately equal the generated plural label — and never the descriptor.
+    MessageKind.MEDIA_ALBUM -> mediaAlbumQuoteLabel(
+        mediaItems.map(MessageMediaItem::mediaType),
+        caption = mediaCaption,
+    )
+    // A failed-parse target quotes as the same generic placeholder it renders as.
+    MessageKind.UNSUPPORTED_ATTACHMENT -> UNSUPPORTED_ATTACHMENT_LABEL
     MessageKind.PAYMENT,
     MessageKind.PAYMENT_REQUEST,
     MessageKind.PAYMENT_TRANSFER,
@@ -409,8 +487,50 @@ fun Message.replyPreviewLabel(): String = when (kind) {
     MessageKind.GROUP_PAYMENT_EVENT,
     MessageKind.CALL,
     MessageKind.SYSTEM,
-    -> text
+    -> presentableText()
 }
+
+/**
+ * The plaintext a long-press Copy may put on the clipboard, or null when the action must be
+ * absent. Only ordinary text and media captions qualify: payment cards, call logs, membership
+ * lines and every raw descriptor are deliberately not exposed. A media-v2 album offers exactly
+ * its caption — a caption-less album has nothing to copy — and unparsed reserved text offers
+ * nothing at all, so descriptor bytes can never travel through the clipboard.
+ */
+fun Message.copyablePlaintext(): String? = when (kind) {
+    // Raw text fields also carry whatever persisted, scheduled or legacy sources stored, so
+    // reserved media-namespace bytes are refused here regardless of how the row was classified.
+    MessageKind.TEXT -> text.takeUnless(KitMediaFamily::isFamilyText)
+    MessageKind.IMAGE, MessageKind.VIDEO, MessageKind.VOICE_NOTE, MessageKind.DOCUMENT ->
+        text.takeIf {
+            it.isNotBlank() && it !in setOf("Photo", "Voice note", "Video", "Document")
+        }?.takeUnless(KitMediaFamily::isFamilyText)
+    // Exactly the validated caption or nothing: presence is a descriptor fact, not a string
+    // comparison, so a caption equal to the generated label still copies and a caption-less
+    // album still cannot. No family guard here — the caption came out of strict v2 validation,
+    // is plain typed bytes even when it happens to begin with "KITMEDIA2:", and must copy
+    // byte-exactly.
+    MessageKind.MEDIA_ALBUM -> mediaCaption
+    MessageKind.UNSUPPORTED_ATTACHMENT,
+    MessageKind.PAYMENT,
+    MessageKind.PAYMENT_REQUEST,
+    MessageKind.PAYMENT_TRANSFER,
+    MessageKind.PAYMENT_EVENT,
+    MessageKind.GROUP_PAYMENT,
+    MessageKind.GROUP_PAYMENT_EVENT,
+    MessageKind.CALL,
+    MessageKind.SYSTEM,
+    -> null
+}
+
+/**
+ * [text] unless it belongs to the reserved media namespace, in which case the generic
+ * placeholder. A correctly classified message never trips this — its text is a caption or a
+ * generated label — so this is pure defense in depth for text from persisted, scheduled or
+ * legacy sources that predate family classification.
+ */
+fun Message.presentableText(): String =
+    if (KitMediaFamily.isFamilyText(text)) UNSUPPORTED_ATTACHMENT_LABEL else text
 
 data class ChatPreview(
     val id: String,

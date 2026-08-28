@@ -1,7 +1,10 @@
 package com.kit.wallet.data.remote
 
+import com.squareup.moshi.FromJson
 import com.squareup.moshi.Json
 import com.squareup.moshi.JsonClass
+import com.squareup.moshi.JsonDataException
+import com.squareup.moshi.JsonReader
 
 @JsonClass(generateAdapter = false)
 data class CurrencyDto(
@@ -16,6 +19,7 @@ data class MessagingProtocolDto(
     val suite: String? = null,
     @Json(name = "post_quantum") val postQuantum: Boolean? = null,
     @Json(name = "rich_media") val richMedia: RichMediaProtocolDto? = null,
+    @Json(name = "media_message") val mediaMessage: MediaMessageProtocolDto? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -28,6 +32,61 @@ data class RichMediaProtocolDto(
     @Json(name = "maximum_ciphertext_bytes") val maximumCiphertextBytes: Long? = null,
     @Json(name = "media_types") val mediaTypes: List<String>? = null,
 )
+
+/**
+ * The optional `protocols.messaging.media_message` block (KITMEDIA2 frozen contract, §5a).
+ *
+ * Parsed only through [MediaMessageProtocolDtoAdapter], never reflectively: the contract requires
+ * this block's decoding to be tolerant and isolated, so a malformed or wrong-typed block renders
+ * exactly one feature unavailable instead of failing the whole capabilities document. Whether a
+ * decoded advertisement is *coherent* — right profile, ready, the exact 64-byte envelope floor —
+ * is judged in [com.kit.wallet.data.messaging.MessagingMediaMessageV2Capability], not here.
+ */
+@JsonClass(generateAdapter = false)
+data class MediaMessageProtocolDto(
+    val ready: Boolean? = null,
+    val profile: String? = null,
+    @Json(name = "max_attachments") val maxAttachments: Long? = null,
+    @Json(name = "max_descriptor_bytes") val maxDescriptorBytes: Long? = null,
+    @Json(name = "max_caption_utf8_bytes") val maxCaptionUtf8Bytes: Long? = null,
+    @Json(name = "min_attachment_ciphertext_bytes") val minAttachmentCiphertextBytes: Long? = null,
+    @Json(name = "max_attachment_ciphertext_bytes") val maxAttachmentCiphertextBytes: Long? = null,
+    @Json(name = "max_aggregate_ciphertext_bytes") val maxAggregateCiphertextBytes: Long? = null,
+)
+
+/**
+ * Decodes [MediaMessageProtocolDto] without ever throwing.
+ *
+ * [JsonReader.readJsonValue] consumes exactly one JSON value whatever its shape, so a block that
+ * arrives as a string, an array, or an object with wrong-typed members leaves the reader
+ * positioned correctly for the rest of the capabilities document and yields `null` (or null
+ * members), which downstream coherence checks read as "feature off". A reflective decode would
+ * instead throw on the first type mismatch and take the whole capabilities response with it.
+ */
+class MediaMessageProtocolDtoAdapter {
+    @FromJson
+    fun fromJson(reader: JsonReader): MediaMessageProtocolDto? {
+        val block = reader.readJsonValue() as? Map<*, *> ?: return null
+        return MediaMessageProtocolDto(
+            ready = block["ready"] as? Boolean,
+            profile = block["profile"] as? String,
+            maxAttachments = integralMember(block, "max_attachments"),
+            maxDescriptorBytes = integralMember(block, "max_descriptor_bytes"),
+            maxCaptionUtf8Bytes = integralMember(block, "max_caption_utf8_bytes"),
+            minAttachmentCiphertextBytes = integralMember(block, "min_attachment_ciphertext_bytes"),
+            maxAttachmentCiphertextBytes = integralMember(block, "max_attachment_ciphertext_bytes"),
+            maxAggregateCiphertextBytes = integralMember(block, "max_aggregate_ciphertext_bytes"),
+        )
+    }
+
+    /** [JsonReader.readJsonValue] yields every number as a [Double]; only whole values count. */
+    private fun integralMember(block: Map<*, *>, key: String): Long? {
+        val number = (block[key] as? Number)?.toDouble() ?: return null
+        if (!number.isFinite() || number != Math.floor(number)) return null
+        if (number < Long.MIN_VALUE.toDouble() || number > Long.MAX_VALUE.toDouble()) return null
+        return number.toLong()
+    }
+}
 
 /**
  * The optional `protocols.realtime` block.
@@ -79,6 +138,73 @@ data class CapabilitiesDto(
     val protocols: ProtocolsDto? = null,
 )
 
+/**
+ * The onboarding service's starter checklist, exactly as the authoritative contract shapes
+ * it. Every field is required: a response missing any of them fails to parse, the fetch
+ * throws, and nothing is published — fail closed. Semantic validation (ownership,
+ * eligibility, policy version, milestone vocabulary) then happens in
+ * [com.kit.wallet.data.repository.validatedStarterChecklist], which rejects the whole
+ * response on any violation.
+ */
+@JsonClass(generateAdapter = false)
+data class StarterChecklistDto(
+    @Json(name = "account_id") val accountId: String,
+    val eligible: Boolean,
+    @Json(name = "policy_version") val policyVersion: Int,
+    val milestones: List<StarterChecklistMilestoneDto>,
+)
+
+/**
+ * One milestone row: `key` and `status` are required strings, and the `completed_at` key
+ * must itself be present even though its value is null until the milestone completes.
+ * Parsed only through [StarterChecklistMilestoneDtoAdapter] — registered ahead of the
+ * reflective factory — because reflection cannot tell an absent `completed_at` key from an
+ * explicit null, and the contract requires the key.
+ */
+@JsonClass(generateAdapter = false)
+data class StarterChecklistMilestoneDto(
+    val key: String,
+    val status: String,
+    @Json(name = "completed_at") val completedAt: String?,
+)
+
+/** Enforces the milestone-row schema, including presence of the nullable `completed_at`. */
+class StarterChecklistMilestoneDtoAdapter {
+    @FromJson
+    fun fromJson(reader: JsonReader): StarterChecklistMilestoneDto {
+        var key: String? = null
+        var status: String? = null
+        var completedAt: String? = null
+        var sawCompletedAt = false
+        reader.beginObject()
+        while (reader.hasNext()) {
+            when (reader.nextName()) {
+                "key" -> key = reader.nextString()
+                "status" -> status = reader.nextString()
+                "completed_at" -> {
+                    sawCompletedAt = true
+                    completedAt = if (reader.peek() == JsonReader.Token.NULL) {
+                        reader.nextNull()
+                    } else {
+                        reader.nextString()
+                    }
+                }
+                else -> reader.skipValue()
+            }
+        }
+        reader.endObject()
+        return StarterChecklistMilestoneDto(
+            key = key ?: throw JsonDataException("milestone row requires 'key'"),
+            status = status ?: throw JsonDataException("milestone row requires 'status'"),
+            completedAt = if (sawCompletedAt) {
+                completedAt
+            } else {
+                throw JsonDataException("milestone row requires the 'completed_at' key")
+            },
+        )
+    }
+}
+
 @JsonClass(generateAdapter = false)
 data class DeviceRegistrationDto(
     @Json(name = "installation_id") val installationId: String,
@@ -94,33 +220,6 @@ data class EmailLoginRequest(
     val email: String,
     val password: String,
     val device: DeviceRegistrationDto,
-)
-
-@JsonClass(generateAdapter = false)
-data class EmailRegistrationRequest(
-    val name: String,
-    val tag: String,
-    val email: String,
-    val password: String,
-    @Json(name = "password_confirmation") val passwordConfirmation: String,
-    @Json(name = "country_code") val countryCode: String = "UG",
-    val locale: String = "en",
-    val timezone: String,
-)
-
-@JsonClass(generateAdapter = false)
-data class EmailVerificationChallengeDto(
-    val type: String,
-    val method: String,
-    val destination: String,
-    @Json(name = "expires_at") val expiresAt: String,
-)
-
-@JsonClass(generateAdapter = false)
-data class EmailRegistrationResultDto(
-    val state: String,
-    val challenge: EmailVerificationChallengeDto,
-    val user: UserDto,
 )
 
 @JsonClass(generateAdapter = false)

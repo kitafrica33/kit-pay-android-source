@@ -1,9 +1,12 @@
 package com.kit.wallet.feature.chat
 
 import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.SystemClock
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateFloat
@@ -137,16 +140,20 @@ import com.kit.wallet.BuildConfig
 import com.kit.wallet.R
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitMediaMessageV2
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.messaging.displayName
 import com.kit.wallet.data.messaging.secureMediaSource
+import com.kit.wallet.data.notifications.ActiveCallPresence
 import com.kit.wallet.data.repository.AbuseReportContext
 import com.kit.wallet.data.repository.AbuseReportSelectionPolicy
 import com.kit.wallet.data.repository.AbuseReportTarget
 import com.kit.wallet.feature.auth.PaymentApproval
 import com.kit.wallet.feature.auth.rememberBiometricApprovalAvailable
+import com.kit.wallet.feature.calls.CallDurationAnchorPolicy
 import com.kit.wallet.feature.funding.TopUpSheet
 import com.kit.wallet.feature.funding.TopUpViewModel
 import com.kit.wallet.feature.chat.camera.CameraPull
@@ -164,6 +171,7 @@ import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.GroupPaymentSummary
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
+import com.kit.wallet.ui.model.MessageMediaItem
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.model.PaymentEventKind
 import com.kit.wallet.ui.model.TransferClaim
@@ -173,6 +181,8 @@ import com.kit.wallet.ui.model.acceptsDeliveryInfo
 import com.kit.wallet.ui.model.acceptsEdits
 import com.kit.wallet.ui.model.acceptsReactions
 import com.kit.wallet.ui.model.acceptsReplies
+import com.kit.wallet.ui.model.copyablePlaintext
+import com.kit.wallet.ui.model.presentableText
 import com.kit.wallet.ui.model.replyPreviewLabel
 import java.io.File
 import com.kit.wallet.ui.theme.KitGreen300
@@ -187,6 +197,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -219,6 +230,12 @@ fun ConversationScreen(
     onVideoCall: (String) -> Unit,
     /** The group's own screen — participants, roles, and the way out of it. */
     onOpenGroup: (String) -> Unit = {},
+    /**
+     * Returns to the live call named by the id. Never starts, answers or ends anything — while
+     * the app is in a call that belongs to this chat, every call affordance here reopens that
+     * call instead of dialing a second one.
+     */
+    onReturnToActiveCall: (String) -> Unit = {},
     viewModel: ConversationViewModel = hiltViewModel(),
     topUp: TopUpViewModel = hiltViewModel(),
     abuseReports: AbuseReportViewModel = hiltViewModel(),
@@ -244,6 +261,7 @@ fun ConversationScreen(
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val historyAvailable by viewModel.historyAvailable.collectAsStateWithLifecycle()
     val messageEditsAvailable by viewModel.messageEditsAvailable.collectAsStateWithLifecycle()
+    val mediaAlbumsAvailable by viewModel.mediaAlbumsAvailable.collectAsStateWithLifecycle()
     val chat by viewModel.chat.collectAsStateWithLifecycle()
     val sending by viewModel.sending.collectAsStateWithLifecycle()
     val retryingMessageId by viewModel.retryingMessageId.collectAsStateWithLifecycle()
@@ -261,6 +279,7 @@ fun ConversationScreen(
     val refusedForFunds by viewModel.topUpRequired.collectAsStateWithLifecycle()
     val topUpRequirement by topUp.requirement.collectAsStateWithLifecycle()
     val abuseReportState by abuseReports.state.collectAsStateWithLifecycle()
+    val activeCallPresence by viewModel.activeCallPresence.collectAsStateWithLifecycle()
     LaunchedEffect(refusedForFunds) {
         val shortfall = refusedForFunds ?: return@LaunchedEffect
         topUp.start(shortfall)
@@ -291,33 +310,73 @@ fun ConversationScreen(
     // library clip can be cut down before it is encrypted — the raw pick never goes straight
     // to the wire anymore. Photos keep their existing transcode-and-send path.
     var libraryVideoDraft by remember { mutableStateOf<LibraryVideoDraft?>(null) }
+    fun handleSingleLibraryPick(uri: Uri) {
+        val resolvedType = context.contentResolver.getType(uri).orEmpty().lowercase()
+        if (resolvedType.startsWith("video/")) {
+            coroutineScope.launch {
+                try {
+                    val staged = withContext(Dispatchers.IO) {
+                        stageLibraryVideoForEditing(context, uri, resolvedType)
+                    }
+                    libraryVideoDraft = staged
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    viewModel.reportMediaSelectionError(
+                        error.message ?: "The selected video could not be opened",
+                    )
+                }
+            }
+        } else {
+            sendPickedMedia {
+                // Photos are re-encoded first (orientation, size, stripped metadata), so this
+                // one really is bytes in heap — a transcoded still, not a source file.
+                val bytes = transcodeChatImage(context.contentResolver, uri)
+                    ?: error("The selected photo could not be prepared")
+                PickedMedia(SecureMediaSource.ofBytes(bytes), "image/jpeg")
+            }
+        }
+    }
     val pickLibraryMedia = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
     ) { uri ->
-        if (uri != null) {
-            val resolvedType = context.contentResolver.getType(uri).orEmpty().lowercase()
-            if (resolvedType.startsWith("video/")) {
-                coroutineScope.launch {
-                    try {
-                        val staged = withContext(Dispatchers.IO) {
-                            stageLibraryVideoForEditing(context, uri, resolvedType)
+        if (uri != null) handleSingleLibraryPick(uri)
+    }
+    // Multi-select variant, offered only while the account's album capability is proven. One
+    // pick stays on the single-item paths (a lone video still opens the trim editor); several
+    // picks become one album, so they arrive as one message rather than a burst of bubbles.
+    val pickLibraryMediaAlbum = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(KitMediaMessageV2.MAX_ATTACHMENTS),
+    ) { uris ->
+        when {
+            uris.isEmpty() -> Unit
+            uris.size == 1 -> handleSingleLibraryPick(uris.single())
+            uris.any {
+                context.contentResolver.getType(it).orEmpty().lowercase().startsWith("video/")
+            } -> {
+                // Albums skip the per-clip trim editor, and skipping it would put raw library
+                // video on the wire — so a mixed pick sends nothing rather than something else.
+                viewModel.reportMediaSelectionError(
+                    "Videos are sent one at a time for now. Select photos only to send them together.",
+                )
+            }
+            else -> coroutineScope.launch {
+                try {
+                    val attachments = withContext(Dispatchers.IO + NonCancellable) {
+                        uris.map { uri ->
+                            val bytes = transcodeChatImage(context.contentResolver, uri)
+                                ?: error("A selected photo could not be prepared")
+                            SecureMediaAlbumSource(SecureMediaSource.ofBytes(bytes), "image/jpeg")
                         }
-                        libraryVideoDraft = staged
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (error: Exception) {
-                        viewModel.reportMediaSelectionError(
-                            error.message ?: "The selected video could not be opened",
-                        )
                     }
-                }
-            } else {
-                sendPickedMedia {
-                    // Photos are re-encoded first (orientation, size, stripped metadata), so this
-                    // one really is bytes in heap — a transcoded still, not a source file.
-                    val bytes = transcodeChatImage(context.contentResolver, uri)
-                        ?: error("The selected photo could not be prepared")
-                    PickedMedia(SecureMediaSource.ofBytes(bytes), "image/jpeg")
+                    coroutineContext.ensureActive()
+                    viewModel.sendMediaAlbum(attachments)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    viewModel.reportMediaSelectionError(
+                        error.message ?: "The selected photos could not be opened",
+                    )
                 }
             }
         }
@@ -507,6 +566,8 @@ fun ConversationScreen(
         onVoiceCall = onVoiceCall,
         onVideoCall = onVideoCall,
         onOpenGroup = { onOpenGroup(currentChat.id) },
+        activeCallPresence = activeCallPresence,
+        onReturnToActiveCall = onReturnToActiveCall,
         sending = sending,
         retryingMessageId = retryingMessageId,
         error = error,
@@ -618,11 +679,17 @@ fun ConversationScreen(
         // stale composition from opening a picker while the release profile is text-only.
         onAttachLibrary = {
             if (BuildConfig.MEDIA_MESSAGING_ENABLED) {
-                pickLibraryMedia.launch(
-                    PickVisualMediaRequest(
-                        ActivityResultContracts.PickVisualMedia.ImageAndVideo,
-                    ),
+                val request = PickVisualMediaRequest(
+                    ActivityResultContracts.PickVisualMedia.ImageAndVideo,
                 )
+                // Multi-select appears only while the server has proven the album capability;
+                // the send path re-proves the whole gate anyway, this just avoids offering a
+                // selection the account could never send as one message.
+                if (mediaAlbumsAvailable) {
+                    pickLibraryMediaAlbum.launch(request)
+                } else {
+                    pickLibraryMedia.launch(request)
+                }
             }
         },
         onAttachCamera = {
@@ -652,6 +719,8 @@ fun ConversationScreen(
         mediaErrors = mediaErrors,
         onOpenMedia = viewModel::openMedia,
         onRetryMedia = viewModel::retryMedia,
+        onOpenAlbumItem = viewModel::openAlbumItem,
+        onRetryAlbumItem = viewModel::retryAlbumItem,
         onOpenViewer = { message -> galleryMessageId = message.id },
         restoredDraft = restoredDraft,
         onRestoredDraftConsumed = viewModel::consumeRestoredDraft,
@@ -710,6 +779,9 @@ private const val CONVERSATION_LEADING_ITEMS = 2
 
 /** How often the thread re-checks which of one's own messages are still inside the edit window. */
 private const val EDIT_WINDOW_TICK_MILLIS = 15_000L
+
+/** How long a focus-jumped message keeps its highlight tint before fading back to normal. */
+private const val FOCUS_HIGHLIGHT_MILLIS = 2_200L
 
 /** In-memory plaintext plus a monotonic edit fence for delayed durable-send callbacks. */
 internal data class ConversationComposerState(
@@ -770,6 +842,14 @@ internal fun ConversationContent(
     onVoiceCall: (String) -> Unit,
     onVideoCall: (String) -> Unit,
     onOpenGroup: () -> Unit = {},
+    /**
+     * The call this app is connected to right now, if any. Drawn as this thread's live-call
+     * banner — and rerouting every call affordance to a reopen — only when it strictly matches
+     * this chat; a call belonging elsewhere renders nothing here.
+     */
+    activeCallPresence: ActiveCallPresence? = null,
+    /** Returns to the live call named by the id; never starts, answers or ends anything. */
+    onReturnToActiveCall: (String) -> Unit = {},
     sending: Boolean,
     retryingMessageId: String?,
     error: String?,
@@ -816,6 +896,8 @@ internal fun ConversationContent(
     mediaErrors: Map<String, String> = emptyMap(),
     onOpenMedia: (Message) -> Unit = {},
     onRetryMedia: (Message) -> Unit = {},
+    onOpenAlbumItem: (Message, MessageMediaItem) -> Unit = { _, _ -> },
+    onRetryAlbumItem: (Message, MessageMediaItem) -> Unit = { _, _ -> },
     onOpenViewer: (Message) -> Unit = {},
     reactionsEnabled: Boolean = false,
     onToggleReaction: (Message, String) -> Unit = { _, _ -> },
@@ -966,6 +1048,12 @@ internal fun ConversationContent(
         )
     }
     var conversationMenuOpen by remember(chat.id) { mutableStateOf(false) }
+    // The call this app is in belongs to this thread only on a strict authenticated match —
+    // the server's conversation linkage, or a direct chat's peer on the call's roster. Anything
+    // else fails closed to "no live call here", so no surface can reopen somebody else's call.
+    val liveCall = activeCallPresence?.takeIf {
+        it.matchesChat(chatId = chat.id, isGroup = chat.isGroup, peerUserId = chat.peerUserId)
+    }
 
     // Keep the newest message visible, just like WhatsApp: jump to the bottom the first time the
     // thread loads, then follow new messages only while the reader is already near the bottom.
@@ -1012,7 +1100,59 @@ internal fun ConversationContent(
     LaunchedEffect(nearBottom) {
         if (nearBottom) pendingNewMessages = 0
     }
-    LaunchedEffect(chat.id, conversationRowKeys, messageIds) {
+    // The voice-note bar's body tap lands this thread on the exact message that is speaking. The
+    // request is consumed before scrolling so it runs once; while it is pending for this thread,
+    // the opening jump-to-newest stands down and lets the focus jump own first positioning.
+    val rowMessageIds = remember(conversationRows) {
+        conversationRows.map { row -> row.messages.map(Message::id) }
+    }
+    val focusRequest by ConversationFocusRequests.current.collectAsStateWithLifecycle()
+    val focusAction = conversationFocusAction(focusRequest, chat.id, rowMessageIds)
+    val focusPending = focusAction is ConversationFocusAction.Jump ||
+        focusAction is ConversationFocusAction.Wait
+    val currentRowMessageIds by rememberUpdatedState(rowMessageIds)
+    val currentMessageIds by rememberUpdatedState(messageIds)
+    var focusedMessageId by remember(chat.id) { mutableStateOf<String?>(null) }
+    // Keyed on the thread, not the request: consuming the request must not cancel the collector
+    // mid-jump. rememberUpdatedState feeds snapshotFlow because it only reacts to State reads.
+    LaunchedEffect(chat.id) {
+        combine(
+            ConversationFocusRequests.current,
+            snapshotFlow { currentRowMessageIds },
+        ) { request, rows -> request to rows }
+            .collect { (request, rows) ->
+                request ?: return@collect
+                when (val action = conversationFocusAction(request, chat.id, rows)) {
+                    is ConversationFocusAction.Jump -> {
+                        // Claim first positioning before consuming, so the scroll effect never
+                        // sees "unpositioned, nothing pending" and jumps to the other end.
+                        val firstPosition = renderedMessageIds == null
+                        if (firstPosition) renderedMessageIds = currentMessageIds.toSet()
+                        ConversationFocusRequests.consume(request)
+                        val targetIndex = action.rowIndex + CONVERSATION_LEADING_ITEMS
+                        snapshotFlow { listState.layoutInfo.totalItemsCount }
+                            .first { totalItems -> totalItems > targetIndex }
+                        focusedMessageId = request.messageId
+                        if (firstPosition) {
+                            listState.scrollToItem(targetIndex)
+                        } else {
+                            listState.animateScrollToItem(targetIndex)
+                        }
+                    }
+                    // Loaded thread, no such message: the quote-jump rule — do nothing rather
+                    // than scroll somewhere arbitrary — but consume so it cannot fire later.
+                    ConversationFocusAction.Drop -> ConversationFocusRequests.consume(request)
+                    ConversationFocusAction.Wait, ConversationFocusAction.Ignore -> Unit
+                }
+            }
+    }
+    LaunchedEffect(focusedMessageId) {
+        if (focusedMessageId != null) {
+            delay(FOCUS_HIGHLIGHT_MILLIS)
+            focusedMessageId = null
+        }
+    }
+    LaunchedEffect(chat.id, conversationRowKeys, messageIds, focusPending) {
         if (messages.isEmpty()) {
             // Keep null for a brand-new conversation composition so its first hydrated rows take
             // the explicit jump path. A thread whose existing rows were removed is already
@@ -1022,7 +1162,8 @@ internal fun ConversationContent(
             return@LaunchedEffect
         }
         val bottomIndex = conversationRows.size + CONVERSATION_LEADING_ITEMS
-        val decision = conversationScrollDecision(renderedMessageIds, messages, nearBottom)
+        val decision =
+            conversationScrollDecision(renderedMessageIds, messages, nearBottom, focusPending)
         when (decision.action) {
             ConversationScrollAction.JUMP_TO_NEWEST,
             ConversationScrollAction.FOLLOW_NEWEST,
@@ -1043,7 +1184,11 @@ internal fun ConversationContent(
                 pendingNewMessages += decision.unseenMessages
             }
         }
-        renderedMessageIds = messageIds.toSet()
+        // While a focus jump still owns first positioning, leave the thread unpositioned here so
+        // the jump's own claim (or its Drop) decides what happens, not a half-taken snapshot.
+        if (!(focusPending && renderedMessageIds == null)) {
+            renderedMessageIds = messageIds.toSet()
+        }
     }
     LaunchedEffect(chat.id, groupPaymentHydrationKey) {
         if (
@@ -1256,17 +1401,41 @@ internal fun ConversationContent(
                     }
                 },
                 actions = {
+                    // While this thread's own call is live, both icons return to it — starting a
+                    // second call over the first is never on offer.
                     IconButton(
-                        enabled = chat.peerUserId != null,
-                        onClick = { chat.peerUserId?.let(onVideoCall) },
+                        enabled = liveCall != null || chat.peerUserId != null,
+                        onClick = {
+                            val live = liveCall
+                            if (live != null) {
+                                onReturnToActiveCall(live.callId)
+                            } else {
+                                chat.peerUserId?.let(onVideoCall)
+                            }
+                        },
                     ) {
-                        Icon(Icons.Rounded.Videocam, contentDescription = "Video call")
+                        Icon(
+                            Icons.Rounded.Videocam,
+                            contentDescription =
+                                if (liveCall != null) "Return to call" else "Video call",
+                        )
                     }
                     IconButton(
-                        enabled = chat.peerUserId != null,
-                        onClick = { chat.peerUserId?.let(onVoiceCall) },
+                        enabled = liveCall != null || chat.peerUserId != null,
+                        onClick = {
+                            val live = liveCall
+                            if (live != null) {
+                                onReturnToActiveCall(live.callId)
+                            } else {
+                                chat.peerUserId?.let(onVoiceCall)
+                            }
+                        },
                     ) {
-                        Icon(Icons.Rounded.Call, contentDescription = "Voice call")
+                        Icon(
+                            Icons.Rounded.Call,
+                            contentDescription =
+                                if (liveCall != null) "Return to call" else "Voice call",
+                        )
                     }
                     if (abuseReportingAvailable && !chat.isGroup) {
                         Box {
@@ -1497,6 +1666,19 @@ internal fun ConversationContent(
                 // republishes the whole list (which happens on every sync commit).
                 key = { index -> conversationRows[index].key },
             ) { i ->
+                val rowFocused = focusedMessageId != null &&
+                    conversationRows[i].messages.any { it.id == focusedMessageId }
+                val focusTint by animateColorAsState(
+                    targetValue = if (rowFocused) {
+                        MaterialTheme.colorScheme.secondary.copy(alpha = 0.18f)
+                    } else {
+                        Color.Transparent
+                    },
+                    label = "conversationFocusHighlight",
+                )
+                // Inline wrapper so the group branch's return@items still returns from the
+                // items lambda; the tint briefly marks the row a focus jump landed on.
+                Box(Modifier.fillMaxWidth().background(focusTint)) {
                 val group = conversationRows[i] as? ConversationRow.ImageGroup
                 if (group != null) {
                     ImageGroupBubble(
@@ -1520,9 +1702,20 @@ internal fun ConversationContent(
                     CallLogBubble(
                         msg = message,
                         onCall = {
-                            message.callDirection?.let {
-                                chat.peerUserId?.let { peer ->
-                                    if (message.callVideo) onVideoCall(peer) else onVoiceCall(peer)
+                            // With this thread's call already live, the log row returns to it
+                            // instead of redialing a second call over the first.
+                            val live = liveCall
+                            if (live != null) {
+                                onReturnToActiveCall(live.callId)
+                            } else {
+                                message.callDirection?.let {
+                                    chat.peerUserId?.let { peer ->
+                                        if (message.callVideo) {
+                                            onVideoCall(peer)
+                                        } else {
+                                            onVoiceCall(peer)
+                                        }
+                                    }
                                 }
                             }
                         },
@@ -1595,6 +1788,11 @@ internal fun ConversationContent(
                         onOpenMedia = { onOpenMedia(message) },
                         onRetryMedia = { onRetryMedia(message) },
                         onOpenViewer = { onOpenViewer(message) },
+                        albumMediaFiles = mediaFiles,
+                        albumMediaLoading = mediaLoading,
+                        albumMediaErrors = mediaErrors,
+                        onOpenAlbumItem = { item -> onOpenAlbumItem(message, item) },
+                        onRetryAlbumItem = { item -> onRetryAlbumItem(message, item) },
                         reactable = reactionsEnabled && message.acceptsReactions,
                         onToggleReaction = { emoji -> onToggleReaction(message, emoji) },
                         replyable = sendEnabled && message.acceptsReplies,
@@ -1638,6 +1836,7 @@ internal fun ConversationContent(
                         onCancelSchedule = { onCancelScheduledSend(message) },
                         showSenderName = message.id in senderNamedIds,
                     )
+                }
                 }
             }
             // Below the last message and above the trailing spacer, so it occupies the place the
@@ -1692,6 +1891,17 @@ internal fun ConversationContent(
                     )
                 }
             }
+        }
+        // This thread's own live call, floating over the top of the list the way the new-message
+        // chip floats over the bottom. Tapping it returns to the call; nothing here starts one.
+        liveCall?.let { call ->
+            LiveCallBanner(
+                call = call,
+                onReturn = { onReturnToActiveCall(call.callId) },
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 10.dp),
+            )
         }
         }
     }
@@ -1780,6 +1990,15 @@ internal fun MessageBubble(
     onOpenMedia: () -> Unit = {},
     onRetryMedia: () -> Unit = {},
     onOpenViewer: () -> Unit = {},
+    /**
+     * Album items key the same media maps per attachment via [albumItemMediaKey], so an album
+     * bubble needs the whole maps where a single-attachment bubble needs one slice.
+     */
+    albumMediaFiles: Map<String, SecureMediaFile> = emptyMap(),
+    albumMediaLoading: Set<String> = emptySet(),
+    albumMediaErrors: Map<String, String> = emptyMap(),
+    onOpenAlbumItem: (MessageMediaItem) -> Unit = {},
+    onRetryAlbumItem: (MessageMediaItem) -> Unit = {},
     /** False while secure messaging is unavailable, so the palette is never offered offline. */
     reactable: Boolean = false,
     onToggleReaction: (String) -> Unit = {},
@@ -1838,22 +2057,7 @@ internal fun MessageBubble(
 
     // Copyable plaintext exists only for ordinary text and media captions; payment cards,
     // call logs and raw descriptors are deliberately not exposed to the clipboard.
-    val copyableText = when (msg.kind) {
-        MessageKind.TEXT -> msg.text
-        MessageKind.IMAGE, MessageKind.VIDEO, MessageKind.VOICE_NOTE, MessageKind.DOCUMENT ->
-            msg.text.takeIf {
-                it.isNotBlank() && it !in setOf("Photo", "Voice note", "Video", "Document")
-            }
-        MessageKind.PAYMENT,
-        MessageKind.PAYMENT_REQUEST,
-        MessageKind.PAYMENT_TRANSFER,
-        MessageKind.PAYMENT_EVENT,
-        MessageKind.GROUP_PAYMENT,
-        MessageKind.GROUP_PAYMENT_EVENT,
-        MessageKind.CALL,
-        MessageKind.SYSTEM,
-        -> null
-    }
+    val copyableText = msg.copyablePlaintext()
     var actionMenuOpen by remember(msg.id) { mutableStateOf(false) }
     var pickerOpen by remember(msg.id) { mutableStateOf(false) }
     var reactorsOpen by remember(msg.id) { mutableStateOf(false) }
@@ -2109,16 +2313,28 @@ internal fun MessageBubble(
                             onRetryMedia = onRetryMedia,
                             onOpenViewer = onOpenViewer,
                         )
+                        MessageKind.MEDIA_ALBUM -> MediaAlbumContent(
+                            msg = msg,
+                            mediaFiles = albumMediaFiles,
+                            mediaLoading = albumMediaLoading,
+                            mediaErrors = albumMediaErrors,
+                            onOpenItem = onOpenAlbumItem,
+                            onRetryItem = onRetryAlbumItem,
+                        )
+                        MessageKind.UNSUPPORTED_ATTACHMENT ->
+                            Text(msg.text, style = MaterialTheme.typography.bodyLarge)
                         // PAYMENT_EVENT, SYSTEM and both group-payment kinds never reach a bubble
                         // — the list renders the golden card and the outcome line full width — and
-                        // CALL is handled by CallLogBubble before this point.
+                        // CALL is handled by CallLogBubble before this point. [presentableText]
+                        // keeps reserved media-namespace bytes from persisted or scheduled
+                        // sources out of the one branch that renders raw text.
                         MessageKind.TEXT,
                         MessageKind.PAYMENT_EVENT,
                         MessageKind.GROUP_PAYMENT,
                         MessageKind.GROUP_PAYMENT_EVENT,
                         MessageKind.SYSTEM,
                         MessageKind.CALL,
-                        -> Text(msg.text, style = MaterialTheme.typography.bodyLarge)
+                        -> Text(msg.presentableText(), style = MaterialTheme.typography.bodyLarge)
                     }
                     Row(
                         Modifier
@@ -3094,6 +3310,74 @@ private fun CallLogBubble(msg: Message, onCall: () -> Unit) {
             }
         }
     }
+}
+
+/**
+ * The floating pill naming this thread's live call: its authenticated display name and, once the
+ * answer anchor exists, a duration ticking each second from that anchor — never a wall clock,
+ * which device time changes would corrupt. Tapping it returns to the call already in progress.
+ */
+@Composable
+private fun LiveCallBanner(
+    call: ActiveCallPresence,
+    onReturn: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val seconds = rememberLiveCallSeconds(call)
+    Surface(
+        shape = CircleShape,
+        color = KitTheme.colors.successContainer,
+        shadowElevation = 4.dp,
+        modifier = modifier.clip(CircleShape).clickable(onClick = onReturn),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                if (call.video) Icons.Rounded.Videocam else Icons.Rounded.Call,
+                contentDescription = "Return to call",
+                tint = KitTheme.colors.success,
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                call.name,
+                style = MaterialTheme.typography.labelMedium,
+                color = KitTheme.colors.onSuccessContainer,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 180.dp),
+            )
+            if (call.anchor != null) {
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    formatCallDuration(seconds),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = KitTheme.colors.onSuccessContainer,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Seconds of connected time for [call], re-read every second from the call's authoritative answer
+ * anchor against the monotonic clock. Before the anchor exists this stays at zero and callers
+ * simply omit the timer, rather than counting from a guess.
+ */
+@Composable
+internal fun rememberLiveCallSeconds(call: ActiveCallPresence): Long {
+    var seconds by remember(call.callId, call.anchor) {
+        mutableLongStateOf(CallDurationAnchorPolicy.seconds(call.anchor, SystemClock.elapsedRealtime()))
+    }
+    LaunchedEffect(call.callId, call.anchor) {
+        while (true) {
+            seconds = CallDurationAnchorPolicy.seconds(call.anchor, SystemClock.elapsedRealtime())
+            delay(1_000)
+        }
+    }
+    return seconds
 }
 
 /** The camera panel peeking from behind the conversation while the pull gesture is held. */

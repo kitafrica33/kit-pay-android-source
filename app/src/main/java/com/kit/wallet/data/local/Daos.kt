@@ -68,6 +68,23 @@ interface WalletTransactionDao {
         walletUuid: String,
     ): Flow<List<WalletTransactionEntity>>
 
+    /**
+     * Every cached transaction across all of the current owner's wallets. The home starter
+     * checklist reads this so a first payment made from a non-selected wallet still counts.
+     */
+    @Query(
+        "SELECT wallet_transactions.* FROM wallet_transactions " +
+            "WHERE EXISTS (" +
+            "SELECT 1 FROM sync_state AS cache_owner " +
+            "WHERE cache_owner.`key` = :ownerKey " +
+            "AND cache_owner.value = :ownerScopeId) " +
+            "ORDER BY occurredAtEpochMillis DESC, id DESC",
+    )
+    fun observeForOwner(
+        ownerScopeId: String,
+        ownerKey: String,
+    ): Flow<List<WalletTransactionEntity>>
+
     @Upsert
     suspend fun upsertAll(transactions: List<WalletTransactionEntity>)
 

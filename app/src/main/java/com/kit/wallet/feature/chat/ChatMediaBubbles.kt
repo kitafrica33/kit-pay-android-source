@@ -62,12 +62,17 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.mediaAlbumPreviewLabel
 import com.kit.wallet.ui.components.kitNameAccent
 import com.kit.wallet.ui.model.Message
+import com.kit.wallet.ui.model.MessageMediaItem
 import com.kit.wallet.ui.model.acceptsReactions
+import com.kit.wallet.ui.model.albumItemMediaKey
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -690,6 +695,455 @@ private fun GroupImageTile(
                         onReportMessage(message)
                     },
                 )
+            }
+        }
+    }
+}
+
+/**
+ * Rows of a `KITMEDIA2` album bubble, in exactly the descriptor's display order: consecutive
+ * photos and videos pair up into tile rows, while a voice note or document always takes a full
+ * row of its own. Order is authoritative — items are grouped, never resorted.
+ */
+internal fun mediaAlbumContentRows(items: List<MessageMediaItem>): List<List<MessageMediaItem>> {
+    val rows = mutableListOf<List<MessageMediaItem>>()
+    val visualRun = mutableListOf<MessageMediaItem>()
+    fun flushVisualRun() {
+        visualRun.chunked(2).forEach { rows.add(it) }
+        visualRun.clear()
+    }
+    items.forEach { item ->
+        if (item.mediaType.substringBefore('/') in setOf("image", "video")) {
+            visualRun.add(item)
+        } else {
+            flushVisualRun()
+            rows.add(listOf(item))
+        }
+    }
+    flushVisualRun()
+    return rows
+}
+
+/**
+ * One `KITMEDIA2` album as one bubble: every attachment is its own tile or row in display order,
+ * each downloading, decrypting, failing and retrying independently, with the caption — when the
+ * descriptor carries one — under the items, inside the same bubble.
+ *
+ * Both queued (local spool) and received (authenticated download) albums render through here; the
+ * per-item open path is decided by the repository from the descriptor, never by the UI.
+ */
+@Composable
+internal fun MediaAlbumContent(
+    msg: Message,
+    mediaFiles: Map<String, SecureMediaFile>,
+    mediaLoading: Set<String>,
+    mediaErrors: Map<String, String>,
+    onOpenItem: (MessageMediaItem) -> Unit,
+    onRetryItem: (MessageMediaItem) -> Unit,
+) {
+    val rows = remember(msg.id, msg.mediaItems) { mediaAlbumContentRows(msg.mediaItems) }
+    val albumLabel = remember(msg.id, msg.mediaItems) {
+        mediaAlbumPreviewLabel(msg.mediaItems.map { it.mediaType })
+    }
+    Column(
+        verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(3.dp),
+    ) {
+        // The tiles keep their own touch semantics; the album as a whole announces its shape the
+        // same way the pre-tile bubble did. The caption below speaks for itself as ordinary text.
+        Column(
+            Modifier
+                .width(248.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .semantics { contentDescription = albumLabel },
+            verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(3.dp),
+        ) {
+            rows.forEach { row ->
+                val single = row.singleOrNull()
+                when {
+                    single != null && single.mediaType.substringBefore('/') !in setOf("image", "video") ->
+                        MediaAlbumWideRow(msg, single, mediaFiles, mediaLoading, mediaErrors, onOpenItem, onRetryItem)
+                    single != null -> MediaAlbumVisualTile(
+                        msg = msg,
+                        item = single,
+                        mediaFiles = mediaFiles,
+                        mediaLoading = mediaLoading,
+                        mediaErrors = mediaErrors,
+                        onOpenItem = onOpenItem,
+                        onRetryItem = onRetryItem,
+                        modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f),
+                    )
+                    else -> Row(
+                        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(3.dp),
+                    ) {
+                        row.forEach { item ->
+                            MediaAlbumVisualTile(
+                                msg = msg,
+                                item = item,
+                                mediaFiles = mediaFiles,
+                                mediaLoading = mediaLoading,
+                                mediaErrors = mediaErrors,
+                                onOpenItem = onOpenItem,
+                                onRetryItem = onRetryItem,
+                                modifier = Modifier.weight(1f).aspectRatio(1f),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        // Presence of a caption is a descriptor fact; it renders verbatim — even a caption that
+        // happens to begin "KITMEDIA2:" is plain typed content once strict validation accepted it.
+        msg.mediaCaption?.let { caption ->
+            Text(
+                caption,
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.padding(top = 1.dp),
+            )
+        }
+    }
+}
+
+/** A photo or video tile of an album: its own download, its own failure, its own player. */
+@Composable
+private fun MediaAlbumVisualTile(
+    msg: Message,
+    item: MessageMediaItem,
+    mediaFiles: Map<String, SecureMediaFile>,
+    mediaLoading: Set<String>,
+    mediaErrors: Map<String, String>,
+    onOpenItem: (MessageMediaItem) -> Unit,
+    onRetryItem: (MessageMediaItem) -> Unit,
+    modifier: Modifier,
+) {
+    val context = LocalContext.current
+    val itemKey = albumItemMediaKey(msg.id, item.attachmentId)
+    val media = mediaFiles[itemKey]
+    val loading = itemKey in mediaLoading
+    val failed = mediaErrors.containsKey(itemKey)
+    val isVideo = item.mediaType.substringBefore('/') == "video"
+    var viewerFile by remember(itemKey) { mutableStateOf<File?>(null) }
+    var imageViewerOpen by remember(itemKey) { mutableStateOf(false) }
+    val thumbnail by produceState<ImageBitmap?>(initialValue = null, itemKey, media) {
+        value = media?.let { opened ->
+            withContext(Dispatchers.Default) {
+                if (isVideo) {
+                    videoPosterFrame(opened.file)?.asImageBitmap()
+                } else {
+                    decodeBoundedSecureImage(opened.file)
+                }
+            }
+        }
+    }
+    Box(
+        modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+            .clickable(enabled = !loading) {
+                when {
+                    failed -> onRetryItem(item)
+                    media == null -> onOpenItem(item)
+                    isVideo -> viewerFile = runCatching {
+                        writeChatMediaTempFile(
+                            context = context,
+                            source = media.file,
+                            mediaType = item.mediaType,
+                            displayName = null,
+                        )
+                    }.getOrNull()
+                    else -> imageViewerOpen = true
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        thumbnail?.let {
+            Image(
+                bitmap = it,
+                contentDescription = if (isVideo) "Encrypted video" else "Photo",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+            )
+        }
+        when {
+            loading -> CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            failed -> Text(
+                "Retry",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+            media == null -> Icon(
+                Icons.Rounded.Download,
+                contentDescription = if (isVideo) "Load video" else "Load photo",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            isVideo -> Box(
+                Modifier
+                    .size(40.dp)
+                    .background(Color.Black.copy(alpha = 0.45f), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Rounded.PlayArrow,
+                    contentDescription = "Play video",
+                    tint = Color.White,
+                    modifier = Modifier.size(26.dp),
+                )
+            }
+        }
+    }
+    viewerFile?.let { file ->
+        SecureVideoPlayerDialog(file = file, onDismiss = {
+            deleteChatMediaTempFile(file)
+            viewerFile = null
+        })
+    }
+    if (imageViewerOpen && media != null) {
+        SecureAlbumImageDialog(file = media.file, onDismiss = { imageViewerOpen = false })
+    }
+}
+
+/** A voice note or document of an album, full width, in the row style of its single-item kind. */
+@Composable
+private fun MediaAlbumWideRow(
+    msg: Message,
+    item: MessageMediaItem,
+    mediaFiles: Map<String, SecureMediaFile>,
+    mediaLoading: Set<String>,
+    mediaErrors: Map<String, String>,
+    onOpenItem: (MessageMediaItem) -> Unit,
+    onRetryItem: (MessageMediaItem) -> Unit,
+) {
+    if (item.mediaType.substringBefore('/') == "audio") {
+        MediaAlbumAudioRow(msg, item, mediaFiles, mediaLoading, mediaErrors, onOpenItem, onRetryItem)
+    } else {
+        MediaAlbumDocumentRow(msg, item, mediaFiles, mediaLoading, mediaErrors, onOpenItem, onRetryItem)
+    }
+}
+
+/**
+ * An audio attachment of an album. Playback runs through [VoiceNotePlayer] keyed by the item key,
+ * so two audio items of one album are two independently playable notes.
+ */
+@Composable
+private fun MediaAlbumAudioRow(
+    msg: Message,
+    item: MessageMediaItem,
+    mediaFiles: Map<String, SecureMediaFile>,
+    mediaLoading: Set<String>,
+    mediaErrors: Map<String, String>,
+    onOpenItem: (MessageMediaItem) -> Unit,
+    onRetryItem: (MessageMediaItem) -> Unit,
+) {
+    val context = LocalContext.current
+    val chatContext = LocalVoiceNoteChatContext.current
+    val itemKey = albumItemMediaKey(msg.id, item.attachmentId)
+    val media = mediaFiles[itemKey]
+    val loading = itemKey in mediaLoading
+    val mediaError = mediaErrors[itemKey]
+    val playback by VoiceNotePlayer.state.collectAsStateWithLifecycle()
+    val isCurrent = playback.isCurrent(itemKey)
+    val playing = isCurrent && !playback.isPaused
+    val progress = if (isCurrent) playback.progress else 0f
+    var playbackError by remember(itemKey) { mutableStateOf<String?>(null) }
+
+    DisposableEffect(itemKey) {
+        VoiceNotePlayer.noteSourceVisibility(true, itemKey)
+        onDispose { VoiceNotePlayer.noteSourceVisibility(false, itemKey) }
+    }
+
+    val accent = LocalContentColor.current
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 2.dp)) {
+        Box(
+            Modifier
+                .size(38.dp)
+                .background(accent.copy(alpha = 0.16f), CircleShape)
+                .clickable(enabled = !loading) {
+                    when {
+                        mediaError != null -> onRetryItem(item)
+                        media == null -> onOpenItem(item)
+                        else -> {
+                            playbackError = null
+                            try {
+                                VoiceNotePlayer.toggle(
+                                    context = context,
+                                    messageId = itemKey,
+                                    file = media.file,
+                                    playbackContext = chatContext.playbackContext(
+                                        msg.senderUserId.takeUnless { msg.fromMe },
+                                    ),
+                                )
+                            } catch (error: Exception) {
+                                playbackError =
+                                    error.message ?: "This voice note could not be played"
+                            }
+                        }
+                    }
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            if (loading) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            } else {
+                Icon(
+                    if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                    contentDescription = if (playing) "Pause voice note" else "Play voice note",
+                    tint = accent,
+                )
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column {
+            VoiceNoteWaveform(
+                messageId = itemKey,
+                playedFraction = progress,
+                accent = accent,
+                modifier = Modifier.voiceNoteSeekGestures(itemKey),
+            )
+            Text(
+                when {
+                    mediaError != null -> mediaError
+                    playbackError != null -> playbackError.orEmpty()
+                    media != null -> "Voice note"
+                    else -> chatMediaByteLabel(item.plaintextBytes).ifEmpty { "Voice note" }
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = if (mediaError != null || playbackError != null) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    accent.copy(alpha = 0.7f)
+                },
+                modifier = Modifier.padding(top = 3.dp),
+            )
+        }
+    }
+}
+
+/**
+ * A document attachment of an album: decrypt on demand, then hand off to the system viewer via
+ * the app's FileProvider grant. A `KITMEDIA2` item carries no filename, so the tile says what the
+ * attachment is rather than what it was called.
+ */
+@Composable
+private fun MediaAlbumDocumentRow(
+    msg: Message,
+    item: MessageMediaItem,
+    mediaFiles: Map<String, SecureMediaFile>,
+    mediaLoading: Set<String>,
+    mediaErrors: Map<String, String>,
+    onOpenItem: (MessageMediaItem) -> Unit,
+    onRetryItem: (MessageMediaItem) -> Unit,
+) {
+    val context = LocalContext.current
+    val itemKey = albumItemMediaKey(msg.id, item.attachmentId)
+    val media = mediaFiles[itemKey]
+    val loading = itemKey in mediaLoading
+    val mediaError = mediaErrors[itemKey]
+    var openError by remember(itemKey) { mutableStateOf<String?>(null) }
+    val accent = LocalContentColor.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .padding(vertical = 2.dp)
+            .clickable(enabled = !loading) {
+                when {
+                    mediaError != null -> onRetryItem(item)
+                    media == null -> onOpenItem(item)
+                    else -> {
+                        openError = null
+                        val result = runCatching {
+                            val file = writeChatMediaTempFile(
+                                context = context,
+                                source = media.file,
+                                mediaType = item.mediaType,
+                                displayName = null,
+                            )
+                            val uri = FileProvider.getUriForFile(
+                                context,
+                                "${context.packageName}.chatmedia",
+                                file,
+                            )
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW)
+                                    .setDataAndType(uri, item.mediaType)
+                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                            )
+                        }
+                        result.exceptionOrNull()?.let { error ->
+                            openError = if (error is ActivityNotFoundException) {
+                                "No app on this phone can open this document"
+                            } else {
+                                "This document could not be opened"
+                            }
+                        }
+                    }
+                }
+            },
+    ) {
+        Box(
+            Modifier
+                .size(42.dp)
+                .background(accent.copy(alpha = 0.16f), RoundedCornerShape(10.dp)),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (loading) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            } else {
+                Icon(Icons.Rounded.Description, contentDescription = null, tint = accent)
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column {
+            Text(
+                "Document",
+                style = MaterialTheme.typography.titleSmall,
+                maxLines = 1,
+            )
+            Text(
+                mediaError ?: openError ?: chatMediaByteLabel(item.plaintextBytes)
+                    .ifEmpty { if (media != null) "Tap to open" else "Tap to download" },
+                style = MaterialTheme.typography.labelSmall,
+                color = if (mediaError != null || openError != null) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    accent.copy(alpha = 0.7f)
+                },
+            )
+        }
+    }
+}
+
+/** Full-screen viewer for one decrypted album photo; the bytes never leave app-private storage. */
+@Composable
+private fun SecureAlbumImageDialog(file: File, onDismiss: () -> Unit) {
+    val image by produceState<ImageBitmap?>(initialValue = null, file) {
+        value = withContext(Dispatchers.Default) { decodeBoundedSecureImage(file) }
+    }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .clickable(onClick = onDismiss),
+            contentAlignment = Alignment.Center,
+        ) {
+            image?.let {
+                Image(
+                    bitmap = it,
+                    contentDescription = "Photo",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit,
+                )
+            }
+            IconButton(
+                onClick = onDismiss,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 40.dp, end = 16.dp)
+                    .background(Color.White.copy(alpha = 0.2f), CircleShape),
+            ) {
+                Icon(Icons.Rounded.Close, contentDescription = "Close photo", tint = Color.White)
             }
         }
     }

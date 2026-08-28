@@ -35,12 +35,54 @@ internal enum class SecureMessagingProjectionDeliveryState {
     OUTBOUND_PERMANENT_FAILURE,
 }
 
+/**
+ * Message-local verdict for reserved media-family text on a record, persisted with the
+ * row's projection metadata. Codec-stable: ordinals are append-only.
+ *
+ * [NONE] means no verdict was ever recorded — ordinary text or rows written before verdicts
+ * existed. [VALIDATED] is positive provenance that strict v2 text was either constructed by the
+ * local send path or passed its envelope binding on receipt; only this makes a multi-item
+ * descriptor actionable. [UNSUPPORTED] pins inbound reserved text that failed strict parsing or
+ * binding to the sanitized placeholder. Verdicts are monotone and [UNSUPPORTED] is absorbing.
+ */
+internal enum class SecureMessagingMediaDisposition {
+    NONE,
+    VALIDATED,
+    UNSUPPORTED,
+}
+
 internal data class SecureMessagingProjectedMessage(
     val durableRecord: LibSignalCompanionRecord,
     val serverMessageId: String?,
     val sentAt: Instant,
     val deliveryState: SecureMessagingProjectionDeliveryState,
-)
+    val mediaDisposition: SecureMessagingMediaDisposition =
+        SecureMessagingMediaDisposition.NONE,
+) {
+    /**
+     * True when this row's reserved media-family text must project as the sanitized generation
+     * marker instead of actionable content: pages substitute the marker and the record is
+     * excluded from archive export and history donation.
+     *
+     * A pinned [SecureMessagingMediaDisposition.UNSUPPORTED] verdict is always sanitized. Family
+     * text with no persisted verdict is also sanitized — covering rows recorded before verdicts
+     * existed and any crash window between the companion commit and the verdict write — unless it
+     * is a strictly valid first-generation single-attachment descriptor, whose legacy records
+     * predate provenance and keep their historical trust. A multi-item descriptor is therefore
+     * actionable only through the positive [SecureMessagingMediaDisposition.VALIDATED] pin and
+     * only while it still strictly parses as v2. This applies in both directions: an outbound row
+     * written by an older build from user-authored spoof text has no pin and remains fail-closed.
+     */
+    val unsupportedMedia: Boolean
+        get() = when (mediaDisposition) {
+            SecureMessagingMediaDisposition.UNSUPPORTED -> true
+            SecureMessagingMediaDisposition.VALIDATED ->
+                requiresModernMediaSchemaFence(durableRecord.authenticatedText) &&
+                    KitMediaMessageV2.parse(durableRecord.authenticatedText) == null
+            SecureMessagingMediaDisposition.NONE ->
+                requiresModernMediaSchemaFence(durableRecord.authenticatedText)
+        }
+}
 
 internal class SecureMessagingProjectionPage(
     messages: List<SecureMessagingProjectedMessage>,
@@ -194,6 +236,7 @@ internal class SecureMessagingProjectionStore @Inject constructor(
                 serverMessageId = metadata.serverMessageId,
                 sentAt = Instant.ofEpochMilli(metadata.sentAtEpochMillis),
                 deliveryState = metadata.deliveryState,
+                mediaDisposition = metadata.mediaDisposition,
             )
         }.filter { it.serverMessageId == messageId }
         check(possible.size <= 1) { "Retained history has duplicate authenticated sources" }
@@ -484,6 +527,8 @@ internal class SecureMessagingProjectionStore @Inject constructor(
                     LibSignalCompanionDirection.OUTBOUND ->
                         SecureMessagingProjectionDeliveryState.OUTBOUND_PENDING
                 },
+                mediaDisposition = metadata?.mediaDisposition
+                    ?: SecureMessagingMediaDisposition.NONE,
             )
         }
         return SecureMessagingProjectionPage(messages, companionPage.nextAfterRecordKey)
@@ -497,6 +542,12 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         // Archiving is deliberately best-effort for live traffic: a temporarily unavailable
         // archive key must not block authenticated messaging. The next projection pass retries.
         page.messages().forEach { projected ->
+            // A sanitized reserved-media row never leaves this device: its durable text is a
+            // descriptor that failed envelope binding — or a multi-item descriptor nothing ever
+            // validated, including rows recorded before verdicts existed — and archiving it
+            // would let a restore resurrect it as ordinary words. Validated rows are archived
+            // with their provenance so restoration can keep them actionable.
+            if (projected.unsupportedMedia) return@forEach
             try {
                 archive.archive(projected)
             } catch (cancelled: CancellationException) {
@@ -568,19 +619,51 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         }
     }
 
+    /**
+     * [disposition] is the caller's media verdict for this row — [SecureMessagingMediaDisposition.VALIDATED]
+     * only when the reserved descriptor's envelope binding was actually checked on this delivery.
+     * It is written with the first metadata commit and excluded from replay-identity validation,
+     * so a duplicate delivery of a row recorded before verdicts existed still acknowledges.
+     */
     suspend fun recordInbound(
         durableRecord: LibSignalCompanionRecord,
         sentAt: Instant,
+        disposition: SecureMessagingMediaDisposition = SecureMessagingMediaDisposition.NONE,
     ) {
         val durable = requireInboundProjection(durableRecord)
-        createOrValidate(
-            inboundMetadata(durable, sentAt),
-            durable,
-        )
-        // Deliberately re-signal an idempotent replay. A process/storage interruption can happen
-        // after metadata commits but before observers see the StateFlow revision. The retained
-        // event then repairs UI visibility without advancing the Signal ratchet a second time.
-        signalChanged()
+        check(disposition != SecureMessagingMediaDisposition.UNSUPPORTED) {
+            "Unsupported media must use the pinning projection path"
+        }
+        val incoming = inboundMetadata(durable, sentAt).copy(mediaDisposition = disposition)
+        repeat(MAX_PROJECTION_WRITE_ATTEMPTS) { attempt ->
+            val existing = readMetadataRecord(durable.recordKey)
+            val updated = if (existing == null) {
+                incoming
+            } else {
+                validateMetadataMatches(existing.metadata, durable)
+                validateIdempotentMetadata(existing.metadata, incoming)
+                existing.metadata.copy(
+                    mediaDisposition = mergeMediaDisposition(
+                        existing.metadata.mediaDisposition,
+                        disposition,
+                    ),
+                )
+            }
+            if (existing != null && updated == existing.metadata) {
+                // Deliberately re-signal an idempotent replay. A process/storage interruption can
+                // happen after metadata commits but before observers see the StateFlow revision.
+                signalChanged()
+                return
+            }
+            try {
+                writeMetadata(durable.recordKey, updated, existing?.version)
+                signalChanged()
+                return
+            } catch (conflict: SecureMessagingStateConflictException) {
+                if (attempt == MAX_PROJECTION_WRITE_ATTEMPTS - 1) throw conflict
+            }
+        }
+        error("Inbound projection write retry bound was exhausted")
     }
 
     /**
@@ -604,6 +687,10 @@ internal class SecureMessagingProjectionStore @Inject constructor(
                     existing.metadata.deliveryState ==
                     SecureMessagingProjectionDeliveryState.INBOUND_SUPPRESSED
                 ) {
+                    // Deliberately re-signal an idempotent replay, mirroring recordInbound: a
+                    // crash between the metadata commit and the StateFlow revision would
+                    // otherwise leave the committed suppression invisible to every observer.
+                    signalChanged()
                     return
                 }
             }
@@ -619,6 +706,53 @@ internal class SecureMessagingProjectionStore @Inject constructor(
             }
         }
         error("Inbound suppression write retry bound was exhausted")
+    }
+
+    /**
+     * Durably pins one authenticated inbound record whose reserved-media content failed its
+     * envelope binding. Unlike suppression the row stays visible — the transcript slot is
+     * authentic — but every projection substitutes the sanitized generation marker for its
+     * text, and the record is excluded from archive export and history donation, so the
+     * descriptor (which embeds attachment keys) can never become actionable or leave the
+     * device. Append-only: replays re-derive the same verdict and nothing ever clears the pin.
+     * A row already suppressed by another authenticated rejection remains suppressed; recording
+     * a media verdict never resurrects hidden content.
+     */
+    suspend fun recordInboundUnsupportedMedia(
+        durableRecord: LibSignalCompanionRecord,
+        sentAt: Instant,
+    ) {
+        val durable = requireInboundProjection(durableRecord)
+        val unsupported = inboundMetadata(durable, sentAt).copy(
+            mediaDisposition = SecureMessagingMediaDisposition.UNSUPPORTED,
+        )
+        repeat(MAX_PROJECTION_WRITE_ATTEMPTS) { attempt ->
+            val existing = readMetadataRecord(durable.recordKey)
+            val updated: ProjectionMetadata
+            if (existing != null) {
+                validateMetadataMatches(existing.metadata, durable)
+                updated = existing.metadata.copy(
+                    mediaDisposition = SecureMessagingMediaDisposition.UNSUPPORTED,
+                )
+                if (updated == existing.metadata) {
+                    // Deliberately re-signal an idempotent replay, mirroring recordInbound: a
+                    // crash between the metadata commit and the StateFlow revision would
+                    // otherwise leave the committed placeholder undiscovered by every observer.
+                    signalChanged()
+                    return
+                }
+            } else {
+                updated = unsupported
+            }
+            try {
+                writeMetadata(durable.recordKey, updated, existing?.version)
+                signalChanged()
+                return
+            } catch (conflict: SecureMessagingStateConflictException) {
+                if (attempt == MAX_PROJECTION_WRITE_ATTEMPTS - 1) throw conflict
+            }
+        }
+        error("Inbound unsupported-media write retry bound was exhausted")
     }
 
     suspend fun recordOutboundPending(
@@ -638,6 +772,16 @@ internal class SecureMessagingProjectionStore @Inject constructor(
                 serverMessageId = null,
                 sentAtEpochMillis = requireTimestamp(createdAt),
                 deliveryState = SecureMessagingProjectionDeliveryState.OUTBOUND_PENDING,
+                // Only a new locally constructed strict-v2 send gets this pin. An existing
+                // pre-verdict outbound row is merely replay-validated by createOrValidate and is
+                // deliberately not promoted, so historical user-authored spoof text stays inert.
+                mediaDisposition = if (
+                    KitMediaMessageV2.parse(durable.authenticatedText) != null
+                ) {
+                    SecureMessagingMediaDisposition.VALIDATED
+                } else {
+                    SecureMessagingMediaDisposition.NONE
+                },
             ),
             durable,
         )) signalChanged()
@@ -1241,9 +1385,27 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         fromCurrentUser: Boolean,
     ) {
         validateArchivedDurableMatch(durable, archived)
-        val desired = archivedProjectionMetadata(durable, archived, fromCurrentUser)
+        val archivedMetadata = archivedProjectionMetadata(durable, archived, fromCurrentUser)
         repeat(MAX_PROJECTION_WRITE_ATTEMPTS) { attempt ->
             val existing = readMetadataRecord(durable.recordKey)
+            val restoredDisposition = if (
+                archived.mediaValidated &&
+                KitMediaMessageV2.parse(durable.authenticatedText) != null
+            ) {
+                SecureMessagingMediaDisposition.VALIDATED
+            } else {
+                SecureMessagingMediaDisposition.NONE
+            }
+            // A local verdict is monotone. Positive archive provenance can repair an older NONE,
+            // but never clears VALIDATED and never overrides an absorbing UNSUPPORTED pin. A flag
+            // on anything other than strict v2 stays inert.
+            val desired = archivedMetadata.copy(
+                mediaDisposition = mergeMediaDisposition(
+                    existing?.metadata?.mediaDisposition
+                        ?: SecureMessagingMediaDisposition.NONE,
+                    restoredDisposition,
+                ),
+            )
             if (existing != null) {
                 validateMetadataMatches(existing.metadata, durable)
                 if (
@@ -1253,14 +1415,36 @@ internal class SecureMessagingProjectionStore @Inject constructor(
                     return // Never resurrect a message-local authenticated rejection.
                 }
                 if (isAcceptedProjectionState(existing.metadata.deliveryState)) {
-                    check(existing.metadata.copy(deliveryState = desired.deliveryState) == desired) {
+                    check(
+                        existing.metadata.copy(
+                            deliveryState = desired.deliveryState,
+                            mediaDisposition = desired.mediaDisposition,
+                        ) == desired,
+                    ) {
                         "Archived projection metadata changed immutable message history"
                     }
                 }
-                if (archivedProjectionRank(existing.metadata.deliveryState) >=
-                    archivedProjectionRank(desired.deliveryState)
+                val existingRank = archivedProjectionRank(existing.metadata.deliveryState)
+                val desiredRank = archivedProjectionRank(desired.deliveryState)
+                if (
+                    existingRank >= desiredRank &&
+                    existing.metadata.mediaDisposition == desired.mediaDisposition
                 ) {
                     return
+                }
+                val update = desired.copy(
+                    deliveryState = if (existingRank >= desiredRank) {
+                        existing.metadata.deliveryState
+                    } else {
+                        desired.deliveryState
+                    },
+                )
+                try {
+                    writeMetadata(durable.recordKey, update, existing.version)
+                    return
+                } catch (conflict: SecureMessagingStateConflictException) {
+                    if (attempt == MAX_PROJECTION_WRITE_ATTEMPTS - 1) throw conflict
+                    return@repeat
                 }
             }
             try {
@@ -1277,18 +1461,39 @@ internal class SecureMessagingProjectionStore @Inject constructor(
         existing: ProjectionMetadata,
         expected: ProjectionMetadata,
     ) {
+        // The media disposition is a local append-only verdict, not part of the message's
+        // replayable identity: a duplicate delivery re-derives its own verdict (or none at all
+        // for rows recorded before verdicts existed), and the original must still validate as
+        // the same record — otherwise the replay throws before its delivery ACK and the
+        // envelope is redelivered forever.
+        val comparableExisting = existing.copy(
+            mediaDisposition = SecureMessagingMediaDisposition.NONE,
+        )
+        val comparableExpected = expected.copy(
+            mediaDisposition = SecureMessagingMediaDisposition.NONE,
+        )
         if (
-            expected.deliveryState == SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED &&
-            existing.deliveryState in INBOUND_DELIVERY_STATES &&
-            existing.copy(
+            comparableExpected.deliveryState ==
+            SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED &&
+            comparableExisting.deliveryState in INBOUND_DELIVERY_STATES &&
+            comparableExisting.copy(
                 deliveryState = SecureMessagingProjectionDeliveryState.INBOUND_RECEIVED,
-            ) == expected
+            ) == comparableExpected
         ) {
             return
         }
-        check(existing == expected) {
+        check(comparableExisting == comparableExpected) {
             "Secure-message projection metadata changed for an existing record"
         }
+    }
+
+    private fun mergeMediaDisposition(
+        existing: SecureMessagingMediaDisposition,
+        incoming: SecureMessagingMediaDisposition,
+    ): SecureMessagingMediaDisposition = when (existing) {
+        SecureMessagingMediaDisposition.UNSUPPORTED -> SecureMessagingMediaDisposition.UNSUPPORTED
+        SecureMessagingMediaDisposition.VALIDATED -> SecureMessagingMediaDisposition.VALIDATED
+        SecureMessagingMediaDisposition.NONE -> incoming
     }
 
     private fun signalChanged() {
@@ -1504,6 +1709,9 @@ private data class ProjectionMetadata(
     val serverMessageId: String?,
     val sentAtEpochMillis: Long,
     val deliveryState: SecureMessagingProjectionDeliveryState,
+    /** Monotone media verdict for reserved-family text; NONE when never judged. */
+    val mediaDisposition: SecureMessagingMediaDisposition =
+        SecureMessagingMediaDisposition.NONE,
 ) {
     init {
         require(isCanonicalUuid(conversationId)) { "Invalid projected conversation ID" }
@@ -1516,6 +1724,10 @@ private data class ProjectionMetadata(
             (direction == LibSignalCompanionDirection.INBOUND) ==
                 (deliveryState in INBOUND_DELIVERY_STATES),
         ) { "Projected message direction and delivery state disagree" }
+        require(
+            mediaDisposition != SecureMessagingMediaDisposition.UNSUPPORTED ||
+                direction == LibSignalCompanionDirection.INBOUND,
+        ) { "Only an inbound projection can pin unsupported media" }
     }
 }
 
@@ -1559,7 +1771,16 @@ private object ProjectionMetadataCodec {
         val data = DataOutputStream(output)
         try {
             data.write(MAGIC)
-            data.writeInt(SCHEMA_VERSION)
+            // A row without a media verdict still encodes byte-identically to the original
+            // schema; only judged rows carry the appended disposition under the new version.
+            val schema = if (
+                metadata.mediaDisposition == SecureMessagingMediaDisposition.NONE
+            ) {
+                SCHEMA_VERSION
+            } else {
+                SCHEMA_VERSION_MEDIA_DISPOSITION
+            }
+            data.writeInt(schema)
             data.writeByte(metadata.direction.ordinal)
             data.writeString(metadata.conversationId)
             data.writeString(metadata.clientMessageId)
@@ -1567,6 +1788,9 @@ private object ProjectionMetadataCodec {
             metadata.serverMessageId?.let { data.writeString(it) }
             data.writeLong(metadata.sentAtEpochMillis)
             data.writeByte(metadata.deliveryState.ordinal)
+            if (metadata.mediaDisposition != SecureMessagingMediaDisposition.NONE) {
+                data.writeByte(metadata.mediaDisposition.ordinal)
+            }
             data.flush()
             return output.toOwnedByteArray()
         } finally {
@@ -1586,7 +1810,10 @@ private object ProjectionMetadataCodec {
                 require(magic.contentEquals(MAGIC)) {
                     "Invalid secure-message projection metadata header"
                 }
-                require(data.readInt() == SCHEMA_VERSION) {
+                val schema = data.readInt()
+                require(
+                    schema == SCHEMA_VERSION || schema == SCHEMA_VERSION_MEDIA_DISPOSITION,
+                ) {
                     "Unsupported secure-message projection metadata schema"
                 }
                 val direction = enumAt<LibSignalCompanionDirection>(data.readUnsignedByte())
@@ -1603,6 +1830,15 @@ private object ProjectionMetadataCodec {
                 val state = enumAt<SecureMessagingProjectionDeliveryState>(
                     data.readUnsignedByte(),
                 )
+                val mediaDisposition = if (schema == SCHEMA_VERSION_MEDIA_DISPOSITION) {
+                    enumAt<SecureMessagingMediaDisposition>(data.readUnsignedByte()).also {
+                        require(it != SecureMessagingMediaDisposition.NONE) {
+                            "Media-disposition projection schema requires a verdict"
+                        }
+                    }
+                } else {
+                    SecureMessagingMediaDisposition.NONE
+                }
                 require(input.available() == 0) {
                     "Secure-message projection metadata contains trailing bytes"
                 }
@@ -1613,6 +1849,7 @@ private object ProjectionMetadataCodec {
                     serverMessageId,
                     sentAtEpochMillis,
                     state,
+                    mediaDisposition,
                 )
             }
         } finally {
@@ -1652,6 +1889,13 @@ private object ProjectionMetadataCodec {
 
     private val MAGIC = byteArrayOf(0x4b, 0x49, 0x54, 0x50, 0x52, 0x4f, 0x4a)
     private const val SCHEMA_VERSION = 1
+
+    /**
+     * Appends the media disposition as a trailing ordinal byte. Kept as a separate version so
+     * every unjudged row still encodes byte-identically to [SCHEMA_VERSION]; only rows that
+     * actually carry a verdict use it.
+     */
+    private const val SCHEMA_VERSION_MEDIA_DISPOSITION = 2
     private const val MAX_STRING_BYTES = 160
     private const val MIN_RECORD_BYTES = 7 + Int.SIZE_BYTES + 1 + 4 + 1 + 4 + 1 + 8 + 1
     private const val MAX_RECORD_BYTES = 1_024

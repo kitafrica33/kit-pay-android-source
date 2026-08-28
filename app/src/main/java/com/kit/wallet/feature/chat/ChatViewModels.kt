@@ -19,8 +19,11 @@ import com.kit.wallet.data.messaging.ScheduledSendDispatcher
 import com.kit.wallet.data.messaging.ScheduledSendKind
 import com.kit.wallet.data.messaging.ScheduledSendState
 import com.kit.wallet.data.messaging.ScheduledSendStore
+import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.data.messaging.SecureMediaSource
+import com.kit.wallet.data.notifications.ActiveCallPresence
+import com.kit.wallet.data.notifications.ActiveCallStateHolder
 import com.kit.wallet.data.realtime.KitConversationSignals
 import com.kit.wallet.data.realtime.KitTypingSignals
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
@@ -46,6 +49,8 @@ import com.kit.wallet.ui.model.GroupPaymentSummary
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageDeliveryInfo
 import com.kit.wallet.ui.model.MessageKind
+import com.kit.wallet.ui.model.MessageMediaItem
+import com.kit.wallet.ui.model.albumItemMediaKey
 import com.kit.wallet.ui.model.PaymentEventKind
 import com.kit.wallet.ui.model.TopUp
 import com.kit.wallet.ui.model.TopUpRequirement
@@ -152,9 +157,13 @@ internal class ConversationSoundBaseline {
 class ChatsViewModel @Inject constructor(
     private val chatRepo: ChatRepository,
     contactRepo: ContactRepository,
+    activeCallState: ActiveCallStateHolder = ActiveCallStateHolder(),
 ) : ViewModel() {
     /** Whether a message can be sent right now. Never a reason to withhold the list. */
     val messagingAvailable = chatRepo.readiness
+
+    /** This account's live call, if any: the list marks its owning row and returns to the call. */
+    internal val activeCallPresence: StateFlow<ActiveCallPresence?> = activeCallState.presence
 
     /** Whether what is on screen came from the local encrypted store. */
     val historyAvailable = chatRepo.localHistoryReady
@@ -233,6 +242,7 @@ class ConversationViewModel @Inject internal constructor(
     private val messageSounds: MessageSoundPlayer,
     private val realtime: KitConversationSignals,
     private val typingSignaller: KitTypingSignals,
+    activeCallState: ActiveCallStateHolder = ActiveCallStateHolder(),
     savedStateHandle: SavedStateHandle,
     internal val richMediaCapability: MessagingRichMediaCapability? = null,
     private val scheduledSends: ScheduledSendStore? = null,
@@ -243,6 +253,9 @@ class ConversationViewModel @Inject internal constructor(
     /** Current authenticated public ID; used only to bind server claims to this direct chat. */
     val currentAccountId: String?
         get() = walletRepo.currentAccountId
+
+    /** This account's live call, if any, for the header actions, call-log rows and live banner. */
+    internal val activeCallPresence: StateFlow<ActiveCallPresence?> = activeCallState.presence
 
     private val chatId: String = savedStateHandle.get<String>("chatId")
         ?.trim()
@@ -264,6 +277,12 @@ class ConversationViewModel @Inject internal constructor(
      * that the send path would have to refuse once it read the conversation roster.
      */
     val messageEditsAvailable = chatRepo.messageEditsAvailable
+
+    /**
+     * Whether the library picker may offer multi-select. False withdraws the affordance; the
+     * send path still re-proves the whole capability gate before any upload.
+     */
+    val mediaAlbumsAvailable = chatRepo.mediaAlbumsAvailable
     val chat: StateFlow<ChatPreview?> = chatRepo.chats
         .map { chats -> chats.singleOrNull { it.id == chatId } }
         .stateIn(
@@ -1815,6 +1834,61 @@ class ConversationViewModel @Inject internal constructor(
     }
 
     /**
+     * Sends everything the person multi-selected as ONE end-to-end encrypted message: one bubble,
+     * one caption, one send. A single-item list falls through to the classic media message.
+     */
+    fun sendMediaAlbum(
+        attachments: List<SecureMediaAlbumSource>,
+        onSent: () -> Unit = {},
+        /** Same contract as [sendMedia]'s: whoever staged the bytes owns them until this fires. */
+        onFinished: () -> Unit = {},
+    ) {
+        val selectedChat = chat.value
+        if (selectedChat == null || !historyAvailable.value || mutableSending.value) {
+            mutableError.value = if (mutableSending.value) {
+                "Wait for the current attachment to finish sending, then try again"
+            } else {
+                "Secure messaging is temporarily unavailable"
+            }
+            onFinished()
+            return
+        }
+        val replyToMessageId = consumeReplyTarget()
+        val sendJob = viewModelScope.launch {
+            mutableSending.value = true
+            mutableError.value = null
+            try {
+                // Per-item policy check first, so an oversized pick fails before any encryption.
+                // A declared size of zero means the provider would not say; the cipher still
+                // stops at the compiled cap.
+                for (attachment in attachments) {
+                    if (attachment.source.declaredByteCount > 0) {
+                        richMediaCapability?.requireSendable(
+                            attachment.mediaType.trim().lowercase(),
+                            attachment.source.declaredByteCount,
+                        )
+                    }
+                }
+                chatRepo.sendMediaAlbumMessage(
+                    chatId = selectedChat.id,
+                    attachments = attachments,
+                    caption = null,
+                    replyToMessageId = replyToMessageId,
+                )
+                onSent()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message
+                    ?: "The secure attachments could not be sent"
+            } finally {
+                mutableSending.value = false
+            }
+        }
+        sendJob.invokeOnCompletion { onFinished() }
+    }
+
+    /**
      * Recording/encoding cap for the in-app camera: the compiled policy clamped to what this
      * service currently accepts, so the camera improves for free when the service limit rises.
      */
@@ -1917,6 +1991,55 @@ class ConversationViewModel @Inject internal constructor(
         discardMedia(message.id)
         mutableMediaErrors.value = mutableMediaErrors.value - message.id
         openMedia(message)
+    }
+
+    /**
+     * [openMedia] for one attachment of an album bubble; results and failures are keyed per item
+     * via [albumItemMediaKey], so eight tiles of one message load, fail and retry independently.
+     */
+    fun openAlbumItem(message: Message, item: MessageMediaItem) {
+        val selectedChat = chat.value ?: return
+        val descriptor = message.mediaDescriptor ?: return
+        if (!historyAvailable.value) return
+        // Composer-staging chips carry placeholder ids; there is nothing to open until the queue
+        // record with real attachment ids replaces them.
+        if (item.attachmentId.startsWith("staging:")) return
+        val key = albumItemMediaKey(message.id, item.attachmentId)
+        if (
+            mutableMediaFiles.value[key]?.exists == true ||
+            key in mutableMediaLoading.value ||
+            mutableMediaErrors.value.containsKey(key)
+        ) return
+        mutableMediaLoading.value = mutableMediaLoading.value + key
+        viewModelScope.launch {
+            try {
+                val opened = secureMediaOpenMutex.withLock {
+                    withContext(NonCancellable) {
+                        chatRepo.openAlbumItemMessage(
+                            selectedChat.id,
+                            descriptor,
+                            item.attachmentId,
+                        )
+                    }
+                }
+                coroutineContext.ensureActive()
+                cacheMedia(key, opened)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableMediaErrors.value = mutableMediaErrors.value +
+                    (key to (error.message ?: "The secure attachment could not be opened"))
+            } finally {
+                mutableMediaLoading.value = mutableMediaLoading.value - key
+            }
+        }
+    }
+
+    fun retryAlbumItem(message: Message, item: MessageMediaItem) {
+        val key = albumItemMediaKey(message.id, item.attachmentId)
+        discardMedia(key)
+        mutableMediaErrors.value = mutableMediaErrors.value - key
+        openAlbumItem(message, item)
     }
 
     /**

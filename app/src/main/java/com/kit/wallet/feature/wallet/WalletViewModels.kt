@@ -32,7 +32,7 @@ class SendMoneyViewModel @Inject constructor(
     private val wallet: WalletRepository,
     private val walletSync: WalletSyncRepository,
     private val chats: ChatRepository,
-    contactRepo: ContactRepository,
+    private val contactRepo: ContactRepository,
 ) : ViewModel() {
 
     val contacts = contactRepo.contacts
@@ -55,6 +55,23 @@ class SendMoneyViewModel @Inject constructor(
      */
     private val _topUpRequired = MutableStateFlow<TopUpRequirement?>(null)
     val topUpRequired = _topUpRequired.asStateFlow()
+
+    init {
+        // The app-wide contact graph is warm-cached for offline use, but Send money is an
+        // authoritative destination picker. Re-read it whenever this flow is opened so a newly
+        // registered or relinked Kit account is not hidden behind an older session snapshot.
+        // Failure deliberately leaves the cached list usable; the payment endpoint still owns
+        // final recipient validation.
+        viewModelScope.launch {
+            try {
+                contactRepo.refresh()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Cached recipients remain useful while offline.
+            }
+        }
+    }
 
     /**
      * How far this wallet falls short of a transfer, or null when it covers it.

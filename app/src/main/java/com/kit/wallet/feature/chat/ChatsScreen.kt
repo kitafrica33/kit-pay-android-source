@@ -22,6 +22,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AddComment
+import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Done
 import androidx.compose.material.icons.rounded.DoneAll
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
@@ -61,7 +63,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.data.demo.DemoData
 import kotlinx.coroutines.delay
+import com.kit.wallet.data.notifications.ActiveCallPresence
 import com.kit.wallet.data.repository.MessageSearchHit
+import com.kit.wallet.feature.calls.formatCallDuration
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
@@ -75,12 +79,15 @@ fun ChatsScreen(
     onNewChat: () -> Unit,
     /** The group builder: pick who is in it, name it, and it opens as a conversation. */
     onNewGroup: () -> Unit = {},
+    /** Returns to the call already in progress; the row never starts a new one. */
+    onReturnToActiveCall: (String) -> Unit = {},
     viewModel: ChatsViewModel = hiltViewModel(),
 ) {
     val chats by viewModel.chats.collectAsStateWithLifecycle()
     val messagingAvailable by viewModel.messagingAvailable.collectAsStateWithLifecycle()
     val historyAvailable by viewModel.historyAvailable.collectAsStateWithLifecycle()
     val contacts by viewModel.searchableContacts.collectAsStateWithLifecycle()
+    val activeCallPresence by viewModel.activeCallPresence.collectAsStateWithLifecycle()
     ChatsContent(
         allChats = chats,
         messagingAvailable = messagingAvailable,
@@ -94,6 +101,8 @@ fun ChatsScreen(
         searchableContacts = contacts,
         searchMessages = viewModel::searchMessages,
         onSearchedContact = { contact -> viewModel.openDirectConversation(contact, onChat) },
+        activeCallPresence = activeCallPresence,
+        onReturnToActiveCall = onReturnToActiveCall,
     )
 }
 
@@ -112,6 +121,9 @@ internal fun ChatsContent(
     searchableContacts: List<Contact> = emptyList(),
     searchMessages: (String) -> List<MessageSearchHit> = { emptyList() },
     onSearchedContact: (Contact) -> Unit = {},
+    /** This account's live call, so its owning row can show it and return to it. */
+    activeCallPresence: ActiveCallPresence? = null,
+    onReturnToActiveCall: (String) -> Unit = {},
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf("All") }
@@ -302,6 +314,12 @@ internal fun ChatsContent(
             }
             items(chats.size) { i ->
                 val chat = chats[i]
+                // The live call marks only the row it strictly belongs to — the server's
+                // conversation linkage or a direct chat's peer on the call roster — never a
+                // lookalike, so this row can never reopen somebody else's call.
+                val liveCall = activeCallPresence?.takeIf {
+                    it.matchesChat(chatId = chat.id, isGroup = chat.isGroup, peerUserId = chat.peerUserId)
+                }
                 ChatRow(
                     chat = chat,
                     selecting = selecting,
@@ -317,6 +335,8 @@ internal fun ChatsContent(
                     onPin = { onSetPinned(listOf(chat.id), !chat.pinned) },
                     onMute = { onSetMuted(listOf(chat.id), !chat.muted) },
                     onMarkRead = { onMarkRead(listOf(chat.id)) },
+                    liveCall = liveCall,
+                    onReturnToCall = { liveCall?.let { onReturnToActiveCall(it.callId) } },
                 )
             }
             if (searching && messageHits.isNotEmpty()) {
@@ -541,6 +561,9 @@ private fun ChatRow(
     onPin: () -> Unit = {},
     onMute: () -> Unit = {},
     onMarkRead: () -> Unit = {},
+    /** The live call this row's conversation strictly owns, or null for the normal preview. */
+    liveCall: ActiveCallPresence? = null,
+    onReturnToCall: () -> Unit = {},
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Box {
@@ -617,6 +640,39 @@ private fun ChatRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            if (liveCall != null) {
+                // The ongoing call takes the preview line: live colour, the call's own kind, and
+                // a duration ticking from the authoritative answer anchor (no anchor, no timer).
+                // Its own tap target returns to the call; the rest of the row still opens the chat.
+                val liveSeconds = rememberLiveCallSeconds(liveCall)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.clickable(onClick = onReturnToCall),
+                ) {
+                    Icon(
+                        if (liveCall.video) Icons.Rounded.Videocam else Icons.Rounded.Call,
+                        contentDescription = "Return to call",
+                        modifier = Modifier
+                            .size(15.dp)
+                            .padding(end = 2.dp),
+                        tint = KitTheme.colors.success,
+                    )
+                    Text(
+                        buildString {
+                            append(if (liveCall.video) "Video call" else "Voice call")
+                            if (liveCall.anchor != null) {
+                                append(" · ")
+                                append(formatCallDuration(liveSeconds))
+                            }
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = KitTheme.colors.success,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            } else {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (chat.lastFromMe) {
                     Icon(
@@ -662,6 +718,7 @@ private fun ChatRow(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+            }
             }
         }
         Spacer(Modifier.width(10.dp))

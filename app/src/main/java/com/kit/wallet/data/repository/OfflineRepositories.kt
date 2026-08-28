@@ -289,7 +289,9 @@ class OfflineWalletRepository @Inject constructor(
                 session.cacheScopeId,
                 AUTHENTICATED_CACHE_OWNER_KEY,
             ).map { wallet ->
-                wallet?.let { OwnedSelectedWallet(session.cacheScopeId, it) }
+                wallet?.let {
+                    OwnedSelectedWallet(session.cacheScopeId, session.accountId, it)
+                }
             }
         }
     }.stateIn(scope, SharingStarted.Eagerly, null)
@@ -319,6 +321,31 @@ class OfflineWalletRepository @Inject constructor(
         }
         .map { rows -> rows.map { it.toUiModel() } }
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
+
+    override val accountTransactions: StateFlow<OwnedTransactions> = selectedWallet
+        .flatMapLatest { selected ->
+            if (selected == null) {
+                flowOf(OwnedTransactions(ownerAccountId = null, transactions = emptyList()))
+            } else {
+                transactionDao.observeForOwner(
+                    selected.ownerScopeId,
+                    AUTHENTICATED_CACHE_OWNER_KEY,
+                ).map { rows ->
+                    // The owner rides in the same emission as the rows it owns, so a
+                    // consumer can never pair one account's evidence with another's
+                    // session — the exact race an account switch used to open.
+                    OwnedTransactions(
+                        ownerAccountId = selected.ownerAccountId,
+                        transactions = rows.map { it.toUiModel() },
+                    )
+                }
+            }
+        }
+        .stateIn(
+            scope,
+            SharingStarted.Eagerly,
+            OwnedTransactions(ownerAccountId = null, transactions = emptyList()),
+        )
 
     override val beneficiaries: StateFlow<List<Beneficiary>> =
         flowOf(emptyList<Beneficiary>()).stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -805,6 +832,8 @@ class OfflineWalletRepository @Inject constructor(
 
     private data class OwnedSelectedWallet(
         val ownerScopeId: String,
+        /** The backend account that owns this cache scope, carried with every emission. */
+        val ownerAccountId: String?,
         val wallet: com.kit.wallet.data.local.WalletEntity,
     )
 }

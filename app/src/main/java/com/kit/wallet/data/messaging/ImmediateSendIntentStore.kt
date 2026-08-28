@@ -119,8 +119,15 @@ internal class ImmediateSendIntentStore @Inject constructor(
                 check(existing.sameUserIntentAs(intent)) {
                     "An immediate-send identity belongs to different content"
                 }
-                if (existing.state == ImmediateSendState.RETRY_REQUIRED) {
-                    writeLocked(existing.copy(state = ImmediateSendState.WAITING))
+                when (existing.state) {
+                    ImmediateSendState.RETRY_REQUIRED ->
+                        writeLocked(existing.copy(state = ImmediateSendState.WAITING))
+                    // A failed record's ciphertext is gone for good, and failure is only ever
+                    // recorded before the encrypted outbox takes over — so sharing the same
+                    // content again is a fresh attempt. Adopt the caller's newly staged items
+                    // wholesale, under the same stable identity.
+                    ImmediateSendState.FAILED -> writeLocked(intent)
+                    ImmediateSendState.WAITING -> Unit
                 }
             }
             publishLocked()
@@ -156,6 +163,9 @@ internal class ImmediateSendIntentStore @Inject constructor(
             loadLocked()
             val existing = live[id] ?: return@withOwner false
             if (existing.state == ImmediateSendState.WAITING) return@withOwner true
+            // Lost ciphertext cannot come back: rearming a failed record would only fail it
+            // again. The bubble already tells the person to send the content afresh.
+            if (existing.state == ImmediateSendState.FAILED) return@withOwner false
             writeLocked(existing.copy(state = ImmediateSendState.WAITING))
             publishLocked()
             true
@@ -284,7 +294,20 @@ private fun ImmediateSendIntent.sameUserIntentAs(other: ImmediateSendIntent): Bo
         mediaType == other.mediaType &&
         caption == other.caption &&
         mediaPlaintextBytes == other.mediaPlaintextBytes &&
-        replyToMessageId == other.replyToMessageId
+        replyToMessageId == other.replyToMessageId &&
+        sameAlbumContentAs(other)
+
+/**
+ * Album items compared the way [ImmediateSendIntent.mediaPlaintextBytes] is for single media:
+ * by what the person chose (each item's type and plaintext size, in order), not by what staging
+ * produced. A re-enqueued batch re-encrypts under fresh attachment ids, keys and digests, and
+ * discards them when the original is still queued — those fields are worker metadata here.
+ */
+private fun ImmediateSendIntent.sameAlbumContentAs(other: ImmediateSendIntent): Boolean =
+    mediaItems.size == other.mediaItems.size &&
+        mediaItems.zip(other.mediaItems).all { (mine, theirs) ->
+            mine.mediaType == theirs.mediaType && mine.plaintextBytes == theirs.plaintextBytes
+        }
 
 private data class ImmediateSendOwnerSnapshot(
     val owner: SessionFence?,

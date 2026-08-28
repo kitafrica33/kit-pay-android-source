@@ -1,10 +1,15 @@
 package com.kit.wallet.data.notifications
 
+import com.kit.wallet.data.messaging.KitMediaFamily
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitMediaMessageV2
+import com.kit.wallet.data.messaging.KitMediaMessageV2Item
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.messaging.SecureMessagingIncomingNotification
+import com.kit.wallet.data.messaging.UNSUPPORTED_ATTACHMENT_LABEL
+import com.kit.wallet.data.messaging.mediaAlbumPreviewLabel
 
 /** Private notification copy derived only from locally authenticated secure-message state. */
 internal data class SecureMessageNotificationPresentation(
@@ -51,6 +56,18 @@ internal object SecureMessageNotificationPresentationFactory {
         // Fail closed if a future/malformed secure-media descriptor cannot be parsed. In
         // particular, never surface its embedded attachment key material in the notification.
         if (KitMediaMessage.isMediaText(this)) return PHOTO_LABEL
+
+        val mediaAlbum = KitMediaMessageV2.parse(this)
+        if (mediaAlbum != null) {
+            return listOfNotNull(
+                mediaAlbumPreviewLabel(mediaAlbum.items.map(KitMediaMessageV2Item::mediaType)),
+                mediaAlbum.caption?.normalizeNotificationText()?.takeIf(String::isNotBlank),
+            ).joinToString(DETAIL_SEPARATOR).truncateNotificationText(MAX_PREVIEW_CODE_POINTS)
+        }
+        // The whole reserved KITMEDIA prefix family fails closed, whatever its generation: text
+        // this build cannot strictly parse may embed attachment key material, so the shade gets
+        // the shared generic label and never the text — with or without any capability flag.
+        if (KitMediaFamily.isFamilyText(this)) return UNSUPPORTED_ATTACHMENT_LABEL
 
         // Reactions are suppressed upstream and never reach the shade. If one ever does, it is
         // summarized rather than surfaced as its raw descriptor.

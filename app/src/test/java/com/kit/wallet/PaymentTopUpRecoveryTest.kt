@@ -52,6 +52,20 @@ class PaymentTopUpRecoveryTest {
     fun tearDown() = Dispatchers.resetMain()
 
     @Test
+    fun `opening send money refreshes the authoritative recipient directory`() = runTest {
+        val contacts = RecordingContacts()
+
+        SendMoneyViewModel(
+            RejectingWalletRepository(staleBalanceMinor = 100_000),
+            authoritativeSync(),
+            EmptyChats,
+            contacts,
+        )
+
+        assertEquals(1, contacts.refreshCalls)
+    }
+
+    @Test
     fun `send rejection refreshes authoritative balance before offering top up`() = runTest {
         val wallet = RejectingWalletRepository(staleBalanceMinor = 100_000)
         val sync = authoritativeSync()
@@ -193,6 +207,17 @@ class PaymentTopUpRecoveryTest {
     private object EmptyContacts : ContactRepository {
         override val contacts: StateFlow<List<Contact>> = MutableStateFlow(emptyList())
         override suspend fun refresh() = Unit
+        override suspend fun syncDeviceContacts() = Unit
+    }
+
+    private class RecordingContacts : ContactRepository {
+        override val contacts: StateFlow<List<Contact>> = MutableStateFlow(emptyList())
+        var refreshCalls = 0
+
+        override suspend fun refresh() {
+            refreshCalls += 1
+        }
+
         override suspend fun syncDeviceContacts() = Unit
     }
 

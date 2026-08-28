@@ -6,8 +6,8 @@ import android.os.SystemClock
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.notifications.ActiveCallPresence
 import com.kit.wallet.data.notifications.ActiveCallStateHolder
-import com.kit.wallet.data.notifications.CallActionReceiver
 import com.kit.wallet.data.notifications.CallLifecycleEvent
 import com.kit.wallet.data.notifications.CallLifecycleEventBus
 import com.kit.wallet.data.notifications.CallLifecycleKind
@@ -386,7 +386,7 @@ class ActiveCallViewModel @Inject constructor(
     fun declineWaitingCall() {
         val waiting = mutableState.value.waitingCall ?: return
         mutableState.value = mutableState.value.copy(waitingCall = null, mergingWaitingCall = false)
-        ringDeadlines.cancel(waiting.callId)
+        ringDeadlines.retire(waiting.callId)
         telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
         applicationScope.launch { runCatching { calls.decline(waiting.callId) } }
     }
@@ -404,7 +404,7 @@ class ActiveCallViewModel @Inject constructor(
                 waitingCall = null,
                 error = "This call can't be merged. Ask them to call back after this call.",
             )
-            ringDeadlines.cancel(waiting.callId)
+            ringDeadlines.retire(waiting.callId)
             telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
             applicationScope.launch { runCatching { calls.decline(waiting.callId) } }
             return
@@ -414,7 +414,7 @@ class ActiveCallViewModel @Inject constructor(
             try {
                 calls.invite(currentCallId, listOf(callerUserId))
                 runCatching { calls.decline(waiting.callId) }
-                ringDeadlines.cancel(waiting.callId)
+                ringDeadlines.retire(waiting.callId)
                 telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
                 mutableState.value = mutableState.value.copy(
                     waitingCall = null,
@@ -546,7 +546,9 @@ class ActiveCallViewModel @Inject constructor(
                     // A successful answer response ends the incoming ringing window even if media
                     // connection takes longer than the original deadline — and so does an answer
                     // that overtook this response on the way here.
-                    ringDeadlines.cancel(session.callId)
+                    // Persist the answered tombstone before dropping an incoming ring deadline so
+                    // an old immutable notification action cannot reopen this accepted call.
+                    closeRingWindow(session.callId)
                 }
                 mutableState.value = mutableState.value.copy(
                     name = session.name,
@@ -554,7 +556,12 @@ class ActiveCallViewModel @Inject constructor(
                     cameraEnabled = session.video,
                 )
                 applyContactPresentation(contacts.contacts.value)
-                CallForegroundService.start(context, mutableState.value.name, session.video)
+                CallForegroundService.start(
+                    context,
+                    mutableState.value.name,
+                    session.video,
+                    callId = session.callId,
+                )
                 room.connect(
                     url = session.url,
                     token = session.token,
@@ -689,6 +696,7 @@ class ActiveCallViewModel @Inject constructor(
                     )
                     selectSpeaker(true)
                     syncRemoteParticipants()
+                    publishPresence()
                 }
                 .onFailure(::fail)
         }
@@ -825,11 +833,8 @@ class ActiveCallViewModel @Inject constructor(
         val callId = incomingCallId ?: return
         if (validationJob?.isActive == true || terminated) return
         verifiedIncomingCall = null
-        // The ringing status-bar banner is owned by this screen once the user is looking at it.
-        context.getSystemService(android.app.NotificationManager::class.java)?.cancel(
-            CallActionReceiver.notificationTag(callId),
-            CallActionReceiver.NOTIFICATION_ID,
-        )
+        // Keep the ringing notification and its deadline alive while the authoritative lookup is
+        // slow or temporarily offline. Only an answer/decline/terminal event may retire it.
         mutableState.value = mutableState.value.copy(
             name = "Incoming Kit Pay call",
             video = false,
@@ -849,7 +854,13 @@ class ActiveCallViewModel @Inject constructor(
                     phase = CallPhase.INCOMING,
                     error = null,
                 )
-                telecom.trackIncoming(callId, incoming.name, incoming.phone, incoming.video)
+                telecom.trackIncoming(
+                    callId,
+                    incoming.name,
+                    incoming.phone,
+                    incoming.video,
+                    incoming.ringExpiresAt,
+                )
                 localTelecomTermination.resolveCallId(callId)
                 ringDeadlines.schedule(callId, incoming.ringExpiresAt)
                 applyContactPresentation(contacts.contacts.value)
@@ -857,8 +868,6 @@ class ActiveCallViewModel @Inject constructor(
                 throw cancelled
             } catch (_: Throwable) {
                 if (!terminated) {
-                    ringDeadlines.cancel(callId)
-                    telecom.finish(callId, KitTelecomDisconnect.ERROR)
                     mutableState.value = mutableState.value.copy(
                         name = "Incoming Kit Pay call",
                         video = false,
@@ -885,6 +894,7 @@ class ActiveCallViewModel @Inject constructor(
         refresh.waitingTelecom?.apply {
             telecom.updatePresentation(callId, name, phone, video)
         }
+        publishPresence()
     }
 
     private fun activeContactPresentationSource(): ActiveCallContactPresentationSource? {
@@ -958,7 +968,7 @@ class ActiveCallViewModel @Inject constructor(
         val safeReason = reason.takeIf { it in setOf("completed", "cancelled", "network_error") }
             ?: "cancelled"
         val telecomCallId = connection?.callId ?: incomingCallId
-        telecomCallId?.let(ringDeadlines::cancel)
+        closeRingWindow(telecomCallId)
         if (telecomCallId != null) {
             val disconnect = when {
                 safeReason == "network_error" -> KitTelecomDisconnect.ERROR
@@ -1026,7 +1036,7 @@ class ActiveCallViewModel @Inject constructor(
     }
 
     private fun markConnected() {
-        (connection?.callId ?: incomingCallId)?.let(ringDeadlines::cancel)
+        closeRingWindow(connection?.callId ?: incomingCallId)
         mutableState.value = mutableState.value.copy(phase = CallPhase.CONNECTED)
         // Media is up, so the call is running whether or not anything authoritative has
         // reached us yet. Anchoring here is never earlier than the real answer, so a
@@ -1040,7 +1050,31 @@ class ActiveCallViewModel @Inject constructor(
         // Mark this device busy so a second incoming call is surfaced as call-waiting, not a
         // full-screen ring over the active call.
         activeCallState.setActiveCall(connection?.callId)
+        publishPresence()
         startTimer()
+    }
+
+    /**
+     * Republishes the connected call to the surfaces outside this screen that show or return to
+     * it: the ongoing-call notification's reopen link, the owning chat's live banner, and the
+     * recent-chats row. Everything published comes from the authenticated session and this
+     * screen's own resolved state — and only while genuinely connected, so a ringing, failed or
+     * torn-down attempt never appears anywhere as a live call.
+     */
+    private fun publishPresence() {
+        val session = connection ?: return
+        if (terminated) return
+        if (mutableState.value.phase !in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)) return
+        activeCallState.publishPresence(
+            ActiveCallPresence(
+                callId = session.callId,
+                name = mutableState.value.name,
+                participantUserIds = session.participantUserIds,
+                conversationId = session.conversationId,
+                video = mutableState.value.video,
+                anchor = durationAnchor,
+            ),
+        )
     }
 
     private fun handleLifecycleEvent(event: CallLifecycleEvent) {
@@ -1081,7 +1115,7 @@ class ActiveCallViewModel @Inject constructor(
                 // armed — would expire mid-call, finish Telecom as MISSED, and tear down a
                 // call both sides are on. Cancelled under this screen's own id, the exact
                 // string the deadline was scheduled with.
-                (connection?.callId ?: incomingCallId)?.let(ringDeadlines::cancel)
+                closeRingWindow(connection?.callId ?: incomingCallId)
                 // Applied on every answer signal, not only the one that moves the phase.
                 // The socket frame, the push and the accept response all carry the same
                 // instant, and taking each of them is what lets the earliest — and so the
@@ -1123,7 +1157,7 @@ class ActiveCallViewModel @Inject constructor(
             return
         }
         terminated = true
-        ringDeadlines.cancel(callId)
+        ringDeadlines.retire(callId)
         telecom.finish(callId, disconnect)
         validationJob?.cancel()
         timerJob?.cancel()
@@ -1164,6 +1198,7 @@ class ActiveCallViewModel @Inject constructor(
             previous = durationAnchor,
         )
         if (timerJob?.isActive == true) publishDuration()
+        publishPresence()
     }
 
     private fun startTimer() {
@@ -1242,7 +1277,7 @@ class ActiveCallViewModel @Inject constructor(
             return
         }
         terminated = true
-        (connection?.callId ?: incomingCallId)?.let(ringDeadlines::cancel)
+        closeRingWindow(connection?.callId ?: incomingCallId)
         timerJob?.cancel()
         timerJob = null
         room.disconnect()
@@ -1298,7 +1333,7 @@ class ActiveCallViewModel @Inject constructor(
         room.release()
         CallForegroundService.stop(context)
         activeCallState.setActiveCall(null)
-        (connection?.callId ?: incomingCallId)?.let(ringDeadlines::cancel)
+        closeRingWindow(connection?.callId ?: incomingCallId)
         connection?.callId?.let { activeCallId ->
             telecom.finish(activeCallId, KitTelecomDisconnect.LOCAL)
             pendingTerminations.enqueue(
@@ -1327,6 +1362,17 @@ class ActiveCallViewModel @Inject constructor(
             }
         }
         super.onCleared()
+    }
+
+    /** Retires an incoming identity; outgoing deadlines need only process-local cancellation. */
+    private fun closeRingWindow(callId: String?) {
+        val canonicalIncomingId = incomingCallId
+        if (callId == null) return
+        if (canonicalIncomingId != null && callId.equals(canonicalIncomingId, ignoreCase = true)) {
+            ringDeadlines.retire(canonicalIncomingId)
+        } else {
+            ringDeadlines.cancel(callId)
+        }
     }
 }
 

@@ -3,8 +3,6 @@ package com.kit.wallet.feature.auth
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.auth.AuthRepository
-import com.kit.wallet.data.auth.normalizeProfileTag
-import com.kit.wallet.data.auth.profileIdentityValidationError
 import com.kit.wallet.data.remote.KitWalletApiException
 import dagger.hilt.android.lifecycle.HiltViewModel
 import java.io.IOException
@@ -18,46 +16,19 @@ data class AccountAccessUiState(
     val error: String? = null,
     val message: String? = null,
     val email: String = "",
-    val verificationDestination: String? = null,
     val identityToken: String = "",
 )
 
+/**
+ * Email account access without registration: sign-up is phone-only, so this flow only
+ * verifies an email an existing account already holds and recovers its password.
+ */
 @HiltViewModel
 class AccountAccessViewModel @Inject constructor(
     private val authRepository: AuthRepository,
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(AccountAccessUiState())
     val state = mutableState.asStateFlow()
-
-    fun register(
-        name: String,
-        tag: String,
-        email: String,
-        password: String,
-        confirmation: String,
-        onRegistered: () -> Unit,
-    ) {
-        val validationError = validateRegistration(name, tag, email, password, confirmation)
-        if (validationError != null) {
-            mutableState.value = mutableState.value.copy(error = validationError, message = null)
-            return
-        }
-        launch {
-            val result = authRepository.registerWithEmail(
-                name = name,
-                tag = normalizeProfileTag(tag),
-                email = email,
-                password = password,
-                passwordConfirmation = confirmation,
-            )
-            mutableState.value = mutableState.value.copy(
-                email = result.email,
-                verificationDestination = result.destination,
-                message = "We sent a verification token to ${result.destination}.",
-            )
-            onRegistered()
-        }
-    }
 
     fun verifyEmail(token: String, onVerified: () -> Unit) {
         if (token.trim().length < MIN_TOKEN_LENGTH) {
@@ -145,22 +116,6 @@ class AccountAccessViewModel @Inject constructor(
 
     fun clearFeedback() {
         mutableState.value = mutableState.value.copy(error = null, message = null)
-    }
-
-    private fun validateRegistration(
-        name: String,
-        tag: String,
-        email: String,
-        password: String,
-        confirmation: String,
-    ): String? {
-        profileIdentityValidationError(name, tag)?.let { return it }
-        return when {
-            !email.isValidEmail() -> "Enter a valid email address."
-            !password.isStrongPassword() -> PASSWORD_REQUIREMENTS
-            password != confirmation -> "The passwords do not match."
-            else -> null
-        }
     }
 
     private fun launch(block: suspend () -> Unit) {

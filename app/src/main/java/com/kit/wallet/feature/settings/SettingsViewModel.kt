@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.repository.ProfileEmailChallenge
 import com.kit.wallet.data.repository.UserRepository
+import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.feature.home.StarterMilestones
 import com.kit.wallet.data.auth.AccountDeletionPreflight
 import com.kit.wallet.data.auth.AuthRepository
 import com.kit.wallet.data.auth.normalizeProfileName
@@ -43,6 +45,8 @@ data class AccountDeletionUiState(
 class SettingsViewModel @Inject constructor(
     private val userRepo: UserRepository,
     private val authRepository: AuthRepository,
+    private val sessions: SessionStore,
+    private val milestones: StarterMilestones,
     private val clock: Clock,
 ) : ViewModel() {
     val profile = userRepo.profile
@@ -276,12 +280,19 @@ class SettingsViewModel @Inject constructor(
 
         viewModelScope.launch {
             mutableDeletionState.value = current.copy(submitting = true, error = null)
-            runCatching {
+            // Captured before the request: an accepted deletion tears the session down, and
+            // the account's local starter markers must go with exactly this account.
+            val deletedAccountId = sessions.current()?.accountId
+            val result = runCatching {
                 authRepository.requestAccountDeletion(preflight, confirmation, paymentPin)
-            }.onFailure { error ->
+            }
+            if (result.isSuccess) {
+                milestones.clearForAccount(deletedAccountId)
+            } else {
                 mutableDeletionState.value = current.copy(
                     submitting = false,
-                    error = error.message ?: "Could not submit the account deletion request",
+                    error = result.exceptionOrNull()?.message
+                        ?: "Could not submit the account deletion request",
                 )
             }
         }

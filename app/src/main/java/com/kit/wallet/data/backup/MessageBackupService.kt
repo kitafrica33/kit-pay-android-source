@@ -6,6 +6,7 @@ import android.content.Intent
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.messaging.AccountArchivedMessage
 import com.kit.wallet.data.messaging.AccountMessageHistoryAccess
+import com.kit.wallet.data.messaging.requiresModernMediaSchemaFence
 import com.kit.wallet.data.repository.SecureMessagingChatRuntime
 import com.kit.wallet.data.session.SessionStore
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -190,6 +191,12 @@ class MessageBackupService @Inject internal constructor(
         if (archived.isEmpty()) {
             throw MessageBackupException("There are no messages on this phone to back up")
         }
+        // Fence on content, not only on positive provenance: an unvalidated v2/future-family row
+        // must still make an older build reject the backup wholesale instead of exposing it as
+        // raw text. Canonical v1-only backups retain schema 1 compatibility.
+        val carriesMediaProvenance = archived.any { message ->
+            message.mediaValidated || requiresModernMediaSchemaFence(message.text)
+        }
         val staged = stagingFile("upload")
         val summary = try {
             val written = withContext(Dispatchers.IO) {
@@ -203,6 +210,7 @@ class MessageBackupService @Inject internal constructor(
                                 writerVersion = BuildConfig.VERSION_NAME,
                             ),
                             messages = archived.asSequence(),
+                            withMediaProvenance = carriesMediaProvenance,
                         )
                     }
                 }
@@ -295,7 +303,7 @@ class MessageBackupService @Inject internal constructor(
                                 "That backup belongs to a different Kit Pay account",
                             )
                         }
-                        read = KitBackupPayload.readMessages(plain) { message ->
+                        read = KitBackupPayload.readMessages(plain, manifest) { message ->
                             if (restored.size >= MAX_RESTORED_MESSAGES) {
                                 throw MessageBackupException(
                                     "This backup is larger than Kit Pay can restore in one go",

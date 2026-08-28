@@ -37,12 +37,6 @@ data class AuthenticatedUser(
     val profileSetupRequired: Boolean,
 )
 
-data class RegistrationResult(
-    val email: String,
-    val destination: String,
-    val expiresAt: String,
-)
-
 data class AccountDeletionPreflight(
     val purpose: String,
     val intent: Map<String, Any?>,
@@ -85,14 +79,6 @@ interface AuthRepository {
     val profileSetupState: StateFlow<ProfileSetupState>
 
     suspend fun loginWithEmail(email: String, password: String): AuthOutcome
-
-    suspend fun registerWithEmail(
-        name: String,
-        tag: String,
-        email: String,
-        password: String,
-        passwordConfirmation: String,
-    ): RegistrationResult
 
     suspend fun verifyEmail(token: String)
 

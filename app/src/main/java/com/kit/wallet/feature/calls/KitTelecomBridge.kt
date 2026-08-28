@@ -17,8 +17,9 @@ import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import android.telecom.VideoProfile
 import androidx.core.content.ContextCompat
-import com.kit.wallet.MainActivity
+import com.kit.wallet.IncomingCallRelayActivity
 import com.kit.wallet.data.notifications.CallActionReceiver
+import com.kit.wallet.data.notifications.IncomingCallLaunchPurpose
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -75,7 +76,14 @@ class KitTelecomBridge @Inject constructor(
             hasSelfManagedCallingPermission() &&
             runCatching { telecom.isOutgoingCallPermitted(accountHandle) }.getOrDefault(false)
         if (!permitted) return
-        val metadata = TelecomCallMetadata(callId, name, phone, video, incoming = false)
+        val metadata = TelecomCallMetadata(
+            callId,
+            name,
+            phone,
+            video,
+            incoming = false,
+            ringExpiresAt = null,
+        )
         val tracked = calls.track(callId, metadata, TelecomCallState.DIALING) ?: return
         if (tracked.alreadyTracked) {
             tracked.call.connection?.applyPresentation(metadata)
@@ -113,11 +121,17 @@ class KitTelecomBridge @Inject constructor(
         false
     }
 
-    fun trackIncoming(callId: String, name: String, phone: String?, video: Boolean) {
+    fun trackIncoming(
+        callId: String,
+        name: String,
+        phone: String?,
+        video: Boolean,
+        ringExpiresAt: String?,
+    ) {
         val permitted = registerPhoneAccount() &&
             runCatching { telecom.isIncomingCallPermitted(accountHandle) }.getOrDefault(false)
         if (!permitted) return
-        val metadata = TelecomCallMetadata(callId, name, phone, video, incoming = true)
+        val metadata = TelecomCallMetadata(callId, name, phone, video, incoming = true, ringExpiresAt)
         val tracked = calls.track(callId, metadata, TelecomCallState.RINGING) ?: return
         if (tracked.alreadyTracked) {
             tracked.call.connection?.applyPresentation(metadata)
@@ -179,9 +193,14 @@ class KitTelecomBridge @Inject constructor(
         return checkNotNull(resolution.liveCall?.connection)
     }
 
-    internal fun systemAnswered(callId: String) {
-        val intent = Intent(context, MainActivity::class.java)
-            .setData(Uri.parse("kitwallet://call/incoming?call_id=$callId&accept=1"))
+    internal fun systemAnswered(callId: String, ringExpiresAt: String?) {
+        val expiry = ringExpiresAt ?: return
+        val intent = IncomingCallRelayActivity.intent(
+            context = context,
+            callId = callId,
+            purpose = IncomingCallLaunchPurpose.ANSWER,
+            ringExpiresAt = expiry,
+        )
             .addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or
                     Intent.FLAG_ACTIVITY_SINGLE_TOP,
@@ -247,6 +266,7 @@ internal data class TelecomCallMetadata(
     val phone: String?,
     val video: Boolean,
     val incoming: Boolean,
+    val ringExpiresAt: String?,
 ) {
     val address: Uri get() = telecomAddress(phone)
     val videoState: Int get() = if (video) VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY
@@ -257,6 +277,7 @@ internal data class TelecomCallMetadata(
         putString(EXTRA_PHONE, phone)
         putBoolean(EXTRA_VIDEO, video)
         putBoolean(EXTRA_INCOMING, incoming)
+        putString(EXTRA_RING_EXPIRES_AT, ringExpiresAt)
     }
 
     companion object {
@@ -265,6 +286,7 @@ internal data class TelecomCallMetadata(
         private const val EXTRA_PHONE = "com.kit.wallet.telecom.PHONE"
         private const val EXTRA_VIDEO = "com.kit.wallet.telecom.VIDEO"
         private const val EXTRA_INCOMING = "com.kit.wallet.telecom.INCOMING"
+        private const val EXTRA_RING_EXPIRES_AT = "com.kit.wallet.telecom.RING_EXPIRES_AT"
 
         fun fromRequest(request: ConnectionRequest, incoming: Boolean): TelecomCallMetadata? {
             val direct = request.extras ?: Bundle.EMPTY
@@ -285,6 +307,7 @@ internal data class TelecomCallMetadata(
                 phone = custom.getString(EXTRA_PHONE)?.trim()?.takeIf(String::isNotEmpty),
                 video = custom.getBoolean(EXTRA_VIDEO, request.videoState != VideoProfile.STATE_AUDIO_ONLY),
                 incoming = custom.getBoolean(EXTRA_INCOMING, incoming),
+                ringExpiresAt = custom.getString(EXTRA_RING_EXPIRES_AT),
             )
         }
     }
@@ -295,6 +318,7 @@ private class KitTelecomConnection(
     private val bridge: KitTelecomBridge,
 ) : Connection() {
     private val callId = metadata.callId
+    private val ringExpiresAt = metadata.ringExpiresAt
 
     init {
         setConnectionProperties(PROPERTY_SELF_MANAGED)
@@ -325,7 +349,7 @@ private class KitTelecomConnection(
     override fun onAnswer(videoState: Int) {
         setVideoState(videoState)
         setActive()
-        bridge.systemAnswered(callId)
+        bridge.systemAnswered(callId, ringExpiresAt)
     }
 
     override fun onReject() {

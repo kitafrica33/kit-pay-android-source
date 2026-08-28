@@ -20,11 +20,9 @@ interface KitWalletApi {
     @POST("api/kit-wallet/v1/auth/email/login")
     suspend fun loginWithEmail(@Body request: EmailLoginRequest): ApiEnvelope<AuthResultDto>
 
-    @POST("api/kit-wallet/v1/auth/email/register")
-    suspend fun registerWithEmail(
-        @Body request: EmailRegistrationRequest,
-    ): ApiEnvelope<EmailRegistrationResultDto>
-
+    // Registration is phone-only: the email register endpoint is retired server-side and
+    // deliberately has no client binding. Email verify/resend and password recovery remain
+    // for accounts that already carry an email.
     @POST("api/kit-wallet/v1/auth/email/verify")
     suspend fun verifyEmail(
         @Body request: VerifyIdentityTokenRequest,
@@ -132,6 +130,16 @@ interface KitWalletApi {
     suspend fun verifyProfileEmail(
         @Body request: EmailAttachmentVerificationRequest,
     ): ApiEnvelope<UserDto>
+
+    /**
+     * Server-owned starter milestones. Only called after the capabilities response
+     * advertises [KitFeature.STARTER_CHECKLIST] as exactly `true`; fenced because the
+     * answer is about one account and must never be sent — or read — across a switch.
+     */
+    @GET("api/v1/onboarding/starter-checklist")
+    suspend fun starterChecklist(
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<StarterChecklistDto>
 
     @GET("api/kit-wallet/v1/wallets")
     suspend fun wallets(): ApiEnvelope<WalletListDto>

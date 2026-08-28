@@ -25,6 +25,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RemoteCallRepositoryTest {
@@ -130,6 +131,19 @@ class RemoteCallRepositoryTest {
     }
 
     @Test
+    fun `answer rejects credentials returned for a different call`() = runTest {
+        val api = RecordingCallApi().apply {
+            acceptedCallIdOverride = "019f8c6f-cc57-720c-9a55-0000000000ee"
+        }
+        val repository = repository(api)
+
+        val result = runCatching { repository.accept(INCOMING_CALL_ID) }
+
+        assertTrue(result.isFailure)
+        assertEquals(0, api.callListRequests)
+    }
+
+    @Test
     fun `a call that has not been answered carries no anchor`() = runTest {
         val api = RecordingCallApi()
         val repository = repository(api)
@@ -180,6 +194,7 @@ class RemoteCallRepositoryTest {
             private set
         var acceptedCalls = 0
             private set
+        var acceptedCallIdOverride: String? = null
         val clientCallIds = mutableListOf<String>()
         val cancelledClientCallIds = mutableListOf<String>()
 
@@ -202,7 +217,10 @@ class RemoteCallRepositoryTest {
                 }
                 "acceptCall" -> {
                     acceptedCalls += 1
-                    ApiEnvelope(ok = true, data = answeredSession())
+                    ApiEnvelope(
+                        ok = true,
+                        data = answeredSession(acceptedCallIdOverride ?: INCOMING_CALL_ID),
+                    )
                 }
                 "endCall" -> ApiEnvelope(
                     ok = true,
@@ -254,9 +272,9 @@ class RemoteCallRepositoryTest {
         const val ANSWERED_AT = "2026-07-23T00:00:10Z"
         const val SERVER_TIME = "2026-07-23T00:00:11Z"
 
-        fun answeredSession() = CallSessionDto(
+        fun answeredSession(callId: String = INCOMING_CALL_ID) = CallSessionDto(
             call = CallDto(
-                id = INCOMING_CALL_ID,
+                id = callId,
                 name = "Registered name",
                 participantUserIds = listOf(RECIPIENT_ID),
                 direction = "incoming",

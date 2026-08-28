@@ -23,6 +23,35 @@ class ConversationScrollPolicyTest {
     }
 
     @Test
+    fun `a pending focus jump owns the thread's first positioning`() {
+        assertEquals(
+            ConversationScrollAction.KEEP_POSITION,
+            conversationScrollDecision(
+                null,
+                listOf(message("target")),
+                nearBottom = false,
+                focusPending = true,
+            ).action,
+        )
+    }
+
+    @Test
+    fun `a pending focus leaves an already positioned thread's behavior unchanged`() {
+        val old = message("old")
+        val incoming = message("incoming")
+
+        val decision = conversationScrollDecision(
+            previousMessageIds = setOf(old.id),
+            messages = listOf(old, incoming),
+            nearBottom = false,
+            focusPending = true,
+        )
+
+        assertEquals(ConversationScrollAction.KEEP_POSITION, decision.action)
+        assertEquals(1, decision.unseenMessages)
+    }
+
+    @Test
     fun `an outgoing group payment never pulls a reader away from older messages`() {
         val old = message("old")
         val payment = message("payment", fromMe = true, kind = MessageKind.GROUP_PAYMENT)

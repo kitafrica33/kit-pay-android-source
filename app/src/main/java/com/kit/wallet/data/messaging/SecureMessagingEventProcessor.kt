@@ -289,7 +289,16 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 // Signal plaintext descriptor. Re-derive it on every retry just as the initial
                 // send path does; retrying an attachment as ordinary encrypted text would create
                 // a message that the recipient can decrypt but can never authorize/download.
-                val attachments = KitMediaMessage.attachmentsFor(durable.authenticatedText)
+                val attachments = kitMediaAttachmentsFor(durable.authenticatedText)
+                if (attachments.isEmpty() &&
+                    KitMediaFamily.isFamilyText(durable.authenticatedText)
+                ) {
+                    // Reserved text that no longer strictly parses has no rows to bind. Sending
+                    // it as ordinary encrypted text would put an unauthenticated descriptor on
+                    // the wire, so this fanout fails closed instead.
+                    session.withProjectionLease { markOutboundPermanentFailure(durable) }
+                    return@forEach
+                }
                 val receipt = try {
                     session.send(conversation, encrypted, attachments)
                 } catch (error: KitWalletApiException) {
@@ -532,6 +541,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     private fun KitWalletApiException.isPermanentAttachmentBindingFailure(): Boolean = when (code) {
         ATTACHMENT_REFERENCE_INVALID -> statusCode == 422
         ATTACHMENT_ALREADY_ATTACHED -> statusCode == 409
+        in MEDIA_MESSAGE_V2_PERMANENT_BINDING_FAILURES -> statusCode == 422
         else -> false
     }
 
@@ -723,6 +733,18 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     clientMessageId = candidate.clientMessageId,
                 )
             } ?: return@forEach
+            // Locally rejected content is never donated: a suppressed row was refused outright,
+            // and unsupported media exists only as a sanitized placeholder — its durable
+            // descriptor bytes must not leave this device. The derived predicate also covers
+            // inbound rows recorded before the disposition pin existed (reserved text with no
+            // strict rows), while own-authored outbound media stays donatable: it was strictly
+            // derived before commit and the recipient re-checks the binding on its own device.
+            if (projected.unsupportedMedia ||
+                projected.deliveryState ==
+                SecureMessagingProjectionDeliveryState.INBOUND_SUPPRESSED
+            ) {
+                return@forEach
+            }
             val transferId = SecureMessagingHistoryBackfillCodec.deterministicTransferId(
                 messageId = candidate.messageId,
                 targetDeviceId = task.targetDeviceId,
@@ -923,16 +945,32 @@ internal class SecureMessagingEventProcessor @Inject constructor(
 
             val persisted = checkNotNull(durable)
             if (!hasAuthenticatedAttachmentBinding(envelope, persisted)) {
-                // A peer controls both the outer metadata and encrypted plaintext it sends. A
-                // mismatch is therefore message-local hostile input, not evidence that this
-                // account activation or ratchet is corrupt. Keep the durable crypto commit,
-                // suppress projection/opening, acknowledge the envelope and advance the cursor
-                // so the peer cannot remotely quarantine or permanently wedge this recipient.
-                // Commit the tombstone before acknowledgement/cursor advance. If this write is
-                // interrupted, replay sees the companion commit, revalidates the same binding,
-                // and retries suppression without re-running the ratchet.
-                state.withProjectionLease {
-                    recordInboundSuppressed(persisted, envelope.sentAt)
+                if (isReservedUnsupportedMediaText(persisted.authenticatedText)) {
+                    // Authenticated reserved-media content whose envelope binding failed: a
+                    // malformed family descriptor, or a strict v2 descriptor carried under the
+                    // wrong outer kind or with a mismatched row set. The transcript slot is
+                    // real, so it stays visible — pinned as unsupported media, projected and
+                    // notified only as the sanitized generation marker, never actionable, and
+                    // its descriptor bytes never enter a page, shade, archive or donation.
+                    publishInboundProjection(
+                        state,
+                        persisted,
+                        envelope.sentAt,
+                        disposition = SecureMessagingMediaDisposition.UNSUPPORTED,
+                    )
+                } else {
+                    // A peer controls both the outer metadata and encrypted plaintext it sends.
+                    // A mismatch is therefore message-local hostile input, not evidence that
+                    // this account activation or ratchet is corrupt. Keep the durable crypto
+                    // commit, suppress projection/opening, acknowledge the envelope and advance
+                    // the cursor so the peer cannot remotely quarantine or permanently wedge
+                    // this recipient. Commit the tombstone before acknowledgement/cursor
+                    // advance. If this write is interrupted, replay sees the companion commit,
+                    // revalidates the same binding, and retries suppression without re-running
+                    // the ratchet.
+                    state.withProjectionLease {
+                        recordInboundSuppressed(persisted, envelope.sentAt)
+                    }
                 }
                 val token = if (decrypted != null) {
                     state.session.deliveryToken(envelope, decrypted)
@@ -942,7 +980,19 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 state.deliveryTokens += token
                 return
             }
-            publishInboundProjection(state, persisted, envelope.sentAt)
+            // Binding held: the outer attachment rows were checked against the authenticated
+            // descriptor on this device. Rows carrying strict media earn a durable VALIDATED
+            // verdict so the provenance survives archive and restore; everything else stays NONE.
+            publishInboundProjection(
+                state,
+                persisted,
+                envelope.sentAt,
+                disposition = if (KitMediaMessageV2.parse(persisted.authenticatedText) != null) {
+                    SecureMessagingMediaDisposition.VALIDATED
+                } else {
+                    SecureMessagingMediaDisposition.NONE
+                },
+            )
             val token = if (decrypted != null) {
                 state.session.deliveryToken(envelope, decrypted)
             } else {
@@ -1066,7 +1116,23 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     // propagation tasks; a process restart also begins unreconciled.
                     historyReconciledActivation = null
                 }
-                publishInboundProjection(state, recovered, authenticated.sentAt)
+                // The recipient re-derives its own verdict: authenticate() re-checked the
+                // envelope binding on this device, so strict media rows recovered here earn
+                // VALIDATED; recovered modern/future-family text without a strict v2 binding
+                // stays pinned UNSUPPORTED so it never turns actionable later. A valid legacy
+                // KITMEDIA1 descriptor needs no provenance pin and retains its historical NONE.
+                publishInboundProjection(
+                    state,
+                    recovered,
+                    authenticated.sentAt,
+                    disposition = when {
+                        KitMediaMessageV2.parse(recovered.authenticatedText) != null ->
+                            SecureMessagingMediaDisposition.VALIDATED
+                        requiresModernMediaSchemaFence(recovered.authenticatedText) ->
+                            SecureMessagingMediaDisposition.UNSUPPORTED
+                        else -> SecureMessagingMediaDisposition.NONE
+                    },
+                )
                 if (retainedSource == null) {
                     scheduleHistoryContinuation(0L)
                 }
@@ -1086,8 +1152,16 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         state: SessionState,
         durable: LibSignalCompanionRecord,
         sentAt: Instant,
+        disposition: SecureMessagingMediaDisposition = SecureMessagingMediaDisposition.NONE,
     ) {
         val authoredOnThisAccount = durable.sender.userId == state.session.binding.userId
+        // A pinned unsupported-media row must never hand its durable text to the shade: the
+        // sanitized generation marker carries the placeholder meaning with zero descriptor bytes.
+        val notificationText = if (disposition == SecureMessagingMediaDisposition.UNSUPPORTED) {
+            KitMediaFamily.sanitizedFamilyMarker(durable.authenticatedText)
+        } else {
+            durable.authenticatedText
+        }
         val notificationPending = state.withProjectionLease {
             // A reaction is an annotation on a bubble the user has already been told about, and
             // its descriptor is not readable copy. It commits to the projection like any other
@@ -1098,7 +1172,11 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             // Commit and signal the conversation projection before making a shade notification
             // externally visible. An interrupted reconnect can now duplicate only the stable-tag
             // notification, never leave the user with an alert for a locally invisible message.
-            recordInbound(durable, sentAt)
+            if (disposition == SecureMessagingMediaDisposition.UNSUPPORTED) {
+                recordInboundUnsupportedMedia(durable, sentAt)
+            } else {
+                recordInbound(durable, sentAt, disposition)
+            }
             pending
         }
         // A committed incoming payment event means balances just changed for this account —
@@ -1127,7 +1205,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                         sessionEpoch = state.session.binding.sessionEpoch,
                         senderName = notificationSender.name,
                         groupTitle = notificationSender.groupTitle,
-                        authenticatedText = durable.authenticatedText,
+                        authenticatedText = notificationText,
                         sentAt = sentAt,
                     ),
                 )
@@ -1182,7 +1260,6 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         envelope: RemoteSecureMessagingTransport.Session.IncomingEnvelope,
         durable: LibSignalCompanionRecord,
     ): Boolean {
-        val descriptor = KitMediaMessage.parse(durable.authenticatedText)
         val reaction = KitReactionMessage.parse(durable.authenticatedText)
         val edit = KitEditMessage.parse(durable.authenticatedText)
         // Text that reaches for a reserved namespace but does not parse into it is refused rather
@@ -1194,14 +1271,37 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         if (KitEditMessage.isEditText(durable.authenticatedText) && edit == null) {
             return false
         }
-        val authenticatedAttachments = descriptor?.let { listOf(it.toAttachmentRequest()) }
-            ?: emptyList()
+        // Reserved media-family text that strictly parses in no generation can never bind. Its
+        // authenticated kind falls back to ordinary text, so without this refusal a zero-row
+        // encrypted_message envelope would satisfy both the kind check and the empty row match
+        // and project raw almost-descriptor bytes. Refusing here routes it into the same
+        // tri-state placeholder disposition the history path applies.
+        if (
+            KitMediaFamily.isFamilyText(durable.authenticatedText) &&
+            kitMediaAttachmentsFor(durable.authenticatedText).isEmpty()
+        ) {
+            return false
+        }
+        // The kind check is what stops a descriptor smuggled inside an ordinary encrypted_message
+        // envelope (zero rows to validate against) from ever becoming an actionable album: media
+        // text of either generation binds itself to encrypted_attachment, so the wrong outer kind
+        // fails here no matter what the row set looks like.
         val authenticatedKind = authenticatedMessageKind(durable.authenticatedText)
         return envelope.kind == authenticatedKind &&
-            envelope.attachments == authenticatedAttachments &&
+            kitMediaOuterAttachmentsMatch(durable.authenticatedText, envelope.attachments) &&
             (reaction == null || reaction.targetMessageId == envelope.replyToMessageId) &&
             (edit == null || edit.targetMessageId == envelope.replyToMessageId)
     }
+
+    /**
+     * Reserved media-family text other than a strictly valid v1 descriptor.
+     *
+     * When such text fails its envelope binding the message is authentic but its media can never
+     * be actionable: it renders as the sanitized generic placeholder instead of being suppressed.
+     * A strictly valid v1 descriptor keeps its historical handling — suppression on mismatch.
+     */
+    private fun isReservedUnsupportedMediaText(text: String): Boolean =
+        requiresModernMediaSchemaFence(text)
 
     private suspend fun commitDecryption(
         session: RemoteSecureMessagingTransport.Session,
@@ -1352,6 +1452,19 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         val ATTACHMENT_COMPATIBILITY_FAILURES = setOf(
             "MESSAGING_ATTACHMENT_CLIENT_UPGRADE_REQUIRED",
             "MESSAGING_V2_CONTENT_PROFILE_UNAVAILABLE",
+            // KITMEDIA2 (§5b): the album is valid, this build's version floor is not — park it.
+            "MESSAGING_MEDIA_MESSAGE_V2_CLIENT_UPGRADE_REQUIRED",
+        )
+
+        /**
+         * KITMEDIA2 422s that condemn this exact fanout: the album broke a structural limit the
+         * server enforces per message, so retrying the same descriptor can never succeed and must
+         * not wedge later outbox entries behind it.
+         */
+        val MEDIA_MESSAGE_V2_PERMANENT_BINDING_FAILURES = setOf(
+            "MESSAGING_MEDIA_MESSAGE_V2_ATTACHMENT_LIMIT_EXCEEDED",
+            "MESSAGING_MEDIA_MESSAGE_V2_AGGREGATE_LIMIT_EXCEEDED",
+            "MESSAGING_MEDIA_MESSAGE_V2_ATTACHMENT_ORDER_INVALID",
         )
         const val SYNC_PAGE_SIZE = 50
         const val OUTBOX_PAGE_SIZE = 100

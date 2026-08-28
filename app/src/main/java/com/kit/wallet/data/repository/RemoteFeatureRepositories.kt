@@ -789,6 +789,9 @@ class RemoteCallRepository @Inject constructor(
 
     override suspend fun accept(callId: String): CallConnection {
         val session = apiCalls.execute { api.acceptCall(callId) }
+        check(session.call.id == callId) {
+            "The call answer returned credentials for an unexpected call"
+        }
         refreshHistoryInBackground()
         return session.toConnection()
     }
@@ -825,6 +828,7 @@ class RemoteCallRepository @Inject constructor(
             ringExpiresAt = call.ringExpiresAt,
             answeredAt = call.answeredAt,
             serverTime = serverTime,
+            conversationId = call.conversationId?.trim()?.takeIf(String::isNotEmpty),
         )
     }
 

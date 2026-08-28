@@ -95,6 +95,13 @@
         </activity>
 
         <activity
+            android:name=".IncomingCallRelayActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:theme="@style/Theme.KitWallet.CallRelay" />
+
+        <activity
             android:name=".ShareRelayActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
             android:excludeFromRecents="true"

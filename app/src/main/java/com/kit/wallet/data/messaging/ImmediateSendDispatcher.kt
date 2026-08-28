@@ -29,9 +29,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
         val owner = store.loadForCurrentOwner()
             ?: return@withLock ImmediateSendDispatchOutcome.IDLE
         val snapshot = store.itemsForOwner(owner)
-        mediaSpool.prune(snapshot.filter { it.kind == ImmediateSendKind.MEDIA }.mapTo(mutableSetOf()) {
-            it.id
-        })
+        mediaSpool.prune(snapshot.flatMapTo(mutableSetOf(), ImmediateSendIntent::spoolIds))
         if (snapshot.isEmpty()) return@withLock ImmediateSendDispatchOutcome.IDLE
 
         var committedAny = false
@@ -41,6 +39,8 @@ internal class ImmediateSendDispatcher @Inject constructor(
             // but never for another conversation. A retired reaction is removed rather than left
             // in this queue, so every remaining RETRY_REQUIRED item is a real head-of-line stop.
             for (original in conversation) {
+                // Terminal and already visible as a failed bubble; nothing behind it waits.
+                if (original.state == ImmediateSendState.FAILED) continue
                 if (original.state == ImmediateSendState.RETRY_REQUIRED) {
                     // Older builds and non-capability failures could leave a reaction or an edit
                     // in this state. Neither has a standalone retry bubble, so such an item can
@@ -71,6 +71,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
                         break
                     }
                     DispatchOneResult.RETIRED -> Unit
+                    DispatchOneResult.FAILED -> Unit
                     DispatchOneResult.RETRY_REQUIRED -> break
                     DispatchOneResult.GONE -> Unit
                 }
@@ -88,6 +89,9 @@ internal class ImmediateSendDispatcher @Inject constructor(
         COMMITTED_RETRY,
         COMMITTED_STOP,
         RETIRED,
+
+        /** Irrecoverable, and the record stays behind as its own visible failed bubble. */
+        FAILED,
         RETRY,
         RETRY_REQUIRED,
         GONE,
@@ -115,6 +119,40 @@ internal class ImmediateSendDispatcher @Inject constructor(
                 }
                 current = prepared
             }
+            if (
+                current.kind == ImmediateSendKind.MEDIA_V2 &&
+                current.preparedMediaDescriptor == null
+            ) {
+                // One roster admission before any byte is uploaded (KITMEDIA2 §6). This is the
+                // gate that predicts the server's unanimous check — the current device's own
+                // attestation included — so an incompatible conversation costs zero uploads.
+                // A capability refusal lands in the RETRY_REQUIRED classification below.
+                chats.assertImmediateAlbumAdmission(owner, current)
+                // Uploads run in ascending attachment-id order — the canonical wire order — and
+                // every confirmed storage key is persisted before the next upload begins, so a
+                // process death resumes exactly where the record says and repeats nothing.
+                for (item in current.mediaItems.sortedBy(ImmediateSendMediaItem::attachmentId)) {
+                    if (item.storageKey != null) continue
+                    val storageKey = chats.uploadImmediateAlbumItem(
+                        owner = owner,
+                        intent = current,
+                        attachmentId = item.attachmentId,
+                        ciphertext = mediaSpool.albumItemCiphertextFile(current, item.attachmentId),
+                    )
+                    val recorded = current.withAlbumItemStorageKey(item.attachmentId, storageKey)
+                    if (!store.replaceForOwner(owner, current, recorded)) {
+                        return DispatchOneResult.GONE
+                    }
+                    current = recorded
+                }
+                // Sealed before Signal encryption: the persisted record now carries the exact
+                // canonical descriptor, and the intent's own invariant re-proves it on decode.
+                val sealed = current.copy(preparedMediaDescriptor = current.buildAlbumDescriptor())
+                if (!store.replaceForOwner(owner, current, sealed)) {
+                    return DispatchOneResult.GONE
+                }
+                current = sealed
+            }
             chats.promoteImmediateSend(owner, current) { encryptedOutboxOwnsSend = true }
             null
         } catch (cancelled: CancellationException) {
@@ -132,7 +170,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
         if (encryptedOutboxOwnsSend) {
             withContext(NonCancellable) {
                 store.removeForOwner(owner, current.id)
-                if (current.kind == ImmediateSendKind.MEDIA) mediaSpool.discard(current.id)
+                current.spoolIds().forEach { mediaSpool.discard(it) }
             }
             // A network error after companion commit belongs to the encrypted outbox, not this
             // plaintext queue. Stop this conversation here: its encrypted head must be accepted (or
@@ -149,7 +187,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
             // or alternate runtime that completed the full network send before notifying it.
             withContext(NonCancellable) {
                 store.removeForOwner(owner, current.id)
-                if (current.kind == ImmediateSendKind.MEDIA) mediaSpool.discard(current.id)
+                current.spoolIds().forEach { mediaSpool.discard(it) }
             }
             return DispatchOneResult.COMMITTED
         }
@@ -175,6 +213,24 @@ internal class ImmediateSendDispatcher @Inject constructor(
                 mediaSpool.discard(current.id)
             }
             return DispatchOneResult.RETIRED
+        }
+        if (
+            current.kind == ImmediateSendKind.MEDIA_V2 &&
+            failure is ImmediateMediaSpoolUnavailableException
+        ) {
+            // An album's lost ciphertext is just as irrecoverable, but KITMEDIA2 §7 requires the
+            // failure to happen in front of the person, never silently — and never as a partial
+            // send. The record flips to its terminal visible state, its remaining spool files
+            // are useless and released, and dispatch skips it from now on.
+            withContext(NonCancellable) {
+                store.replaceForOwner(
+                    owner,
+                    current,
+                    current.copy(state = ImmediateSendState.FAILED),
+                )
+                current.spoolIds().forEach { mediaSpool.discard(it) }
+            }
+            return DispatchOneResult.FAILED
         }
         return if (failure.isTransientImmediateSendFailure()) {
             DispatchOneResult.RETRY

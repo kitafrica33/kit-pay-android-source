@@ -2,6 +2,8 @@ package com.kit.wallet
 
 import com.kit.wallet.data.messaging.KitEditMessage
 import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.KitMediaMessageV2
+import com.kit.wallet.data.messaging.KitMediaMessageV2Item
 import com.kit.wallet.data.messaging.KitReactionAction
 import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.repository.AuthenticatedProjectedText
@@ -205,6 +207,16 @@ class MessageEditTest {
         assertTrue(folded.isEmpty())
     }
 
+    @Test
+    fun `an inbound edit targeting a media v2 album is never folded`() {
+        val folded = fold(
+            message(TARGET, MEDIA_V2_DESCRIPTOR, fromMe = false),
+            edit(TARGET, "Replace the album caption", fromMe = false),
+        )
+
+        assertTrue(folded.isEmpty())
+    }
+
     // MARK: what the composer offers
 
     @Test
@@ -325,6 +337,29 @@ class MessageEditTest {
             keyMaterialBase64 = Base64.getEncoder().encodeToString(ByteArray(64) { 7 }),
             plaintextByteSize = 4_000,
             caption = "A photo",
+        ).encode()
+        val MEDIA_V2_DESCRIPTOR: String = KitMediaMessageV2(
+            items = listOf(
+                KitMediaMessageV2Item(
+                    attachmentId = "11111111-1111-4111-8111-111111111111",
+                    storageKey = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    mediaType = "image/jpeg",
+                    ciphertextByteSize = 1_088,
+                    ciphertextSha256 = "1".repeat(64),
+                    keyMaterialBase64 = Base64.getEncoder().encodeToString(ByteArray(64)),
+                    plaintextByteSize = 1_024,
+                ),
+                KitMediaMessageV2Item(
+                    attachmentId = "22222222-2222-4222-8222-222222222222",
+                    storageKey = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    mediaType = "video/mp4",
+                    ciphertextByteSize = 5_242_944,
+                    ciphertextSha256 = "2".repeat(64),
+                    keyMaterialBase64 = Base64.getEncoder().encodeToString(ByteArray(64) { 1 }),
+                    plaintextByteSize = 5_242_880,
+                ),
+            ),
+            caption = "Family photos",
         ).encode()
     }
 }

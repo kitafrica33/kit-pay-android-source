@@ -185,24 +185,26 @@ class RemoteAuthRepositoryTest {
     }
 
     @Test
-    fun `email registration sends the normalized user chosen tag`() = runTest {
-        server.enqueue(jsonResponse(REGISTRATION_JSON))
-        val repository = repository(FakeSessionStore(), FakeRefreshTrigger())
-
-        val result = repository.registerWithEmail(
-            name = "  Amina   Yusuf  ",
-            tag = " @Amina_01 ",
-            email = "amina@example.test",
-            password = "Strong-password-123",
-            passwordConfirmation = "Strong-password-123",
-        )
-
-        assertEquals("amina@example.test", result.email)
-        val request = server.takeRequest()
-        assertEquals("/api/kit-wallet/v1/auth/email/register", request.path)
-        val body = request.body.readUtf8()
-        assertTrue(body.contains("\"name\":\"Amina Yusuf\""))
-        assertTrue(body.contains("\"tag\":\"amina_01\""))
+    fun `the retired email registration route has no client binding`() {
+        // Registration is phone-only. This walks every declared endpoint so a future
+        // binding of the retired route — under any HTTP method — fails here, not in review.
+        val boundRoutes = KitWalletApi::class.java.methods.flatMap { method ->
+            method.annotations.mapNotNull { annotation ->
+                when (annotation) {
+                    is retrofit2.http.GET -> annotation.value
+                    is retrofit2.http.POST -> annotation.value
+                    is retrofit2.http.PUT -> annotation.value
+                    is retrofit2.http.PATCH -> annotation.value
+                    is retrofit2.http.DELETE -> annotation.value
+                    else -> null
+                }
+            }
+        }
+        assertTrue(boundRoutes.size > 10)
+        assertTrue(boundRoutes.none { it.contains("auth/email/register") })
+        // The email endpoints that survive the retirement really are still bound.
+        assertTrue(boundRoutes.any { it.contains("auth/email/verify") })
+        assertTrue(boundRoutes.any { it.contains("auth/password/forgot") })
     }
 
     @Test
@@ -1418,10 +1420,6 @@ class RemoteAuthRepositoryTest {
 
         val PLACEHOLDER_PROFILE_JSON = """
             {"ok":true,"data":{"state":"authenticated","session":{"access_token":"access-token","refresh_token":"refresh-token","token_type":"Bearer","session_id":"session-uuid"},"user":{"id":"7","name":null,"phone":"+256772345678","tag":null,"payment_pin_set":null,"mfa_enabled":null,"profile_setup_required":false}},"meta":{"request_id":"request-placeholder"}}
-        """.trimIndent()
-
-        val REGISTRATION_JSON = """
-            {"ok":true,"data":{"state":"verification_required","challenge":{"type":"email_verification","method":"email","destination":"a***@example.test","expires_at":"2026-07-16T12:05:00Z"},"user":{"id":"7","name":"Amina Yusuf","email":"amina@example.test","tag":"amina_01"}},"meta":{"request_id":"request-register"}}
         """.trimIndent()
 
         val NULL_MESSAGE_JSON = """

@@ -20,4 +20,8 @@
     <style name="Theme.KitWallet.ShareRelay" parent="Theme.KitWallet">
         <item name="android:windowBackground">@color/kit_navy</item>
     </style>
+
+    <!-- This relay performs no asynchronous work and always finishes from onCreate. Keeping it
+         non-rendering avoids a flash between the system call surface and MainActivity. -->
+    <style name="Theme.KitWallet.CallRelay" parent="android:style/Theme.NoDisplay" />
 </resources>
