@@ -17,8 +17,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ConversationPrefEntity::class,
         ProfilePhotoEntity::class,
         BeneficiaryContactEntity::class,
+        SupportOutboxEntity::class,
     ],
-    version = 12,
+    version = 13,
     exportSchema = true,
 )
 abstract class KitWalletDatabase : RoomDatabase() {
@@ -32,6 +33,7 @@ abstract class KitWalletDatabase : RoomDatabase() {
     abstract fun conversationPrefsDao(): ConversationPrefsDao
     abstract fun profilePhotoDao(): ProfilePhotoDao
     abstract fun beneficiaryContactDao(): BeneficiaryContactDao
+    abstract fun supportOutboxDao(): SupportOutboxDao
 
     companion object {
         val MIGRATION_1_2: Migration = object : Migration(1, 2) {
@@ -222,6 +224,30 @@ abstract class KitWalletDatabase : RoomDatabase() {
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS index_beneficiary_contacts_ownerScopeId " +
                         "ON beneficiary_contacts(ownerScopeId)",
+                )
+            }
+        }
+
+        val MIGRATION_12_13: Migration = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS support_outbox (" +
+                        "ownerScopeId TEXT NOT NULL, " +
+                        "clientMessageId TEXT NOT NULL, " +
+                        "kind TEXT NOT NULL, " +
+                        "ticketId TEXT, " +
+                        "categoryKey TEXT, " +
+                        "subject TEXT, " +
+                        "body TEXT NOT NULL, " +
+                        "status TEXT NOT NULL, " +
+                        "failureCode TEXT, " +
+                        "createdAtEpochMillis INTEGER NOT NULL, " +
+                        "lastAttemptAtEpochMillis INTEGER, " +
+                        "PRIMARY KEY(ownerScopeId, clientMessageId))",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_support_outbox_ownerScopeId_ticketId " +
+                        "ON support_outbox(ownerScopeId, ticketId)",
                 )
             }
         }

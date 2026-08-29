@@ -597,4 +597,93 @@ interface KitWalletApi {
 
     @DELETE("api/kit-wallet/v1/devices/current/push-token")
     suspend fun unregisterPushToken(): ApiEnvelope<PushTokenStatusDto>
+
+    // --- In-app support (docs/support-client.md). Every call is fenced to the session that
+    // prepared it: ticket content is account-private and must never ride a successor session.
+
+    @GET("api/kit-wallet/v1/support/categories")
+    suspend fun supportCategories(
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<SupportCategoryListDto>
+
+    @GET("api/kit-wallet/v1/support/tickets")
+    suspend fun supportTickets(
+        @Query("status") status: String?,
+        @Query("limit") limit: Int,
+        /** Opaque `meta.next_cursor` from a prior page, verbatim, or null for the first page. */
+        @Query("cursor") cursor: String?,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<SupportTicketListDto>
+
+    @POST("api/kit-wallet/v1/support/tickets")
+    suspend fun openSupportTicket(
+        @Body request: OpenSupportTicketRequest,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<SupportTicketDto>
+
+    @GET("api/kit-wallet/v1/support/tickets/{ticketId}")
+    suspend fun supportTicket(
+        @Path("ticketId") ticketId: String,
+        @Query("limit") limit: Int,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<SupportTicketDetailDto>
+
+    @POST("api/kit-wallet/v1/support/tickets/{ticketId}/close")
+    suspend fun closeSupportTicket(
+        @Path("ticketId") ticketId: String,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<SupportTicketDto>
+
+    @POST("api/kit-wallet/v1/support/tickets/{ticketId}/escalate")
+    suspend fun escalateSupportTicket(
+        @Path("ticketId") ticketId: String,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<SupportTicketDto>
+
+    @GET("api/kit-wallet/v1/support/tickets/{ticketId}/messages")
+    suspend fun supportTicketMessages(
+        @Path("ticketId") ticketId: String,
+        @Query("after_position") afterPosition: Long,
+        @Query("limit") limit: Int,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<SupportMessagePageDto>
+
+    @POST("api/kit-wallet/v1/support/tickets/{ticketId}/messages")
+    suspend fun sendSupportMessage(
+        @Path("ticketId") ticketId: String,
+        @Body request: SendSupportMessageRequest,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<SupportMessageDto>
+
+    @POST("api/kit-wallet/v1/support/tickets/{ticketId}/payments")
+    suspend fun createSupportPayment(
+        @Path("ticketId") ticketId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: CreateSupportPaymentRequest,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<SupportPaymentDto>
+
+    /**
+     * Ticket-scoped agent photo. Bytes only, `Cache-Control: private, no-store`: the caller
+     * must keep the decoded image in memory and never persist it. 404 covers every
+     * unavailable state alike, so it is handled as "no photo", never as an error.
+     */
+    @GET("api/kit-wallet/v1/support/tickets/{ticketId}/agent-avatar")
+    suspend fun supportAgentAvatar(
+        @Path("ticketId") ticketId: String,
+        @Tag expectedOwner: SessionFence,
+    ): retrofit2.Response<okhttp3.ResponseBody>
+
+    // --- Referrals (dark unless `features.referrals` is exactly true).
+
+    @GET("api/kit-wallet/v1/referrals")
+    suspend fun referralOverview(
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<ReferralOverviewDto>
+
+    @POST("api/kit-wallet/v1/referrals/code")
+    suspend fun ensureReferralCode(
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<ReferralCodeResultDto>
 }

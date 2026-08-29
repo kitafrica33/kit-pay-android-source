@@ -28,6 +28,25 @@ object KitFeature {
      * milestones rest on device-local evidence alone.
      */
     const val STARTER_CHECKLIST = "starter_checklist"
+
+    /**
+     * Authenticated in-app support. The feature flag alone is not sufficient: the surface
+     * additionally requires the exact `protocols.support` handshake
+     * (see `com.kit.wallet.data.support.SupportContract`), and every deviation fails closed.
+     */
+    const val SUPPORT = "support"
+
+    /** Customer-initiated, company-beneficiary payments inside a support ticket. */
+    const val SUPPORT_PAYMENTS = "support_payments"
+
+    /** Presentation gate for the support AI assistant; per-ticket state stays authoritative. */
+    const val SUPPORT_AI = "support_ai"
+
+    /**
+     * Referral program surface. Dark unless this key is exactly `true` on a successfully
+     * loaded snapshot; the client renders only server-provided policy and reward states.
+     */
+    const val REFERRALS = "referrals"
 }
 
 /** Held-transfer actions require their wallet and send dependencies as well as the rollout flag. */

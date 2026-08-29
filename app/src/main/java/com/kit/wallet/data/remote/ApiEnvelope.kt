@@ -45,6 +45,11 @@ data class ApiMetaDto(
     @Json(name = "request_id") val requestId: String? = null,
     @Json(name = "api_version") val apiVersion: String? = null,
     @Json(name = "server_time") val serverTime: String? = null,
+    /** True when an idempotent command was replayed and no new record was created. */
+    @Json(name = "idempotent_replay") val idempotentReplay: Boolean? = null,
+    /** Opaque continuation cursor for list endpoints; sent back verbatim or not at all. */
+    @Json(name = "next_cursor") val nextCursor: String? = null,
+    @Json(name = "has_more") val hasMore: Boolean? = null,
 )
 
 data class ApiCallResult<T>(

@@ -56,6 +56,11 @@ object Dest {
     const val SECURITY = "settings/security"
     const val PROFILE_EDIT = "settings/profile/edit"
     const val CHAT_BACKUP = "settings/chats/backup"
+    // Support is reachable from Settings only; nothing else links into these routes.
+    const val SUPPORT = "settings/support"
+    const val SUPPORT_NEW_TICKET = "settings/support/new"
+    const val SUPPORT_TICKET = "settings/support/ticket/{ticketId}"
+    const val REFERRALS = "settings/referrals"
 
     fun txDetail(id: String) = "wallet/tx/$id"
     fun send(contactId: String? = null) = contactId
@@ -73,4 +78,5 @@ object Dest {
     fun incomingCall(callId: String, accept: Boolean = false) =
         "call/incoming/${Uri.encode(callId)}?accept=${if (accept) "1" else "0"}"
     fun profileSetup(needsPin: Boolean) = "auth/profile/setup?needsPin=$needsPin"
+    fun supportTicket(ticketId: String) = "settings/support/ticket/${Uri.encode(ticketId)}"
 }

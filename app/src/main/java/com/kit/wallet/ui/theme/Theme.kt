@@ -113,6 +113,15 @@ data class KitExtendedColors(
     /** The two ends of the sheen along a group payment card's edge. */
     val goldSheenStart: Color,
     val goldSheenEnd: Color,
+    /**
+     * Verified-organization blue worn only by official Kit Pay support identities
+     * (server designation `official_support`). Deliberately not the green
+     * KYC/success family: a badge about who is talking must never look like a
+     * claim about the customer's own verification.
+     */
+    val verifiedBadge: Color,
+    val verifiedBadgeContainer: Color,
+    val onVerifiedBadgeContainer: Color,
 )
 
 private val LightExtended = KitExtendedColors(
@@ -135,6 +144,9 @@ private val LightExtended = KitExtendedColors(
     onGoldContainer = KitInk,
     goldSheenStart = KitGoldSheenStart,
     goldSheenEnd = KitGoldSheenEnd,
+    verifiedBadge = KitVerifiedBlue,
+    verifiedBadgeContainer = KitVerifiedBlueContainer,
+    onVerifiedBadgeContainer = Color(0xFF0D3C71),
 )
 
 private val DarkExtended = KitExtendedColors(
@@ -157,6 +169,9 @@ private val DarkExtended = KitExtendedColors(
     onGoldContainer = KitFog,
     goldSheenStart = KitGoldSheenStartDark,
     goldSheenEnd = KitGoldSheenEndDark,
+    verifiedBadge = KitVerifiedBlueDark,
+    verifiedBadgeContainer = KitVerifiedBlueContainerDark,
+    onVerifiedBadgeContainer = Color(0xFFCBE0F7),
 )
 
 private val LocalKitColors = staticCompositionLocalOf { LightExtended }

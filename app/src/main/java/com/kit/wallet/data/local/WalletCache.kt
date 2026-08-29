@@ -40,6 +40,7 @@ class RoomWalletCache @Inject constructor(
     private val profilePhotoDao: ProfilePhotoDao? = null,
     private val profileAvatarBytes: ProfileAvatarByteStore? = null,
     private val beneficiaryContactDao: BeneficiaryContactDao? = null,
+    private val supportOutboxDao: SupportOutboxDao? = null,
 ) : WalletCache {
     override val ownerScope: Flow<String?> = syncStateDao.observe(AUTHENTICATED_CACHE_OWNER_KEY)
 
@@ -129,6 +130,9 @@ class RoomWalletCache @Inject constructor(
         // Which of this account's payout destinations belong to which of its contacts is just as
         // much theirs, and says as much about them, as the faces do.
         beneficiaryContactDao?.clear()
+        // Queued support text is the account's own words to Kit staff. It must neither render
+        // under nor ever be transmitted by whoever signs in next.
+        supportOutboxDao?.clear()
         // A file that will not delete must not roll back the row erasure — leaving the rows behind
         // would be the worse of the two failures by far.
         runCatching { profileAvatarBytes?.clear() }

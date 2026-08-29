@@ -10,6 +10,8 @@ import com.kit.wallet.data.realtime.KitNetworkEvent
 import com.kit.wallet.data.realtime.KitNetworkSource
 import com.kit.wallet.data.remote.KitFeature
 import com.kit.wallet.data.repository.ChatRepository
+import com.kit.wallet.data.support.NegotiatedSupportProtocol
+import com.kit.wallet.data.support.SupportContract
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
@@ -47,6 +49,13 @@ data class AppCapabilities(
     val biometricTokensAvailable: Boolean = false,
     // The current scanner is presentation-only: it has no CameraX/QR decoder integration.
     val qrScannerClientReady: Boolean = false,
+    /**
+     * The support protocol negotiated from the last successful capability response, or null
+     * when the server advertised none or anything this build does not speak exactly. Support
+     * has no retained/display-only form: its content lives on the server, so there is nothing
+     * truthful to show from a stale snapshot and the surface simply goes dark.
+     */
+    val supportProtocol: NegotiatedSupportProtocol? = null,
 ) {
     fun enabled(feature: String): Boolean = loaded && !loadFailed && features[feature] == true
 
@@ -118,6 +127,39 @@ data class AppCapabilities(
             qrScannerClientReady
 
     /**
+     * In-app support: the feature flag and the exact protocol handshake must both hold
+     * (docs/support-client.md N1). Everything support-related — the Settings entry, the
+     * routes, every API call site — derives from this one value, so a deviation anywhere
+     * darkens the whole surface at once.
+     */
+    val supportUsable: Boolean
+        get() = enabled(KitFeature.SUPPORT) && supportProtocol != null
+
+    /**
+     * Support payments ride the normal wallet-transfer machinery, so they require the wallet
+     * and transfer features as well as their own flag and the protocol's payment readiness
+     * (N2). The beneficiary shown pre-confirmation comes from the negotiated protocol only.
+     */
+    val supportPaymentsUsable: Boolean
+        get() = supportUsable &&
+            allEnabled(
+                KitFeature.SUPPORT_PAYMENTS,
+                KitFeature.WALLETS,
+                KitFeature.INTERNAL_TRANSFERS,
+            ) &&
+            supportProtocol?.paymentsReady == true
+
+    /** Presentation-only AI gate (N3); each ticket's `assistant_active` stays authoritative. */
+    val supportAiAdvertised: Boolean
+        get() = supportUsable &&
+            enabled(KitFeature.SUPPORT_AI) &&
+            supportProtocol?.aiEnabled == true
+
+    /** Referrals are dark unless the flag is exactly true on a successful load (N4). */
+    val referralsUsable: Boolean
+        get() = enabled(KitFeature.REFERRALS)
+
+    /**
      * Central navigation guard. Unknown feature-backed screens are not inferred from a route;
      * every route listed here mirrors the backend feature names above.
      */
@@ -157,6 +199,10 @@ data class AppCapabilities(
             Dest.SCAN -> qrPaymentsUsable
             Dest.TRANSACTIONS, Dest.TX_DETAIL -> enabled(KitFeature.WALLETS)
             Dest.KYC -> enabled(KitFeature.KYC)
+            // Support content lives on the server; there is no read-only local fallback, so
+            // these routes follow the strict handshake rather than lastKnownEnabled.
+            Dest.SUPPORT, Dest.SUPPORT_NEW_TICKET, Dest.SUPPORT_TICKET -> supportUsable
+            Dest.REFERRALS -> referralsUsable
             // Phone OTP is the only way an account is created. The registration screen is
             // retired outright rather than capability-gated: a stale snapshot that still
             // advertises email_registration must not resurrect it, so this is a constant,
@@ -265,6 +311,7 @@ class AppCapabilitiesViewModel @Inject constructor(
                     messagingProtocolSuite = null,
                     messagingProtocolPostQuantum = null,
                     biometricTokensAvailable = false,
+                    supportProtocol = null,
                 )
             }
         }
@@ -288,6 +335,7 @@ class AppCapabilitiesViewModel @Inject constructor(
                         messagingProtocolSuite = messagingProtocol?.suite,
                         messagingProtocolPostQuantum = messagingProtocol?.postQuantum,
                         biometricTokensAvailable = biometricTokens,
+                        supportProtocol = SupportContract.negotiate(response.protocols?.support),
                     )
                 }
             } catch (cancelled: CancellationException) {
@@ -309,6 +357,7 @@ class AppCapabilitiesViewModel @Inject constructor(
                         messagingProtocolSuite = null,
                         messagingProtocolPostQuantum = null,
                         biometricTokensAvailable = false,
+                        supportProtocol = null,
                     )
                 }
             }

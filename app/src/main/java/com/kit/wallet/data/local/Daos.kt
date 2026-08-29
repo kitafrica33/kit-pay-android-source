@@ -317,3 +317,53 @@ interface BeneficiaryContactDao {
     @Query("DELETE FROM beneficiary_contacts")
     suspend fun clear()
 }
+
+@Dao
+interface SupportOutboxDao {
+    @Query(
+        "SELECT * FROM support_outbox WHERE ownerScopeId = :ownerScopeId " +
+            "ORDER BY createdAtEpochMillis ASC, clientMessageId ASC",
+    )
+    fun observeForOwner(ownerScopeId: String): Flow<List<SupportOutboxEntity>>
+
+    @Query(
+        "SELECT * FROM support_outbox WHERE ownerScopeId = :ownerScopeId " +
+            "AND status = :status " +
+            "ORDER BY createdAtEpochMillis ASC, clientMessageId ASC",
+    )
+    suspend fun listForOwner(ownerScopeId: String, status: String): List<SupportOutboxEntity>
+
+    // ABORT, not REPLACE: an enqueued draft is immutable — its content is what the server's
+    // idempotency fingerprint binds, so overwriting it would silently break replay safety.
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun enqueue(row: SupportOutboxEntity)
+
+    @Query(
+        "UPDATE support_outbox SET lastAttemptAtEpochMillis = :attemptedAtEpochMillis " +
+            "WHERE ownerScopeId = :ownerScopeId AND clientMessageId = :clientMessageId",
+    )
+    suspend fun markAttempted(
+        ownerScopeId: String,
+        clientMessageId: String,
+        attemptedAtEpochMillis: Long,
+    )
+
+    @Query(
+        "UPDATE support_outbox SET status = 'failed', failureCode = :failureCode " +
+            "WHERE ownerScopeId = :ownerScopeId AND clientMessageId = :clientMessageId",
+    )
+    suspend fun markFailed(
+        ownerScopeId: String,
+        clientMessageId: String,
+        failureCode: String?,
+    )
+
+    @Query(
+        "DELETE FROM support_outbox WHERE ownerScopeId = :ownerScopeId " +
+            "AND clientMessageId = :clientMessageId",
+    )
+    suspend fun delete(ownerScopeId: String, clientMessageId: String)
+
+    @Query("DELETE FROM support_outbox")
+    suspend fun clear()
+}

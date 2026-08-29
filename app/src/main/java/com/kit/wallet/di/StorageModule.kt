@@ -10,6 +10,7 @@ import com.kit.wallet.data.local.KitWalletDatabase
 import com.kit.wallet.data.local.ProfileDao
 import com.kit.wallet.data.local.ProfilePhotoDao
 import com.kit.wallet.data.local.SecureMessagingMetadataDao
+import com.kit.wallet.data.local.SupportOutboxDao
 import com.kit.wallet.data.local.SyncStateDao
 import com.kit.wallet.data.local.WalletDao
 import com.kit.wallet.data.local.WalletTransactionDao
@@ -17,6 +18,8 @@ import com.kit.wallet.data.media.ProfileAvatarByteStore
 import com.kit.wallet.data.media.ProfileAvatarImages
 import com.kit.wallet.data.remote.MediaMessageProtocolDtoAdapter
 import com.kit.wallet.data.remote.StarterChecklistMilestoneDtoAdapter
+import com.kit.wallet.data.remote.SupportPaymentBeneficiaryDtoAdapter
+import com.kit.wallet.data.remote.SupportProtocolDtoAdapter
 import com.kit.wallet.data.remote.UpdateMessagingConversationRequestAdapter
 import com.kit.wallet.data.remote.UpdateProfileRequestAdapter
 import com.kit.wallet.data.repository.AndroidKeystoreBeneficiaryPhoneIdentity
@@ -148,6 +151,11 @@ object StorageModule {
         // Ahead of the reflective factory: a malformed `media_message` capabilities block must
         // turn one feature off, not fail the whole capabilities document.
         .add(MediaMessageProtocolDtoAdapter())
+        // Ahead of the reflective factory: the support protocol block and the payment
+        // beneficiary bind with additionalProperties:false semantics reflection cannot express
+        // — the protocol block contains its own drift, the beneficiary rejects it outright.
+        .add(SupportProtocolDtoAdapter())
+        .add(SupportPaymentBeneficiaryDtoAdapter())
         .add(KotlinJsonAdapterFactory())
         .build()
 
@@ -167,6 +175,7 @@ object StorageModule {
                 KitWalletDatabase.MIGRATION_9_10,
                 KitWalletDatabase.MIGRATION_10_11,
                 KitWalletDatabase.MIGRATION_11_12,
+                KitWalletDatabase.MIGRATION_12_13,
             )
             .fallbackToDestructiveMigrationOnDowngrade()
             .build()
@@ -195,6 +204,10 @@ object StorageModule {
     @Provides
     fun provideBeneficiaryContactDao(database: KitWalletDatabase): BeneficiaryContactDao =
         database.beneficiaryContactDao()
+
+    @Provides
+    fun provideSupportOutboxDao(database: KitWalletDatabase): SupportOutboxDao =
+        database.supportOutboxDao()
 
     @Provides
     @Singleton

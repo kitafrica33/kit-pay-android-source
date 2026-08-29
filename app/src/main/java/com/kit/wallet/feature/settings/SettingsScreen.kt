@@ -26,6 +26,7 @@ import androidx.compose.material.icons.rounded.AlternateEmail
 import androidx.compose.material.icons.rounded.Badge
 import androidx.compose.material.icons.rounded.Block
 import androidx.compose.material.icons.rounded.Call
+import androidx.compose.material.icons.rounded.CardGiftcard
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.ChatBubbleOutline
 import androidx.compose.material.icons.rounded.CloudSync
@@ -37,6 +38,7 @@ import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.PrivacyTip
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Security
+import androidx.compose.material.icons.rounded.SupportAgent
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material3.AlertDialog
@@ -94,6 +96,8 @@ fun SettingsScreen(
     onSecurity: () -> Unit,
     onChatBackup: () -> Unit,
     onKyc: () -> Unit,
+    onSupport: () -> Unit,
+    onReferrals: () -> Unit,
     onLogoutCurrentDevice: () -> Unit,
     logoutBusy: Boolean = false,
     logoutError: String? = null,
@@ -335,6 +339,12 @@ fun SettingsScreen(
         onKyc = {
             if (capabilities.enabled(KitFeature.KYC)) onKyc() else showKycUnavailable = true
         },
+        // Fail-closed entries: absent unless the server advertises the capability
+        // (and, for support, the exact protocol handshake holds).
+        supportVisible = capabilities.supportUsable,
+        onSupport = onSupport,
+        referralsVisible = capabilities.referralsUsable,
+        onReferrals = onReferrals,
         onPrivacyPolicy = {
             val policy = privacyPolicyPresentation()
             if (!isTrustedKitPrivacyPolicyUrl(policy.url)) {
@@ -391,6 +401,10 @@ private fun SettingsContent(
     onRefreshCommunicationPrivacy: () -> Unit,
     onBlockedAccounts: () -> Unit,
     onKyc: () -> Unit,
+    supportVisible: Boolean,
+    onSupport: () -> Unit,
+    referralsVisible: Boolean,
+    onReferrals: () -> Unit,
     onPrivacyPolicy: () -> Unit,
     onOpenSourceLicence: () -> Unit,
     onDeleteAccount: () -> Unit,
@@ -513,6 +527,28 @@ private fun SettingsContent(
                     "Encrypted backup and restore with Google Drive",
                     onClick = onChatBackup,
                 )
+            }
+        }
+        if (supportVisible || referralsVisible) {
+            item {
+                SettingsGroup {
+                    if (supportVisible) {
+                        SettingsRow(
+                            Icons.Rounded.SupportAgent,
+                            "Help & support",
+                            "Open a ticket with the official Kit Pay support team",
+                            onClick = onSupport,
+                        )
+                    }
+                    if (referralsVisible) {
+                        SettingsRow(
+                            Icons.Rounded.CardGiftcard,
+                            "Invite friends",
+                            "Share your link and earn rewards when friends join",
+                            onClick = onReferrals,
+                        )
+                    }
+                }
             }
         }
         item {
@@ -1291,6 +1327,10 @@ private fun SettingsPreview() {
             onRefreshCommunicationPrivacy = {},
             onBlockedAccounts = {},
             onKyc = {},
+            supportVisible = false,
+            onSupport = {},
+            referralsVisible = false,
+            onReferrals = {},
             onPrivacyPolicy = {},
             onOpenSourceLicence = {},
             onDeleteAccount = {},

@@ -120,6 +120,10 @@ import com.kit.wallet.feature.settings.KycScreen
 import com.kit.wallet.feature.settings.ProfileEditorScreen
 import com.kit.wallet.feature.settings.SettingsScreen
 import com.kit.wallet.feature.settings.KIT_PRIVACY_POLICY_URL
+import com.kit.wallet.feature.referrals.ReferralScreen
+import com.kit.wallet.feature.support.NewSupportTicketScreen
+import com.kit.wallet.feature.support.SupportHubScreen
+import com.kit.wallet.feature.support.SupportTicketScreen
 import com.kit.wallet.feature.wallet.ReceiveScreen
 import com.kit.wallet.feature.wallet.RequestMoneyScreen
 import com.kit.wallet.feature.wallet.ScanScreen
@@ -877,6 +881,8 @@ private fun KitNavHost(
                     onSecurity = { navController.navigate(Dest.SECURITY) },
                     onChatBackup = { navController.navigate(Dest.CHAT_BACKUP) },
                     onKyc = { navController.navigate(Dest.KYC) },
+                    onSupport = { navController.navigate(Dest.SUPPORT) },
+                    onReferrals = { navController.navigate(Dest.REFERRALS) },
                     onLogoutCurrentDevice = authViewModel::logoutCurrentDevice,
                     logoutBusy = authState.loading,
                     logoutError = authState.error,
@@ -1189,6 +1195,49 @@ private fun KitNavHost(
         composable(Dest.KYC) {
             FeatureRouteContent(signedIn, capabilities, Dest.KYC) {
                 KycScreen(onBack = { navController.popBackStack() })
+            }
+        }
+
+        // --- Support & referrals (Settings-only; strict handshake, see routeUsable) ---
+        composable(Dest.SUPPORT) {
+            FeatureRouteContent(signedIn, capabilities, Dest.SUPPORT) {
+                SupportHubScreen(
+                    onBack = { navController.popBackStack() },
+                    onNewTicket = { navController.navigate(Dest.SUPPORT_NEW_TICKET) },
+                    onTicket = { navController.navigate(Dest.supportTicket(it)) },
+                )
+            }
+        }
+        composable(Dest.SUPPORT_NEW_TICKET) {
+            FeatureRouteContent(signedIn, capabilities, Dest.SUPPORT_NEW_TICKET) {
+                NewSupportTicketScreen(
+                    aiAdvertised = capabilities.supportAiAdvertised,
+                    onBack = { navController.popBackStack() },
+                    // The ticket now exists on the server; composing is done with,
+                    // so back from the thread lands on the hub.
+                    onOpened = { ticketId ->
+                        navController.navigate(Dest.supportTicket(ticketId)) {
+                            popUpTo(Dest.SUPPORT_NEW_TICKET) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
+                    onQueued = { navController.popBackStack(Dest.SUPPORT, inclusive = false) },
+                )
+            }
+        }
+        composable(Dest.SUPPORT_TICKET) {
+            FeatureRouteContent(signedIn, capabilities, Dest.SUPPORT_TICKET) {
+                SupportTicketScreen(
+                    supportPaymentsUsable = capabilities.supportPaymentsUsable,
+                    companyBeneficiaryName =
+                        capabilities.supportProtocol?.companyBeneficiaryName,
+                    onBack = { navController.popBackStack() },
+                )
+            }
+        }
+        composable(Dest.REFERRALS) {
+            FeatureRouteContent(signedIn, capabilities, Dest.REFERRALS) {
+                ReferralScreen(onBack = { navController.popBackStack() })
             }
         }
     }

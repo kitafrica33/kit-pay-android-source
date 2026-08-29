@@ -194,3 +194,51 @@ data class AccountMessageArchiveEntity(
     val ciphertext: ByteArray,
     val updatedAtEpochMillis: Long,
 )
+
+/** A queued support write awaiting the network; retryable with its idempotency identity fixed. */
+const val SUPPORT_OUTBOX_STATUS_PENDING = "pending"
+
+/** Definitively rejected by the support endpoint; kept for display until the user discards it. */
+const val SUPPORT_OUTBOX_STATUS_FAILED = "failed"
+
+const val SUPPORT_OUTBOX_KIND_OPEN_TICKET = "open_ticket"
+const val SUPPORT_OUTBOX_KIND_MESSAGE = "message"
+
+/**
+ * Durable idempotent outbox for support writes. A queued ticket-open or message-send
+ * survives process death and offline periods with its client-minted `clientMessageId`
+ * fixed, so a retry of an unknown outcome can never create a second server record.
+ * Content is immutable once enqueued (the server's replay fingerprint binds it); a row
+ * leaves `pending` only on server success — which deletes it — or on a definitive
+ * endpoint rejection, which marks it `failed` without ever rotating the id. Owner-scoped
+ * like every authenticated cache table, so one account's queued support text can neither
+ * render under nor be transmitted by another account.
+ */
+@Entity(
+    tableName = "support_outbox",
+    primaryKeys = ["ownerScopeId", "clientMessageId"],
+    indices = [Index(value = ["ownerScopeId", "ticketId"])],
+)
+data class SupportOutboxEntity(
+    /** Exact authenticated cache epoch that is allowed to observe and flush this row. */
+    val ownerScopeId: String,
+    /** Client-minted UUID; the server-side idempotency identity of this write. */
+    val clientMessageId: String,
+    /** [SUPPORT_OUTBOX_KIND_OPEN_TICKET] or [SUPPORT_OUTBOX_KIND_MESSAGE]. */
+    val kind: String,
+    /** Target ticket for a message row; null for an open-ticket row. */
+    val ticketId: String?,
+    /** Chosen category key; open-ticket rows only. */
+    val categoryKey: String?,
+    /** Ticket subject; open-ticket rows only. */
+    val subject: String?,
+    /** Message text — the opening message for an open-ticket row. */
+    val body: String,
+    /** [SUPPORT_OUTBOX_STATUS_PENDING] or [SUPPORT_OUTBOX_STATUS_FAILED]. */
+    val status: String,
+    /** Definitive rejection code once failed; null while pending. */
+    val failureCode: String?,
+    val createdAtEpochMillis: Long,
+    /** When the row last left the device; null while it has never been attempted. */
+    val lastAttemptAtEpochMillis: Long?,
+)

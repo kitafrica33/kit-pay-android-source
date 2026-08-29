@@ -127,6 +127,8 @@ data class RealtimeChannelsDto(
 data class ProtocolsDto(
     val messaging: MessagingProtocolDto? = null,
     val realtime: RealtimeProtocolDto? = null,
+    /** Parsed only by [SupportProtocolDtoAdapter]; absent or drifted means support is off. */
+    val support: SupportProtocolDto? = null,
 )
 
 @JsonClass(generateAdapter = false)

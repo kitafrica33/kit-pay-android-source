@@ -70,3 +70,12 @@ val KitGoldSheenEndDark = Color(0xFF966E1E)
 /** Read-receipt blue for double-tick "read" state, matching common messenger conventions. */
 val KitReadReceipt = Color(0xFF34B7F1)
 val KitReadReceiptDark = Color(0xFF53BDEB)
+
+// Verified-organization blue. Official Kit Pay support wears this and nothing else does: it must
+// never be confused with the green KYC/"verified account" family (a claim about the customer) or
+// with the read-receipt sky blue (a claim about a message). Deep professional blue in light mode
+// so it carries a white check; lifted toward powder blue in dark mode to hold contrast on navy.
+val KitVerifiedBlue = Color(0xFF1565C0)
+val KitVerifiedBlueDark = Color(0xFF7FB4EA)
+val KitVerifiedBlueContainer = Color(0xFFD8E7F9)
+val KitVerifiedBlueContainerDark = Color(0xFF173E63)
