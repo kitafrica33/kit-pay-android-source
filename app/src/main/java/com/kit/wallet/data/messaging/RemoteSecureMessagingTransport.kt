@@ -288,6 +288,20 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val memberRole: String? = null,
         ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt)
 
+        class FinancialMetadataEvent internal constructor(
+            owner: Session,
+            issuanceIdentity: Any,
+            eventId: Long,
+            conversationId: String,
+            occurredAt: Instant,
+            val type: String,
+            val paymentId: String,
+            val requesterUserId: String?,
+            val contributionId: String?,
+            val contributorUserId: String?,
+            val contributionAmountMinor: String?,
+        ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt)
+
         class SyncBatch internal constructor(
             private val owner: Session,
             internal val issuanceIdentity: Any,
@@ -2451,6 +2465,19 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 type = validated.type,
                 memberUserId = validated.memberUserId,
                 memberRole = validated.memberRole,
+            )
+            is ValidatedMessagingSyncEvent.FinancialMetadata -> FinancialMetadataEvent(
+                owner = this,
+                issuanceIdentity = identity,
+                eventId = validated.eventId,
+                conversationId = validated.conversationId,
+                occurredAt = validated.occurredAt,
+                type = validated.type,
+                paymentId = validated.paymentId,
+                requesterUserId = validated.requesterUserId,
+                contributionId = validated.contributionId,
+                contributorUserId = validated.contributorUserId,
+                contributionAmountMinor = validated.contributionAmountMinor,
             )
         }
 

@@ -575,9 +575,46 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     processRosterRefresh(state, event)
                 is RemoteSecureMessagingTransport.Session.MetadataEvent ->
                     processMetadata(state, event)
+                is RemoteSecureMessagingTransport.Session.FinancialMetadataEvent ->
+                    processFinancialMetadata(state, event)
             }
             state.eventIndex++
         }
+    }
+
+    /**
+     * Financial sync rows are authenticated wake hints, never money authority. Refreshing the
+     * wallet and invalidating the conversation makes the UI exact-read the referenced resource;
+     * malformed events have already been rejected by the transport validator.
+     */
+    private suspend fun processFinancialMetadata(
+        state: SessionState,
+        event: RemoteSecureMessagingTransport.Session.FinancialMetadataEvent,
+    ) {
+        if (event.type in GROUP_PAYMENT_REQUEST_SYSTEM_EVENT_TYPES) {
+            try {
+                systemEvents?.record(
+                    conversationId = event.conversationId,
+                    event = ConversationSystemEvent(
+                        eventId = event.eventId,
+                        type = event.type,
+                        userId = event.requesterUserId,
+                        role = null,
+                        occurredAt = event.occurredAt,
+                        paymentId = event.paymentId,
+                        contributionId = event.contributionId,
+                        contributorUserId = event.contributorUserId,
+                        contributionAmountMinor = event.contributionAmountMinor,
+                    ),
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Best effort presentation record; wallet refresh remains the money authority.
+            }
+        }
+        walletRefresh.refreshNow()
+        state.invalidateConversation(event.conversationId)
     }
 
     /**

@@ -165,6 +165,7 @@ internal fun ScheduleSendDialog(
     confirmLabel: String,
     nowEpochMillis: Long,
     initialEpochMillis: Long? = null,
+    explanation: String = "It stays on this device, encrypted, until it goes out.",
     onDismiss: () -> Unit,
     onSchedule: (Long) -> Unit,
 ) {
@@ -208,11 +209,17 @@ internal fun ScheduleSendDialog(
                 text = {
                     Column {
                         Text(
-                            "It stays on this device, encrypted, until it goes out.",
+                            explanation,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Spacer(Modifier.height(10.dp))
+                        Text(
+                            "Time zone: ${zone.id}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(6.dp))
                         presets.forEach { preset ->
                             ScheduleChoiceRow(
                                 icon = Icons.Rounded.Schedule,

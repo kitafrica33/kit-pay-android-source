@@ -127,9 +127,115 @@ data class RealtimeChannelsDto(
 data class ProtocolsDto(
     val messaging: MessagingProtocolDto? = null,
     val realtime: RealtimeProtocolDto? = null,
+    /** Every new payment surface remains dark unless its complete frozen handshake matches. */
+    val payments: PaymentProtocolsDto? = null,
     /** Parsed only by [SupportProtocolDtoAdapter]; absent or drifted means support is off. */
     val support: SupportProtocolDto? = null,
 )
+
+@JsonClass(generateAdapter = false)
+data class PaymentProtocolsDto(
+    @Json(name = "group_payment_requests")
+    val groupPaymentRequests: GroupPaymentRequestsProtocolDto? = null,
+    @Json(name = "scheduled_chat_payments")
+    val scheduledChatPayments: ScheduledChatPaymentsProtocolDto? = null,
+    @Json(name = "scheduled_group_payments")
+    val scheduledGroupPayments: ScheduledGroupPaymentsProtocolDto? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class GroupPaymentRequestsProtocolDto(
+    val version: String? = null,
+    val ready: Boolean? = null,
+    @Json(name = "partial_contributions") val partialContributions: Boolean? = null,
+    @Json(name = "progress_basis_points_max") val progressBasisPointsMax: Int? = null,
+    @Json(name = "minimum_android_version") val minimumAndroidVersion: String? = null,
+    @Json(name = "minimum_android_version_code") val minimumAndroidVersionCode: Int? = null,
+) {
+    val supportsAndroidV1: Boolean
+        get() = ready == true && version == "v1" && partialContributions == true &&
+            progressBasisPointsMax == 10_000 && minimumAndroidVersion == "0.2.35" &&
+            minimumAndroidVersionCode == 46
+}
+
+@JsonClass(generateAdapter = false)
+data class ScheduledChatPaymentsProtocolDto(
+    val version: String? = null,
+    val ready: Boolean? = null,
+    @Json(name = "minimum_android_version") val minimumAndroidVersion: String? = null,
+    @Json(name = "minimum_android_version_code") val minimumAndroidVersionCode: Int? = null,
+) {
+    val supportsAndroidV1: Boolean
+        get() = ready == true && version == "v1" && minimumAndroidVersion == "0.2.35" &&
+            minimumAndroidVersionCode == 46
+}
+
+@JsonClass(generateAdapter = false)
+data class ScheduledGroupPaymentsProtocolDto(
+    val version: String? = null,
+    val ready: Boolean? = null,
+    @Json(name = "minimum_android_version") val minimumAndroidVersion: String? = null,
+    @Json(name = "minimum_android_version_code") val minimumAndroidVersionCode: Int? = null,
+    @Json(name = "minimum_lead_seconds") val minimumLeadSeconds: Int? = null,
+    @Json(name = "maximum_horizon_seconds") val maximumHorizonSeconds: Int? = null,
+) {
+    val supportsAndroidV1: Boolean
+        get() = ready == true && version == "v1" && minimumAndroidVersion == "0.2.35" &&
+            minimumAndroidVersionCode == 46 && minimumLeadSeconds == 60 &&
+            maximumHorizonSeconds == 31_536_000
+}
+
+/**
+ * Isolates additive payment handshakes from the bootstrap document. A malformed future block
+ * disables only that surface instead of making wallets and messaging fail to bootstrap.
+ */
+class PaymentProtocolsDtoAdapter {
+    @FromJson
+    fun fromJson(reader: JsonReader): PaymentProtocolsDto? {
+        val root = reader.readJsonValue() as? Map<*, *> ?: return null
+        return PaymentProtocolsDto(
+            groupPaymentRequests = objectMember(root, "group_payment_requests")?.let { value ->
+                GroupPaymentRequestsProtocolDto(
+                    version = value.string("version"),
+                    ready = value.boolean("ready"),
+                    partialContributions = value.boolean("partial_contributions"),
+                    progressBasisPointsMax = value.integer("progress_basis_points_max"),
+                    minimumAndroidVersion = value.string("minimum_android_version"),
+                    minimumAndroidVersionCode = value.integer("minimum_android_version_code"),
+                )
+            },
+            scheduledChatPayments = objectMember(root, "scheduled_chat_payments")?.let { value ->
+                ScheduledChatPaymentsProtocolDto(
+                    version = value.string("version"),
+                    ready = value.boolean("ready"),
+                    minimumAndroidVersion = value.string("minimum_android_version"),
+                    minimumAndroidVersionCode = value.integer("minimum_android_version_code"),
+                )
+            },
+            scheduledGroupPayments = objectMember(root, "scheduled_group_payments")?.let { value ->
+                ScheduledGroupPaymentsProtocolDto(
+                    version = value.string("version"),
+                    ready = value.boolean("ready"),
+                    minimumAndroidVersion = value.string("minimum_android_version"),
+                    minimumAndroidVersionCode = value.integer("minimum_android_version_code"),
+                    minimumLeadSeconds = value.integer("minimum_lead_seconds"),
+                    maximumHorizonSeconds = value.integer("maximum_horizon_seconds"),
+                )
+            },
+        )
+    }
+
+    private fun objectMember(root: Map<*, *>, key: String): Map<*, *>? = root[key] as? Map<*, *>
+    private fun Map<*, *>.string(key: String): String? = this[key] as? String
+    private fun Map<*, *>.boolean(key: String): Boolean? = this[key] as? Boolean
+    private fun Map<*, *>.integer(key: String): Int? {
+        val number = (this[key] as? Number)?.toDouble() ?: return null
+        if (!number.isFinite() || number != Math.floor(number) ||
+            number < Int.MIN_VALUE || number > Int.MAX_VALUE
+        ) return null
+        return number.toInt()
+    }
+}
 
 @JsonClass(generateAdapter = false)
 data class CapabilitiesDto(

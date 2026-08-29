@@ -21,6 +21,17 @@ internal data class ConversationScrollDecision(
 )
 
 /**
+ * Releases the opening anchor at the first real vertical user delta, before LazyColumn consumes
+ * it. Observing `isScrollInProgress` alone is one frame too late and can let the anchoring effect
+ * snap the list back under that first drag. Horizontal swipe-to-reply and stationary long presses
+ * deliberately do not release it.
+ */
+internal fun shouldReleaseOpeningBottomAnchor(
+    userInput: Boolean,
+    verticalDelta: Float,
+): Boolean = userInput && verticalDelta != 0f
+
+/**
  * Whether a payment-card hydration may restore the bottom anchor after its height changes.
  *
  * Hydration is not a new message, so it gets no unread count. It may only correct layout for a
@@ -49,6 +60,7 @@ internal fun conversationScrollDecision(
     messages: List<Message>,
     nearBottom: Boolean,
     focusPending: Boolean = false,
+    openingBottomAnchorActive: Boolean = false,
 ): ConversationScrollDecision {
     if (messages.isEmpty()) return ConversationScrollDecision(ConversationScrollAction.KEEP_POSITION)
     if (previousMessageIds == null) {
@@ -63,7 +75,7 @@ internal fun conversationScrollDecision(
     if (added.isEmpty()) {
         return ConversationScrollDecision(ConversationScrollAction.KEEP_POSITION)
     }
-    if (nearBottom) {
+    if (nearBottom || (openingBottomAnchorActive && !focusPending)) {
         return ConversationScrollDecision(ConversationScrollAction.FOLLOW_NEWEST)
     }
 
@@ -81,4 +93,5 @@ internal fun conversationScrollDecision(
 }
 
 private val MessageKind.isGroupPaymentRow: Boolean
-    get() = this == MessageKind.GROUP_PAYMENT || this == MessageKind.GROUP_PAYMENT_EVENT
+    get() = this == MessageKind.GROUP_PAYMENT || this == MessageKind.GROUP_PAYMENT_EVENT ||
+        this == MessageKind.GROUP_PAYMENT_REQUEST || this == MessageKind.GROUP_PAYMENT_REQUEST_EVENT

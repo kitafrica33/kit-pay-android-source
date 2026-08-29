@@ -477,6 +477,13 @@ interface ChatRepository {
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
     ) = sendPaymentEvent(chatId, descriptor, onDurablyCommitted)
 
+    /** Sends a canonical collaborative-request descriptor through its independently validated path. */
+    suspend fun sendGroupPaymentRequestEvent(
+        chatId: String,
+        descriptor: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit = {},
+    ) = sendPaymentEvent(chatId, descriptor, onDurablyCommitted)
+
     suspend fun retryMessage(chatId: String, clientMessageId: String, text: String) {
         error("This chat repository does not support explicit secure-message retries")
     }

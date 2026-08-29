@@ -346,6 +346,52 @@ interface KitWalletApi {
         @Body request: GroupPaymentResolutionRequest,
     ): ApiEnvelope<GroupPaymentDto>
 
+    @GET("api/kit-wallet/v1/conversations/{conversationId}/group-payment-requests")
+    suspend fun groupPaymentRequests(
+        @Path("conversationId") conversationId: String,
+        @Query("status") status: String? = null,
+    ): ApiEnvelope<GroupPaymentRequestListDto>
+
+    @POST("api/kit-wallet/v1/conversations/{conversationId}/group-payment-requests")
+    suspend fun createGroupPaymentRequest(
+        @Path("conversationId") conversationId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Body request: CreateCollaborativeGroupPaymentRequest,
+    ): ApiEnvelope<GroupPaymentRequestDto>
+
+    @GET("api/kit-wallet/v1/group-payment-requests/{requestId}")
+    suspend fun groupPaymentRequest(
+        @Path("requestId") requestId: String,
+    ): ApiEnvelope<GroupPaymentRequestDto>
+
+    @GET("api/kit-wallet/v1/group-payment-requests/{requestId}/contributions")
+    suspend fun groupPaymentRequestContributions(
+        @Path("requestId") requestId: String,
+        @Query("before") before: String? = null,
+        @Query("limit") limit: Int = 50,
+    ): ApiEnvelope<GroupPaymentRequestContributionPageDto>
+
+    /** Exact lookup hydrates contribution events older than the newest embedded 50 rows. */
+    @GET("api/kit-wallet/v1/group-payment-requests/{requestId}/contributions/{contributionId}")
+    suspend fun groupPaymentRequestContribution(
+        @Path("requestId") requestId: String,
+        @Path("contributionId") contributionId: String,
+    ): ApiEnvelope<GroupPaymentRequestContributionDto>
+
+    @POST("api/kit-wallet/v1/group-payment-requests/{requestId}/contributions")
+    suspend fun contributeToGroupPaymentRequest(
+        @Path("requestId") requestId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: ContributeGroupPaymentRequest,
+    ): ApiEnvelope<GroupPaymentRequestContributionResultDto>
+
+    @POST("api/kit-wallet/v1/group-payment-requests/{requestId}/cancel")
+    suspend fun cancelGroupPaymentRequest(
+        @Path("requestId") requestId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+    ): ApiEnvelope<GroupPaymentRequestDto>
+
     @POST("api/kit-wallet/v1/payments/requests")
     suspend fun createPaymentRequest(
         @Header("Idempotency-Key") idempotencyKey: String,
@@ -363,6 +409,65 @@ interface KitWalletApi {
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: PayPaymentRequestDto,
     ): ApiEnvelope<PaymentRequestDto>
+
+    @GET("api/kit-wallet/v1/payments/scheduled")
+    suspend fun scheduledPayments(
+        @Query("conversation_id") conversationId: String? = null,
+        @Query("status") status: String? = null,
+        @Query("before") before: String? = null,
+        @Query("limit") limit: Int = 50,
+    ): ApiEnvelope<ScheduledPaymentPageDto>
+
+    @GET("api/kit-wallet/v1/payments/scheduled/{scheduledPaymentId}")
+    suspend fun scheduledPayment(
+        @Path("scheduledPaymentId") scheduledPaymentId: String,
+    ): ApiEnvelope<ScheduledPaymentDto>
+
+    @POST("api/kit-wallet/v1/payments/scheduled")
+    suspend fun createScheduledPayment(
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: CreateScheduledPaymentRequest,
+    ): ApiEnvelope<ScheduledPaymentDto>
+
+    @POST("api/kit-wallet/v1/payments/scheduled/{scheduledPaymentId}/cancel")
+    suspend fun cancelScheduledPayment(
+        @Path("scheduledPaymentId") scheduledPaymentId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+    ): ApiEnvelope<ScheduledPaymentDto>
+
+    @POST("api/kit-wallet/v1/conversations/{conversationId}/scheduled-group-payments/preview")
+    suspend fun previewScheduledGroupPayment(
+        @Path("conversationId") conversationId: String,
+        @Body request: PreviewScheduledGroupPaymentRequest,
+    ): ApiEnvelope<ScheduledGroupPaymentPlanDto>
+
+    @POST("api/kit-wallet/v1/conversations/{conversationId}/scheduled-group-payments")
+    suspend fun createScheduledGroupPayment(
+        @Path("conversationId") conversationId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
+        @Body request: CreateScheduledGroupPaymentRequest,
+    ): ApiEnvelope<ScheduledGroupPaymentDto>
+
+    @GET("api/kit-wallet/v1/conversations/{conversationId}/scheduled-group-payments")
+    suspend fun scheduledGroupPayments(
+        @Path("conversationId") conversationId: String,
+        @Query("status") status: String,
+        @Query("before") before: String? = null,
+        @Query("limit") limit: Int = 50,
+    ): ApiEnvelope<ScheduledGroupPaymentPageDto>
+
+    @GET("api/kit-wallet/v1/scheduled-group-payments/{scheduledGroupPaymentId}")
+    suspend fun scheduledGroupPayment(
+        @Path("scheduledGroupPaymentId") scheduledGroupPaymentId: String,
+    ): ApiEnvelope<ScheduledGroupPaymentDto>
+
+    @POST("api/kit-wallet/v1/scheduled-group-payments/{scheduledGroupPaymentId}/cancel")
+    suspend fun cancelScheduledGroupPayment(
+        @Path("scheduledGroupPaymentId") scheduledGroupPaymentId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+    ): ApiEnvelope<ScheduledGroupPaymentDto>
 
     @POST("api/kit-wallet/v1/payments/requests/{requestId}/cancel")
     suspend fun cancelPaymentRequest(
@@ -395,6 +500,11 @@ interface KitWalletApi {
         @Header("Idempotency-Key") idempotencyKey: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: CreateProviderOperationRequest,
+    ): ApiEnvelope<ProviderOperationDto>
+
+    @GET("api/kit-wallet/v1/providers/operations/{operationId}")
+    suspend fun providerOperation(
+        @Path("operationId") operationId: String,
     ): ApiEnvelope<ProviderOperationDto>
 
     @PUT("api/kit-wallet/v1/auth/payment-pin")

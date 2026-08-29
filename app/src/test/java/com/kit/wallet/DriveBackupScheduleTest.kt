@@ -2,9 +2,13 @@ package com.kit.wallet
 
 import com.kit.wallet.data.backup.DriveBackupState
 import com.kit.wallet.data.backup.MessageBackupFrequency
+import com.kit.wallet.data.backup.MessageBackupRunStatus
+import com.kit.wallet.feature.backup.ChatBackupUiState
+import com.kit.wallet.feature.backup.automaticBackupStatusText
 import com.kit.wallet.feature.backup.formatByteSize
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -58,6 +62,94 @@ class DriveBackupScheduleTest {
         )
         assertFalse(state.isDue(now = 6 * day))
         assertTrue(state.isDue(now = 7 * day))
+    }
+
+    @Test fun `an empty-history run waits for the selected cadence instead of spinning`() {
+        val state = connected.copy(
+            lastAttemptAtEpochMillis = 10 * day,
+            lastRunStatus = MessageBackupRunStatus.NOTHING_TO_BACK_UP,
+        )
+
+        assertFalse(state.isDue(now = 10 * day + day / 2))
+        assertTrue(state.isDue(now = 11 * day))
+        assertEquals(11 * day, state.nextDueAtEpochMillis(now = 10 * day + day / 2))
+    }
+
+    @Test fun `a retryable failure remains immediately due`() {
+        val state = connected.copy(
+            lastAttemptAtEpochMillis = 10 * day,
+            lastRunStatus = MessageBackupRunStatus.RETRYING,
+            lastFailureAtEpochMillis = 10 * day,
+            consecutiveFailures = 2,
+        )
+
+        assertTrue(state.isDue(now = 10 * day + 1))
+        assertEquals(10 * day + 1, state.nextDueAtEpochMillis(now = 10 * day + 1))
+    }
+
+    @Test fun `a retry remains due even after a recent successful backup`() {
+        val now = 10 * day + day / 2
+        val state = connected.copy(
+            lastBackupAtEpochMillis = 10 * day,
+            lastAttemptAtEpochMillis = now - 1,
+            lastRunStatus = MessageBackupRunStatus.RETRYING,
+            lastFailureAtEpochMillis = now - 1,
+            consecutiveFailures = 1,
+        )
+
+        assertTrue(state.isDue(now))
+        assertEquals(now, state.nextDueAtEpochMillis(now))
+    }
+
+    @Test fun `an in-process running backup is not booked twice`() {
+        val state = connected.copy(
+            lastAttemptAtEpochMillis = 10 * day,
+            lastRunStatus = MessageBackupRunStatus.RUNNING,
+        )
+
+        assertFalse(state.isDue(now = 10 * day + 1))
+        assertNull(state.nextDueAtEpochMillis(now = 10 * day + 1))
+    }
+
+    @Test fun `a running marker from a dead process becomes a visible retry`() {
+        val state = connected.copy(
+            lastBackupAtEpochMillis = 9 * day,
+            lastAttemptAtEpochMillis = 10 * day,
+            lastRunStatus = MessageBackupRunStatus.RUNNING,
+            consecutiveFailures = 2,
+        ).normalizedAfterProcessRestart()
+
+        assertEquals(MessageBackupRunStatus.RETRYING, state.lastRunStatus)
+        assertEquals(10 * day, state.lastFailureAtEpochMillis)
+        assertEquals(3, state.consecutiveFailures)
+        assertTrue(state.isDue(now = 10 * day + 1))
+        assertEquals(
+            "The last backup could not reach Google Drive. Kit Pay will retry automatically.",
+            automaticBackupStatusText(ChatBackupUiState(lastRunStatus = state.lastRunStatus)),
+        )
+    }
+
+    @Test fun `next due is absent when disconnected or switched off`() {
+        assertNull(connected.copy(connected = false).nextDueAtEpochMillis(10 * day))
+        assertNull(
+            connected.copy(frequency = MessageBackupFrequency.OFF)
+                .nextDueAtEpochMillis(10 * day),
+        )
+    }
+
+    @Test fun `automatic backup status explains recovery without exposing an exception`() {
+        assertEquals(
+            "The last backup could not reach Google Drive. Kit Pay will retry automatically.",
+            automaticBackupStatusText(
+                ChatBackupUiState(lastRunStatus = MessageBackupRunStatus.RETRYING),
+            ),
+        )
+        assertEquals(
+            "Reconnect Google Drive to resume automatic backup.",
+            automaticBackupStatusText(
+                ChatBackupUiState(lastRunStatus = MessageBackupRunStatus.NEEDS_SIGN_IN),
+            ),
+        )
     }
 }
 

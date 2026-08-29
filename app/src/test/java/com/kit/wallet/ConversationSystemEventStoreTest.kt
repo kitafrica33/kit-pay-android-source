@@ -66,6 +66,36 @@ class ConversationSystemEventStoreTest {
         )
     }
 
+    @Test fun `exact group request contribution metadata survives restart`() = runTest {
+        val state = TestSecureMessagingStateStore()
+        val store = ConversationSystemEventStore(state)
+        val requestId = "00000000-0000-4000-8000-000000000003"
+        val contributionId = "00000000-0000-4000-8000-000000000006"
+
+        store.record(
+            CONVERSATION_ID,
+            ConversationSystemEvent(
+                eventId = 8,
+                type = "group_payment_request.completed",
+                userId = MEMBER_ID,
+                role = null,
+                occurredAt = Instant.ofEpochMilli(8_000),
+                paymentId = requestId,
+                contributionId = contributionId,
+                contributorUserId = MEMBER_ID,
+                contributionAmountMinor = "25000000",
+            ),
+        )
+
+        val restarted = ConversationSystemEventStore(state)
+        restarted.load(listOf(CONVERSATION_ID))
+        val event = restarted.events.value.getValue(CONVERSATION_ID).single()
+        assertEquals(requestId, event.paymentId)
+        assertEquals(contributionId, event.contributionId)
+        assertEquals(MEMBER_ID, event.contributorUserId)
+        assertEquals("25000000", event.contributionAmountMinor)
+    }
+
     @Test fun `history stays bounded, keeping the most recent changes`() = runTest {
         val state = TestSecureMessagingStateStore()
         val store = ConversationSystemEventStore(state)

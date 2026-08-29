@@ -147,6 +147,8 @@ private val MessageKind.interruptsSenderRun: Boolean
         MessageKind.PAYMENT_EVENT,
         MessageKind.GROUP_PAYMENT,
         MessageKind.GROUP_PAYMENT_EVENT,
+        MessageKind.GROUP_PAYMENT_REQUEST,
+        MessageKind.GROUP_PAYMENT_REQUEST_EVENT,
         MessageKind.CALL,
         MessageKind.SYSTEM,
         -> true

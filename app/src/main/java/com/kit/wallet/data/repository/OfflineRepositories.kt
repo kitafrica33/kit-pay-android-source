@@ -19,7 +19,9 @@ import com.kit.wallet.data.remote.CreateProviderOperationRequest
 import com.kit.wallet.data.remote.CreateProviderQuoteRequest
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.remote.ProviderOperationDto
 import com.kit.wallet.data.remote.claimableTransfersAvailable
+import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.remote.ProfileAvatarUploader
 import com.kit.wallet.data.remote.EmailAddressRequest
 import com.kit.wallet.data.remote.EmailAttachmentVerificationRequest
@@ -45,6 +47,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.ceil
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -776,15 +779,27 @@ class OfflineWalletRepository @Inject constructor(
             paymentPin,
         )
         val request = CreateProviderOperationRequest(quoteId, walletId, clientReference)
-        val operation = apiCalls.execute {
+        val submitted = apiCalls.execute {
             if (quote.operationType == "bill_payment") {
                 api.createBillPayment(clientReference, stepUpToken, request)
             } else {
                 api.createAirtimePurchase(clientReference, stepUpToken, request)
             }
         }
-        validateProviderOperationResponse(operation, quote, walletId, clientReference)
-        runCatching { walletSync.refresh() }
+        validateProviderOperationResponse(submitted, quote, walletId, clientReference)
+        val operation = awaitProviderOperationTerminal(
+            initial = submitted,
+            fetch = { operationId ->
+                apiCalls.execute { api.providerOperation(operationId) }.also {
+                    validateProviderOperationResponse(it, quote, walletId, clientReference)
+                    check(it.id == submitted.id) {
+                        "The provider status response belongs to another operation"
+                    }
+                }
+            },
+            refreshWallet = { walletSync.refresh() },
+            mayStopPolling = Throwable::isKitConnectivityError,
+        )
         return Transaction(
             id = operation.id,
             counterparty = quote.destinationName ?: operation.productName,
@@ -795,7 +810,7 @@ class OfflineWalletRepository @Inject constructor(
             type = if (quote.operationType == "bill_payment") TxType.BILL else TxType.AIRTIME,
             status = when (operation.status) {
                 "succeeded" -> TxStatus.COMPLETED
-                "failed" -> TxStatus.FAILED
+                "failed", "reversed" -> TxStatus.FAILED
                 else -> TxStatus.PENDING
             },
             reference = operation.providerReference ?: clientReference,
@@ -837,6 +852,53 @@ class OfflineWalletRepository @Inject constructor(
         val wallet: com.kit.wallet.data.local.WalletEntity,
     )
 }
+
+/**
+ * Gives fast provider outcomes a short window to become authoritative, then refreshes the wallet
+ * exactly once from whichever state was last observed. In particular, a failed or reversed
+ * operation has already released its hold when the terminal response is visible; delaying this
+ * single refresh until then prevents the just-released amount being replaced by the earlier held
+ * balance. A slower provider remains pending and is picked up by normal foreground wallet sync.
+ */
+internal suspend fun awaitProviderOperationTerminal(
+    initial: ProviderOperationDto,
+    fetch: suspend (String) -> ProviderOperationDto,
+    refreshWallet: suspend () -> Unit,
+    mayStopPolling: (Throwable) -> Boolean = { false },
+    waitBeforePoll: suspend (Long) -> Unit = { delay(it) },
+    pollLimit: Int = PROVIDER_OPERATION_POLL_LIMIT,
+    pollIntervalMillis: Long = PROVIDER_OPERATION_POLL_INTERVAL_MILLIS,
+): ProviderOperationDto {
+    require(pollLimit >= 0)
+    require(pollIntervalMillis >= 0L)
+    var operation = initial
+    var polls = 0
+    while (operation.status !in TERMINAL_PROVIDER_OPERATION_STATUSES && polls < pollLimit) {
+        waitBeforePoll(pollIntervalMillis)
+        operation = try {
+            fetch(operation.id)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            // A foreground/home refresh remains recovery. Do not turn an accepted payment into a
+            // failure merely because its immediate status follow-up was temporarily unavailable.
+            if (mayStopPolling(error)) break else throw error
+        }
+        polls++
+    }
+    try {
+        refreshWallet()
+    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        // The accepted operation remains truthful even if this immediate cache refresh fails.
+    }
+    return operation
+}
+
+private val TERMINAL_PROVIDER_OPERATION_STATUSES = setOf("succeeded", "failed", "reversed")
+private const val PROVIDER_OPERATION_POLL_LIMIT = 8
+private const val PROVIDER_OPERATION_POLL_INTERVAL_MILLIS = 500L
 
 internal fun providerDestinationPresentation(value: String?): String =
     value?.trim()?.takeIf(String::isNotBlank) ?: "Destination unavailable"
@@ -1063,6 +1125,7 @@ internal fun validateProviderOperationResponse(
     }.getOrNull()
     check(
         operation.id.isNotBlank() && operation.type == quote.operationType &&
+            operation.status in PROVIDER_OPERATION_STATUSES &&
             operation.walletId == walletId &&
             (quote.productId == null || operation.productId == quote.productId) &&
             (operation.clientReference == null || operation.clientReference == clientReference) &&
@@ -1073,3 +1136,7 @@ internal fun validateProviderOperationResponse(
             minor(operation.total) == quote.customerDebitMinor,
     ) { "The submitted operation does not match the approved quote" }
 }
+
+private val PROVIDER_OPERATION_STATUSES = setOf(
+    "pending", "submitting", "succeeded", "failed", "unknown", "reversed",
+)

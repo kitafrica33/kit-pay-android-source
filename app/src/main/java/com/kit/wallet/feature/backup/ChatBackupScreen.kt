@@ -72,6 +72,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.backup.MessageBackupFrequency
+import com.kit.wallet.data.backup.MessageBackupRunStatus
 import com.kit.wallet.ui.theme.KitGreen600
 import com.kit.wallet.ui.theme.KitWalletTheme
 import java.time.Instant
@@ -156,6 +157,7 @@ fun ChatBackupScreen(
                 item {
                     ConnectCard(
                         connecting = state.task == ChatBackupTask.CONNECTING,
+                        lastRunStatus = state.lastRunStatus,
                         onConnect = viewModel::connect,
                     )
                 }
@@ -307,7 +309,11 @@ private fun UnavailableCard() {
 }
 
 @Composable
-private fun ConnectCard(connecting: Boolean, onConnect: () -> Unit) {
+private fun ConnectCard(
+    connecting: Boolean,
+    lastRunStatus: MessageBackupRunStatus,
+    onConnect: () -> Unit,
+) {
     BackupCard {
         Text("Connect Google Drive", style = MaterialTheme.typography.titleSmall)
         Spacer(Modifier.height(6.dp))
@@ -318,6 +324,16 @@ private fun ConnectCard(connecting: Boolean, onConnect: () -> Unit) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (lastRunStatus == MessageBackupRunStatus.NEEDS_SIGN_IN) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "Automatic backup is paused because Google Drive needs permission again. " +
+                    "Reconnect once and your previous schedule will resume.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
         Spacer(Modifier.height(14.dp))
         PrimaryButton(
             label = if (connecting) "Asking Google…" else "Connect Google Drive",
@@ -462,6 +478,25 @@ private fun ScheduleCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    automaticBackupStatusText(state),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = when (state.lastRunStatus) {
+                        MessageBackupRunStatus.NEEDS_SIGN_IN,
+                        MessageBackupRunStatus.FAILED,
+                        -> MaterialTheme.colorScheme.error
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
+                state.nextBackupAt?.let { next ->
+                    Text(
+                        "Next backup due ${formatBackupMoment(next)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }
@@ -688,6 +723,21 @@ private val BACKUP_MOMENT: DateTimeFormatter =
 
 internal fun formatBackupMoment(instant: Instant): String =
     BACKUP_MOMENT.format(instant.atZone(ZoneId.systemDefault()))
+
+/** Stable, actionable copy for a worker result that may have happened while the app was closed. */
+internal fun automaticBackupStatusText(state: ChatBackupUiState): String = when (state.lastRunStatus) {
+    MessageBackupRunStatus.NEVER -> "Automatic backup is ready."
+    MessageBackupRunStatus.RUNNING -> "Backup is in progress."
+    MessageBackupRunStatus.SUCCEEDED -> "Automatic backup is up to date."
+    MessageBackupRunStatus.NOTHING_TO_BACK_UP ->
+        "There are no new messages to back up yet."
+    MessageBackupRunStatus.RETRYING ->
+        "The last backup could not reach Google Drive. Kit Pay will retry automatically."
+    MessageBackupRunStatus.NEEDS_SIGN_IN ->
+        "Reconnect Google Drive to resume automatic backup."
+    MessageBackupRunStatus.FAILED ->
+        "The last backup did not finish. Tap Back up now to try again."
+}
 
 /** Decimal units, because that is what a phone's storage screen shows the user. */
 internal fun formatByteSize(bytes: Long): String = when {

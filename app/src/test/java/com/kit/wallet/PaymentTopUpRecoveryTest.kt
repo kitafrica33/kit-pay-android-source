@@ -27,6 +27,8 @@ import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
 import com.kit.wallet.ui.model.Transaction
+import com.kit.wallet.ui.model.TxStatus
+import com.kit.wallet.ui.model.TxType
 import com.kit.wallet.ui.model.UserProfile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -117,6 +119,35 @@ class PaymentTopUpRecoveryTest {
     }
 
     @Test
+    fun `authoritative airtime failure stays on screen after released balance refresh`() = runTest {
+        val wallet = RejectingWalletRepository(staleBalanceMinor = 100_000).apply {
+            providerResult = Transaction(
+                id = "airtime-failed",
+                counterparty = "MTN Airtime",
+                note = "+256 700 000 001",
+                amountMinor = -50_000,
+                time = "Just now",
+                dateGroup = "Today",
+                type = TxType.AIRTIME,
+                status = TxStatus.FAILED,
+                reference = "android-provider-reference",
+            )
+        }
+        val viewModel = AirtimeViewModel(wallet, authoritativeSync(), FakeBillsRepository(), FakeUserRepository)
+        var completed = false
+
+        viewModel.review(AIRTIME.id, "+256700000001", 50_000)
+        viewModel.buy("") { completed = true }
+
+        assertEquals(false, completed)
+        assertEquals(null, viewModel.quote.value)
+        assertEquals(
+            "The airtime purchase failed. Your held balance has been released.",
+            viewModel.error.value,
+        )
+    }
+
+    @Test
     fun `chat request rejection keeps card payable and offers common top up`() = runTest {
         val wallet = RejectingWalletRepository(staleBalanceMinor = 100_000)
         val sync = authoritativeSync()
@@ -139,6 +170,7 @@ class PaymentTopUpRecoveryTest {
     }
 
     private class RejectingWalletRepository(staleBalanceMinor: Long) : WalletRepository {
+        var providerResult: Transaction? = null
         val balance = MutableStateFlow(staleBalanceMinor)
         override val balanceMinor: StateFlow<Long> = balance
         override val walletCurrency: StateFlow<WalletCurrency> =
@@ -178,7 +210,7 @@ class PaymentTopUpRecoveryTest {
         override suspend fun submitProviderOperation(
             quote: FinancialOperationQuote,
             paymentPin: String,
-        ): Transaction = throw wrappedInsufficientFunds()
+        ): Transaction = providerResult ?: throw wrappedInsufficientFunds()
 
         override suspend fun payBill(
             provider: BillProvider,

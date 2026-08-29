@@ -134,10 +134,23 @@ private fun Intent.streamUris(multiple: Boolean): List<Uri> {
         @Suppress("DEPRECATION")
         listOfNotNull(getParcelableExtra<Uri>(Intent.EXTRA_STREAM))
     }
-    if (extras.isNotEmpty()) return extras.filterNotNull()
-    // Some senders only populate the clip, never the extra.
-    val clip = clipData ?: return emptyList()
-    return (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri }
+    // Android senders are inconsistent here: some use EXTRA_STREAM, some use ClipData, and a few
+    // OEM share sheets split a multi-selection across both. Read both without duplicating the
+    // common case where ClipData merely repeats the extras. The relay remains alive while every
+    // resulting content URI is copied, so its temporary read grants are never relied on later.
+    val clipUris = clipData?.let { clip ->
+        (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri }
+    }.orEmpty()
+    return orderedDistinctIncomingShareItems(extras.filterNotNull(), clipUris)
+}
+
+/** Preserves the sender's order while merging the two Android URI transport conventions. */
+internal fun <T> orderedDistinctIncomingShareItems(
+    extraItems: List<T>,
+    clipItems: List<T>,
+): List<T> = buildList {
+    val seen = linkedSetOf<T>()
+    (extraItems + clipItems).forEach { item -> if (seen.add(item)) add(item) }
 }
 
 private fun textProblem(text: String): String? {

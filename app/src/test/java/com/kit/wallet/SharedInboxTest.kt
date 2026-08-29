@@ -4,6 +4,7 @@ import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
 import com.kit.wallet.feature.chat.SharedInboxPolicy
 import com.kit.wallet.feature.chat.SharedInboxItem
+import com.kit.wallet.feature.chat.orderedDistinctIncomingShareItems
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -19,6 +20,28 @@ import org.junit.Test
  * share this app accepts has to be a share its own wire will carry.
  */
 class SharedInboxTest {
+    @Test
+    fun `multi-item share merges extra streams and clip content without duplicates`() {
+        assertEquals(
+            listOf("content://sender/one", "content://sender/two", "content://sender/three"),
+            orderedDistinctIncomingShareItems(
+                extraItems = listOf("content://sender/one", "content://sender/two"),
+                clipItems = listOf("content://sender/two", "content://sender/three"),
+            ),
+        )
+    }
+
+    @Test
+    fun `clip-only content URI share remains available to staging`() {
+        assertEquals(
+            listOf("content://sender/document"),
+            orderedDistinctIncomingShareItems(
+                extraItems = emptyList(),
+                clipItems = listOf("content://sender/document"),
+            ),
+        )
+    }
+
 
     // The two ends of the hand-off agree
 

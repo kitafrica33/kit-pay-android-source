@@ -31,6 +31,9 @@ internal enum class ImmediateSendKind {
      * ordinal-stability reason as [GROUP_PAYMENT_EVENT].
      */
     MEDIA_V2,
+
+    /** Canonical `KITGREQ1` request announcement or outcome. Appended for codec stability. */
+    GROUP_PAYMENT_REQUEST_EVENT,
 }
 
 /**
@@ -180,6 +183,13 @@ internal data class ImmediateSendIntent(
                 requireStandardSecureMessagingText(text)
                 requireMediaFieldsAbsent()
             }
+            ImmediateSendKind.GROUP_PAYMENT_REQUEST_EVENT -> {
+                require(com.kit.wallet.data.remote.KitGroupPaymentRequestMessage.parse(text) != null) {
+                    "Invalid queued group payment request event"
+                }
+                requireStandardSecureMessagingText(text)
+                requireMediaFieldsAbsent()
+            }
             ImmediateSendKind.MEDIA -> {
                 require(text.isEmpty())
                 require(mediaItems.isEmpty()) { "A single queued media send carries no item list" }
@@ -259,6 +269,7 @@ internal data class ImmediateSendIntent(
             ImmediateSendKind.PAYMENT_EVENT,
             ImmediateSendKind.REACTION,
             ImmediateSendKind.GROUP_PAYMENT_EVENT,
+            ImmediateSendKind.GROUP_PAYMENT_REQUEST_EVENT,
             ImmediateSendKind.EDIT,
             -> text
             ImmediateSendKind.MEDIA,

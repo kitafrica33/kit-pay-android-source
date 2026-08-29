@@ -840,6 +840,9 @@ object SecureMessagingTransportValidator {
                 required(event.data, "conversation event data")
                 ValidatedMessagingSyncEvent.Metadata(eventId, type, conversationId, occurredAt)
             }
+            in FINANCIAL_EVENT_TYPES -> validateFinancialEvent(
+                event, eventId, type, conversationId, occurredAt,
+            )
             in MEMBERSHIP_EVENT_TYPES -> {
                 requireTransport(
                     event.resourceType == CONVERSATION_MEMBER_RESOURCE,
@@ -871,6 +874,90 @@ object SecureMessagingTransportValidator {
             }
             else -> rejectTransport("messaging sync event type")
         }
+    }
+
+    private fun validateFinancialEvent(
+        event: MessagingSyncEventDto,
+        eventId: Long,
+        type: String,
+        conversationId: String,
+        occurredAt: Instant,
+    ): ValidatedMessagingSyncEvent.FinancialMetadata {
+        val data = required(event.data, "financial event data")
+        requireTransport(data.conversationId == conversationId, "financial event conversation changed")
+        val resourceId = required(event.resourceId, "financial event resource ID")
+        requireUuid(resourceId, "financial event resource ID")
+        val family = type.substringBeforeLast('.')
+        val action = type.substringAfterLast('.')
+        val expectedResource = when (family) {
+            "group_payment_request" -> if (action in setOf("contributed", "completed")) {
+                "group_payment_request_contribution"
+            } else "group_payment_request"
+            "scheduled_payment" -> "scheduled_payment"
+            "scheduled_group_payment" -> "scheduled_group_payment"
+            else -> rejectTransport("financial event family")
+        }
+        requireTransport(event.resourceType == expectedResource, "financial event resource type")
+        val primaryId = when (family) {
+            "group_payment_request" -> required(data.groupPaymentRequestId, "group request ID")
+            "scheduled_payment" -> required(data.scheduledPaymentId, "scheduled payment ID")
+            else -> required(data.scheduledGroupPaymentId, "scheduled group payment ID")
+        }
+        requireUuid(primaryId, "financial event payment ID")
+        if (family != "group_payment_request") {
+            requireTransport(resourceId == primaryId, "financial event resource changed")
+        }
+        var requesterUserId: String? = null
+        if (family == "group_payment_request") {
+            requireTransport(data.schema == "kit.group-payment-request.v1", "group request schema")
+            val requester = required(data.requesterUserId, "group request requester")
+            requireUuid(requester, "group request requester")
+            requesterUserId = requester
+            val target = canonicalMinor(required(data.targetAmountMinor, "group request target"))
+            val contributed = canonicalMinor(required(data.contributedAmountMinor, "group request contributed"))
+            val remaining = canonicalMinor(required(data.remainingAmountMinor, "group request remaining"))
+            requireTransport(target > 0 && contributed in 0..target && remaining == target - contributed,
+                "group request totals")
+            requireTransport(required(data.currency, "group request currency").matches(Regex("^[A-Z]{3}$")),
+                "group request currency")
+            requireTransport(data.currencyScale in 0..6, "group request currency scale")
+            requireTransport(data.progressBasisPoints == if (contributed == target) 10_000 else
+                ((contributed * 10_000L) / target).toInt(), "group request progress")
+            if (action in setOf("contributed", "completed")) {
+                val contributionId = required(data.contributionId, "group request contribution ID")
+                requireUuid(contributionId, "group request contribution ID")
+                requireTransport(resourceId == contributionId, "group request contribution resource changed")
+                requireUuid(required(data.contributorUserId, "group request contributor"), "group request contributor")
+                requireTransport(canonicalMinor(required(data.contributionAmountMinor,
+                    "group request contribution amount")) > 0, "group request contribution amount")
+            }
+        } else {
+            val expectedSchema = if (family == "scheduled_payment") {
+                "kit.scheduled-payment.v1"
+            } else "kit.scheduled-group-payment.v1"
+            requireTransport(data.schema == expectedSchema, "scheduled payment schema")
+            requireTransport(required(data.status, "scheduled payment status") == action,
+                "scheduled payment terminal status")
+            requireTransport(action in setOf("completed", "failed", "cancelled"),
+                "scheduled payment event action")
+            requireTransport(
+                data.scheduledFor?.let { runCatching { Instant.parse(it) }.getOrNull() } != null,
+                "scheduled payment time",
+            )
+            data.groupPaymentId?.let { requireUuid(it, "completed group payment ID") }
+            data.walletTransactionId?.let { requireUuid(it, "scheduled wallet transaction ID") }
+        }
+        return ValidatedMessagingSyncEvent.FinancialMetadata(
+            eventId, conversationId, occurredAt, type, primaryId,
+            requesterUserId, data.contributionId, data.contributorUserId,
+            data.contributionAmountMinor,
+        )
+    }
+
+    private fun canonicalMinor(raw: String): Long {
+        requireTransport(raw.matches(Regex("^(0|[1-9][0-9]*)$")), "financial minor amount")
+        return raw.toLongOrNull()?.also { requireTransport(it >= 0, "financial minor amount") }
+            ?: rejectTransport("financial minor amount")
     }
 
     private fun validateDeliveryReceiptEvent(
@@ -1229,13 +1316,20 @@ object SecureMessagingTransportValidator {
         "device.revoked",
         "devices.revoked",
     )
+    private val FINANCIAL_EVENT_TYPES = setOf(
+        "group_payment_request.created", "group_payment_request.contributed",
+        "group_payment_request.completed", "group_payment_request.cancelled",
+        "group_payment_request.expired", "scheduled_payment.completed", "scheduled_payment.failed",
+        "scheduled_payment.cancelled", "scheduled_group_payment.completed",
+        "scheduled_group_payment.failed", "scheduled_group_payment.cancelled",
+    )
     private val SYNC_EVENT_TYPES = setOf(
         MESSAGE_CREATED_EVENT,
         MESSAGE_DELIVERY_UPDATED_EVENT,
         READ_RECEIPT_UPDATED_EVENT,
         CONVERSATION_CREATED_EVENT,
         CONVERSATION_UPDATED_EVENT,
-    ) + MEMBERSHIP_EVENT_TYPES + DEVICE_LIFECYCLE_EVENT_TYPES
+    ) + MEMBERSHIP_EVENT_TYPES + DEVICE_LIFECYCLE_EVENT_TYPES + FINANCIAL_EVENT_TYPES
 }
 
 data class ValidatedConversationMember(
@@ -1389,6 +1483,18 @@ sealed interface ValidatedMessagingSyncEvent {
         val memberUserId: String? = null,
         /** The subject's role after a `membership.role_changed`; null on every other event. */
         val memberRole: String? = null,
+    ) : ValidatedMessagingSyncEvent
+
+    data class FinancialMetadata(
+        override val eventId: Long,
+        override val conversationId: String,
+        override val occurredAt: Instant,
+        val type: String,
+        val paymentId: String,
+        val requesterUserId: String?,
+        val contributionId: String?,
+        val contributorUserId: String?,
+        val contributionAmountMinor: String?,
     ) : ValidatedMessagingSyncEvent
 }
 

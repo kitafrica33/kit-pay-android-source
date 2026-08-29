@@ -12,6 +12,7 @@ import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.ui.model.BillProvider
 import com.kit.wallet.ui.model.TopUp
 import com.kit.wallet.ui.model.TopUpRequirement
+import com.kit.wallet.ui.model.TxStatus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -140,9 +141,13 @@ class BillPayViewModel @Inject constructor(
             _error.value = null
             try {
                 try {
-                    wallet.submitProviderOperation(reviewed, paymentPin)
+                    val operation = wallet.submitProviderOperation(reviewed, paymentPin)
                     _quote.value = null
-                    onDone()
+                    if (operation.status == TxStatus.FAILED) {
+                        _error.value = "The bill payment failed. Your held balance has been released."
+                    } else {
+                        onDone()
+                    }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {
@@ -257,9 +262,13 @@ class AirtimeViewModel @Inject constructor(
             _error.value = null
             try {
                 try {
-                    wallet.submitProviderOperation(reviewed, paymentPin)
+                    val operation = wallet.submitProviderOperation(reviewed, paymentPin)
                     _quote.value = null
-                    onDone()
+                    if (operation.status == TxStatus.FAILED) {
+                        _error.value = "The airtime purchase failed. Your held balance has been released."
+                    } else {
+                        onDone()
+                    }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {

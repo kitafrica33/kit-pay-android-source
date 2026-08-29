@@ -9,14 +9,17 @@ import com.kit.wallet.data.backup.DriveConnectStep
 import com.kit.wallet.data.backup.MessageBackupDescription
 import com.kit.wallet.data.backup.MessageBackupException
 import com.kit.wallet.data.backup.MessageBackupFrequency
+import com.kit.wallet.data.backup.MessageBackupRunStatus
 import com.kit.wallet.data.backup.MessageBackupService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import java.io.IOException
+import java.time.Clock
 import java.time.Instant
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -32,6 +35,11 @@ data class ChatBackupUiState(
     val lastBackupAt: Instant? = null,
     val lastBackupBytes: Long? = null,
     val lastBackupMessageCount: Int? = null,
+    val lastAttemptAt: Instant? = null,
+    val lastRunStatus: MessageBackupRunStatus = MessageBackupRunStatus.NEVER,
+    val lastFailureAt: Instant? = null,
+    val consecutiveFailures: Int = 0,
+    val nextBackupAt: Instant? = null,
     val available: MessageBackupDescription? = null,
     val task: ChatBackupTask = ChatBackupTask.NONE,
     val recoveryCode: String? = null,
@@ -47,12 +55,16 @@ data class ChatBackupUiState(
 @HiltViewModel
 class ChatBackupViewModel @Inject constructor(
     private val backups: MessageBackupService,
+    private val clock: Clock,
 ) : ViewModel() {
     private val mutableState = MutableStateFlow(ChatBackupUiState(configured = backups.supported))
     val state = mutableState.asStateFlow()
 
     init {
         publish(backups.snapshot())
+        viewModelScope.launch {
+            backups.state.collectLatest { publish(backups.snapshot()) }
+        }
         refresh()
     }
 
@@ -252,6 +264,11 @@ class ChatBackupViewModel @Inject constructor(
                 lastBackupAt = state.lastBackupAtEpochMillis?.let(Instant::ofEpochMilli),
                 lastBackupBytes = state.lastBackupBytes,
                 lastBackupMessageCount = state.lastBackupMessageCount,
+                lastAttemptAt = state.lastAttemptAtEpochMillis?.let(Instant::ofEpochMilli),
+                lastRunStatus = state.lastRunStatus,
+                lastFailureAt = state.lastFailureAtEpochMillis?.let(Instant::ofEpochMilli),
+                consecutiveFailures = state.consecutiveFailures,
+                nextBackupAt = state.nextDueAtEpochMillis(clock.millis())?.let(Instant::ofEpochMilli),
             )
         }
     }

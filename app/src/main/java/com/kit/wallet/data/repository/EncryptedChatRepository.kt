@@ -7,6 +7,7 @@ import com.kit.wallet.data.local.ConversationPrefsDao
 import com.kit.wallet.data.messaging.ConversationRosterStore
 import com.kit.wallet.data.messaging.ConversationSystemEvent
 import com.kit.wallet.data.messaging.ConversationSystemEventStore
+import com.kit.wallet.data.messaging.GROUP_PAYMENT_REQUEST_SYSTEM_EVENT_TYPES
 import com.kit.wallet.data.messaging.ImmediateMediaSpool
 import com.kit.wallet.data.messaging.ImmediateSendIntent
 import com.kit.wallet.data.messaging.ImmediateSendIntentStore
@@ -76,6 +77,8 @@ import com.kit.wallet.data.realtime.KitTypingRegistry
 import com.kit.wallet.data.remote.ADMIN_CONVERSATION_ROLE
 import com.kit.wallet.data.remote.GROUP_CONVERSATION_TYPE
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.remote.KitGroupPaymentRequestAction
+import com.kit.wallet.data.remote.KitGroupPaymentRequestMessage
 import com.kit.wallet.data.remote.MEMBER_CONVERSATION_ROLE
 import com.kit.wallet.data.remote.OWNER_CONVERSATION_ROLE
 import com.kit.wallet.data.remote.ValidatedMessageDeliveryInfo
@@ -2790,6 +2793,18 @@ class EncryptedChatRepository @Inject internal constructor(
         onDurablyCommitted = onDurablyCommitted,
     )
 
+    override suspend fun sendGroupPaymentRequestEvent(
+        chatId: String,
+        descriptor: String,
+        onDurablyCommitted: (clientMessageId: String) -> Unit,
+    ) = sendValidatedText(
+        chatId = chatId,
+        text = descriptor,
+        retryClientMessageId = null,
+        authorship = AuthoredContent.GROUP_PAYMENT_REQUEST_EVENT,
+        onDurablyCommitted = onDurablyCommitted,
+    )
+
     override suspend fun sendPaymentEventForOwner(
         owner: SessionFence,
         chatId: String,
@@ -2917,6 +2932,7 @@ class EncryptedChatRepository @Inject internal constructor(
         USER_TEXT,
         PAYMENT_EVENT,
         GROUP_PAYMENT_EVENT,
+        GROUP_PAYMENT_REQUEST_EVENT,
         REACTION,
         EDIT,
     }
@@ -2940,6 +2956,10 @@ class EncryptedChatRepository @Inject internal constructor(
             AuthoredContent.GROUP_PAYMENT_EVENT ->
                 require(KitGroupPaymentMessage.parse(normalized) != null) {
                     "Kit Pay could not validate this group payment event"
+                }
+            AuthoredContent.GROUP_PAYMENT_REQUEST_EVENT ->
+                require(KitGroupPaymentRequestMessage.parse(normalized) != null) {
+                    "Kit Pay could not validate this group payment request event"
                 }
             AuthoredContent.REACTION -> require(KitReactionMessage.parse(normalized) != null) {
                 "Kit Pay could not validate this reaction"
@@ -2975,6 +2995,8 @@ class EncryptedChatRepository @Inject internal constructor(
                     AuthoredContent.PAYMENT_EVENT -> ImmediateSendKind.PAYMENT_EVENT
                     AuthoredContent.GROUP_PAYMENT_EVENT ->
                         ImmediateSendKind.GROUP_PAYMENT_EVENT
+                    AuthoredContent.GROUP_PAYMENT_REQUEST_EVENT ->
+                        ImmediateSendKind.GROUP_PAYMENT_REQUEST_EVENT
                     AuthoredContent.REACTION -> ImmediateSendKind.REACTION
                     AuthoredContent.EDIT -> ImmediateSendKind.EDIT
                 },
@@ -3837,19 +3859,23 @@ class EncryptedChatRepository @Inject internal constructor(
                 .filter { it.conversationId == conversationId }
                 .map(::toStagingMediaMessage)
                 .toList()
-            // Membership lines belong to a group's timeline, not to a direct chat, whose
-            // membership cannot change at all.
+            // Server-readable membership and financial events are durable timeline annotations.
+            // Financial rows remain hints; the conversation ViewModel exact-fetches API state.
             val notices = conversation?.takeIf(AuthenticatedConversation::isGroup)?.let { group ->
                 membershipHistory[conversationId].orEmpty().mapNotNull { event ->
-                    toSystemMessage(
-                        event = event,
-                        isViewer = event.userId.equals(group.viewerUserId, ignoreCase = true),
-                        // A removed member has already left the roster by the time this reads
-                        // it, so the address book is what usually names them. Nothing is
-                        // invented when neither knows: the line names no one instead.
-                        name = savedNames[event.userId.lowercase()]
-                            ?: group.memberNamed(event.userId)?.name.safeChatContactName(),
-                    )
+                    if (event.type in GROUP_PAYMENT_REQUEST_SYSTEM_EVENT_TYPES) {
+                        toGroupPaymentRequestSystemMessage(event, group.viewerUserId)
+                    } else {
+                        val subject = event.userId ?: return@mapNotNull null
+                        toSystemMessage(
+                            event = event,
+                            isViewer = subject.equals(group.viewerUserId, ignoreCase = true),
+                            // A removed member has already left the roster by the time this reads
+                            // it, so the address book is what usually names them.
+                            name = savedNames[subject.lowercase()]
+                                ?: group.memberNamed(subject)?.name.safeChatContactName(),
+                        )
+                    }
                 }
             }.orEmpty()
             // sortedBy is stable, so the authenticated bubbles keep their order exactly and a
@@ -4041,6 +4067,38 @@ class EncryptedChatRepository @Inject internal constructor(
         )
     }
 
+    private fun toGroupPaymentRequestSystemMessage(
+        event: ConversationSystemEvent,
+        viewerUserId: String,
+    ): Message? {
+        val requestId = event.paymentId ?: return null
+        val action = when (event.type) {
+            "group_payment_request.created" -> KitGroupPaymentRequestAction.REQUESTED
+            "group_payment_request.contributed" -> KitGroupPaymentRequestAction.CONTRIBUTED
+            "group_payment_request.completed" -> KitGroupPaymentRequestAction.COMPLETED
+            "group_payment_request.cancelled" -> KitGroupPaymentRequestAction.CANCELLED
+            "group_payment_request.expired" -> KitGroupPaymentRequestAction.EXPIRED
+            else -> return null
+        }
+        val actor = event.contributorUserId ?: event.userId
+        return Message(
+            id = "financial:${event.eventId}",
+            text = "",
+            time = formatChatTime(event.occurredAt),
+            fromMe = actor?.equals(viewerUserId, ignoreCase = true) == true,
+            senderUserId = actor,
+            kind = if (action == KitGroupPaymentRequestAction.REQUESTED) {
+                MessageKind.GROUP_PAYMENT_REQUEST
+            } else {
+                MessageKind.GROUP_PAYMENT_REQUEST_EVENT
+            },
+            groupPaymentRequestId = requestId,
+            groupPaymentRequestAction = action.wire,
+            groupPaymentRequestContributionId = event.contributionId,
+            sortEpochMillis = event.occurredAt.toEpochMilli(),
+        )
+    }
+
     private fun toUiMessage(
         projected: AuthenticatedProjectedText,
         reactions: List<MessageReaction>,
@@ -4063,6 +4121,11 @@ class EncryptedChatRepository @Inject internal constructor(
         } else {
             KitGroupPaymentMessage.parse(projected.text)
         }
+        val groupRequest = if (mediaFamily || payment != null || groupPayment != null) {
+            null
+        } else {
+            KitGroupPaymentRequestMessage.parse(projected.text)
+        }
         return Message(
             id = projected.messageId,
             text = when {
@@ -4076,11 +4139,12 @@ class EncryptedChatRepository @Inject internal constructor(
                 )
                 unsupportedMedia -> UNSUPPORTED_ATTACHMENT_LABEL
                 // A correction replaces the visible wording and nothing else.
-                edit != null && payment == null && groupPayment == null -> edit.text
+                edit != null && payment == null && groupPayment == null && groupRequest == null -> edit.text
                 payment != null -> payment.note.orEmpty()
                 // The announcement's own line is built in the chat, where the members' names are
                 // known; the note is all of it that survives this layer.
                 groupPayment != null -> groupPayment.note.orEmpty()
+                groupRequest != null -> groupRequest.note.orEmpty()
                 else -> projected.text
             },
             time = formatChatTime(projected.sentAt),
@@ -4096,6 +4160,11 @@ class EncryptedChatRepository @Inject internal constructor(
                 mediaAlbum != null -> MessageKind.MEDIA_ALBUM
                 unsupportedMedia -> MessageKind.UNSUPPORTED_ATTACHMENT
                 groupPayment != null -> groupPayment.action.toMessageKind()
+                groupRequest != null -> if (groupRequest.action == KitGroupPaymentRequestAction.REQUESTED) {
+                    MessageKind.GROUP_PAYMENT_REQUEST
+                } else {
+                    MessageKind.GROUP_PAYMENT_REQUEST_EVENT
+                }
                 payment == null -> MessageKind.TEXT
                 else -> payment.action.toMessageKind()
             },
@@ -4104,7 +4173,7 @@ class EncryptedChatRepository @Inject internal constructor(
             // follow-up action, and withholding the handle confines the raw bytes to this layer.
             mediaDescriptor = when {
                 unsupportedMedia -> null
-                media != null || mediaAlbum != null || payment != null || groupPayment != null ->
+                media != null || mediaAlbum != null || payment != null || groupPayment != null || groupRequest != null ->
                     projected.text
                 else -> null
             },
@@ -4133,6 +4202,9 @@ class EncryptedChatRepository @Inject internal constructor(
             paymentCurrencyScale = payment?.currencyScale ?: com.kit.wallet.ui.model.Money.SCALE,
             groupPaymentId = groupPayment?.groupPaymentId,
             groupPaymentEvent = groupPayment?.action?.toGroupPaymentEventKind(),
+            groupPaymentRequestId = groupRequest?.requestId,
+            groupPaymentRequestAction = groupRequest?.action?.wire,
+            groupPaymentRequestContributionId = groupRequest?.contributionId,
             sortEpochMillis = projected.sentAt.toEpochMilli(),
             reactions = reactions,
             replyToMessageId = projected.replyToMessageId,

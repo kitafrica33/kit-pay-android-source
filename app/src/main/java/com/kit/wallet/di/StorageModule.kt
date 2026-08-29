@@ -17,6 +17,7 @@ import com.kit.wallet.data.local.WalletTransactionDao
 import com.kit.wallet.data.media.ProfileAvatarByteStore
 import com.kit.wallet.data.media.ProfileAvatarImages
 import com.kit.wallet.data.remote.MediaMessageProtocolDtoAdapter
+import com.kit.wallet.data.remote.PaymentProtocolsDtoAdapter
 import com.kit.wallet.data.remote.StarterChecklistMilestoneDtoAdapter
 import com.kit.wallet.data.remote.SupportPaymentBeneficiaryDtoAdapter
 import com.kit.wallet.data.remote.SupportProtocolDtoAdapter
@@ -151,6 +152,7 @@ object StorageModule {
         // Ahead of the reflective factory: a malformed `media_message` capabilities block must
         // turn one feature off, not fail the whole capabilities document.
         .add(MediaMessageProtocolDtoAdapter())
+        .add(PaymentProtocolsDtoAdapter())
         // Ahead of the reflective factory: the support protocol block and the payment
         // beneficiary bind with additionalProperties:false semantics reflection cannot express
         // — the protocol block contains its own drift, the beneficiary rejects it outright.

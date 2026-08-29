@@ -35,6 +35,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
@@ -125,6 +126,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -148,6 +150,11 @@ import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.messaging.displayName
 import com.kit.wallet.data.messaging.secureMediaSource
 import com.kit.wallet.data.notifications.ActiveCallPresence
+import com.kit.wallet.data.remote.GroupPaymentRequestContributionDto
+import com.kit.wallet.data.remote.GroupPaymentRequestDto
+import com.kit.wallet.data.remote.KitGroupPaymentRequestMessage
+import com.kit.wallet.data.remote.ScheduledGroupPaymentDto
+import com.kit.wallet.data.remote.ScheduledPaymentDto
 import com.kit.wallet.data.repository.AbuseReportContext
 import com.kit.wallet.data.repository.AbuseReportSelectionPolicy
 import com.kit.wallet.data.repository.AbuseReportTarget
@@ -198,6 +205,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -224,6 +232,9 @@ fun ConversationScreen(
     claimableTransfersEnabled: Boolean,
     /** Whether this account may send a payment into the group, and answer one it was sent. */
     groupPaymentsEnabled: Boolean = false,
+    groupPaymentRequestsEnabled: Boolean = false,
+    scheduledChatPaymentsEnabled: Boolean = false,
+    scheduledGroupPaymentsEnabled: Boolean = false,
     abuseReportingEnabled: Boolean = false,
     onBack: () -> Unit,
     onVoiceCall: (String) -> Unit,
@@ -240,6 +251,15 @@ fun ConversationScreen(
     topUp: TopUpViewModel = hiltViewModel(),
     abuseReports: AbuseReportViewModel = hiltViewModel(),
 ) {
+    LaunchedEffect(groupPaymentRequestsEnabled, viewModel) {
+        viewModel.setGroupPaymentRequestsEnabled(groupPaymentRequestsEnabled)
+    }
+    LaunchedEffect(scheduledChatPaymentsEnabled, scheduledGroupPaymentsEnabled, viewModel) {
+        viewModel.setServerSchedulingEnabled(
+            direct = scheduledChatPaymentsEnabled,
+            group = scheduledGroupPaymentsEnabled,
+        )
+    }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, viewModel) {
         val observer = LifecycleEventObserver { _, event ->
@@ -275,6 +295,12 @@ fun ConversationScreen(
     val messageInfo by viewModel.messageInfo.collectAsStateWithLifecycle()
     val transferClaims by viewModel.transferClaims.collectAsStateWithLifecycle()
     val groupPayments by viewModel.groupPayments.collectAsStateWithLifecycle()
+    val groupPaymentRequests by viewModel.groupPaymentRequests.collectAsStateWithLifecycle()
+    val groupPaymentRequestContributions by
+        viewModel.groupPaymentRequestContributions.collectAsStateWithLifecycle()
+    val serverScheduledDirect by viewModel.serverScheduledDirect.collectAsStateWithLifecycle()
+    val serverScheduledGroup by viewModel.serverScheduledGroup.collectAsStateWithLifecycle()
+    val serverSchedulesHaveMore by viewModel.serverSchedulesHaveMore.collectAsStateWithLifecycle()
     val groupMembers by viewModel.groupMembers.collectAsStateWithLifecycle()
     val refusedForFunds by viewModel.topUpRequired.collectAsStateWithLifecycle()
     val topUpRequirement by topUp.requirement.collectAsStateWithLifecycle()
@@ -641,6 +667,52 @@ fun ConversationScreen(
         // announcement only carries ids for, and to offer the composer somebody to pay.
         groupPaymentsEnabled = groupPaymentsEnabled && currentChat.isGroup,
         groupPayments = groupPayments,
+        groupPaymentRequestsEnabled = groupPaymentRequestsEnabled && currentChat.isGroup,
+        groupPaymentRequests = groupPaymentRequests,
+        groupPaymentRequestContributions = groupPaymentRequestContributions,
+        onCreateGroupPaymentRequest = { amount, note, done ->
+            viewModel.createGroupPaymentRequest(amount, note, groupPaymentRequestsEnabled, done)
+        },
+        onContributeToGroupPaymentRequest = { requestId, amount, pin, done ->
+            viewModel.contributeToGroupPaymentRequest(
+                requestId, amount, pin, groupPaymentRequestsEnabled, done,
+            )
+        },
+        onCancelGroupPaymentRequest = { requestId ->
+            viewModel.cancelGroupPaymentRequest(requestId, groupPaymentRequestsEnabled)
+        },
+        serverScheduledDirect = serverScheduledDirect,
+        serverScheduledGroup = serverScheduledGroup,
+        serverSchedulesHaveMore = serverSchedulesHaveMore,
+        onLoadMoreServerSchedules = viewModel::loadMoreServerSchedules,
+        onCancelServerSchedule = viewModel::cancelServerSchedule,
+        serverPaymentsSchedulingEnabled = if (currentChat.isGroup) {
+            scheduledGroupPaymentsEnabled
+        } else {
+            scheduledChatPaymentsEnabled
+        },
+        onPrepareServerSchedule = { amount, note, at, ready ->
+            viewModel.prepareServerSchedule(
+                amount, note, at,
+                enabled = if (currentChat.isGroup) {
+                    scheduledGroupPaymentsEnabled
+                } else {
+                    scheduledChatPaymentsEnabled
+                },
+                onReady = ready,
+            )
+        },
+        onCreateServerSchedule = { amount, note, at, pin, done ->
+            viewModel.createServerSchedule(
+                amount, note, at, pin,
+                enabled = if (currentChat.isGroup) {
+                    scheduledGroupPaymentsEnabled
+                } else {
+                    scheduledChatPaymentsEnabled
+                },
+                onDone = done,
+            )
+        },
         groupMembers = groupMembers,
         onSendGroupPayment = {
                 splitMode,
@@ -875,6 +947,23 @@ internal fun ConversationContent(
     groupPaymentsEnabled: Boolean = false,
     /** The server's live view of every group payment this thread mentions, keyed by lower-case id. */
     groupPayments: Map<String, GroupPaymentSummary> = emptyMap(),
+    groupPaymentRequestsEnabled: Boolean = false,
+    groupPaymentRequests: Map<String, GroupPaymentRequestDto> = emptyMap(),
+    groupPaymentRequestContributions: Map<String, GroupPaymentRequestContributionDto> = emptyMap(),
+    onCreateGroupPaymentRequest: (Long, String?, () -> Unit) -> Unit = { _, _, done -> done() },
+    onContributeToGroupPaymentRequest: (String, Long, String, () -> Unit) -> Unit =
+        { _, _, _, done -> done() },
+    onCancelGroupPaymentRequest: (String) -> Unit = {},
+    serverScheduledDirect: List<ScheduledPaymentDto> = emptyList(),
+    serverScheduledGroup: List<ScheduledGroupPaymentDto> = emptyList(),
+    serverSchedulesHaveMore: Boolean = false,
+    onLoadMoreServerSchedules: () -> Unit = {},
+    onCancelServerSchedule: (String, Boolean) -> Unit = { _, _ -> },
+    serverPaymentsSchedulingEnabled: Boolean = false,
+    onPrepareServerSchedule: (Long, String?, Long, (ServerSchedulePreview) -> Unit) -> Unit =
+        { _, _, _, _ -> },
+    onCreateServerSchedule: (Long, String?, Long, String, () -> Unit) -> Unit =
+        { _, _, _, _, done -> done() },
     groupMembers: List<ChatMember> = emptyList(),
     onSendGroupPayment: GroupPaymentSendHandler = {
             _, _, _, _, _, _, _, _, done ->
@@ -1004,7 +1093,12 @@ internal fun ConversationContent(
         snapshotFlow { composerState.text }.drop(1).collect(onComposerChanged)
     }
     var showRequestDialog by remember { mutableStateOf(false) }
+    var showServerScheduleAmountDialog by remember { mutableStateOf(false) }
+    var serverScheduleApproval by remember { mutableStateOf<ServerSchedulePreview?>(null) }
     var payTarget by remember { mutableStateOf<Message?>(null) }
+    var groupRequestPayTarget by remember {
+        mutableStateOf<Pair<GroupPaymentRequestDto, Boolean>?>(null)
+    }
     // What the schedule picker is currently being opened for. One state, three callers: the
     // composer, the request dialog, and "Edit schedule" on an entry already in the queue.
     var scheduleTarget by remember { mutableStateOf<ScheduleTarget?>(null) }
@@ -1059,6 +1153,8 @@ internal fun ConversationContent(
     // thread loads, then follow new messages only while the reader is already near the bottom.
     // A reader who scrolled up to older history is never yanked; a chip offers the way back.
     val listState = key(chat.id) { rememberLazyListState() }
+    var openingBottomAnchorActive by remember(chat.id) { mutableStateOf(true) }
+    val userIsDragging by listState.interactionSource.collectIsDraggedAsState()
     val conversationRows = remember(messages) { groupConversationRows(messages) }
     val conversationRowKeys = remember(conversationRows) { conversationRows.map(ConversationRow::key) }
     val messageIds = remember(messages) { messages.map(Message::id) }
@@ -1110,6 +1206,9 @@ internal fun ConversationContent(
     val focusAction = conversationFocusAction(focusRequest, chat.id, rowMessageIds)
     val focusPending = focusAction is ConversationFocusAction.Jump ||
         focusAction is ConversationFocusAction.Wait
+    LaunchedEffect(userIsDragging, focusPending) {
+        if (userIsDragging || focusPending) openingBottomAnchorActive = false
+    }
     val currentRowMessageIds by rememberUpdatedState(rowMessageIds)
     val currentMessageIds by rememberUpdatedState(messageIds)
     var focusedMessageId by remember(chat.id) { mutableStateOf<String?>(null) }
@@ -1163,7 +1262,13 @@ internal fun ConversationContent(
         }
         val bottomIndex = conversationRows.size + CONVERSATION_LEADING_ITEMS
         val decision =
-            conversationScrollDecision(renderedMessageIds, messages, nearBottom, focusPending)
+            conversationScrollDecision(
+                renderedMessageIds,
+                messages,
+                nearBottom,
+                focusPending,
+                openingBottomAnchorActive,
+            )
         when (decision.action) {
             ConversationScrollAction.JUMP_TO_NEWEST,
             ConversationScrollAction.FOLLOW_NEWEST,
@@ -1188,6 +1293,20 @@ internal fun ConversationContent(
         // the jump's own claim (or its Drop) decides what happens, not a half-taken snapshot.
         if (!(focusPending && renderedMessageIds == null)) {
             renderedMessageIds = messageIds.toSet()
+        }
+    }
+    // Room history, server history and rich-card hydration can all arrive after the first frame.
+    // Until the person actually drags (or explicit target navigation owns the viewport), keep the
+    // normal conversation opening pinned to the real laid-out tail rather than a stale row count.
+    LaunchedEffect(chat.id, openingBottomAnchorActive, focusPending) {
+        if (!openingBottomAnchorActive || focusPending) return@LaunchedEffect
+        snapshotFlow {
+            val info = listState.layoutInfo
+            info.totalItemsCount to info.visibleItemsInfo.sumOf { it.size }
+        }.distinctUntilChanged().collect { (count, _) ->
+            if (count > 0 && openingBottomAnchorActive && !focusPending) {
+                listState.scrollToItem(count - 1)
+            }
         }
     }
     LaunchedEffect(chat.id, groupPaymentHydrationKey) {
@@ -1228,13 +1347,44 @@ internal fun ConversationContent(
     if (showRequestDialog) {
         PaymentRequestDialog(
             sending = sending,
-            schedulingEnabled = schedulingEnabled,
+            title = if (chat.isGroup && groupPaymentRequestsEnabled) {
+                "Create group payment request"
+            } else {
+                "Request a payment"
+            },
+            explanation = if (chat.isGroup && groupPaymentRequestsEnabled) {
+                "Members can contribute partially until the full amount is collected."
+            } else {
+                "The request is shared securely in this chat. Money moves only when they approve it."
+            },
+            schedulingEnabled = schedulingEnabled && !(chat.isGroup && groupPaymentRequestsEnabled),
             onDismiss = { showRequestDialog = false },
             onRequest = { amountMinor, note ->
-                onSendPaymentRequest(amountMinor, note) { showRequestDialog = false }
+                if (chat.isGroup && groupPaymentRequestsEnabled) {
+                    onCreateGroupPaymentRequest(amountMinor, note) { showRequestDialog = false }
+                } else {
+                    onSendPaymentRequest(amountMinor, note) { showRequestDialog = false }
+                }
             },
             onRequestLater = { amountMinor, note ->
                 scheduleTarget = ScheduleTarget.Request(amountMinor, note)
+            },
+        )
+    }
+    if (showServerScheduleAmountDialog) {
+        PaymentRequestDialog(
+            sending = sending,
+            title = if (chat.isGroup) "Schedule a group payment" else "Schedule a payment",
+            explanation = if (chat.isGroup) {
+                "The member list and exact even split will be previewed and frozen when you approve."
+            } else {
+                "The payment is held by Kit and executes on the server at the selected time."
+            },
+            confirmLabel = "Choose time",
+            onDismiss = { showServerScheduleAmountDialog = false },
+            onRequest = { amount, note ->
+                scheduleTarget = ScheduleTarget.ServerPayment(amount, note)
+                showServerScheduleAmountDialog = false
             },
         )
     }
@@ -1246,6 +1396,7 @@ internal fun ConversationContent(
             heading = when (target) {
                 ScheduleTarget.Composer -> "Send later"
                 is ScheduleTarget.Request -> "Request later"
+                is ScheduleTarget.ServerPayment -> "Schedule payment"
                 is ScheduleTarget.Existing -> "Change the send time"
             },
             confirmLabel = if (target is ScheduleTarget.Existing) "Reschedule" else "Schedule",
@@ -1253,6 +1404,11 @@ internal fun ConversationContent(
             initialEpochMillis = (target as? ScheduleTarget.Existing)
                 ?.message
                 ?.scheduledAtEpochMillis,
+            explanation = if (target is ScheduleTarget.ServerPayment) {
+                "Kit schedules this payment on the server after you approve the exact amount and time."
+            } else {
+                "It stays on this device, encrypted, until it goes out."
+            },
             onDismiss = { scheduleTarget = null },
             onSchedule = { atEpochMillis ->
                 when (target) {
@@ -1269,6 +1425,13 @@ internal fun ConversationContent(
                         target.note,
                         atEpochMillis,
                     ) { showRequestDialog = false }
+                    is ScheduleTarget.ServerPayment -> {
+                        onPrepareServerSchedule(
+                            target.amountMinor,
+                            target.note,
+                            atEpochMillis,
+                        ) { preview -> serverScheduleApproval = preview }
+                    }
                     is ScheduleTarget.Existing -> onRescheduleSend(target.message, atEpochMillis)
                 }
                 scheduleTarget = null
@@ -1291,6 +1454,52 @@ internal fun ConversationContent(
             onDismiss = { payTarget = null },
             onConfirm = { pin ->
                 onPayRequest(target, pin) { payTarget = null }
+            },
+        )
+    }
+    groupRequestPayTarget?.let { (request, useRemaining) ->
+        GroupPaymentRequestContributionDialog(
+            request = request,
+            useRemainingInitially = useRemaining,
+            sending = sending,
+            error = error,
+            onDismiss = { groupRequestPayTarget = null },
+            onConfirm = { amount, pin ->
+                onContributeToGroupPaymentRequest(request.id, amount, pin) {
+                    groupRequestPayTarget = null
+                }
+            },
+        )
+    }
+    serverScheduleApproval?.let { approval ->
+        PaymentApprovalDialog(
+            amountText = Money.format(
+                approval.amountMinor,
+                approval.currencyCode,
+                approval.currencyScale,
+            ),
+            detail = buildString {
+                append("To ").append(GroupPaymentCopy.nameList(approval.recipientNames)
+                    ?: "the selected recipient")
+                append(" · ").append(
+                    formatScheduledFor(
+                        approval.scheduledAtEpochMillis,
+                        System.currentTimeMillis(),
+                    ),
+                )
+                append(" · ").append(java.time.ZoneId.systemDefault().id)
+            },
+            sending = sending,
+            error = error,
+            biometricsAvailable = biometricsAvailable,
+            onDismiss = { serverScheduleApproval = null },
+            onConfirm = { pin ->
+                onCreateServerSchedule(
+                    approval.amountMinor,
+                    approval.note,
+                    approval.scheduledAtEpochMillis,
+                    pin,
+                ) { serverScheduleApproval = null }
             },
         )
     }
@@ -1534,6 +1743,12 @@ internal fun ConversationContent(
                         if (error != null) onClearError()
                         showGroupPaymentComposer = true
                     },
+                    serverPaymentsSchedulingEnabled =
+                        serverPaymentsSchedulingEnabled && editTarget == null,
+                    onSchedulePayment = {
+                        if (error != null) onClearError()
+                        showServerScheduleAmountDialog = true
+                    },
                     sendEnabled = sendEnabled,
                     editing = editTarget != null,
                     schedulingEnabled = schedulingEnabled && editTarget == null,
@@ -1557,7 +1772,11 @@ internal fun ConversationContent(
         val cameraPullConnection = remember(mediaEnabled, cameraPullMaxPx, cameraPullThresholdPx) {
             object : NestedScrollConnection {
                 override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                    if (!mediaEnabled || source != NestedScrollSource.UserInput) return Offset.Zero
+                    val userInput = source == NestedScrollSource.UserInput
+                    if (shouldReleaseOpeningBottomAnchor(userInput, available.y)) {
+                        openingBottomAnchorActive = false
+                    }
+                    if (!mediaEnabled || !userInput) return Offset.Zero
                     val result = CameraPull.collapse(cameraRevealPx, available.y)
                     cameraRevealPx = result.revealPx
                     return Offset(0f, result.consumedY)
@@ -1720,6 +1939,34 @@ internal fun ConversationContent(
                             }
                         },
                     )
+                } else if (message.kind == MessageKind.GROUP_PAYMENT_REQUEST) {
+                    val requestId = message.groupPaymentRequestId
+                    if (requestId != null) {
+                        val hint = message.mediaDescriptor?.let(KitGroupPaymentRequestMessage::parse)
+                        GroupPaymentRequestChatCard(
+                            request = groupPaymentRequests[requestId.lowercase()],
+                            fallbackAmountMinor = hint?.amountMinor,
+                            fallbackCurrencyCode = hint?.currencyCode ?: "UGX",
+                            fallbackCurrencyScale = hint?.currencyScale ?: Money.SCALE,
+                            fallbackNote = message.text.takeIf(String::isNotBlank),
+                            displayName = displayGroupMemberName,
+                            busy = sending,
+                            onPayRemaining = { request -> groupRequestPayTarget = request to true },
+                            onPayPartial = { request -> groupRequestPayTarget = request to false },
+                            onCancel = { onCancelGroupPaymentRequest(requestId) },
+                        )
+                    }
+                } else if (message.kind == MessageKind.GROUP_PAYMENT_REQUEST_EVENT) {
+                    val request = message.groupPaymentRequestId
+                        ?.lowercase()?.let(groupPaymentRequests::get)
+                    val contribution = message.groupPaymentRequestContributionId
+                        ?.lowercase()?.let(groupPaymentRequestContributions::get)
+                    groupPaymentRequestEventText(
+                        message = message,
+                        request = request,
+                        contribution = contribution,
+                        displayName = displayGroupMemberName,
+                    )?.let { summary -> TimelineNotice(summary) }
                 } else if (message.kind == MessageKind.GROUP_PAYMENT) {
                     // Only ever drawn from a descriptor the projection already vouched for, so a
                     // null here means the message is not one and nothing should be drawn at all.
@@ -1837,6 +2084,41 @@ internal fun ConversationContent(
                         showSenderName = message.id in senderNamedIds,
                     )
                 }
+                }
+            }
+            serverScheduledDirect.forEach { schedule ->
+                item(key = "server-schedule:${schedule.id}") {
+                    ServerScheduledPaymentCard(
+                        amount = schedule.amount,
+                        currencyCode = schedule.currency.code,
+                        scheduledFor = schedule.scheduledFor,
+                        note = schedule.note,
+                        group = false,
+                        busy = sending,
+                        onCancel = { onCancelServerSchedule(schedule.id, false) },
+                    )
+                }
+            }
+            serverScheduledGroup.forEach { schedule ->
+                item(key = "server-group-schedule:${schedule.id}") {
+                    ServerScheduledPaymentCard(
+                        amount = schedule.totalAmount,
+                        currencyCode = schedule.currency.code,
+                        scheduledFor = schedule.scheduledFor,
+                        note = schedule.note,
+                        group = true,
+                        busy = sending,
+                        onCancel = { onCancelServerSchedule(schedule.id, true) },
+                    )
+                }
+            }
+            if (serverSchedulesHaveMore) {
+                item(key = "server-schedules-more") {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        TextButton(onClick = onLoadMoreServerSchedules, enabled = !sending) {
+                            Text("Load older scheduled payments")
+                        }
+                    }
                 }
             }
             // Below the last message and above the trailing spacer, so it occupies the place the
@@ -2332,6 +2614,8 @@ internal fun MessageBubble(
                         MessageKind.PAYMENT_EVENT,
                         MessageKind.GROUP_PAYMENT,
                         MessageKind.GROUP_PAYMENT_EVENT,
+                        MessageKind.GROUP_PAYMENT_REQUEST,
+                        MessageKind.GROUP_PAYMENT_REQUEST_EVENT,
                         MessageKind.SYSTEM,
                         MessageKind.CALL,
                         -> Text(msg.presentableText(), style = MaterialTheme.typography.bodyLarge)
@@ -3128,15 +3412,22 @@ private sealed interface ScheduleTarget {
     /** An amount and note already filled in on the request dialog, not yet sent to the server. */
     data class Request(val amountMinor: Long, val note: String?) : ScheduleTarget
 
+    data class ServerPayment(val amountMinor: Long, val note: String?) : ScheduleTarget
+
     /** An entry already in the queue, being moved to a different time. */
     data class Existing(val message: Message) : ScheduleTarget
 }
+
 
 @Composable
 private fun PaymentRequestDialog(
     sending: Boolean,
     onDismiss: () -> Unit,
     onRequest: (Long, String?) -> Unit,
+    title: String = "Request a payment",
+    explanation: String =
+        "The request is shared securely in this chat. Money moves only when they approve it.",
+    confirmLabel: String = "Request",
     schedulingEnabled: Boolean = false,
     onRequestLater: (Long, String?) -> Unit = { _, _ -> },
 ) {
@@ -3145,11 +3436,11 @@ private fun PaymentRequestDialog(
     val amountMinor = Money.parseMinor(amountText)
     AlertDialog(
         onDismissRequest = { if (!sending) onDismiss() },
-        title = { Text("Request a payment") },
+        title = { Text(title) },
         text = {
             Column {
                 Text(
-                    "The request is shared securely in this chat. Money moves only when they approve it.",
+                    explanation,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -3170,7 +3461,7 @@ private fun PaymentRequestDialog(
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = note,
-                    onValueChange = { note = it.take(140) },
+                    onValueChange = { note = it.take(280) },
                     enabled = !sending,
                     label = { Text("Note (optional)") },
                     singleLine = true,
@@ -3181,7 +3472,7 @@ private fun PaymentRequestDialog(
             TextButton(
                 enabled = !sending && (amountMinor ?: 0L) > 0L,
                 onClick = { onRequest(checkNotNull(amountMinor), note.trim().ifBlank { null }) },
-            ) { Text(if (sending) "Sending…" else "Request") }
+            ) { Text(if (sending) "Sending…" else confirmLabel) }
         },
         dismissButton = {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -3199,6 +3490,79 @@ private fun PaymentRequestDialog(
     )
 }
 
+@Composable
+private fun GroupPaymentRequestContributionDialog(
+    request: GroupPaymentRequestDto,
+    useRemainingInitially: Boolean,
+    sending: Boolean,
+    error: String?,
+    onDismiss: () -> Unit,
+    onConfirm: (Long, String) -> Unit,
+) {
+    val scale = request.currencyScale ?: return
+    val remaining = request.remainingMinor ?: return
+    var amountText by remember(request.id, remaining, useRemainingInitially) {
+        mutableStateOf(
+            if (useRemainingInitially) {
+                java.math.BigDecimal.valueOf(remaining, scale).stripTrailingZeros().toPlainString()
+            } else {
+                ""
+            },
+        )
+    }
+    var pin by remember(request.id) { mutableStateOf("") }
+    val amountMinor = Money.parseMinor(amountText, scale)
+    val validAmount = amountMinor != null && amountMinor in 1..remaining
+    AlertDialog(
+        onDismissRequest = { if (!sending) onDismiss() },
+        title = { Text("Contribute to request") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Remaining: ${Money.format(remaining, request.currency.code, scale)}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedTextField(
+                    value = amountText,
+                    onValueChange = { value ->
+                        amountText = value.filter { it.isDigit() || it == '.' }
+                    },
+                    enabled = !sending,
+                    label = { Text("Amount (${request.currency.code})") },
+                    visualTransformation = GroupedAmountTransformation,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    isError = amountText.isNotEmpty() && !validAmount,
+                    supportingText = if (amountText.isNotEmpty() && !validAmount) {
+                        { Text("Enter no more than the remaining amount") }
+                    } else null,
+                )
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { pin = it.filter(Char::isDigit).take(12) },
+                    enabled = !sending,
+                    label = { Text("Wallet PIN") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                )
+                error?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !sending && validAmount && pin.isNotBlank(),
+                onClick = { onConfirm(checkNotNull(amountMinor), pin) },
+            ) { Text(if (sending) "Contributing…" else "Contribute") }
+        },
+        dismissButton = {
+            TextButton(enabled = !sending, onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}
+
 /**
  * Approves an in-chat payment.
  *
@@ -3212,6 +3576,7 @@ private fun PaymentApprovalDialog(
     sending: Boolean,
     error: String?,
     biometricsAvailable: Boolean,
+    detail: String? = null,
     onDismiss: () -> Unit,
     onConfirm: (String) -> Unit,
 ) {
@@ -3220,6 +3585,14 @@ private fun PaymentApprovalDialog(
         title = { Text("Pay $amountText") },
         text = {
             Column {
+                detail?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                }
                 Text(
                     "Money moves only once you approve it.",
                     style = MaterialTheme.typography.bodySmall,
@@ -3621,6 +3994,8 @@ private fun Composer(
     /** Whether this thread can pay its members. False everywhere but a group. */
     groupPaymentsEnabled: Boolean = false,
     onPayGroup: () -> Unit = {},
+    serverPaymentsSchedulingEnabled: Boolean = false,
+    onSchedulePayment: () -> Unit = {},
     /**
      * Whether a message can actually leave this device right now.
      *
@@ -3949,6 +4324,16 @@ private fun Composer(
                                             onClick = {
                                                 attachMenuOpen = false
                                                 onPayGroup()
+                                            },
+                                        )
+                                    }
+                                    if (serverPaymentsSchedulingEnabled) {
+                                        DropdownMenuItem(
+                                            text = { Text("Schedule payment") },
+                                            leadingIcon = { Icon(Icons.Rounded.Schedule, null) },
+                                            onClick = {
+                                                attachMenuOpen = false
+                                                onSchedulePayment()
                                             },
                                         )
                                     }

@@ -9,6 +9,9 @@ import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.realtime.KitNetworkEvent
 import com.kit.wallet.data.realtime.KitNetworkSource
 import com.kit.wallet.data.remote.KitFeature
+import com.kit.wallet.data.remote.groupPaymentRequestsAvailable
+import com.kit.wallet.data.remote.scheduledChatPaymentsAvailable
+import com.kit.wallet.data.remote.scheduledGroupPaymentsAvailable
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.support.NegotiatedSupportProtocol
 import com.kit.wallet.data.support.SupportContract
@@ -49,6 +52,10 @@ data class AppCapabilities(
     val biometricTokensAvailable: Boolean = false,
     // The current scanner is presentation-only: it has no CameraX/QR decoder integration.
     val qrScannerClientReady: Boolean = false,
+    /** Exact caller-scoped payment protocol handshakes. Never retained across a failed refresh. */
+    val groupPaymentRequestsReady: Boolean = false,
+    val scheduledChatPaymentsReady: Boolean = false,
+    val scheduledGroupPaymentsReady: Boolean = false,
     /**
      * The support protocol negotiated from the last successful capability response, or null
      * when the server advertised none or anything this build does not speak exactly. Support
@@ -311,6 +318,9 @@ class AppCapabilitiesViewModel @Inject constructor(
                     messagingProtocolSuite = null,
                     messagingProtocolPostQuantum = null,
                     biometricTokensAvailable = false,
+                    groupPaymentRequestsReady = false,
+                    scheduledChatPaymentsReady = false,
+                    scheduledGroupPaymentsReady = false,
                     supportProtocol = null,
                 )
             }
@@ -335,6 +345,9 @@ class AppCapabilitiesViewModel @Inject constructor(
                         messagingProtocolSuite = messagingProtocol?.suite,
                         messagingProtocolPostQuantum = messagingProtocol?.postQuantum,
                         biometricTokensAvailable = biometricTokens,
+                        groupPaymentRequestsReady = response.groupPaymentRequestsAvailable(),
+                        scheduledChatPaymentsReady = response.scheduledChatPaymentsAvailable(),
+                        scheduledGroupPaymentsReady = response.scheduledGroupPaymentsAvailable(),
                         supportProtocol = SupportContract.negotiate(response.protocols?.support),
                     )
                 }
@@ -357,6 +370,9 @@ class AppCapabilitiesViewModel @Inject constructor(
                         messagingProtocolSuite = null,
                         messagingProtocolPostQuantum = null,
                         biometricTokensAvailable = false,
+                        groupPaymentRequestsReady = false,
+                        scheduledChatPaymentsReady = false,
+                        scheduledGroupPaymentsReady = false,
                         supportProtocol = null,
                     )
                 }

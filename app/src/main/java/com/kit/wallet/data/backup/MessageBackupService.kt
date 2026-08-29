@@ -18,6 +18,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -159,7 +160,7 @@ class MessageBackupService @Inject internal constructor(
         // Minting the key here rather than at the first backup means the recovery code exists
         // before anything has been uploaded that would need it.
         store.key(accountId)
-        return store.connect(accountId)
+        return store.connect(accountId).also(::reschedule)
     }
 
     suspend fun disconnect(): DriveBackupState {
@@ -182,65 +183,91 @@ class MessageBackupService @Inject internal constructor(
     /** Reads the archive, seals it and uploads it, replacing whatever was there before. */
     suspend fun backUpNow(now: Long): MessageBackupSummary = operation.withLock {
         val accountId = requireAccount()
-        val current = store.forAccount(accountId)
-        if (!current.connected) {
-            throw MessageBackupException("Connect a Google account first", requiresSignIn = true)
+        store.update(accountId) {
+            it.copy(
+                lastAttemptAtEpochMillis = now,
+                lastRunStatus = MessageBackupRunStatus.RUNNING,
+            )
         }
-        val key = store.key(accountId)
-        val archived = history.capture(accountId).readAll()
-        if (archived.isEmpty()) {
-            throw MessageBackupException("There are no messages on this phone to back up")
-        }
-        // Fence on content, not only on positive provenance: an unvalidated v2/future-family row
-        // must still make an older build reject the backup wholesale instead of exposing it as
-        // raw text. Canonical v1-only backups retain schema 1 compatibility.
-        val carriesMediaProvenance = archived.any { message ->
-            message.mediaValidated || requiresModernMediaSchemaFence(message.text)
-        }
-        val staged = stagingFile("upload")
-        val summary = try {
-            val written = withContext(Dispatchers.IO) {
-                staged.outputStream().use { file ->
-                    KitBackupArchive.encryptingStream(file, key).use { sealed ->
-                        KitBackupPayload.write(
-                            sink = sealed,
-                            manifest = KitBackupManifest(
-                                ownerAccountId = accountId,
-                                createdAt = Instant.ofEpochMilli(now),
-                                writerVersion = BuildConfig.VERSION_NAME,
-                            ),
-                            messages = archived.asSequence(),
-                            withMediaProvenance = carriesMediaProvenance,
+        try {
+            val current = store.forAccount(accountId)
+            if (!current.connected) {
+                throw MessageBackupException("Connect a Google account first", requiresSignIn = true)
+            }
+            val key = store.key(accountId)
+            val archived = history.capture(accountId).readAll()
+            if (archived.isEmpty()) {
+                throw MessageBackupException(NO_MESSAGES_TO_BACK_UP)
+            }
+            // Fence on content, not only on positive provenance: an unvalidated v2/future-family row
+            // must still make an older build reject the backup wholesale instead of exposing it as
+            // raw text. Canonical v1-only backups retain schema 1 compatibility.
+            val carriesMediaProvenance = archived.any { message ->
+                message.mediaValidated || requiresModernMediaSchemaFence(message.text)
+            }
+            val staged = stagingFile("upload")
+            val summary = try {
+                val written = withContext(Dispatchers.IO) {
+                    staged.outputStream().use { file ->
+                        KitBackupArchive.encryptingStream(file, key).use { sealed ->
+                            KitBackupPayload.write(
+                                sink = sealed,
+                                manifest = KitBackupManifest(
+                                    ownerAccountId = accountId,
+                                    createdAt = Instant.ofEpochMilli(now),
+                                    writerVersion = BuildConfig.VERSION_NAME,
+                                ),
+                                messages = archived.asSequence(),
+                                withMediaProvenance = carriesMediaProvenance,
+                            )
+                        }
+                    }
+                }
+                val uploaded = withToken(accountId) { token ->
+                    drive.upload(
+                        accessToken = token,
+                        fileId = current.driveFileId,
+                        name = backupFileName(accountId),
+                        source = staged,
+                    )
+                }
+                MessageBackupSummary(
+                    messageCount = written,
+                    byteSize = uploaded.sizeBytes ?: staged.length(),
+                    createdAt = Instant.ofEpochMilli(now),
+                ).also { done ->
+                    store.update(accountId) {
+                        it.copy(
+                            driveFileId = uploaded.id,
+                            lastBackupAtEpochMillis = now,
+                            lastBackupBytes = done.byteSize,
+                            lastBackupMessageCount = done.messageCount,
+                            lastAttemptAtEpochMillis = now,
+                            lastRunStatus = MessageBackupRunStatus.SUCCEEDED,
+                            lastFailureAtEpochMillis = null,
+                            consecutiveFailures = 0,
                         )
                     }
                 }
+            } finally {
+                staged.delete()
             }
-            val uploaded = withToken(accountId) { token ->
-                drive.upload(
-                    accessToken = token,
-                    fileId = current.driveFileId,
-                    name = backupFileName(accountId),
-                    source = staged,
-                )
+            summary
+        } catch (cancelled: CancellationException) {
+            recordBackupOutcome(accountId, now, MessageBackupRunStatus.RETRYING)
+            throw cancelled
+        } catch (failure: Throwable) {
+            val status = when {
+                failure is MessageBackupException && failure.message == NO_MESSAGES_TO_BACK_UP ->
+                    MessageBackupRunStatus.NOTHING_TO_BACK_UP
+                failure is MessageBackupException && failure.requiresSignIn ->
+                    MessageBackupRunStatus.NEEDS_SIGN_IN
+                failure is IOException -> MessageBackupRunStatus.RETRYING
+                else -> MessageBackupRunStatus.FAILED
             }
-            MessageBackupSummary(
-                messageCount = written,
-                byteSize = uploaded.sizeBytes ?: staged.length(),
-                createdAt = Instant.ofEpochMilli(now),
-            ).also { done ->
-                store.update(accountId) {
-                    it.copy(
-                        driveFileId = uploaded.id,
-                        lastBackupAtEpochMillis = now,
-                        lastBackupBytes = done.byteSize,
-                        lastBackupMessageCount = done.messageCount,
-                    )
-                }
-            }
-        } finally {
-            staged.delete()
+            recordBackupOutcome(accountId, now, status)
+            throw failure
         }
-        summary
     }
 
     /** Looks for a backup in Drive without downloading it, so the screen can describe one. */
@@ -397,7 +424,10 @@ class MessageBackupService @Inject internal constructor(
 
     private suspend fun signInRequired(cause: GoogleAuthorizationException): MessageBackupException {
         val accountId = currentAccountId()
-        if (accountId != null) store.disconnect(accountId)
+        if (accountId != null) {
+            store.requireReconnect(accountId)
+            schedule.cancel()
+        }
         return MessageBackupException(
             cause.message ?: "Google Drive needs you to sign in again",
             requiresSignIn = true,
@@ -416,6 +446,29 @@ class MessageBackupService @Inject internal constructor(
         return File(directory, "$purpose.kitbak").apply { delete() }
     }
 
+    /** Records a terminal attempt even when WorkManager is cancelling this coroutine. */
+    private suspend fun recordBackupOutcome(
+        accountId: String,
+        now: Long,
+        status: MessageBackupRunStatus,
+    ) = withContext(NonCancellable) {
+        runCatching {
+            store.update(accountId) { current ->
+                val failed = status != MessageBackupRunStatus.NOTHING_TO_BACK_UP
+                current.copy(
+                    lastAttemptAtEpochMillis = now,
+                    lastRunStatus = status,
+                    lastFailureAtEpochMillis = now.takeIf { failed },
+                    consecutiveFailures = when {
+                        !failed -> 0
+                        current.consecutiveFailures == Int.MAX_VALUE -> Int.MAX_VALUE
+                        else -> current.consecutiveFailures + 1
+                    },
+                )
+            }
+        }
+    }
+
     /**
      * A per-account file name, so two Kit Pay accounts sharing one Google account do not overwrite
      * each other. Hashed rather than plain, because the account ID is not Google's to keep.
@@ -430,6 +483,7 @@ class MessageBackupService @Inject internal constructor(
     private companion object {
         const val STAGING_DIRECTORY = "backup"
         const val RESTORE_INITIAL_CAPACITY = 512
+        const val NO_MESSAGES_TO_BACK_UP = "There are no messages on this phone to back up"
 
         /**
          * A ceiling on what one restore will hold in memory at once. Far above any real Kit Pay

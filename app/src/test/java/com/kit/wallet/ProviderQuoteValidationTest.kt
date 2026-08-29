@@ -63,6 +63,7 @@ class ProviderQuoteValidationTest {
     @Test fun `rejects operations that differ from the approved quote`() {
         val mismatches = listOf(
             operation(type = "airtime_purchase"),
+            operation(status = "completed"),
             operation(walletId = "other-wallet"),
             operation(productId = "other-product"),
             operation(clientReference = "other-reference"),
@@ -131,6 +132,7 @@ class ProviderQuoteValidationTest {
 
     private fun operation(
         type: String = "bill_payment",
+        status: String = "submitting",
         walletId: String = WALLET_ID,
         productId: String = PRODUCT_ID,
         clientReference: String? = CLIENT_REFERENCE,
@@ -141,7 +143,7 @@ class ProviderQuoteValidationTest {
     ) = ProviderOperationDto(
         id = "operation-1",
         type = type,
-        status = "processing",
+        status = status,
         walletId = walletId,
         providerCode = "umeme",
         productId = productId,

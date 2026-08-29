@@ -149,6 +149,10 @@ enum class MessageKind {
      * member who wrote it.
      */
     GROUP_PAYMENT_EVENT,
+    /** Collaborative request card; all progress and actions are hydrated from the API. */
+    GROUP_PAYMENT_REQUEST,
+    /** Authenticated request contribution/terminal timeline hint. */
+    GROUP_PAYMENT_REQUEST_EVENT,
     VOICE_NOTE,
     IMAGE,
     VIDEO,
@@ -334,6 +338,9 @@ data class Message(
     val groupPaymentId: String? = null,
     /** For group-payment entries: what the descriptor records happening. */
     val groupPaymentEvent: GroupPaymentEventKind? = null,
+    val groupPaymentRequestId: String? = null,
+    val groupPaymentRequestAction: String? = null,
+    val groupPaymentRequestContributionId: String? = null,
     /** Epoch millis used to interleave messages with call-log entries in a conversation. */
     val sortEpochMillis: Long = 0,
     /**
@@ -390,6 +397,8 @@ val Message.acceptsReactions: Boolean
             kind == MessageKind.PAYMENT_EVENT ||
             kind == MessageKind.GROUP_PAYMENT ||
             kind == MessageKind.GROUP_PAYMENT_EVENT ||
+            kind == MessageKind.GROUP_PAYMENT_REQUEST ||
+            kind == MessageKind.GROUP_PAYMENT_REQUEST_EVENT ||
             kind == MessageKind.SYSTEM -> false
         else -> when (state) {
             DeliveryState.SENDING,
@@ -485,6 +494,8 @@ fun Message.replyPreviewLabel(): String = when (kind) {
     MessageKind.PAYMENT_EVENT,
     MessageKind.GROUP_PAYMENT,
     MessageKind.GROUP_PAYMENT_EVENT,
+    MessageKind.GROUP_PAYMENT_REQUEST,
+    MessageKind.GROUP_PAYMENT_REQUEST_EVENT,
     MessageKind.CALL,
     MessageKind.SYSTEM,
     -> presentableText()
@@ -518,6 +529,8 @@ fun Message.copyablePlaintext(): String? = when (kind) {
     MessageKind.PAYMENT_EVENT,
     MessageKind.GROUP_PAYMENT,
     MessageKind.GROUP_PAYMENT_EVENT,
+    MessageKind.GROUP_PAYMENT_REQUEST,
+    MessageKind.GROUP_PAYMENT_REQUEST_EVENT,
     MessageKind.CALL,
     MessageKind.SYSTEM,
     -> null

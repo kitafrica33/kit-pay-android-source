@@ -238,6 +238,8 @@ class MessageReactionFoldTest {
             // lines are records the group states about itself. Neither is a bubble.
             MessageKind.GROUP_PAYMENT,
             MessageKind.GROUP_PAYMENT_EVENT,
+            MessageKind.GROUP_PAYMENT_REQUEST,
+            MessageKind.GROUP_PAYMENT_REQUEST_EVENT,
             MessageKind.SYSTEM,
         )
         MessageKind.entries.forEach { kind ->

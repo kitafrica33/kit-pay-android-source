@@ -3,12 +3,45 @@ package com.kit.wallet
 import com.kit.wallet.feature.chat.ConversationScrollAction
 import com.kit.wallet.feature.chat.conversationScrollDecision
 import com.kit.wallet.feature.chat.shouldRepinAfterGroupPaymentHydration
+import com.kit.wallet.feature.chat.shouldReleaseOpeningBottomAnchor
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class ConversationScrollPolicyTest {
+    @Test
+    fun `first vertical user delta releases opening anchor before list consumption`() {
+        assertEquals(true, shouldReleaseOpeningBottomAnchor(userInput = true, verticalDelta = -1f))
+        assertEquals(true, shouldReleaseOpeningBottomAnchor(userInput = true, verticalDelta = 1f))
+        assertEquals(false, shouldReleaseOpeningBottomAnchor(userInput = true, verticalDelta = 0f))
+        assertEquals(false, shouldReleaseOpeningBottomAnchor(userInput = false, verticalDelta = -20f))
+    }
+
+    @Test
+    fun `opening anchor follows async history even after first render moved away from bottom`() {
+        val initial = listOf(message("one"))
+        val hydrated = listOf(message("older"), message("one"))
+
+        assertEquals(
+            ConversationScrollAction.FOLLOW_NEWEST,
+            conversationScrollDecision(
+                previousMessageIds = initial.map(Message::id).toSet(),
+                messages = hydrated,
+                nearBottom = false,
+                openingBottomAnchorActive = true,
+            ).action,
+        )
+        assertEquals(
+            ConversationScrollAction.KEEP_POSITION,
+            conversationScrollDecision(
+                previousMessageIds = initial.map(Message::id).toSet(),
+                messages = hydrated,
+                nearBottom = false,
+                openingBottomAnchorActive = false,
+            ).action,
+        )
+    }
     @Test
     fun `a direct or group thread opens at its newest message`() {
         for (messages in listOf(

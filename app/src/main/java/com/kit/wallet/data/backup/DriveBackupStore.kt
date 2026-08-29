@@ -33,6 +33,23 @@ enum class MessageBackupFrequency(val label: String, val intervalMillis: Long?) 
     MONTHLY("Monthly", 30L * 24 * 60 * 60 * 1000),
 }
 
+/** The last durable fact the app knows about an automatic or manual backup attempt. */
+enum class MessageBackupRunStatus {
+    NEVER,
+    RUNNING,
+    SUCCEEDED,
+    NOTHING_TO_BACK_UP,
+    RETRYING,
+    NEEDS_SIGN_IN,
+    FAILED,
+    ;
+
+    companion object {
+        fun fromStored(value: String?): MessageBackupRunStatus =
+            entries.firstOrNull { it.name == value } ?: NEVER
+    }
+}
+
 /** Everything the backup feature remembers between runs, for exactly one signed-in account. */
 data class DriveBackupState(
     val accountId: String? = null,
@@ -44,14 +61,59 @@ data class DriveBackupState(
     val lastBackupAtEpochMillis: Long? = null,
     val lastBackupBytes: Long? = null,
     val lastBackupMessageCount: Int? = null,
+    val lastAttemptAtEpochMillis: Long? = null,
+    val lastRunStatus: MessageBackupRunStatus = MessageBackupRunStatus.NEVER,
+    val lastFailureAtEpochMillis: Long? = null,
+    val consecutiveFailures: Int = 0,
 ) {
     val everBackedUp: Boolean get() = lastBackupAtEpochMillis != null
 
+    /**
+     * RUNNING is process-local: after a cold start no coroutine can still own that attempt.
+     * Treat the persisted marker as retryable instead of leaving the UI and cadence stuck forever.
+     */
+    fun normalizedAfterProcessRestart(): DriveBackupState {
+        if (lastRunStatus != MessageBackupRunStatus.RUNNING) return this
+
+        return copy(
+            lastRunStatus = MessageBackupRunStatus.RETRYING,
+            lastFailureAtEpochMillis = lastFailureAtEpochMillis ?: lastAttemptAtEpochMillis,
+            consecutiveFailures = if (consecutiveFailures == Int.MAX_VALUE) {
+                Int.MAX_VALUE
+            } else {
+                consecutiveFailures + 1
+            },
+        )
+    }
+
     fun isDue(now: Long): Boolean {
         val interval = frequency.intervalMillis ?: return false
-        val last = lastBackupAtEpochMillis ?: return true
+        if (lastRunStatus == MessageBackupRunStatus.RETRYING) return true
+        if (lastRunStatus == MessageBackupRunStatus.RUNNING) return false
+        // An empty history is a successful no-op, not a reason to wake every fifteen minutes.
+        // Retryable failures deliberately do not become an anchor: WorkManager should retry them.
+        val last = lastBackupAtEpochMillis
+            ?: lastAttemptAtEpochMillis.takeIf {
+                lastRunStatus == MessageBackupRunStatus.NOTHING_TO_BACK_UP
+            }
+            ?: return true
         // A clock that jumped backwards must not postpone a backup indefinitely.
         return last > now || now - last >= interval
+    }
+
+    /** The cadence's next due time. WorkManager may batch the actual run later. */
+    fun nextDueAtEpochMillis(now: Long): Long? {
+        val interval = frequency.intervalMillis ?: return null
+        if (!connected) return null
+        if (lastRunStatus == MessageBackupRunStatus.RETRYING) return now
+        if (lastRunStatus == MessageBackupRunStatus.RUNNING) return null
+        val anchor = lastBackupAtEpochMillis
+            ?: lastAttemptAtEpochMillis.takeIf {
+                lastRunStatus == MessageBackupRunStatus.NOTHING_TO_BACK_UP
+            }
+            ?: return now
+        if (anchor > now) return now
+        return runCatching { Math.addExact(anchor, interval) }.getOrDefault(now)
     }
 }
 
@@ -120,6 +182,16 @@ class DriveBackupStore @Inject constructor(
     }
 
     /**
+     * Marks a revoked/expired Google grant without erasing the user's cadence or Drive file.
+     * Reconnecting can therefore resume the schedule they explicitly chose.
+     */
+    suspend fun requireReconnect(accountId: String): DriveBackupState = mutex.withLock {
+        val updated = forAccount(accountId).copy(connected = false)
+        writeLocked(updated, secretLocked(accountId))
+        updated
+    }
+
+    /**
      * Forgets the Google grant but keeps the backup key and the schedule preference, so a user who
      * reconnects is not silently given a new key that cannot open the archive already in Drive.
      */
@@ -163,6 +235,10 @@ class DriveBackupStore @Inject constructor(
                 lastBackupAtEpochMillis = state.lastBackupAtEpochMillis,
                 lastBackupBytes = state.lastBackupBytes,
                 lastBackupMessageCount = state.lastBackupMessageCount,
+                lastAttemptAtEpochMillis = state.lastAttemptAtEpochMillis,
+                lastRunStatus = state.lastRunStatus.name,
+                lastFailureAtEpochMillis = state.lastFailureAtEpochMillis,
+                consecutiveFailures = state.consecutiveFailures,
                 backupKey = keyBytes?.let { Base64.encodeToString(it, Base64.NO_WRAP) },
             )
         } finally {
@@ -187,7 +263,11 @@ class DriveBackupStore @Inject constructor(
             lastBackupAtEpochMillis = stored.lastBackupAtEpochMillis,
             lastBackupBytes = stored.lastBackupBytes,
             lastBackupMessageCount = stored.lastBackupMessageCount,
-        )
+            lastAttemptAtEpochMillis = stored.lastAttemptAtEpochMillis,
+            lastRunStatus = MessageBackupRunStatus.fromStored(stored.lastRunStatus),
+            lastFailureAtEpochMillis = stored.lastFailureAtEpochMillis,
+            consecutiveFailures = stored.consecutiveFailures.coerceAtLeast(0),
+        ).normalizedAfterProcessRestart()
     } ?: DriveBackupState()
 
     private fun readStored(): StoredBackupState? {
@@ -253,5 +333,9 @@ internal data class StoredBackupState(
     val lastBackupAtEpochMillis: Long?,
     val lastBackupBytes: Long?,
     val lastBackupMessageCount: Int?,
+    val lastAttemptAtEpochMillis: Long? = null,
+    val lastRunStatus: String = MessageBackupRunStatus.NEVER.name,
+    val lastFailureAtEpochMillis: Long? = null,
+    val consecutiveFailures: Int = 0,
     val backupKey: String?,
 )

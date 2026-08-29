@@ -94,6 +94,12 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
             return
         }
 
+        val financialAlert = FinancialPaymentAlert.fromData(envelope.data)
+        if (financialAlert != null) {
+            showFinancialPayment(manager, envelope, financialAlert)
+            return
+        }
+
         val notification = envelope.notification ?: return
         manager.createNotificationChannel(
             NotificationChannel(
@@ -116,6 +122,49 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
                 .setContentText(notification.body.orEmpty())
                 .setAutoCancel(true)
                 .setContentIntent(openApp)
+                .build(),
+        )
+    }
+
+    private fun showFinancialPayment(
+        manager: NotificationManager,
+        envelope: PushEnvelope,
+        alert: FinancialPaymentAlert,
+    ) {
+        manager.createNotificationChannel(
+            NotificationChannel(
+                PAYMENTS_CHANNEL_ID,
+                "Kit Pay payments",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply { lockscreenVisibility = NotificationCompat.VISIBILITY_PRIVATE },
+        )
+        val open = PendingIntent.getActivity(
+            context,
+            alert.notificationTag.hashCode(),
+            Intent(context, MainActivity::class.java)
+                .setAction(Intent.ACTION_VIEW)
+                // Never trust the server-provided deep_link; reconstruct it from canonical IDs.
+                .setData(Uri.parse(alert.deepLink()))
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        manager.notify(
+            alert.notificationTag,
+            PAYMENT_NOTIFICATION_ID,
+            NotificationCompat.Builder(context, PAYMENTS_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_kit_mark)
+                .setContentTitle(envelope.notification?.title ?: context.getString(R.string.app_name))
+                .setContentText(envelope.notification?.body ?: "Open Kit Pay to view this payment.")
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setPublicVersion(
+                    NotificationCompat.Builder(context, PAYMENTS_CHANNEL_ID)
+                        .setSmallIcon(R.drawable.ic_kit_mark)
+                        .setContentTitle(context.getString(R.string.app_name))
+                        .setContentText("New payment activity")
+                        .build(),
+                )
+                .setAutoCancel(true)
+                .setContentIntent(open)
                 .build(),
         )
     }

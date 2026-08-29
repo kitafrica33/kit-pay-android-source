@@ -6,6 +6,10 @@ object KitFeature {
     const val INTERNAL_TRANSFERS = "internal_transfers"
     const val CLAIMABLE_TRANSFERS = "claimable_transfers"
     const val GROUP_PAYMENTS = "group_payments"
+    const val GROUP_PAYMENT_REQUESTS_V1 = "group_payment_requests_v1"
+    const val SCHEDULED_PAYMENTS = "scheduled_payments"
+    const val SCHEDULED_CHAT_PAYMENTS_V1 = "scheduled_chat_payments_v1"
+    const val SCHEDULED_GROUP_PAYMENTS_V1 = "scheduled_group_payments_v1"
     const val PAYMENT_REQUESTS = "payment_requests"
     const val MERCHANT_PAYMENTS = "merchant_payments"
     const val QR_PAYMENTS = "qr_payments"
@@ -63,3 +67,22 @@ internal fun CapabilitiesDto.claimableTransfersAvailable(): Boolean {
  */
 internal fun CapabilitiesDto.groupPaymentsAvailable(): Boolean =
     claimableTransfersAvailable() && features.orEmpty()[KitFeature.GROUP_PAYMENTS] == true
+
+internal fun CapabilitiesDto.groupPaymentRequestsAvailable(): Boolean =
+    features.orEmpty()[KitFeature.WALLETS] == true &&
+        features.orEmpty()[KitFeature.INTERNAL_TRANSFERS] == true &&
+        features.orEmpty()[KitFeature.GROUP_PAYMENT_REQUESTS_V1] == true &&
+        protocols?.payments?.groupPaymentRequests?.supportsAndroidV1 == true
+
+internal fun CapabilitiesDto.scheduledChatPaymentsAvailable(): Boolean =
+    features.orEmpty()[KitFeature.WALLETS] == true &&
+        features.orEmpty()[KitFeature.INTERNAL_TRANSFERS] == true &&
+        features.orEmpty()[KitFeature.SCHEDULED_PAYMENTS] == true &&
+        features.orEmpty()[KitFeature.SCHEDULED_CHAT_PAYMENTS_V1] == true &&
+        protocols?.payments?.scheduledChatPayments?.supportsAndroidV1 == true
+
+internal fun CapabilitiesDto.scheduledGroupPaymentsAvailable(): Boolean =
+    groupPaymentsAvailable() &&
+        features.orEmpty()[KitFeature.SCHEDULED_PAYMENTS] == true &&
+        features.orEmpty()[KitFeature.SCHEDULED_GROUP_PAYMENTS_V1] == true &&
+        protocols?.payments?.scheduledGroupPayments?.supportsAndroidV1 == true
