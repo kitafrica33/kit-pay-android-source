@@ -45,6 +45,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.SectionHeader
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.theme.KitTheme
@@ -215,12 +216,12 @@ private fun CallRow(call: CallEntry, onCall: (() -> Unit)?) {
             call.name,
             size = 48.dp,
             avatarUrl = call.avatarUrl,
-            accountVerification = call.accountVerification,
         )
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                call.name,
+            VerifiedAccountName(
+                name = call.name,
+                verification = call.accountVerification,
                 style = MaterialTheme.typography.titleSmall,
                 color = if (call.direction == CallDirection.MISSED) MaterialTheme.colorScheme.error
                 else MaterialTheme.colorScheme.onSurface,

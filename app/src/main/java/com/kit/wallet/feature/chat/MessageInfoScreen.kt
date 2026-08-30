@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.kit.wallet.ui.components.KitAvatar
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.MessageDeliveryInfo
 import com.kit.wallet.ui.model.MessageDeliveryPerson
 import java.time.Instant
@@ -165,12 +166,12 @@ private fun RecipientRow(recipient: MessageDeliveryPerson, sentAtEpochMillis: Lo
                 recipient.name,
                 size = 44.dp,
                 avatarUrl = recipient.avatarUrl,
-                accountVerification = recipient.accountVerification,
             )
             Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
-                Text(
-                    recipient.name,
+                VerifiedAccountName(
+                    name = recipient.name,
+                    verification = recipient.accountVerification,
                     style = MaterialTheme.typography.titleSmall,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,

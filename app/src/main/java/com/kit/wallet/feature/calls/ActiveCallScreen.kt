@@ -93,7 +93,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.KitAvatarPhoto
-import com.kit.wallet.ui.components.AccountVerificationBadge
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.components.initialsOf
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.theme.KitGreen100
@@ -783,16 +783,17 @@ private fun ColumnScope.VoiceCallBody(state: ActiveCallUiState) {
                         color = KitGreen700,
                     )
                     KitAvatarPhoto(avatarUrl = state.avatarUrl, size = 132.dp)
-                    AccountVerificationBadge(
-                        verification = state.accountVerification,
-                        modifier = Modifier.align(Alignment.TopEnd),
-                        size = 30.dp,
-                    )
                 }
             }
         }
         Spacer(Modifier.height(28.dp))
-        Text(state.name, style = MaterialTheme.typography.headlineMedium, color = Color.White)
+        VerifiedAccountName(
+            name = state.name,
+            verification = state.accountVerification,
+            style = MaterialTheme.typography.headlineMedium,
+            color = Color.White,
+            badgeSize = 24.dp,
+        )
         Spacer(Modifier.height(6.dp))
         Text(
             state.statusText(),
@@ -903,13 +904,14 @@ private fun GroupVideoGrid(
                                 name = participant.name,
                                 size = 96.dp,
                                 avatarUrl = participant.avatarUrl,
-                                accountVerification = participant.accountVerification,
                             )
                         }
-                        Text(
-                            participant.name,
+                        VerifiedAccountName(
+                            name = participant.name,
+                            verification = participant.accountVerification,
                             style = MaterialTheme.typography.labelSmall,
                             color = Color.White,
+                            badgeSize = 12.dp,
                             modifier = Modifier
                                 .align(Alignment.BottomStart)
                                 .padding(6.dp),
@@ -954,10 +956,13 @@ private fun AddPeopleDialog(
                                 contact.name,
                                 size = 40.dp,
                                 avatarUrl = contact.avatarUrl,
-                                accountVerification = contact.accountVerification,
                             )
                             Spacer(Modifier.width(12.dp))
-                            Text(contact.name, style = MaterialTheme.typography.titleSmall)
+                            VerifiedAccountName(
+                                name = contact.name,
+                                verification = contact.accountVerification,
+                                style = MaterialTheme.typography.titleSmall,
+                            )
                         }
                     }
                 }

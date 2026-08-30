@@ -67,6 +67,7 @@ import com.kit.wallet.data.notifications.ActiveCallPresence
 import com.kit.wallet.data.repository.MessageSearchHit
 import com.kit.wallet.feature.calls.formatCallDuration
 import com.kit.wallet.ui.components.KitAvatar
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
@@ -295,12 +296,12 @@ internal fun ChatsContent(
                             contact.name,
                             size = 40.dp,
                             avatarUrl = contact.avatarUrl,
-                            accountVerification = contact.accountVerification,
                         )
                         Spacer(Modifier.width(12.dp))
                         Column {
-                            Text(
-                                contact.name,
+                            VerifiedAccountName(
+                                name = contact.name,
+                                verification = contact.accountVerification,
                                 style = MaterialTheme.typography.titleSmall,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
@@ -360,12 +361,12 @@ internal fun ChatsContent(
                             size = 40.dp,
                             avatarUrl = hit.chat.avatarUrl,
                             isGroup = hit.chat.isGroup,
-                            accountVerification = hit.chat.accountVerification,
                         )
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(
-                                hit.chat.name,
+                            VerifiedAccountName(
+                                name = hit.chat.name,
+                                verification = hit.chat.accountVerification,
                                 style = MaterialTheme.typography.titleSmall,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
@@ -637,12 +638,12 @@ private fun ChatRow(
             online = chat.online,
             avatarUrl = chat.avatarUrl,
             isGroup = chat.isGroup,
-            accountVerification = chat.accountVerification,
         )
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                chat.name,
+            VerifiedAccountName(
+                name = chat.name,
+                verification = chat.accountVerification,
                 style = MaterialTheme.typography.titleMedium,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

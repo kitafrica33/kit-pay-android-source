@@ -57,6 +57,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.SectionHeader
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.theme.KitWalletTheme
 
@@ -412,11 +413,14 @@ private fun ContactsContent(
                         c.name,
                         size = 48.dp,
                         avatarUrl = c.avatarUrl,
-                        accountVerification = c.accountVerification,
                     )
                     Spacer(Modifier.width(14.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(c.name, style = MaterialTheme.typography.titleSmall)
+                        VerifiedAccountName(
+                            name = c.name,
+                            verification = c.accountVerification,
+                            style = MaterialTheme.typography.titleSmall,
+                        )
                         Text(
                             contactSubtitle(c),
                             style = MaterialTheme.typography.bodySmall,

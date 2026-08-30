@@ -68,6 +68,7 @@ import com.kit.wallet.navigation.financialRouteAccessAllowed
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.SectionHeader
 import com.kit.wallet.ui.components.TransactionRow
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.model.Transaction
@@ -378,12 +379,13 @@ private fun HomeContent(
                                     contact.name,
                                     size = 52.dp,
                                     avatarUrl = contact.avatarUrl,
-                                    accountVerification = contact.accountVerification,
                                 )
                                 Spacer(Modifier.height(6.dp))
-                                Text(
-                                    contact.name.substringBefore(" "),
+                                VerifiedAccountName(
+                                    name = contact.name.substringBefore(" "),
+                                    verification = contact.accountVerification,
                                     style = MaterialTheme.typography.labelMedium,
+                                    badgeSize = 14.dp,
                                 )
                             }
                         }

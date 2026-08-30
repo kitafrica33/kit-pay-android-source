@@ -51,6 +51,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.remote.MAX_GROUP_MEMBERS
 import com.kit.wallet.ui.components.KitAvatar
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.ChatMember
 import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.theme.KitTheme
@@ -515,12 +516,12 @@ private fun GroupMemberRow(
             size = 46.dp,
             online = member.online,
             avatarUrl = member.avatarUrl,
-            accountVerification = member.accountVerification,
         )
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                if (member.isSelf) "You" else member.name,
+            VerifiedAccountName(
+                name = if (member.isSelf) "You" else member.name,
+                verification = member.accountVerification,
                 style = MaterialTheme.typography.titleSmall,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

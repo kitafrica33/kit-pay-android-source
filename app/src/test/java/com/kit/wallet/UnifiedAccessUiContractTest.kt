@@ -8,7 +8,7 @@ import org.junit.Test
 
 class UnifiedAccessUiContractTest {
     @Test
-    fun `self designation appears once in the profile header and nowhere else`() {
+    fun `self designation follows the profile header name and nowhere else in profile UI`() {
         val root = repositoryRoot()
         val settings = source(root, "feature/settings/SettingsScreen.kt")
         val nonProfileSurfaces = listOf(
@@ -20,15 +20,14 @@ class UnifiedAccessUiContractTest {
 
         assertEquals(
             1,
-            Regex("""AccountVerificationBadge\(\s*profile\.accountVerification""")
-                .findAll(settings)
-                .count(),
+            Regex("""verification\s*=\s*profile\.accountVerification""").findAll(settings).count(),
         )
+        assertTrue(settings.contains("VerifiedAccountName("))
         nonProfileSurfaces.forEach { (path, text) ->
             assertFalse(path, text.contains("accountVerification = profile.accountVerification"))
             assertFalse(
                 path,
-                Regex("""AccountVerificationBadge\(\s*profile\.accountVerification""")
+                Regex("""verification\s*=\s*profile\.accountVerification""")
                     .containsMatchIn(text),
             )
         }

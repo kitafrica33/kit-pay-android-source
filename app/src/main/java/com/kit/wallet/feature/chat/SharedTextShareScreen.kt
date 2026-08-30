@@ -63,6 +63,7 @@ import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.KitGreenButton
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.AccountVerification
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
@@ -749,12 +750,12 @@ private fun RecipientRow(
             size = 44.dp,
             online = chat?.online == true,
             avatarUrl = recipient.avatarUrl,
-            accountVerification = recipient.accountVerification,
         )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                recipient.name,
+            VerifiedAccountName(
+                name = recipient.name,
+                verification = recipient.accountVerification,
                 style = MaterialTheme.typography.titleSmall,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -791,13 +792,13 @@ private fun SharePreview(
                     recipient.name,
                     size = 36.dp,
                     avatarUrl = recipient.avatarUrl,
-                    accountVerification = recipient.accountVerification,
                 )
                 Spacer(Modifier.width(10.dp))
                 Column {
                     Text("To", style = MaterialTheme.typography.labelSmall)
-                    Text(
-                        recipient.name,
+                    VerifiedAccountName(
+                        name = recipient.name,
+                        verification = recipient.accountVerification,
                         style = MaterialTheme.typography.titleSmall,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,

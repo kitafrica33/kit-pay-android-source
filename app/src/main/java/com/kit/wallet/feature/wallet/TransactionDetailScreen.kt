@@ -31,6 +31,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.ui.components.EmptyState
 import com.kit.wallet.ui.components.KitAvatar
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.components.StatusChip
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.model.Transaction
@@ -124,10 +125,13 @@ private fun TransactionDetailContent(tx: Transaction, onBack: () -> Unit) {
                 tx.counterparty,
                 size = 64.dp,
                 avatarUrl = tx.counterpartyAvatarUrl,
-                accountVerification = tx.accountVerification,
             )
             Spacer(Modifier.height(12.dp))
-            Text(tx.counterparty, style = MaterialTheme.typography.titleLarge)
+            VerifiedAccountName(
+                name = tx.counterparty,
+                verification = tx.accountVerification,
+                style = MaterialTheme.typography.titleLarge,
+            )
             Spacer(Modifier.height(4.dp))
             Text(
                 Money.format(tx.amountMinor, tx.currencyCode, tx.currencyScale, signed = true),

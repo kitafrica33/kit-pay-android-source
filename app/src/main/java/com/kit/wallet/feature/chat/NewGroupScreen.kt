@@ -42,6 +42,7 @@ import com.kit.wallet.data.remote.MAX_GROUP_MEMBERS
 import com.kit.wallet.data.remote.isValidMessagingGroupTitle
 import com.kit.wallet.data.remote.normalizeMessagingGroupTitle
 import com.kit.wallet.ui.components.KitAvatar
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.Contact
 
 internal fun isMessagingGroupTitleInputError(value: String): Boolean {
@@ -241,12 +242,12 @@ internal fun SelectableContactRow(
             contact.name,
             size = 46.dp,
             avatarUrl = contact.avatarUrl,
-            accountVerification = contact.accountVerification,
         )
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                contact.name,
+            VerifiedAccountName(
+                name = contact.name,
+                verification = contact.accountVerification,
                 style = MaterialTheme.typography.titleSmall,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

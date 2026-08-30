@@ -53,6 +53,7 @@ import com.kit.wallet.feature.auth.rememberBiometricApprovalAvailable
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.KitOutlinedButton
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.BankInstitution
 import com.kit.wallet.ui.model.MobileMoneyNetwork
 import com.kit.wallet.ui.model.MobileMoneyVerificationState
@@ -325,11 +326,14 @@ private fun SourceRow(source: TopUpSource, selected: Boolean, onClick: () -> Uni
             source.title,
             size = 40.dp,
             avatarUrl = source.avatarUrl,
-            accountVerification = source.accountVerification,
         )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(source.title, style = MaterialTheme.typography.titleSmall)
+            VerifiedAccountName(
+                name = source.title,
+                verification = source.accountVerification,
+                style = MaterialTheme.typography.titleSmall,
+            )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     when (source.channel) {

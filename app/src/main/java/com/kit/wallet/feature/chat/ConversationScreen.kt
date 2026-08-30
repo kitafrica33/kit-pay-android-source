@@ -178,6 +178,7 @@ import com.kit.wallet.feature.chat.camera.LibraryVideoDraft
 import com.kit.wallet.feature.chat.camera.stageLibraryVideoForEditing
 import com.kit.wallet.ui.components.GroupedAmountTransformation
 import com.kit.wallet.ui.components.KitAvatar
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.components.kitNameAccent
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.ChatMember
@@ -1767,11 +1768,16 @@ internal fun ConversationContent(
                             online = chat.online,
                             avatarUrl = chat.avatarUrl,
                             isGroup = chat.isGroup,
-                            accountVerification = chat.accountVerification,
                         )
                         Spacer(Modifier.width(10.dp))
                         Column {
-                            Text(chat.name, style = MaterialTheme.typography.titleMedium)
+                            VerifiedAccountName(
+                                name = chat.name,
+                                verification = chat.accountVerification,
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
                             // Typing outranks online. Somebody typing is necessarily present, and
                             // showing the weaker of two true statements wastes the one line here.
                             // In a group the same line says who, because "typing…" under a group

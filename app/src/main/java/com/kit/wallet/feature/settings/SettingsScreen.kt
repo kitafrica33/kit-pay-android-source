@@ -80,8 +80,8 @@ import com.kit.wallet.feature.legal.OpenSourceLicenceDialog
 import com.kit.wallet.feature.legal.isTrustedKitReleaseSourceUrl
 import com.kit.wallet.feature.legal.openSourceLicencePresentation
 import com.kit.wallet.navigation.AppCapabilities
-import com.kit.wallet.ui.components.AccountVerificationBadge
 import com.kit.wallet.ui.components.KitAvatar
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.UserProfile
 import com.kit.wallet.ui.model.formatKitTag
@@ -450,20 +450,14 @@ private fun SettingsContent(
                 )
                 Spacer(Modifier.width(16.dp))
                 Column(Modifier.weight(1f)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        Text(
-                            // The verified name leads. A chosen display name is a nickname and is
-                            // named as one below, so the two are never mistaken for each other.
-                            profile.displayIdentityName.ifBlank { "Kit Pay user" },
-                            style = MaterialTheme.typography.titleLarge,
-                        )
-                        // The account's sole self-designation badge sits beside its identity.
-                        // KYC, email and legal-name state never reach this component.
-                        AccountVerificationBadge(profile.accountVerification, size = 18.dp)
-                    }
+                    VerifiedAccountName(
+                        // The verified name leads. A chosen display name is a nickname and is
+                        // named as one below, so the two are never mistaken for each other.
+                        name = profile.displayIdentityName.ifBlank { "Kit Pay user" },
+                        verification = profile.accountVerification,
+                        style = MaterialTheme.typography.titleLarge,
+                        badgeSize = 18.dp,
+                    )
                     Text(
                         profileIdentitySubtitle(profile),
                         style = MaterialTheme.typography.bodySmall,

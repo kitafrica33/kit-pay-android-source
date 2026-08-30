@@ -40,6 +40,7 @@ import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.ui.components.GroupedAmountTransformation
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.KitGreenButton
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.theme.KitWalletTheme
@@ -126,14 +127,15 @@ internal fun RequestMoneyContent(
                             size = 56.dp,
                             online = selected,
                             avatarUrl = c.avatarUrl,
-                            accountVerification = c.accountVerification,
                         )
                         Spacer(Modifier.height(6.dp))
-                        Text(
-                            c.name.substringBefore(" "),
+                        VerifiedAccountName(
+                            name = c.name.substringBefore(" "),
+                            verification = c.accountVerification,
                             style = MaterialTheme.typography.labelMedium,
                             color = if (selected) MaterialTheme.colorScheme.secondary
                             else MaterialTheme.colorScheme.onSurface,
+                            badgeSize = 14.dp,
                         )
                     }
                 }

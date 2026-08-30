@@ -55,6 +55,7 @@ import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.KitKeypad
 import com.kit.wallet.ui.components.KitOutlinedButton
 import com.kit.wallet.ui.components.SectionHeader
+import com.kit.wallet.ui.components.VerifiedAccountName
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.model.TopUpRequirement
@@ -298,10 +299,14 @@ private fun RecipientPicker(contacts: List<Contact>, onPick: (Contact) -> Unit) 
                             c.name,
                             size = 52.dp,
                             avatarUrl = c.avatarUrl,
-                            accountVerification = c.accountVerification,
                         )
                         Spacer(Modifier.height(6.dp))
-                        Text(c.name.substringBefore(" "), style = MaterialTheme.typography.labelMedium)
+                        VerifiedAccountName(
+                            name = c.name.substringBefore(" "),
+                            verification = c.accountVerification,
+                            style = MaterialTheme.typography.labelMedium,
+                            badgeSize = 14.dp,
+                        )
                     }
                 }
             }
@@ -323,11 +328,14 @@ private fun RecipientPicker(contacts: List<Contact>, onPick: (Contact) -> Unit) 
                     c.name,
                     size = 46.dp,
                     avatarUrl = c.avatarUrl,
-                    accountVerification = c.accountVerification,
                 )
                 Spacer(Modifier.width(14.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(c.name, style = MaterialTheme.typography.titleSmall)
+                    VerifiedAccountName(
+                        name = c.name,
+                        verification = c.accountVerification,
+                        style = MaterialTheme.typography.titleSmall,
+                    )
                     Text(
                         c.phone,
                         style = MaterialTheme.typography.bodySmall,
@@ -371,10 +379,21 @@ private fun AmountEntry(
                     recipient.name,
                     size = 32.dp,
                     avatarUrl = recipient.avatarUrl,
-                    accountVerification = recipient.accountVerification,
                 )
                 Spacer(Modifier.width(8.dp))
-                Text(recipient.phone, style = MaterialTheme.typography.bodyMedium)
+                Column {
+                    VerifiedAccountName(
+                        name = recipient.name,
+                        verification = recipient.accountVerification,
+                        style = MaterialTheme.typography.bodyMedium,
+                        badgeSize = 14.dp,
+                    )
+                    Text(
+                        recipient.phone,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
         Spacer(Modifier.weight(1f))
@@ -438,10 +457,13 @@ private fun ConfirmPayment(
             recipient.name,
             size = 64.dp,
             avatarUrl = recipient.avatarUrl,
-            accountVerification = recipient.accountVerification,
         )
         Spacer(Modifier.height(10.dp))
-        Text(recipient.name, style = MaterialTheme.typography.titleMedium)
+        VerifiedAccountName(
+            name = recipient.name,
+            verification = recipient.accountVerification,
+            style = MaterialTheme.typography.titleMedium,
+        )
         Text(
             recipient.phone,
             style = MaterialTheme.typography.bodySmall,
