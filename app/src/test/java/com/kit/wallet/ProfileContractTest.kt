@@ -9,6 +9,7 @@ import com.kit.wallet.data.mapper.toUiModel
 import com.kit.wallet.data.remote.UpdateProfileRequest
 import com.kit.wallet.data.remote.UpdateProfileRequestAdapter
 import com.kit.wallet.data.remote.UserDto
+import com.kit.wallet.data.remote.ContactDto
 import com.kit.wallet.feature.settings.normalizeProfileTag
 import com.kit.wallet.feature.settings.profileIdentitySubtitle
 import com.kit.wallet.feature.settings.mergeProfileEditorInitialValues
@@ -16,7 +17,9 @@ import com.kit.wallet.feature.settings.ProfileEditorInitialValues
 import com.kit.wallet.feature.settings.profileEditorInitialValues
 import com.kit.wallet.feature.settings.profileEmailPresentation
 import com.kit.wallet.feature.settings.profileValidationError
+import com.kit.wallet.data.repository.toContactModel
 import com.kit.wallet.ui.model.UserProfile
+import com.kit.wallet.ui.model.AccountVerificationDesignation
 import com.kit.wallet.ui.model.formatKitTag
 import com.kit.wallet.navigation.Dest
 import com.kit.wallet.navigation.shouldRequireProfileSetup
@@ -29,6 +32,119 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProfileContractTest {
+    @Test
+    fun `exact account designations decode persist and map with their grant time`() {
+        val adapter = Moshi.Builder()
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(UserDto::class.java)
+        val supported = mapOf(
+            "verified" to AccountVerificationDesignation.VERIFIED,
+            "official" to AccountVerificationDesignation.OFFICIAL,
+            "official_support" to AccountVerificationDesignation.OFFICIAL_SUPPORT,
+        )
+
+        supported.forEach { (serverValue, expected) ->
+            val user = requireNotNull(
+                adapter.fromJson(
+                    """{"id":"user-1","name":"Amina","tag":"amina","verification":{"designation":"$serverValue","since":"2026-08-28T10:00:00Z"}}""",
+                ),
+            )
+            val cached = user.toEntity(nowEpochMillis = 123L)
+            val presented = cached.toUiModel().accountVerification
+
+            assertEquals(serverValue, cached.verificationDesignation)
+            assertEquals("2026-08-28T10:00:00Z", cached.verificationSince)
+            assertEquals(expected, presented?.designation)
+            assertEquals("2026-08-28T10:00:00Z", presented?.since)
+        }
+    }
+
+    @Test
+    fun `unknown designation casing padding kyc and display text never create a blue seal`() {
+        val adapter = Moshi.Builder()
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(UserDto::class.java)
+
+        listOf("Verified", " verified", "official-support", "official_support ", "support", "")
+            .forEach { serverValue ->
+                val user = requireNotNull(
+                    adapter.fromJson(
+                        """{"id":"user-1","name":"Official Support ✓","tag":"support-team","kyc_status":"verified","verification":{"designation":"$serverValue","since":"2026-08-28T10:00:00Z"}}""",
+                    ),
+                )
+                val cached = user.toEntity(nowEpochMillis = 123L)
+
+                assertNull(cached.verificationDesignation)
+                assertNull(cached.verificationSince)
+                assertNull(cached.toUiModel().accountVerification)
+            }
+
+        val presentationOnly = UserDto(
+            id = "user-1",
+            name = "Official Support ✓",
+            tag = "verified",
+            kycStatus = "verified",
+        ).toEntity(nowEpochMillis = 123L)
+        assertNull(presentationOnly.toUiModel().accountVerification)
+    }
+
+    @Test
+    fun `designation alone grants badge while malformed optional grant time is discarded`() {
+        val adapter = Moshi.Builder()
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(UserDto::class.java)
+        val user = requireNotNull(
+            adapter.fromJson(
+                """{"id":"user-1","name":"Amina","tag":"amina","verification":{"designation":"verified","since":"yesterday"}}""",
+            ),
+        )
+
+        val cached = user.toEntity(nowEpochMillis = 123L)
+
+        assertEquals("verified", cached.verificationDesignation)
+        assertNull(cached.verificationSince)
+        assertEquals(
+            AccountVerificationDesignation.VERIFIED,
+            cached.toUiModel().accountVerification?.designation,
+        )
+    }
+
+    @Test
+    fun `contact verification payload decodes without using the contact name`() {
+        val adapter = Moshi.Builder()
+            .add(KotlinJsonAdapterFactory())
+            .build()
+            .adapter(ContactDto::class.java)
+        val contact = requireNotNull(
+            adapter.fromJson(
+                """{"id":"contact-1","name":"Ordinary name","phone":"+256700000001","is_kit_user":true,"verification":{"designation":"official_support","since":"2026-08-28T11:00:00Z"}}""",
+            ),
+        )
+        val mapped = contact.toContactModel()
+        val verification = mapped.accountVerification
+
+        assertEquals("Ordinary name", mapped.name)
+        assertEquals(AccountVerificationDesignation.OFFICIAL_SUPPORT, verification?.designation)
+        assertEquals("2026-08-28T11:00:00Z", verification?.since)
+
+        val unknown = requireNotNull(
+            adapter.fromJson(
+                """{"id":"contact-2","name":"Official Support ✓","phone":"+256700000002","verification":{"designation":"Official_Support","since":"2026-08-28T11:00:00Z"}}""",
+            ),
+        )
+        assertNull(unknown.toContactModel().accountVerification)
+
+        val unlinked = requireNotNull(
+            adapter.fromJson(
+                """{"id":"local-contact","name":"Ordinary name","phone":"+256700000003","is_kit_user":false,"verification":{"designation":"verified","since":"2026-08-28T11:00:00Z"}}""",
+            ),
+        )
+        assertNull(unlinked.toContactModel().accountVerification)
+    }
+
     @Test
     fun `explicit null user flags parse and normalize safely`() {
         val adapter = Moshi.Builder()
@@ -324,7 +440,7 @@ class ProfileContractTest {
         )
 
         assertEquals("Email address", presentation.title)
-        assertTrue(presentation.subtitle.contains("Verified"))
+        assertFalse(presentation.subtitle.contains("Verified"))
         assertTrue(presentation.subtitle.contains("not yet supported"))
         assertFalse(presentation.canAttach)
     }

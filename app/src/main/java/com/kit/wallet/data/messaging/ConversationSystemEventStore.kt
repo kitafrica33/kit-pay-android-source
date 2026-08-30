@@ -30,6 +30,8 @@ internal data class ConversationSystemEvent(
     val contributionId: String? = null,
     val contributorUserId: String? = null,
     val contributionAmountMinor: String? = null,
+    /** Exact-hydrated local-only descriptor for a scheduled-payment terminal projection. */
+    val projectionText: String? = null,
 ) {
     init {
         require(eventId > 0) { "A conversation system event needs its sync event ID" }
@@ -38,6 +40,10 @@ internal data class ConversationSystemEvent(
         } else if (type in GROUP_PAYMENT_REQUEST_SYSTEM_EVENT_TYPES) {
             require(!paymentId.isNullOrBlank()) {
                 "A financial event needs its exact payment request"
+            }
+        } else if (type in SCHEDULED_PAYMENT_SYSTEM_EVENT_TYPES) {
+            require(!paymentId.isNullOrBlank() && !projectionText.isNullOrBlank()) {
+                "A scheduled payment event needs its exact local projection"
             }
         }
     }
@@ -59,6 +65,15 @@ internal val GROUP_PAYMENT_REQUEST_SYSTEM_EVENT_TYPES = setOf(
     "group_payment_request.completed",
     "group_payment_request.cancelled",
     "group_payment_request.expired",
+)
+
+internal val SCHEDULED_PAYMENT_SYSTEM_EVENT_TYPES = setOf(
+    "scheduled_payment.completed",
+    "scheduled_payment.failed",
+    "scheduled_payment.cancelled",
+    "scheduled_group_payment.completed",
+    "scheduled_group_payment.failed",
+    "scheduled_group_payment.cancelled",
 )
 
 /**
@@ -120,9 +135,19 @@ internal class ConversationSystemEventStore @Inject constructor(
      * The sync log is append-only and a fresh login starts without a cursor, so the same event can
      * arrive more than once; [ConversationSystemEvent.eventId] is what makes that idempotent.
      */
+    suspend fun record(
+        activation: SecureMessagingActivationCapability,
+        conversationId: String,
+        event: ConversationSystemEvent,
+    ) = stateStore.withActivationLease(activation) {
+        record(conversationId, event)
+    }
+
+    /** Caller without an activation capability; retained for bounded presentation-store tooling. */
     suspend fun record(conversationId: String, event: ConversationSystemEvent) {
         if (event.type !in MEMBERSHIP_SYSTEM_EVENT_TYPES &&
-            event.type !in GROUP_PAYMENT_REQUEST_SYSTEM_EVENT_TYPES
+            event.type !in GROUP_PAYMENT_REQUEST_SYSTEM_EVENT_TYPES &&
+            event.type !in SCHEDULED_PAYMENT_SYSTEM_EVENT_TYPES
         ) return
         val canonical = canonicalIdOrNull(conversationId) ?: return
         writeLock.withLock {
@@ -211,6 +236,7 @@ internal class ConversationSystemEventStore @Inject constructor(
                 data.writeUTF(event.contributionId.orEmpty())
                 data.writeUTF(event.contributorUserId.orEmpty())
                 data.writeUTF(event.contributionAmountMinor.orEmpty())
+                data.writeUTF(event.projectionText.orEmpty())
             }
         }
         return out.toByteArray()
@@ -219,7 +245,7 @@ internal class ConversationSystemEventStore @Inject constructor(
     private fun decode(bytes: ByteArray): List<ConversationSystemEvent> = try {
         DataInputStream(ByteArrayInputStream(bytes)).use { data ->
             val version = data.readByte()
-            if (version != VERSION && version != LEGACY_VERSION) {
+            if (version != VERSION && version != GROUP_REQUEST_VERSION && version != LEGACY_VERSION) {
                 emptyList()
             } else {
                 val count = data.readInt()
@@ -234,16 +260,19 @@ internal class ConversationSystemEventStore @Inject constructor(
                                 userId = data.readUTF().takeIf(String::isNotEmpty),
                                 role = data.readUTF().takeIf(String::isNotEmpty),
                                 occurredAt = Instant.ofEpochMilli(data.readLong()),
-                                paymentId = if (version == VERSION) {
+                                paymentId = if (version >= GROUP_REQUEST_VERSION) {
                                     data.readUTF().takeIf(String::isNotEmpty)
                                 } else null,
-                                contributionId = if (version == VERSION) {
+                                contributionId = if (version >= GROUP_REQUEST_VERSION) {
                                     data.readUTF().takeIf(String::isNotEmpty)
                                 } else null,
-                                contributorUserId = if (version == VERSION) {
+                                contributorUserId = if (version >= GROUP_REQUEST_VERSION) {
                                     data.readUTF().takeIf(String::isNotEmpty)
                                 } else null,
-                                contributionAmountMinor = if (version == VERSION) {
+                                contributionAmountMinor = if (version >= GROUP_REQUEST_VERSION) {
+                                    data.readUTF().takeIf(String::isNotEmpty)
+                                } else null,
+                                projectionText = if (version == VERSION) {
                                     data.readUTF().takeIf(String::isNotEmpty)
                                 } else null,
                             )
@@ -268,7 +297,8 @@ internal class ConversationSystemEventStore @Inject constructor(
     private companion object {
         const val NAMESPACE = "conversation-system-events"
         const val LEGACY_VERSION: Byte = 0x01
-        const val VERSION: Byte = 0x02
+        const val GROUP_REQUEST_VERSION: Byte = 0x02
+        const val VERSION: Byte = 0x03
 
         /**
          * Membership changes are rare next to messages, and a group is capped at 32 people, so

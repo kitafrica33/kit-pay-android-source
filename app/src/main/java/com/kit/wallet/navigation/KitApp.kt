@@ -85,6 +85,8 @@ import com.kit.wallet.feature.auth.PinSetupScreen
 import com.kit.wallet.feature.auth.ResetPasswordScreen
 import com.kit.wallet.feature.auth.SessionAssuranceViewModel
 import com.kit.wallet.feature.auth.SessionUnlockGate
+import com.kit.wallet.feature.auth.scopedAccessState
+import com.kit.wallet.feature.auth.shouldPresentSessionUnlockGate
 import com.kit.wallet.feature.auth.BiometricApprovalPrompt
 import com.kit.wallet.feature.auth.BiometricApprovalViewModel
 import com.kit.wallet.feature.auth.VerifyEmailScreen
@@ -125,6 +127,11 @@ import com.kit.wallet.feature.support.NewSupportTicketScreen
 import com.kit.wallet.feature.support.SupportHubScreen
 import com.kit.wallet.feature.support.SupportTicketScreen
 import com.kit.wallet.feature.wallet.ReceiveScreen
+import com.kit.wallet.feature.wallet.FinancialAccessScreen
+import com.kit.wallet.feature.wallet.FinancialBlockReason
+import com.kit.wallet.feature.wallet.FinancialIdentityViewModel
+import com.kit.wallet.feature.wallet.ScopedAccessState
+import com.kit.wallet.feature.wallet.financialAccessDecision
 import com.kit.wallet.feature.wallet.RequestMoneyScreen
 import com.kit.wallet.feature.wallet.ScanScreen
 import com.kit.wallet.feature.wallet.SendMoneyScreen
@@ -159,6 +166,7 @@ internal fun KitApp(
     accountAccessViewModel: AccountAccessViewModel = hiltViewModel(),
     capabilitiesViewModel: AppCapabilitiesViewModel = hiltViewModel(),
     sessionAssuranceViewModel: SessionAssuranceViewModel = hiltViewModel(),
+    financialIdentityViewModel: FinancialIdentityViewModel = hiltViewModel(),
     biometricApprovalViewModel: BiometricApprovalViewModel = hiltViewModel(),
     paymentClaimNavigationViewModel: PaymentClaimNavigationViewModel = hiltViewModel(),
 ) {
@@ -173,6 +181,41 @@ internal fun KitApp(
     val authState by authViewModel.uiState.collectAsStateWithLifecycle()
     val capabilities by capabilitiesViewModel.state.collectAsStateWithLifecycle()
     val sessionAssurance by sessionAssuranceViewModel.state.collectAsStateWithLifecycle()
+    val financialIdentity by financialIdentityViewModel.state.collectAsStateWithLifecycle()
+    // Session assurance is freshest after an unlock. Authenticated capability discovery fills the
+    // short window before that fetch. A response contributes its complete pair or none of it: a
+    // partial session pair must fail closed rather than borrowing the missing half from another
+    // request.
+    val sessionScopedAccess = sessionAssurance.scopedAccessState()
+    val capabilityScopedAccess = ScopedAccessState(
+        communicationAllowed = capabilities.communicationAccess?.allowed,
+        communicationBasis = capabilities.communicationAccess?.basis,
+        communicationRequiredAction = capabilities.communicationAccess?.requiredAction,
+        financialAllowed = capabilities.financialAccess?.allowed,
+        financialReadOnly = capabilities.financialAccess?.readOnly == true,
+        financialBasis = capabilities.financialAccess?.basis,
+        financialRequiredAction = capabilities.financialAccess?.requiredAction,
+    )
+    val effectiveScopedAccess = if (sessionScopedAccess.hasAnyScopedValue) {
+        sessionScopedAccess
+    } else {
+        capabilityScopedAccess
+    }
+    val financialAccess = financialAccessDecision(
+        identity = financialIdentity,
+        scopedAccess = effectiveScopedAccess,
+        legacySessionAssured = !sessionAssurance.required,
+    )
+    val moneyMovementAllowed = financialAccess.moneyMovementAllowed
+    val requestFinancialAccess: () -> Unit = {
+        financialAccessDestination(
+            financialAccess.blockReason,
+            capabilities.enabled(KitFeature.KYC),
+        )?.let { destination ->
+            navController.navigate(destination) { launchSingleTop = true }
+        }
+        Unit
+    }
     val biometricApproval by biometricApprovalViewModel.request.collectAsStateWithLifecycle()
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(lifecycleOwner, capabilitiesViewModel) {
@@ -241,6 +284,7 @@ internal fun KitApp(
         capabilities.features,
         capabilities.messagingServerCompatible,
         capabilities.secureMessagingClientReady,
+        moneyMovementAllowed,
     ) {
         val rawDeepLink = deepLinkUri
         if (
@@ -294,6 +338,11 @@ internal fun KitApp(
                     // checks finish. The push contributed nothing but the claim id.
                     return@LaunchedEffect
                 }
+                if (!moneyMovementAllowed) {
+                    onDeepLinkConsumed()
+                    requestFinancialAccess()
+                    return@LaunchedEffect
+                }
                 // Consumed now: resolution refetches the claim asynchronously and owns its
                 // own wallet-history fallback, so the link must not replay on recomposition.
                 onDeepLinkConsumed()
@@ -338,12 +387,17 @@ internal fun KitApp(
     // identity and opens the account's own wallet activity, unfiltered — never a payload URL,
     // never the claim's transaction. Nothing on this path settles or renders claim data itself.
     val paymentClaimTarget by paymentClaimNavigationViewModel.target.collectAsStateWithLifecycle()
-    LaunchedEffect(paymentClaimTarget, signedIn) {
+    LaunchedEffect(paymentClaimTarget, signedIn, moneyMovementAllowed) {
         val target = paymentClaimTarget ?: return@LaunchedEffect
         // Mirror of iOS's authenticated-context recheck before navigation: a target resolved
         // for an account that signed out or switched since resolution dies unnavigated.
         if (!signedIn || !paymentClaimNavigationViewModel.targetOwnerStillCurrent()) {
             paymentClaimNavigationViewModel.consumed()
+            return@LaunchedEffect
+        }
+        if (!moneyMovementAllowed) {
+            paymentClaimNavigationViewModel.consumed()
+            requestFinancialAccess()
             return@LaunchedEffect
         }
         when (target) {
@@ -381,6 +435,22 @@ internal fun KitApp(
             if (!navController.popBackStack(Dest.HOME, inclusive = false)) {
                 navController.resetTo(Dest.HOME)
             }
+        }
+    }
+
+    // A restored back stack or deep link can name a wallet route without going through a Home
+    // callback. Remove it before any financial content renders, then explain the identity step.
+    LaunchedEffect(signedIn, currentRoute, financialAccess) {
+        val fallback = financialRouteRedirect(
+            currentRoute,
+            financialAccess.allowed,
+            financialAccess.readOnly,
+        )
+        if (signedIn && fallback != null) {
+            if (!navController.popBackStack(Dest.HOME, inclusive = false)) {
+                navController.resetTo(fallback)
+            }
+            requestFinancialAccess()
         }
     }
 
@@ -534,6 +604,11 @@ internal fun KitApp(
                     accountAccessViewModel = accountAccessViewModel,
                     authState = authState,
                     capabilities = capabilities,
+                    moneyAccessAllowed = financialAccess.allowed,
+                    moneyReadOnly = financialAccess.readOnly,
+                    moneyMovementAllowed = moneyMovementAllowed,
+                    financialBlockReason = financialAccess.blockReason,
+                    onFinancialIdentityRequired = requestFinancialAccess,
                     activeAuthorizedIncomingCall = activeAuthorizedIncomingCall,
                     onAuthorizedIncomingCallRejected = onAuthorizedIncomingCallRejected,
                     onAuthorizedIncomingCallSurfaceChanged =
@@ -576,7 +651,15 @@ internal fun KitApp(
     // the gate on those screens previously trapped brand-new users: the server saved their
     // first PIN but refused to unlock until identity verification, which the gate never offered.
     val accountSetupActive = profileSetupRequired || currentRoute in ACCOUNT_SETUP_ROUTES
-    if (signedIn && sessionAssurance.required && !accountSetupActive && currentRoute != Dest.KYC) {
+    if (signedIn &&
+        shouldPresentSessionUnlockGate(
+            sessionAssurance,
+            financialIdentity.accountState,
+            effectiveScopedAccess,
+        ) &&
+        !accountSetupActive &&
+        currentRoute != Dest.KYC
+    ) {
         SessionUnlockGate(
             state = sessionAssurance,
             onUnlock = sessionAssuranceViewModel::unlockWithPin,
@@ -623,6 +706,11 @@ private fun KitNavHost(
     accountAccessViewModel: AccountAccessViewModel,
     authState: com.kit.wallet.feature.auth.AuthUiState,
     capabilities: AppCapabilities,
+    moneyAccessAllowed: Boolean,
+    moneyReadOnly: Boolean,
+    moneyMovementAllowed: Boolean,
+    financialBlockReason: FinancialBlockReason?,
+    onFinancialIdentityRequired: () -> Unit,
     activeAuthorizedIncomingCall: AuthorizedIncomingCallLaunch? = null,
     onAuthorizedIncomingCallRejected: (String) -> Unit = {},
     onAuthorizedIncomingCallSurfaceChanged: (String, Boolean) -> Unit = { _, _ -> },
@@ -630,6 +718,13 @@ private fun KitNavHost(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
+    val openFinancialRoute: (String) -> Unit = { route ->
+        if (financialRouteAccessAllowed(route, moneyAccessAllowed, moneyReadOnly)) {
+            navController.navigate(route) { launchSingleTop = true }
+        } else {
+            onFinancialIdentityRequired()
+        }
+    }
     val openAuthenticated: (Boolean, Boolean) -> Unit =
         { needsPaymentPinSetup, needsProfileSetup ->
         val destination = when {
@@ -838,19 +933,22 @@ private fun KitNavHost(
             AuthenticatedRouteContent(signedIn) {
                 HomeScreen(
                     capabilities = capabilities,
-                    onSend = { navController.navigate(Dest.SEND) },
-                    onReceive = { navController.navigate(Dest.RECEIVE) },
-                    onScan = { navController.navigate(Dest.SCAN) },
-                    onBills = { navController.navigate(Dest.BILLS) },
-                    onAirtime = { navController.navigate(Dest.AIRTIME) },
-                    onBank = { navController.navigate(Dest.BANK) },
-                    onMobileMoney = { navController.navigate(Dest.MOBILE_MONEY) },
-                    onRequest = { navController.navigate(Dest.REQUEST) },
+                    moneyAccessAllowed = moneyAccessAllowed,
+                    moneyReadOnly = moneyReadOnly,
+                    onSend = { openFinancialRoute(Dest.SEND) },
+                    onReceive = { openFinancialRoute(Dest.RECEIVE) },
+                    onScan = { openFinancialRoute(Dest.SCAN) },
+                    onBills = { openFinancialRoute(Dest.BILLS) },
+                    onAirtime = { openFinancialRoute(Dest.AIRTIME) },
+                    onBank = { openFinancialRoute(Dest.BANK) },
+                    onMobileMoney = { openFinancialRoute(Dest.MOBILE_MONEY) },
+                    onRequest = { openFinancialRoute(Dest.REQUEST) },
                     onKyc = { navController.navigate(Dest.KYC) },
                     onStartChat = { navController.navigate(Dest.CONTACTS) },
-                    onAllTransactions = { navController.navigate(Dest.TRANSACTIONS) },
-                    onTransaction = { navController.navigate(Dest.txDetail(it)) },
-                    onFavorite = { navController.navigate(Dest.send(it)) },
+                    onAllTransactions = { openFinancialRoute(Dest.TRANSACTIONS) },
+                    onTransaction = { openFinancialRoute(Dest.txDetail(it)) },
+                    onFavorite = { openFinancialRoute(Dest.send(it)) },
+                    onVerifyIdentityRequired = onFinancialIdentityRequired,
                 )
             }
         }
@@ -902,7 +1000,9 @@ private fun KitNavHost(
                 },
             ),
         ) { entry ->
-            FeatureRouteContent(signedIn, capabilities, Dest.SEND) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.SEND, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 SendMoneyScreen(
                     initialContactId = entry.arguments?.getString("contactId"),
                     onBack = { navController.popBackStack() },
@@ -911,7 +1011,9 @@ private fun KitNavHost(
             }
         }
         composable(Dest.RECEIVE) {
-            FeatureRouteContent(signedIn, capabilities, Dest.RECEIVE) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.RECEIVE, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 ReceiveScreen(
                     requestMoneyAvailable = capabilities.routeUsable(Dest.REQUEST),
                     onRequestAmount = { navController.navigate(Dest.REQUEST) },
@@ -920,12 +1022,16 @@ private fun KitNavHost(
             }
         }
         composable(Dest.SCAN) {
-            FeatureRouteContent(signedIn, capabilities, Dest.SCAN) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.SCAN, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 ScanScreen(onBack = { navController.popBackStack() })
             }
         }
         composable(Dest.REQUEST) {
-            FeatureRouteContent(signedIn, capabilities, Dest.REQUEST) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.REQUEST, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 RequestMoneyScreen(
                     onBack = { navController.popBackStack() },
                     onDone = { navController.popBackStack(Dest.HOME, inclusive = false) },
@@ -933,7 +1039,9 @@ private fun KitNavHost(
             }
         }
         composable(Dest.TRANSACTIONS) {
-            FeatureRouteContent(signedIn, capabilities, Dest.TRANSACTIONS) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.TRANSACTIONS, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 TransactionsScreen(
                     onBack = { navController.popBackStack() },
                     onTransaction = { navController.navigate(Dest.txDetail(it)) },
@@ -941,7 +1049,9 @@ private fun KitNavHost(
             }
         }
         composable(Dest.TX_DETAIL) { entry ->
-            FeatureRouteContent(signedIn, capabilities, Dest.TX_DETAIL) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.TX_DETAIL, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 TransactionDetailScreen(
                     txId = entry.arguments?.getString("txId").orEmpty(),
                     onBack = { navController.popBackStack() },
@@ -951,7 +1061,9 @@ private fun KitNavHost(
 
         // --- Bills & bank ---
         composable(Dest.BILLS) {
-            FeatureRouteContent(signedIn, capabilities, Dest.BILLS) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.BILLS, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 BillsScreen(
                     airtimeEnabled = capabilities.enabled(KitFeature.AIRTIME),
                     onBack = { navController.popBackStack() },
@@ -961,7 +1073,9 @@ private fun KitNavHost(
             }
         }
         composable(Dest.BILL_PAY) { entry ->
-            FeatureRouteContent(signedIn, capabilities, Dest.BILL_PAY) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.BILL_PAY, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 BillPayScreen(
                     providerId = entry.arguments?.getString("providerId").orEmpty(),
                     onBack = { navController.popBackStack() },
@@ -970,7 +1084,9 @@ private fun KitNavHost(
             }
         }
         composable(Dest.AIRTIME) {
-            FeatureRouteContent(signedIn, capabilities, Dest.AIRTIME) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.AIRTIME, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 AirtimeScreen(
                     onBack = { navController.popBackStack() },
                     onDone = { navController.popBackStack(Dest.HOME, inclusive = false) },
@@ -978,7 +1094,9 @@ private fun KitNavHost(
             }
         }
         composable(Dest.BANK) {
-            FeatureRouteContent(signedIn, capabilities, Dest.BANK) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.BANK, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 BankScreen(
                     onBack = { navController.popBackStack() },
                     depositsEnabled = capabilities.bankDepositsUsable,
@@ -987,7 +1105,9 @@ private fun KitNavHost(
             }
         }
         composable(Dest.MOBILE_MONEY) {
-            FeatureRouteContent(signedIn, capabilities, Dest.MOBILE_MONEY) {
+            FinancialRouteContent(
+                signedIn, capabilities, Dest.MOBILE_MONEY, moneyAccessAllowed, moneyReadOnly,
+            ) {
                 MobileMoneyScreen(onBack = { navController.popBackStack() })
             }
         }
@@ -1021,6 +1141,8 @@ private fun KitNavHost(
             FeatureRouteContent(signedIn, capabilities, Dest.CONVERSATION) {
                 ConversationScreen(
                     chatId = entry.arguments?.getString("chatId").orEmpty(),
+                    moneyMovementAllowed = moneyMovementAllowed,
+                    onVerifyIdentityRequired = onFinancialIdentityRequired,
                     claimableTransfersEnabled = capabilities.allEnabled(
                         KitFeature.WALLETS,
                         KitFeature.INTERNAL_TRANSFERS,
@@ -1200,6 +1322,18 @@ private fun KitNavHost(
                 KycScreen(onBack = { navController.popBackStack() })
             }
         }
+        composable(Dest.FINANCIAL_ACCESS) {
+            AuthenticatedRouteContent(signedIn) {
+                FinancialAccessScreen(
+                    blockReason = financialBlockReason ?: FinancialBlockReason.SESSION_ASSURANCE,
+                    verificationAvailable = capabilities.enabled(KitFeature.KYC),
+                    onBack = { navController.popBackStack() },
+                    onVerifyIdentity = {
+                        navController.navigate(Dest.KYC) { launchSingleTop = true }
+                    },
+                )
+            }
+        }
 
         // --- Support & referrals (Settings-only; strict handshake, see routeUsable) ---
         composable(Dest.SUPPORT) {
@@ -1232,6 +1366,8 @@ private fun KitNavHost(
             FeatureRouteContent(signedIn, capabilities, Dest.SUPPORT_TICKET) {
                 SupportTicketScreen(
                     supportPaymentsUsable = capabilities.supportPaymentsUsable,
+                    moneyMovementAllowed = moneyMovementAllowed,
+                    onVerifyIdentityRequired = onFinancialIdentityRequired,
                     companyBeneficiaryName =
                         capabilities.supportProtocol?.companyBeneficiaryName,
                     onBack = { navController.popBackStack() },
@@ -1288,6 +1424,20 @@ private fun FeatureRouteContent(
     content: @Composable () -> Unit,
 ) {
     if (routeAccess && capabilities.routeUsable(route)) content()
+}
+
+@Composable
+private fun FinancialRouteContent(
+    signedIn: Boolean,
+    capabilities: AppCapabilities,
+    route: String,
+    moneyAccessAllowed: Boolean,
+    moneyReadOnly: Boolean,
+    content: @Composable () -> Unit,
+) {
+    if (financialRouteAccessAllowed(route, moneyAccessAllowed, moneyReadOnly)) {
+        FeatureRouteContent(signedIn, capabilities, route, content)
+    }
 }
 
 @Composable

@@ -27,6 +27,14 @@ data class CachedSessionAssurance(
     val loginUnlockStatus: String,
     val loginUnlockRequired: Boolean,
     val loginUnlockMethods: List<String>,
+    /** Nullable defaults preserve encrypted sessions written before scoped access existed. */
+    val communicationAccessAllowed: Boolean? = null,
+    val communicationAccessBasis: String? = null,
+    val communicationRequiredAction: String? = null,
+    val financialAccessAllowed: Boolean? = null,
+    val financialAccessBasis: String? = null,
+    val financialRequiredAction: String? = null,
+    val financialReadOnly: Boolean = false,
 )
 
 data class SessionTokens(

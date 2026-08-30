@@ -1,6 +1,7 @@
 package com.kit.wallet.navigation
 
 import android.net.Uri
+import com.kit.wallet.feature.wallet.FinancialBlockReason
 
 /**
  * Where a landing on the retired email-registration route continues. Phone OTP is the only
@@ -37,6 +38,7 @@ object Dest {
     const val REQUEST = "wallet/request"
     const val TRANSACTIONS = "wallet/transactions"
     const val TX_DETAIL = "wallet/tx/{txId}"
+    const val FINANCIAL_ACCESS = "wallet/access"
     const val BILLS = "bills"
     const val BILL_PAY = "bills/pay/{providerId}"
     const val AIRTIME = "bills/airtime"
@@ -79,4 +81,65 @@ object Dest {
         "call/incoming/${Uri.encode(callId)}?accept=${if (accept) "1" else "0"}"
     fun profileSetup(needsPin: Boolean) = "auth/profile/setup?needsPin=$needsPin"
     fun supportTicket(ticketId: String) = "settings/support/ticket/${Uri.encode(ticketId)}"
+}
+
+/**
+ * Routes that expose wallet balances, payment instruments, or money instructions.
+ *
+ * This is intentionally separate from capability routing: a feature can be deployed and still be
+ * unavailable to an account that has not completed identity verification. Dynamic route values
+ * are matched explicitly so restored back stacks and deep links cannot bypass the same boundary
+ * used by dashboard taps.
+ */
+internal fun isFinancialRoute(route: String?): Boolean {
+    if (route == null) return false
+    if (route == Dest.SEND || route == Dest.SEND_ROUTE || route.startsWith("${Dest.SEND}?")) {
+        return true
+    }
+    if (route == Dest.TX_DETAIL || route.startsWith("wallet/tx/")) return true
+    if (route == Dest.BILL_PAY || route.startsWith("bills/pay/")) return true
+    return route in setOf(
+        Dest.RECEIVE,
+        Dest.SCAN,
+        Dest.REQUEST,
+        Dest.TRANSACTIONS,
+        Dest.BILLS,
+        Dest.AIRTIME,
+        Dest.BANK,
+        Dest.MOBILE_MONEY,
+    )
+}
+
+/** App Review's synthetic account may inspect history, but can never initiate money movement. */
+internal fun isReadOnlyFinancialRoute(route: String?): Boolean =
+    route == Dest.TRANSACTIONS || route == Dest.TX_DETAIL || route?.startsWith("wallet/tx/") == true
+
+internal fun financialRouteAccessAllowed(
+    route: String?,
+    moneyAccessAllowed: Boolean,
+    moneyReadOnly: Boolean,
+): Boolean = when {
+    !isFinancialRoute(route) -> true
+    !moneyAccessAllowed -> false
+    !moneyReadOnly -> true
+    else -> isReadOnlyFinancialRoute(route)
+}
+
+internal fun financialRouteRedirect(
+    route: String?,
+    moneyAccessAllowed: Boolean,
+    moneyReadOnly: Boolean = false,
+): String? = Dest.HOME.takeIf {
+    !financialRouteAccessAllowed(route, moneyAccessAllowed, moneyReadOnly)
+}
+
+/** Full-screen destination for a blocked financial entry point; session assurance owns its gate. */
+internal fun financialAccessDestination(
+    blockReason: FinancialBlockReason?,
+    verificationAvailable: Boolean,
+): String? = when (blockReason) {
+    FinancialBlockReason.VERIFY_IDENTITY ->
+        if (verificationAvailable) Dest.KYC else Dest.FINANCIAL_ACCESS
+    FinancialBlockReason.READ_ONLY, null -> Dest.FINANCIAL_ACCESS
+    FinancialBlockReason.SESSION_ASSURANCE -> null
 }

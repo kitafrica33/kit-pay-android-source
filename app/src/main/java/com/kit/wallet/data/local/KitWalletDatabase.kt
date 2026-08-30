@@ -19,7 +19,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         BeneficiaryContactEntity::class,
         SupportOutboxEntity::class,
     ],
-    version = 13,
+    version = 15,
     exportSchema = true,
 )
 abstract class KitWalletDatabase : RoomDatabase() {
@@ -248,6 +248,31 @@ abstract class KitWalletDatabase : RoomDatabase() {
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS index_support_outbox_ownerScopeId_ticketId " +
                         "ON support_outbox(ownerScopeId, ticketId)",
+                )
+            }
+        }
+
+        val MIGRATION_13_14: Migration = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Both columns are nullable so existing profiles remain unbadged until the next
+                // authenticated profile refresh. No KYC/name field is consulted during migration.
+                db.execSQL("ALTER TABLE profile ADD COLUMN verificationDesignation TEXT")
+                db.execSQL("ALTER TABLE profile ADD COLUMN verificationSince TEXT")
+            }
+        }
+
+        val MIGRATION_14_15: Migration = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // A public account id is the only safe join key for counterparty presentation.
+                // Existing rows stay unbadged until a wallet refresh supplies that identity.
+                db.execSQL("ALTER TABLE wallet_transactions ADD COLUMN counterpartyUserId TEXT")
+                db.execSQL("ALTER TABLE wallet_transactions ADD COLUMN counterpartyAvatarUrl TEXT")
+                db.execSQL(
+                    "ALTER TABLE wallet_transactions ADD COLUMN " +
+                        "counterpartyVerificationDesignation TEXT",
+                )
+                db.execSQL(
+                    "ALTER TABLE wallet_transactions ADD COLUMN counterpartyVerificationSince TEXT",
                 )
             }
         }

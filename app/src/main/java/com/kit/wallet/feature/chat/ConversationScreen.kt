@@ -144,6 +144,10 @@ import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitMediaMessageV2
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.KitScheduledGroupPaymentOutcomeAction
+import com.kit.wallet.data.messaging.KitScheduledGroupPaymentOutcomeMessage
+import com.kit.wallet.data.messaging.KitScheduledPaymentAction
+import com.kit.wallet.data.messaging.KitScheduledPaymentMessage
 import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.data.messaging.SecureMediaSource
@@ -154,6 +158,9 @@ import com.kit.wallet.data.remote.GroupPaymentRequestContributionDto
 import com.kit.wallet.data.remote.GroupPaymentRequestDto
 import com.kit.wallet.data.remote.KitGroupPaymentRequestMessage
 import com.kit.wallet.data.remote.ScheduledGroupPaymentDto
+import com.kit.wallet.data.messaging.GroupPaymentAudience
+import com.kit.wallet.data.messaging.GroupPaymentSplitMode
+import com.kit.wallet.data.repository.GroupPaymentDraftPolicy
 import com.kit.wallet.data.remote.ScheduledPaymentDto
 import com.kit.wallet.data.repository.AbuseReportContext
 import com.kit.wallet.data.repository.AbuseReportSelectionPolicy
@@ -163,6 +170,7 @@ import com.kit.wallet.feature.auth.rememberBiometricApprovalAvailable
 import com.kit.wallet.feature.calls.CallDurationAnchorPolicy
 import com.kit.wallet.feature.funding.TopUpSheet
 import com.kit.wallet.feature.funding.TopUpViewModel
+import com.kit.wallet.feature.wallet.runFinancialAction
 import com.kit.wallet.feature.chat.camera.CameraPull
 import com.kit.wallet.feature.chat.camera.KitChatCameraFlow
 import com.kit.wallet.feature.chat.camera.KitChatVideoEditorFlow
@@ -192,6 +200,7 @@ import com.kit.wallet.ui.model.copyablePlaintext
 import com.kit.wallet.ui.model.presentableText
 import com.kit.wallet.ui.model.replyPreviewLabel
 import java.io.File
+import java.util.UUID
 import com.kit.wallet.ui.theme.KitGreen300
 import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
@@ -229,6 +238,8 @@ private data class PickedMedia(
 @Composable
 fun ConversationScreen(
     chatId: String,
+    moneyMovementAllowed: Boolean,
+    onVerifyIdentityRequired: () -> Unit,
     claimableTransfersEnabled: Boolean,
     /** Whether this account may send a payment into the group, and answer one it was sent. */
     groupPaymentsEnabled: Boolean = false,
@@ -301,15 +312,23 @@ fun ConversationScreen(
     val serverScheduledDirect by viewModel.serverScheduledDirect.collectAsStateWithLifecycle()
     val serverScheduledGroup by viewModel.serverScheduledGroup.collectAsStateWithLifecycle()
     val serverSchedulesHaveMore by viewModel.serverSchedulesHaveMore.collectAsStateWithLifecycle()
+    val serverScheduleApproval by viewModel.serverScheduleApproval.collectAsStateWithLifecycle()
     val groupMembers by viewModel.groupMembers.collectAsStateWithLifecycle()
     val refusedForFunds by viewModel.topUpRequired.collectAsStateWithLifecycle()
     val topUpRequirement by topUp.requirement.collectAsStateWithLifecycle()
     val abuseReportState by abuseReports.state.collectAsStateWithLifecycle()
     val activeCallPresence by viewModel.activeCallPresence.collectAsStateWithLifecycle()
-    LaunchedEffect(refusedForFunds) {
+    LaunchedEffect(refusedForFunds, moneyMovementAllowed) {
         val shortfall = refusedForFunds ?: return@LaunchedEffect
-        topUp.start(shortfall)
+        if (moneyMovementAllowed) {
+            topUp.start(shortfall)
+        } else {
+            onVerifyIdentityRequired()
+        }
         viewModel.clearTopUpRequired()
+    }
+    LaunchedEffect(moneyMovementAllowed) {
+        if (!moneyMovementAllowed) topUp.dismiss()
     }
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -633,11 +652,27 @@ fun ConversationScreen(
                 }
             }
         },
-        onSendPaymentRequest = viewModel::sendPaymentRequest,
-        onPayRequest = viewModel::payPaymentRequest,
-        shortfallForPaymentRequest = viewModel::shortfallForPaymentRequest,
+        moneyMovementAllowed = moneyMovementAllowed,
+        onVerifyIdentityRequired = onVerifyIdentityRequired,
+        onSendPaymentRequest = { amount, note, done ->
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.sendPaymentRequest(amount, note, done)
+            }
+        },
+        onPayRequest = { message, pin, done ->
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.payPaymentRequest(message, pin, done)
+            }
+        },
+        shortfallForPaymentRequest = { message ->
+            if (moneyMovementAllowed) viewModel.shortfallForPaymentRequest(message) else null
+        },
         topUpRequirement = topUpRequirement,
-        onTopUpNeeded = topUp::start,
+        onTopUpNeeded = { requirement ->
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                topUp.start(requirement)
+            }
+        },
         topUpSheet = { onFunded ->
             TopUpSheet(
                 viewModel = topUp,
@@ -649,19 +684,33 @@ fun ConversationScreen(
             )
         },
         biometricsAvailable = rememberBiometricApprovalAvailable(),
-        onDeclineRequest = { message -> viewModel.declinePaymentRequest(message) },
-        onCancelRequest = { message -> viewModel.cancelPaymentRequest(message) },
+        onDeclineRequest = { message ->
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.declinePaymentRequest(message)
+            }
+        },
+        onCancelRequest = { message ->
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.cancelPaymentRequest(message)
+            }
+        },
         claimableTransfersEnabled = claimableTransfersEnabled,
         currentAccountId = viewModel.currentAccountId,
         transferClaims = transferClaims,
         onAcceptTransfer = { message ->
-            viewModel.acceptTransfer(message, claimableTransfersEnabled)
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.acceptTransfer(message, claimableTransfersEnabled)
+            }
         },
         onRejectTransfer = { message, reason ->
-            viewModel.rejectTransfer(message, reason, claimableTransfersEnabled)
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.rejectTransfer(message, reason, claimableTransfersEnabled)
+            }
         },
         onReverseTransfer = { message, reason, pin ->
-            viewModel.reverseTransfer(message, reason, pin, claimableTransfersEnabled)
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.reverseTransfer(message, reason, pin, claimableTransfersEnabled)
+            }
         },
         // A group payment needs the roster for two different reasons: to name the members an
         // announcement only carries ids for, and to offer the composer somebody to pay.
@@ -671,47 +720,85 @@ fun ConversationScreen(
         groupPaymentRequests = groupPaymentRequests,
         groupPaymentRequestContributions = groupPaymentRequestContributions,
         onCreateGroupPaymentRequest = { amount, note, done ->
-            viewModel.createGroupPaymentRequest(amount, note, groupPaymentRequestsEnabled, done)
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.createGroupPaymentRequest(amount, note, groupPaymentRequestsEnabled, done)
+            }
         },
         onContributeToGroupPaymentRequest = { requestId, amount, pin, done ->
-            viewModel.contributeToGroupPaymentRequest(
-                requestId, amount, pin, groupPaymentRequestsEnabled, done,
-            )
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.contributeToGroupPaymentRequest(
+                    requestId, amount, pin, groupPaymentRequestsEnabled, done,
+                )
+            }
         },
         onCancelGroupPaymentRequest = { requestId ->
-            viewModel.cancelGroupPaymentRequest(requestId, groupPaymentRequestsEnabled)
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.cancelGroupPaymentRequest(requestId, groupPaymentRequestsEnabled)
+            }
         },
         serverScheduledDirect = serverScheduledDirect,
         serverScheduledGroup = serverScheduledGroup,
         serverSchedulesHaveMore = serverSchedulesHaveMore,
-        onLoadMoreServerSchedules = viewModel::loadMoreServerSchedules,
-        onCancelServerSchedule = viewModel::cancelServerSchedule,
+        serverScheduleApproval = serverScheduleApproval,
+        onLoadMoreServerSchedules = {
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.loadMoreServerSchedules()
+            }
+        },
+        onCancelServerSchedule = { id, group ->
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.cancelServerSchedule(id, group)
+            }
+        },
+        onDismissServerScheduleApproval = viewModel::dismissServerScheduleApproval,
         serverPaymentsSchedulingEnabled = if (currentChat.isGroup) {
             scheduledGroupPaymentsEnabled
         } else {
             scheduledChatPaymentsEnabled
         },
         onPrepareServerSchedule = { amount, note, at, ready ->
-            viewModel.prepareServerSchedule(
-                amount, note, at,
-                enabled = if (currentChat.isGroup) {
-                    scheduledGroupPaymentsEnabled
-                } else {
-                    scheduledChatPaymentsEnabled
-                },
-                onReady = ready,
-            )
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.prepareServerSchedule(
+                    amount, note, at,
+                    enabled = if (currentChat.isGroup) {
+                        scheduledGroupPaymentsEnabled
+                    } else {
+                        scheduledChatPaymentsEnabled
+                    },
+                    onReady = ready,
+                )
+            }
         },
-        onCreateServerSchedule = { amount, note, at, pin, done ->
-            viewModel.createServerSchedule(
-                amount, note, at, pin,
-                enabled = if (currentChat.isGroup) {
-                    scheduledGroupPaymentsEnabled
-                } else {
-                    scheduledChatPaymentsEnabled
-                },
-                onDone = done,
-            )
+        onPrepareServerGroupSchedule = { split, audience, selected, total, custom, note, at, key, ready ->
+            var prepared = false
+            val ran = runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                prepared = viewModel.prepareServerGroupSchedule(
+                    split,
+                    audience,
+                    selected,
+                    total,
+                    custom,
+                    note,
+                    at,
+                    key,
+                    enabled = scheduledGroupPaymentsEnabled,
+                    onReady = ready,
+                )
+            }
+            ran && prepared
+        },
+        onCreateServerSchedule = { pin, done ->
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.createServerSchedule(
+                    pin,
+                    enabled = if (currentChat.isGroup) {
+                        scheduledGroupPaymentsEnabled
+                    } else {
+                        scheduledChatPaymentsEnabled
+                    },
+                    onDone = done,
+                )
+            }
         },
         groupMembers = groupMembers,
         onSendGroupPayment = {
@@ -725,27 +812,37 @@ fun ConversationScreen(
                 idempotencyKey,
                 onSent,
             ->
-            viewModel.sendGroupPayment(
-                splitMode = splitMode,
-                audience = audience,
-                selected = selected,
-                totalInput = total,
-                customAmounts = custom,
-                note = note,
-                paymentPin = pin,
-                idempotencyKey = idempotencyKey,
-                groupPaymentsEnabled = groupPaymentsEnabled,
-                onSent = onSent,
-            )
+            var sent = false
+            val ran = runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                sent = viewModel.sendGroupPayment(
+                    splitMode = splitMode,
+                    audience = audience,
+                    selected = selected,
+                    totalInput = total,
+                    customAmounts = custom,
+                    note = note,
+                    paymentPin = pin,
+                    idempotencyKey = idempotencyKey,
+                    groupPaymentsEnabled = groupPaymentsEnabled,
+                    onSent = onSent,
+                )
+            }
+            ran && sent
         },
         onAcceptGroupShare = { message ->
-            viewModel.acceptGroupPaymentShare(message, groupPaymentsEnabled)
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.acceptGroupPaymentShare(message, groupPaymentsEnabled)
+            }
         },
         onRejectGroupShare = { message, reason ->
-            viewModel.rejectGroupPaymentShare(message, reason, groupPaymentsEnabled)
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.rejectGroupPaymentShare(message, reason, groupPaymentsEnabled)
+            }
         },
         onReverseGroupPayment = { message, reason, pin ->
-            viewModel.reverseUnclaimedGroupPayment(message, reason, pin, groupPaymentsEnabled)
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.reverseUnclaimedGroupPayment(message, reason, pin, groupPaymentsEnabled)
+            }
         },
         // Dormant-feature guard: the composer hides the affordances, and these keep even a
         // stale composition from opening a picker while the release profile is text-only.
@@ -800,10 +897,38 @@ fun ConversationScreen(
         onComposerChanged = viewModel::onComposerChanged,
         schedulingEnabled = viewModel.schedulingAvailable && historyAvailable,
         onScheduleSend = viewModel::scheduleSend,
-        onSchedulePaymentRequest = viewModel::schedulePaymentRequest,
-        onSendScheduledNow = viewModel::sendScheduledNow,
-        onRescheduleSend = viewModel::rescheduleSend,
-        onCancelScheduledSend = viewModel::cancelScheduledSend,
+        onSchedulePaymentRequest = { amount, note, at, done ->
+            runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                viewModel.schedulePaymentRequest(amount, note, at, done)
+            }
+        },
+        onSendScheduledNow = { message ->
+            if (message.kind == MessageKind.PAYMENT_REQUEST) {
+                runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                    viewModel.sendScheduledNow(message)
+                }
+            } else {
+                viewModel.sendScheduledNow(message)
+            }
+        },
+        onRescheduleSend = { message, at ->
+            if (message.kind == MessageKind.PAYMENT_REQUEST) {
+                runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                    viewModel.rescheduleSend(message, at)
+                }
+            } else {
+                viewModel.rescheduleSend(message, at)
+            }
+        },
+        onCancelScheduledSend = { message ->
+            if (message.kind == MessageKind.PAYMENT_REQUEST) {
+                runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                    viewModel.cancelScheduledSend(message)
+                }
+            } else {
+                viewModel.cancelScheduledSend(message)
+            }
+        },
     )
 }
 
@@ -928,6 +1053,9 @@ internal fun ConversationContent(
     onClearError: () -> Unit,
     onSend: (String, () -> Unit) -> Unit,
     onRetry: (Message, () -> Unit) -> Unit,
+    /** Account-level KYC gate. Message, media, reaction and call actions remain independent. */
+    moneyMovementAllowed: Boolean = true,
+    onVerifyIdentityRequired: () -> Unit = {},
     onSendPaymentRequest: (Long, String?, () -> Unit) -> Unit = { _, _, done -> done() },
     onPayRequest: (Message, String, () -> Unit) -> Unit = { _, _, done -> done() },
     shortfallForPaymentRequest: (Message) -> TopUpRequirement? = { null },
@@ -957,13 +1085,25 @@ internal fun ConversationContent(
     serverScheduledDirect: List<ScheduledPaymentDto> = emptyList(),
     serverScheduledGroup: List<ScheduledGroupPaymentDto> = emptyList(),
     serverSchedulesHaveMore: Boolean = false,
+    serverScheduleApproval: ServerSchedulePreview? = null,
     onLoadMoreServerSchedules: () -> Unit = {},
     onCancelServerSchedule: (String, Boolean) -> Unit = { _, _ -> },
+    onDismissServerScheduleApproval: () -> Unit = {},
     serverPaymentsSchedulingEnabled: Boolean = false,
     onPrepareServerSchedule: (Long, String?, Long, (ServerSchedulePreview) -> Unit) -> Unit =
         { _, _, _, _ -> },
-    onCreateServerSchedule: (Long, String?, Long, String, () -> Unit) -> Unit =
-        { _, _, _, _, done -> done() },
+    onPrepareServerGroupSchedule: (
+        GroupPaymentSplitMode,
+        GroupPaymentAudience,
+        List<GroupPaymentDraftPolicy.Member>,
+        String,
+        Map<String, String>,
+        String?,
+        Long,
+        String,
+        (ServerSchedulePreview) -> Unit,
+    ) -> Boolean = { _, _, _, _, _, _, _, _, _ -> false },
+    onCreateServerSchedule: (String, () -> Unit) -> Unit = { _, done -> done() },
     groupMembers: List<ChatMember> = emptyList(),
     onSendGroupPayment: GroupPaymentSendHandler = {
             _, _, _, _, _, _, _, _, done ->
@@ -1094,10 +1234,11 @@ internal fun ConversationContent(
     }
     var showRequestDialog by remember { mutableStateOf(false) }
     var showServerScheduleAmountDialog by remember { mutableStateOf(false) }
-    var serverScheduleApproval by remember { mutableStateOf<ServerSchedulePreview?>(null) }
+    var showScheduledGroupComposer by remember(chat.id) { mutableStateOf(false) }
+    var scheduledGroupAt by remember(chat.id) { mutableStateOf<Long?>(null) }
     var payTarget by remember { mutableStateOf<Message?>(null) }
     var groupRequestPayTarget by remember {
-        mutableStateOf<Pair<GroupPaymentRequestDto, Boolean>?>(null)
+        mutableStateOf<GroupPaymentRequestContributionTarget?>(null)
     }
     // What the schedule picker is currently being opened for. One state, three callers: the
     // composer, the request dialog, and "Edit schedule" on an entry already in the queue.
@@ -1119,6 +1260,21 @@ internal fun ConversationContent(
     // Declining a share and returning the unclaimed ones both explain themselves, for the same
     // reason a one-to-one reversal does.
     var groupAnswerTarget by remember { mutableStateOf<GroupPaymentAnswerPrompt?>(null) }
+    LaunchedEffect(moneyMovementAllowed) {
+        if (!moneyMovementAllowed) {
+            showRequestDialog = false
+            showServerScheduleAmountDialog = false
+            showScheduledGroupComposer = false
+            scheduledGroupAt = null
+            payTarget = null
+            groupRequestPayTarget = null
+            scheduleTarget = null
+            reasonTarget = null
+            showGroupPaymentComposer = false
+            groupAnswerTarget = null
+            onDismissServerScheduleApproval()
+        }
+    }
     // A group payment names its members by id; only the roster can turn one into a name.
     val memberNames = remember(groupMembers) {
         groupMembers.associateBy({ it.userId.lowercase() }, { it.name })
@@ -1397,6 +1553,7 @@ internal fun ConversationContent(
                 ScheduleTarget.Composer -> "Send later"
                 is ScheduleTarget.Request -> "Request later"
                 is ScheduleTarget.ServerPayment -> "Schedule payment"
+                ScheduleTarget.ServerGroupPayment -> "Schedule group payment"
                 is ScheduleTarget.Existing -> "Change the send time"
             },
             confirmLabel = if (target is ScheduleTarget.Existing) "Reschedule" else "Schedule",
@@ -1404,7 +1561,9 @@ internal fun ConversationContent(
             initialEpochMillis = (target as? ScheduleTarget.Existing)
                 ?.message
                 ?.scheduledAtEpochMillis,
-            explanation = if (target is ScheduleTarget.ServerPayment) {
+            explanation = if (
+                target is ScheduleTarget.ServerPayment || target == ScheduleTarget.ServerGroupPayment
+            ) {
                 "Kit schedules this payment on the server after you approve the exact amount and time."
             } else {
                 "It stays on this device, encrypted, until it goes out."
@@ -1430,13 +1589,48 @@ internal fun ConversationContent(
                             target.amountMinor,
                             target.note,
                             atEpochMillis,
-                        ) { preview -> serverScheduleApproval = preview }
+                        ) { }
+                    }
+                    ScheduleTarget.ServerGroupPayment -> {
+                        scheduledGroupAt = atEpochMillis
+                        showScheduledGroupComposer = true
                     }
                     is ScheduleTarget.Existing -> onRescheduleSend(target.message, atEpochMillis)
                 }
                 scheduleTarget = null
             },
         )
+    }
+    if (showScheduledGroupComposer && chat.isGroup && serverPaymentsSchedulingEnabled) {
+        val scheduledAt = scheduledGroupAt
+        if (scheduledAt != null) {
+            GroupPaymentComposerDialog(
+                members = groupMembers,
+                currencyCode = groupPayments.values.firstOrNull()?.currencyCode ?: Money.SYMBOL,
+                sending = sending,
+                error = error,
+                biometricsAvailable = biometricsAvailable,
+                onDismiss = { showScheduledGroupComposer = false },
+                onSend = { _, _, _, _, _, _, _, _, _ -> false },
+                title = "Schedule a group payment",
+                explanation = "Choose who is paid and how to split the amount. Kit freezes the " +
+                    "reviewed recipients and sends it from the server at the selected time.",
+                onReview = { split, audience, selected, total, custom, note, key, done ->
+                    onPrepareServerGroupSchedule(
+                        split,
+                        audience,
+                        selected,
+                        total,
+                        custom,
+                        note,
+                        scheduledAt,
+                        key,
+                    ) {
+                        done()
+                    }
+                },
+            )
+        }
     }
     if (topUpRequirement != null && topUpSheet != null) {
         topUpSheet { /* The retained payTarget reopens approval when the sheet closes. */ }
@@ -1457,15 +1651,19 @@ internal fun ConversationContent(
             },
         )
     }
-    groupRequestPayTarget?.let { (request, useRemaining) ->
+    groupRequestPayTarget?.let { target ->
         GroupPaymentRequestContributionDialog(
-            request = request,
-            useRemainingInitially = useRemaining,
+            request = target.request,
+            useRemainingInitially = target.useRemaining,
             sending = sending,
             error = error,
             onDismiss = { groupRequestPayTarget = null },
             onConfirm = { amount, pin ->
-                onContributeToGroupPaymentRequest(request.id, amount, pin) {
+                onContributeToGroupPaymentRequest(
+                    target.request.id,
+                    amount,
+                    pin,
+                ) {
                     groupRequestPayTarget = null
                 }
             },
@@ -1492,14 +1690,9 @@ internal fun ConversationContent(
             sending = sending,
             error = error,
             biometricsAvailable = biometricsAvailable,
-            onDismiss = { serverScheduleApproval = null },
+            onDismiss = onDismissServerScheduleApproval,
             onConfirm = { pin ->
-                onCreateServerSchedule(
-                    approval.amountMinor,
-                    approval.note,
-                    approval.scheduledAtEpochMillis,
-                    pin,
-                ) { serverScheduleApproval = null }
+                onCreateServerSchedule(pin) { }
             },
         )
     }
@@ -1574,6 +1767,7 @@ internal fun ConversationContent(
                             online = chat.online,
                             avatarUrl = chat.avatarUrl,
                             isGroup = chat.isGroup,
+                            accountVerification = chat.accountVerification,
                         )
                         Spacer(Modifier.width(10.dp))
                         Column {
@@ -1734,20 +1928,39 @@ internal fun ConversationContent(
                     // withdrawn while the mode is open, so no gesture can quietly leave it.
                     mediaEnabled = mediaEnabled && editTarget == null,
                     onRequestPayment = {
-                        if (error != null) onClearError()
-                        showRequestDialog = true
+                        runFinancialAction(
+                            moneyMovementAllowed,
+                            onVerifyIdentityRequired,
+                        ) {
+                            if (error != null) onClearError()
+                            showRequestDialog = true
+                        }
                     },
                     groupPaymentsEnabled = groupPaymentsEnabled && editTarget == null,
                     paymentsEnabled = editTarget == null,
                     onPayGroup = {
-                        if (error != null) onClearError()
-                        showGroupPaymentComposer = true
+                        runFinancialAction(
+                            moneyMovementAllowed,
+                            onVerifyIdentityRequired,
+                        ) {
+                            if (error != null) onClearError()
+                            showGroupPaymentComposer = true
+                        }
                     },
                     serverPaymentsSchedulingEnabled =
                         serverPaymentsSchedulingEnabled && editTarget == null,
                     onSchedulePayment = {
-                        if (error != null) onClearError()
-                        showServerScheduleAmountDialog = true
+                        runFinancialAction(
+                            moneyMovementAllowed,
+                            onVerifyIdentityRequired,
+                        ) {
+                            if (error != null) onClearError()
+                            if (chat.isGroup) {
+                                scheduleTarget = ScheduleTarget.ServerGroupPayment
+                            } else {
+                                showServerScheduleAmountDialog = true
+                            }
+                        }
                     },
                     sendEnabled = sendEnabled,
                     editing = editTarget != null,
@@ -1951,9 +2164,34 @@ internal fun ConversationContent(
                             fallbackNote = message.text.takeIf(String::isNotBlank),
                             displayName = displayGroupMemberName,
                             busy = sending,
-                            onPayRemaining = { request -> groupRequestPayTarget = request to true },
-                            onPayPartial = { request -> groupRequestPayTarget = request to false },
-                            onCancel = { onCancelGroupPaymentRequest(requestId) },
+                            onPayRemaining = { request ->
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                ) {
+                                    groupRequestPayTarget = GroupPaymentRequestContributionTarget(
+                                        request,
+                                        true,
+                                    )
+                                }
+                            },
+                            onPayPartial = { request ->
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                ) {
+                                    groupRequestPayTarget = GroupPaymentRequestContributionTarget(
+                                        request,
+                                        false,
+                                    )
+                                }
+                            },
+                            onCancel = {
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                ) { onCancelGroupPaymentRequest(requestId) }
+                            },
                         )
                     }
                 } else if (message.kind == MessageKind.GROUP_PAYMENT_REQUEST_EVENT) {
@@ -1985,14 +2223,33 @@ internal fun ConversationContent(
                                 ?: chat.name,
                             displayName = displayGroupMemberName,
                             isBusy = sending,
-                            onAccept = { onAcceptGroupShare(message) },
+                            onAccept = {
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                ) { onAcceptGroupShare(message) }
+                            },
                             onDecline = {
-                                groupAnswerTarget =
-                                    GroupPaymentAnswerPrompt(message, returningUnclaimed = false)
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                ) {
+                                    groupAnswerTarget = GroupPaymentAnswerPrompt(
+                                        message,
+                                        returningUnclaimed = false,
+                                    )
+                                }
                             },
                             onReturnUnclaimed = {
-                                groupAnswerTarget =
-                                    GroupPaymentAnswerPrompt(message, returningUnclaimed = true)
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                ) {
+                                    groupAnswerTarget = GroupPaymentAnswerPrompt(
+                                        message,
+                                        returningUnclaimed = true,
+                                    )
+                                }
                             },
                         )
                     }
@@ -2011,6 +2268,20 @@ internal fun ConversationContent(
                     // Outcomes are the conversation talking about itself, not either person
                     // talking. They read like the encryption notice: centred, unattributed.
                     TimelineNotice(paymentEventSummary(message, chat.name))
+                } else if (message.kind == MessageKind.SCHEDULED_PAYMENT_EVENT) {
+                    message.mediaDescriptor?.let(KitScheduledPaymentMessage::parse)?.let {
+                        TimelineNotice(scheduledPaymentEventSummary(it, message.fromMe, chat.name))
+                    }
+                } else if (message.kind == MessageKind.SCHEDULED_GROUP_PAYMENT_EVENT) {
+                    message.mediaDescriptor?.let(KitScheduledGroupPaymentOutcomeMessage::parse)?.let {
+                        TimelineNotice(
+                            if (it.action == KitScheduledGroupPaymentOutcomeAction.FAILED) {
+                                "Your scheduled group payment could not be sent"
+                            } else {
+                                "Your scheduled group payment was cancelled"
+                            },
+                        )
+                    }
                 } else if (message.kind == MessageKind.SYSTEM) {
                     // A membership change is the group talking about itself, so it reads exactly
                     // the same way — the copy is already resolved and actor-free.
@@ -2066,21 +2337,78 @@ internal fun ConversationContent(
                             capabilityEnabled = claimableTransfersEnabled,
                         ),
                         onPayRequest = {
-                            payTarget = message
-                            shortfallForPaymentRequest(message)?.let(onTopUpNeeded)
+                            runFinancialAction(
+                                moneyMovementAllowed,
+                                onVerifyIdentityRequired,
+                            ) {
+                                payTarget = message
+                                shortfallForPaymentRequest(message)?.let(onTopUpNeeded)
+                            }
                         },
-                        onDeclineRequest = { onDeclineRequest(message) },
-                        onCancelRequest = { onCancelRequest(message) },
-                        onAcceptTransfer = { onAcceptTransfer(message) },
+                        onDeclineRequest = {
+                            runFinancialAction(
+                                moneyMovementAllowed,
+                                onVerifyIdentityRequired,
+                            ) { onDeclineRequest(message) }
+                        },
+                        onCancelRequest = {
+                            runFinancialAction(
+                                moneyMovementAllowed,
+                                onVerifyIdentityRequired,
+                            ) { onCancelRequest(message) }
+                        },
+                        onAcceptTransfer = {
+                            runFinancialAction(
+                                moneyMovementAllowed,
+                                onVerifyIdentityRequired,
+                            ) { onAcceptTransfer(message) }
+                        },
                         onRejectTransfer = {
-                            reasonTarget = TransferReasonPrompt(message, reverse = false)
+                            runFinancialAction(
+                                moneyMovementAllowed,
+                                onVerifyIdentityRequired,
+                            ) {
+                                reasonTarget = TransferReasonPrompt(message, reverse = false)
+                            }
                         },
                         onReverseTransfer = {
-                            reasonTarget = TransferReasonPrompt(message, reverse = true)
+                            runFinancialAction(
+                                moneyMovementAllowed,
+                                onVerifyIdentityRequired,
+                            ) {
+                                reasonTarget = TransferReasonPrompt(message, reverse = true)
+                            }
                         },
-                        onSendScheduledNow = { onSendScheduledNow(message) },
-                        onEditSchedule = { scheduleTarget = ScheduleTarget.Existing(message) },
-                        onCancelSchedule = { onCancelScheduledSend(message) },
+                        onSendScheduledNow = {
+                            if (message.kind == MessageKind.PAYMENT_REQUEST) {
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                ) { onSendScheduledNow(message) }
+                            } else {
+                                onSendScheduledNow(message)
+                            }
+                        },
+                        onEditSchedule = {
+                            if (message.kind == MessageKind.PAYMENT_REQUEST) {
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                ) { scheduleTarget = ScheduleTarget.Existing(message) }
+                            } else {
+                                scheduleTarget = ScheduleTarget.Existing(message)
+                            }
+                        },
+                        onCancelSchedule = {
+                            if (message.kind == MessageKind.PAYMENT_REQUEST) {
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                ) { onCancelScheduledSend(message) }
+                            } else {
+                                onCancelScheduledSend(message)
+                            }
+                        },
                         showSenderName = message.id in senderNamedIds,
                     )
                 }
@@ -2095,7 +2423,12 @@ internal fun ConversationContent(
                         note = schedule.note,
                         group = false,
                         busy = sending,
-                        onCancel = { onCancelServerSchedule(schedule.id, false) },
+                        onCancel = {
+                            runFinancialAction(
+                                moneyMovementAllowed,
+                                onVerifyIdentityRequired,
+                            ) { onCancelServerSchedule(schedule.id, false) }
+                        },
                     )
                 }
             }
@@ -2108,14 +2441,28 @@ internal fun ConversationContent(
                         note = schedule.note,
                         group = true,
                         busy = sending,
-                        onCancel = { onCancelServerSchedule(schedule.id, true) },
+                        onCancel = {
+                            runFinancialAction(
+                                moneyMovementAllowed,
+                                onVerifyIdentityRequired,
+                            ) { onCancelServerSchedule(schedule.id, true) }
+                        },
                     )
                 }
             }
             if (serverSchedulesHaveMore) {
                 item(key = "server-schedules-more") {
                     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        TextButton(onClick = onLoadMoreServerSchedules, enabled = !sending) {
+                        TextButton(
+                            onClick = {
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                    onLoadMoreServerSchedules,
+                                )
+                            },
+                            enabled = !sending,
+                        ) {
                             Text("Load older scheduled payments")
                         }
                     }
@@ -2616,6 +2963,8 @@ internal fun MessageBubble(
                         MessageKind.GROUP_PAYMENT_EVENT,
                         MessageKind.GROUP_PAYMENT_REQUEST,
                         MessageKind.GROUP_PAYMENT_REQUEST_EVENT,
+                        MessageKind.SCHEDULED_PAYMENT_EVENT,
+                        MessageKind.SCHEDULED_GROUP_PAYMENT_EVENT,
                         MessageKind.SYSTEM,
                         MessageKind.CALL,
                         -> Text(msg.presentableText(), style = MaterialTheme.typography.bodyLarge)
@@ -3414,9 +3763,16 @@ private sealed interface ScheduleTarget {
 
     data class ServerPayment(val amountMinor: Long, val note: String?) : ScheduleTarget
 
+    data object ServerGroupPayment : ScheduleTarget
+
     /** An entry already in the queue, being moved to a different time. */
     data class Existing(val message: Message) : ScheduleTarget
 }
+
+internal data class GroupPaymentRequestContributionTarget(
+    val request: GroupPaymentRequestDto,
+    val useRemaining: Boolean,
+)
 
 
 @Composable

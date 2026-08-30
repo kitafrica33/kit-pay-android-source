@@ -80,11 +80,11 @@ import com.kit.wallet.feature.legal.OpenSourceLicenceDialog
 import com.kit.wallet.feature.legal.isTrustedKitReleaseSourceUrl
 import com.kit.wallet.feature.legal.openSourceLicencePresentation
 import com.kit.wallet.navigation.AppCapabilities
+import com.kit.wallet.ui.components.AccountVerificationBadge
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.UserProfile
 import com.kit.wallet.ui.model.formatKitTag
-import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
 import java.net.URI
 import kotlinx.coroutines.delay
@@ -175,7 +175,7 @@ fun SettingsScreen(
     if (showKycUnavailable) {
         AlertDialog(
             onDismissRequest = { showKycUnavailable = false },
-            title = { Text("Didit verification unavailable") },
+            title = { Text("Identity verification unavailable") },
             text = {
                 Text("Identity verification is temporarily unavailable. Please try again later.")
             },
@@ -443,30 +443,32 @@ private fun SettingsContent(
                     .padding(horizontal = 20.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                KitAvatar(profile.displayIdentityName, size = 76.dp, avatarUrl = profile.avatarUrl)
+                KitAvatar(
+                    profile.displayIdentityName,
+                    size = 76.dp,
+                    avatarUrl = profile.avatarUrl,
+                )
                 Spacer(Modifier.width(16.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(
-                        // The verified name leads. A chosen display name is a nickname and is
-                        // named as one below, so the two are never mistaken for each other.
-                        profile.displayIdentityName.ifBlank { "Kit Pay user" },
-                        style = MaterialTheme.typography.titleLarge,
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            // The verified name leads. A chosen display name is a nickname and is
+                            // named as one below, so the two are never mistaken for each other.
+                            profile.displayIdentityName.ifBlank { "Kit Pay user" },
+                            style = MaterialTheme.typography.titleLarge,
+                        )
+                        // The account's sole self-designation badge sits beside its identity.
+                        // KYC, email and legal-name state never reach this component.
+                        AccountVerificationBadge(profile.accountVerification, size = 18.dp)
+                    }
                     Text(
                         profileIdentitySubtitle(profile),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    if (kycAvailable) {
-                        Text(
-                            (if (identityVerification.verified) "✓ " else "Didit • ") +
-                                identityVerification.status,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (identityVerification.verified) KitTheme.colors.success
-                            else MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
                 }
             }
         }
@@ -510,9 +512,9 @@ private fun SettingsContent(
                 SettingsRow(
                     Icons.Rounded.Badge,
                     if (kycAvailable) identityVerification.title
-                    else "Verify your identity with Didit",
+                    else "Identity verification",
                     if (kycAvailable) identityVerification.subtitle
-                    else "Didit verification is temporarily unavailable",
+                    else "Verification is temporarily unavailable",
                     onClick = onKyc,
                 )
                 SettingsRow(
@@ -1047,13 +1049,13 @@ internal fun identityVerificationPresentation(rawStatus: String): IdentityVerifi
     // same account.
     return when (kycVerificationStateOf(status)) {
         KycVerificationState.VERIFIED -> IdentityVerificationPresentation(
-            title = "Identity verified with Didit",
-            subtitle = status,
+            title = "Identity verification",
+            subtitle = "Complete",
             status = status,
             verified = true,
         )
         KycVerificationState.IN_REVIEW -> IdentityVerificationPresentation(
-            title = "Didit verification in review",
+            title = "Identity verification in review",
             subtitle = "$status • Tap to refresh your status",
             status = status,
             verified = false,
@@ -1072,7 +1074,7 @@ internal fun identityVerificationPresentation(rawStatus: String): IdentityVerifi
             verified = false,
         )
         KycVerificationState.NOT_STARTED -> IdentityVerificationPresentation(
-            title = "Verify your identity with Didit",
+            title = "Verify your identity",
             subtitle = "$status • Tap to start the secure identity check",
             status = status,
             verified = false,
@@ -1092,7 +1094,7 @@ internal fun profileEmailPresentation(
 ): ProfileEmailPresentation = when {
     profile.emailVerified && !profile.email.isNullOrBlank() -> ProfileEmailPresentation(
         title = "Email address",
-        subtitle = "${profile.email} • Verified • Email changes are not yet supported",
+        subtitle = "${profile.email} • Email changes are not yet supported",
         canAttach = false,
     )
     !attachmentAvailable -> ProfileEmailPresentation(

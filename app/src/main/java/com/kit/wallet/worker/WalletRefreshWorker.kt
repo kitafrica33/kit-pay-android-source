@@ -49,7 +49,8 @@ class WalletRefreshScheduler @Inject constructor(
     private val workManager: WorkManager,
 ) : WalletRefreshTrigger {
     fun schedule() {
-        refreshNow()
+        // Foreground reconciliation is direct and lifecycle-aware. The periodic job remains the
+        // durable fallback for a process that stays alive without another foreground transition.
         schedulePeriodic()
     }
 

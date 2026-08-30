@@ -61,7 +61,6 @@ import com.kit.wallet.data.notifications.PaymentClaimLink
 import com.kit.wallet.data.notifications.PushTokenCoordinator
 import com.kit.wallet.data.notifications.canonicalIncomingCallId
 import com.kit.wallet.data.remote.KitWalletApiException
-import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.feature.chat.ChatMediaScratch
@@ -103,7 +102,6 @@ class MainActivity : FragmentActivity() {
     @Inject internal lateinit var incomingCallAuthorizer: IncomingCallLaunchAuthorizer
     @Inject lateinit var incomingCallReplayLedger: IncomingCallReplayLedger
     @Inject lateinit var pushTokens: PushTokenCoordinator
-    @Inject lateinit var walletRefresh: WalletRefreshTrigger
     private val foregroundStartMutex = Mutex()
     private var foregroundStartJob: Job? = null
     private var pendingDeepLink by mutableStateOf<String?>(null)
@@ -268,9 +266,6 @@ class MainActivity : FragmentActivity() {
 
     override fun onStart() {
         super.onStart()
-        // The backend has no wallet push, so money received while backgrounded only becomes
-        // visible on the next sync; returning to the foreground is that moment.
-        if (sessions.current() != null) walletRefresh.refreshNow()
         foregroundStartJob?.cancel()
         foregroundStartJob = lifecycleScope.launch {
             // Cancellation is asynchronous; the mutex ensures a rapid stop/start or duplicate

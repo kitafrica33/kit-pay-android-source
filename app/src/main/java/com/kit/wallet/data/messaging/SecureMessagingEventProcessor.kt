@@ -1,6 +1,10 @@
 package com.kit.wallet.data.messaging
 
 import androidx.annotation.VisibleForTesting
+import com.kit.wallet.data.remote.ScheduleContract
+import com.kit.wallet.data.remote.ScheduledPaymentStatus
+import com.kit.wallet.data.repository.GroupPaymentRepository
+import com.kit.wallet.data.repository.ServerScheduledPaymentRepository
 import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.remote.KitWalletApiException
 import java.io.IOException
@@ -102,6 +106,8 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         NoOpSecureMessagingHistoryContinuationScheduler,
     private val walletRefresh: WalletRefreshTrigger = NoOpWalletRefreshTrigger,
     private val systemEvents: ConversationSystemEventStore? = null,
+    private val scheduledPayments: ServerScheduledPaymentRepository? = null,
+    private val groupPayments: GroupPaymentRepository? = null,
 ) {
     private class SessionState(
         val session: RemoteSecureMessagingTransport.Session,
@@ -594,6 +600,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         if (event.type in GROUP_PAYMENT_REQUEST_SYSTEM_EVENT_TYPES) {
             try {
                 systemEvents?.record(
+                    activation = state.activation,
                     conversationId = event.conversationId,
                     event = ConversationSystemEvent(
                         eventId = event.eventId,
@@ -612,10 +619,229 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             } catch (_: Exception) {
                 // Best effort presentation record; wallet refresh remains the money authority.
             }
+        } else if (event.type in SCHEDULED_PAYMENT_SYSTEM_EVENT_TYPES) {
+            processScheduledPaymentMetadata(state, event)
         }
         walletRefresh.refreshNow()
         state.invalidateConversation(event.conversationId)
     }
+
+    /** A terminal wake hint becomes visible only after every stated fact matches exact API state. */
+    private suspend fun processScheduledPaymentMetadata(
+        state: SessionState,
+        event: RemoteSecureMessagingTransport.Session.FinancialMetadataEvent,
+    ) {
+        val conversations = state.conversations ?: state.session.conversations()
+            .associateBy(RemoteSecureMessagingTransport.Session.SecureConversation::conversationId)
+            .also { state.conversations = it }
+        val conversation = conversations[event.conversationId]
+        val scheduleRepository = checkNotNull(scheduledPayments) {
+            "Scheduled-payment authority is unavailable"
+        }
+        val directEvent = event.type.startsWith("scheduled_payment.")
+        val directAction = if (directEvent) {
+            checkNotNull(KitScheduledPaymentAction.fromEventType(event.type))
+        } else null
+        val exactDirect = if (directEvent) {
+            val sender = checkNotNull(event.senderUserId)
+            val recipient = checkNotNull(event.recipientUserId)
+            val currentUserId = state.session.binding.userId.lowercase()
+            val exact = try {
+                scheduleRepository.direct(event.paymentId)
+            } catch (error: KitWalletApiException) {
+                // A full conversation read plus the resource's own 404 is authoritative proof that
+                // a chat left/deleted before this queued event was consumed is no longer visible.
+                // Transient and server failures must still pin the cursor for a later exact read.
+                if (conversation == null && error.statusCode == 404 &&
+                    error.code == "SCHEDULED_PAYMENT_NOT_FOUND"
+                ) return
+                throw error
+            }
+            val action = checkNotNull(directAction)
+            val amountMinor = checkNotNull(event.amountMinor)
+            val currency = checkNotNull(event.currency)
+            val scale = checkNotNull(event.currencyScale)
+            val scheduledFor = checkNotNull(event.scheduledFor)
+            check(exact.conversationId == event.conversationId &&
+                exact.knownStatus?.wire == action.wire &&
+                ScheduleContract.minor(exact.amount, scale) == amountMinor &&
+                exact.currency.code == currency && exact.currency.scale.toIntOrNull() == scale &&
+                Instant.parse(exact.scheduledFor) == scheduledFor && exact.note == event.note &&
+                exact.walletTransactionId == event.walletTransactionId
+            ) { "Scheduled-payment exact state did not match its event" }
+            if (exact.sourceWalletId != null) {
+                check(currentUserId == sender) {
+                    "A creator's scheduled-payment event changed its sender"
+                }
+            } else {
+                check(action == KitScheduledPaymentAction.COMPLETED && currentUserId == recipient) {
+                    "A recipient's scheduled-payment event changed its recipient"
+                }
+            }
+            when (action) {
+                KitScheduledPaymentAction.COMPLETED -> check(
+                    exact.failure == null && exact.completedAt?.let(Instant::parse) == event.completedAt &&
+                        exact.cancelledAt == null,
+                )
+                KitScheduledPaymentAction.FAILED -> {
+                    val failure = checkNotNull(exact.failure)
+                    check(
+                        failure.isStructurallyValid() && failure.code == event.failureCode &&
+                            (event.failureMessage == null ||
+                                failure.message == event.failureMessage) &&
+                            exact.completedAt?.let(Instant::parse) == event.completedAt &&
+                            exact.cancelledAt == null,
+                    )
+                }
+                KitScheduledPaymentAction.CANCELLED -> check(
+                    exact.failure == null && exact.completedAt == null &&
+                        exact.cancelledAt?.let(Instant::parse) == event.cancelledAt,
+                )
+            }
+            exact
+        } else null
+        val exactGroup = if (!directEvent) {
+            val exact = try {
+                scheduleRepository.group(event.paymentId)
+            } catch (error: KitWalletApiException) {
+                if (conversation == null && error.statusCode == 404 &&
+                    error.code == "SCHEDULED_GROUP_PAYMENT_NOT_FOUND"
+                ) return
+                throw error
+            }
+            val action = event.type.substringAfterLast('.')
+            check(exact.conversationId == event.conversationId && exact.knownStatus?.wire == action &&
+                Instant.parse(exact.scheduledFor) == event.scheduledFor &&
+                exact.groupPaymentId == event.groupPaymentId
+            ) { "Scheduled-group exact state did not match its event" }
+            when (exact.knownStatus) {
+                ScheduledPaymentStatus.COMPLETED -> check(
+                    exact.failure == null && exact.completedAt?.let(Instant::parse) == event.completedAt &&
+                        exact.cancelledAt == null,
+                )
+                ScheduledPaymentStatus.FAILED -> {
+                    val failure = checkNotNull(exact.failure)
+                    val legacyHint = event.failureCode == null && event.failureMessage == null
+                    check(
+                        failure.isStructurallyValid() &&
+                            (legacyHint || failure.code == event.failureCode &&
+                                failure.message == event.failureMessage) &&
+                            exact.completedAt?.let(Instant::parse) == event.completedAt &&
+                            exact.cancelledAt == null,
+                    )
+                }
+                ScheduledPaymentStatus.CANCELLED -> check(
+                    exact.failure == null && exact.completedAt == null &&
+                        exact.cancelledAt?.let(Instant::parse) == event.cancelledAt,
+                )
+                else -> error("Scheduled-group exact state is not terminal")
+            }
+            exact
+        } else null
+
+        // A full authoritative conversation list can legitimately omit a chat the user left or
+        // deleted. Consume its already-validated terminal hint without recreating local history.
+        val visibleConversation = conversation ?: return
+        val projection = if (directEvent) {
+            check(!visibleConversation.isGroup) { "A direct schedule event belongs to a group" }
+            val sender = checkNotNull(event.senderUserId)
+            val recipient = checkNotNull(event.recipientUserId)
+            val members = visibleConversation.members.map { it.userId.lowercase() }.toSet()
+            check(members == setOf(sender, recipient)) {
+                "A direct schedule event changed its participants"
+            }
+            val exact = checkNotNull(exactDirect)
+            val action = checkNotNull(directAction)
+            val amountMinor = checkNotNull(event.amountMinor)
+            val currency = checkNotNull(event.currency)
+            val scale = checkNotNull(event.currencyScale)
+            val scheduledFor = checkNotNull(event.scheduledFor)
+            val reason = when (action) {
+                KitScheduledPaymentAction.COMPLETED -> null
+                KitScheduledPaymentAction.FAILED -> checkNotNull(exact.failure).message
+                    .trim().take(MAX_SCHEDULED_PAYMENT_REASON_LENGTH)
+                KitScheduledPaymentAction.CANCELLED -> "The scheduled payment was cancelled."
+            }
+            val descriptor = checkNotNull(
+                KitScheduledPaymentMessage.create(
+                    action, event.paymentId, amountMinor, currency, scale, scheduledFor,
+                    event.walletTransactionId, event.note, reason,
+                ),
+            ) { "A scheduled-payment projection is invalid" }
+            ScheduleProjection(descriptor.encode(), sender, descriptor.deterministicMessageId())
+        } else {
+            check(visibleConversation.isGroup) { "A scheduled group event belongs to a direct chat" }
+            val exact = checkNotNull(exactGroup)
+            if (exact.knownStatus == ScheduledPaymentStatus.COMPLETED) {
+                val resultId = checkNotNull(event.groupPaymentId)
+                val payment = checkNotNull(groupPayments) {
+                    "Group-payment authority is unavailable"
+                }.groupPayment(resultId)
+                val memberIds = visibleConversation.members.map { it.userId.lowercase() }.toSet()
+                val sender = checkNotNull(payment.senderUserId).lowercase()
+                val scheduledRecipients = exact.recipients.map { it.userId.lowercase() }
+                val paymentRecipients = payment.recipients.mapNotNull { it.userId?.lowercase() }
+                check(sender in memberIds && payment.id.lowercase() == resultId &&
+                    payment.conversationId == event.conversationId &&
+                    payment.splitMode == exact.splitMode && payment.audience == exact.audience &&
+                    payment.currencyCode == exact.currency.code &&
+                    payment.currencyScale == exact.currency.scale.toIntOrNull() &&
+                    payment.recipientCount == exact.recipientCount && payment.note == exact.note &&
+                    payment.pendingCount >= 0 && payment.acceptedCount >= 0 &&
+                    payment.returnedCount >= 0 &&
+                    payment.pendingCount + payment.acceptedCount + payment.returnedCount ==
+                    payment.recipientCount && paymentRecipients.size == payment.recipientCount &&
+                    paymentRecipients.toSet() == scheduledRecipients.toSet() &&
+                    scheduledRecipients.toSet().all { it in memberIds } &&
+                    (exact.splitMode != "even" ||
+                        ScheduleContract.minor(exact.totalAmount!!, payment.currencyScale) ==
+                        payment.totalAmountMinor)
+                ) { "Scheduled group result did not match its reviewed schedule" }
+                val descriptor = checkNotNull(
+                    KitGroupPaymentMessage.announcing(payment, scheduledRecipients),
+                ) { "Scheduled group result could not be projected" }
+                check(descriptor.matchesAuthoritativePayment(payment)) {
+                    "Scheduled group projection did not match exact state"
+                }
+                ScheduleProjection(
+                    descriptor.encode(), sender,
+                    deterministicUuid("scheduled-group-payment|${exact.id}|$resultId"),
+                )
+            } else {
+                val outcome = if (exact.knownStatus == ScheduledPaymentStatus.FAILED) {
+                    KitScheduledGroupPaymentOutcomeAction.FAILED
+                } else KitScheduledGroupPaymentOutcomeAction.CANCELLED
+                val descriptor = checkNotNull(
+                    KitScheduledGroupPaymentOutcomeMessage.create(
+                        outcome, exact.id, Instant.parse(exact.scheduledFor),
+                    ),
+                ) { "Scheduled group outcome could not be projected" }
+                ScheduleProjection(
+                    descriptor.encode(), state.session.binding.userId,
+                    descriptor.deterministicMessageId(),
+                )
+            }
+        }
+        systemEvents?.record(
+            activation = state.activation,
+            conversationId = event.conversationId,
+            event = ConversationSystemEvent(
+                eventId = event.eventId,
+                type = event.type,
+                userId = projection.senderUserId,
+                role = null,
+                occurredAt = event.occurredAt,
+                paymentId = event.paymentId,
+                projectionText = projection.text,
+            ),
+        )
+    }
+
+    private data class ScheduleProjection(
+        val text: String,
+        val senderUserId: String,
+        val messageId: String,
+    )
 
     /**
      * A metadata event carries no ciphertext, so the only thing it can change is what the next
@@ -635,6 +861,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         if (subject != null && event.type in MEMBERSHIP_SYSTEM_EVENT_TYPES) {
             try {
                 systemEvents?.record(
+                    activation = state.activation,
                     conversationId = event.conversationId,
                     event = ConversationSystemEvent(
                         eventId = event.eventId,
@@ -1510,6 +1737,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         const val MAX_HISTORY_TASKS_PER_BATCH = 4
         const val MAX_HISTORY_WORK_UNITS_PER_RUN = 16
         const val HISTORY_FAILURE_RETRY_DELAY_MILLIS = 30_000L
+        const val MAX_SCHEDULED_PAYMENT_REASON_LENGTH = 280
         const val DEVICE_REVOKED_EVENT = "device.revoked"
         const val DEVICE_ENROLLED_EVENT = "device.enrolled"
         const val ALL_DEVICES_REVOKED_EVENT = "devices.revoked"

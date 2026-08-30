@@ -4,6 +4,8 @@ import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.ApiEnvelope
 import com.kit.wallet.data.remote.CallDto
 import com.kit.wallet.data.remote.CallPageDto
+import com.kit.wallet.data.remote.CallParticipantDto
+import com.kit.wallet.data.remote.AccountVerificationDto
 import com.kit.wallet.data.remote.CallSessionDto
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.RtcCredentialsDto
@@ -16,6 +18,7 @@ import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionSnapshot
 import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.ui.model.Contact
+import com.kit.wallet.ui.model.AccountVerificationDesignation
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.lang.reflect.Proxy
@@ -131,6 +134,37 @@ class RemoteCallRepositoryTest {
     }
 
     @Test
+    fun `call connection keeps structured first sighting metadata beside legacy ids`() = runTest {
+        val api = RecordingCallApi().apply {
+            structuredParticipants = listOf(
+                CallParticipantDto(
+                    userId = RECIPIENT_ID.uppercase(),
+                    name = "Registered name",
+                    avatarUrl = "https://pay.kit.africa/media/a1",
+                    verification = AccountVerificationDto(
+                        "official_support",
+                        "2026-08-29T10:11:12Z",
+                    ),
+                ),
+            )
+        }
+        val repository = repository(api)
+
+        val connection = repository.start(RECIPIENT_ID, video = false)
+
+        // The address-book alias is presentation only. Photo and badge remain bound to the exact
+        // structured participant ID returned with the call.
+        assertEquals("Saved locally", connection.name)
+        assertEquals(listOf(RECIPIENT_ID), connection.participantUserIds)
+        assertEquals(RECIPIENT_ID, connection.participants.single().userId)
+        assertEquals("https://pay.kit.africa/media/a1", connection.avatarUrl)
+        assertEquals(
+            AccountVerificationDesignation.OFFICIAL_SUPPORT,
+            connection.accountVerification?.designation,
+        )
+    }
+
+    @Test
     fun `answer rejects credentials returned for a different call`() = runTest {
         val api = RecordingCallApi().apply {
             acceptedCallIdOverride = "019f8c6f-cc57-720c-9a55-0000000000ee"
@@ -195,6 +229,7 @@ class RemoteCallRepositoryTest {
         var acceptedCalls = 0
             private set
         var acceptedCallIdOverride: String? = null
+        var structuredParticipants: List<CallParticipantDto?>? = null
         val clientCallIds = mutableListOf<String>()
         val cancelledClientCallIds = mutableListOf<String>()
 
@@ -205,7 +240,7 @@ class RemoteCallRepositoryTest {
             when (method.name) {
                 "startCall" -> {
                     clientCallIds += (arguments?.first() as StartCallRequest).clientCallId.orEmpty()
-                    ApiEnvelope(ok = true, data = callSession(++startedCalls))
+                    ApiEnvelope(ok = true, data = withStructuredParticipants(callSession(++startedCalls)))
                 }
                 "cancelCallAttempt" -> {
                     val id = arguments?.first() as String
@@ -219,7 +254,9 @@ class RemoteCallRepositoryTest {
                     acceptedCalls += 1
                     ApiEnvelope(
                         ok = true,
-                        data = answeredSession(acceptedCallIdOverride ?: INCOMING_CALL_ID),
+                        data = withStructuredParticipants(
+                            answeredSession(acceptedCallIdOverride ?: INCOMING_CALL_ID),
+                        ),
                     )
                 }
                 "endCall" -> ApiEnvelope(
@@ -236,6 +273,9 @@ class RemoteCallRepositoryTest {
                 else -> error("Unexpected API call: ${method.name}")
             }
         } as KitWalletApi
+
+        private fun withStructuredParticipants(session: CallSessionDto): CallSessionDto =
+            session.copy(call = session.call.copy(participants = structuredParticipants))
     }
 
     private fun sessionStore(): SessionStore {

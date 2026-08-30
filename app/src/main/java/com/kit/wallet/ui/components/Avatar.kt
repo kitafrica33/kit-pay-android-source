@@ -29,6 +29,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.kit.wallet.ui.model.AccountVerification
 import com.kit.wallet.ui.theme.KitTheme
 
 private val AvatarPalette = listOf(
@@ -82,6 +83,7 @@ fun KitAvatar(
     online: Boolean = false,
     avatarUrl: String? = null,
     isGroup: Boolean = false,
+    accountVerification: AccountVerification? = null,
 ) {
     val (fg, bg) = AvatarPalette[paletteIndexOf(name)]
     Box(modifier = modifier.size(size)) {
@@ -112,6 +114,22 @@ fun KitAvatar(
                 )
             }
             KitAvatarPhoto(avatarUrl = avatarUrl, size = size)
+        }
+        if (!isGroup && accountVerification != null) {
+            // Top-end leaves the bottom-end presence dot free. The small surface-coloured disc
+            // keeps the blue seal legible over both photos and deterministic initials.
+            Box(
+                modifier = Modifier
+                    .size(size * 0.38f)
+                    .align(Alignment.TopEnd)
+                    .background(MaterialTheme.colorScheme.surface, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                AccountVerificationBadge(
+                    verification = accountVerification,
+                    size = size * 0.32f,
+                )
+            }
         }
         if (isGroup) {
             // The badge survives a photo: it is the unambiguous "this is a group" mark on

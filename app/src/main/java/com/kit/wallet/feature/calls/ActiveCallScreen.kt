@@ -93,6 +93,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.KitAvatarPhoto
+import com.kit.wallet.ui.components.AccountVerificationBadge
 import com.kit.wallet.ui.components.initialsOf
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.theme.KitGreen100
@@ -782,6 +783,11 @@ private fun ColumnScope.VoiceCallBody(state: ActiveCallUiState) {
                         color = KitGreen700,
                     )
                     KitAvatarPhoto(avatarUrl = state.avatarUrl, size = 132.dp)
+                    AccountVerificationBadge(
+                        verification = state.accountVerification,
+                        modifier = Modifier.align(Alignment.TopEnd),
+                        size = 30.dp,
+                    )
                 }
             }
         }
@@ -897,6 +903,7 @@ private fun GroupVideoGrid(
                                 name = participant.name,
                                 size = 96.dp,
                                 avatarUrl = participant.avatarUrl,
+                                accountVerification = participant.accountVerification,
                             )
                         }
                         Text(
@@ -943,7 +950,12 @@ private fun AddPeopleDialog(
                                 .padding(vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            KitAvatar(contact.name, size = 40.dp, avatarUrl = contact.avatarUrl)
+                            KitAvatar(
+                                contact.name,
+                                size = 40.dp,
+                                avatarUrl = contact.avatarUrl,
+                                accountVerification = contact.accountVerification,
+                            )
                             Spacer(Modifier.width(12.dp))
                             Text(contact.name, style = MaterialTheme.typography.titleSmall)
                         }

@@ -121,7 +121,13 @@ internal fun RequestMoneyContent(
                             .clickable { selectedId = c.id }
                             .padding(horizontal = 6.dp, vertical = 4.dp),
                     ) {
-                        KitAvatar(c.name, size = 56.dp, online = selected, avatarUrl = c.avatarUrl)
+                        KitAvatar(
+                            c.name,
+                            size = 56.dp,
+                            online = selected,
+                            avatarUrl = c.avatarUrl,
+                            accountVerification = c.accountVerification,
+                        )
                         Spacer(Modifier.height(6.dp))
                         Text(
                             c.name.substringBefore(" "),

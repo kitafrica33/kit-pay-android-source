@@ -118,6 +118,9 @@ data class MessagingConversationMemberDto(
     val name: String? = null,
     val role: String? = null,
     @Json(name = "joined_at") val joinedAt: String? = null,
+    @Json(name = "avatar_url") val avatarUrl: String? = null,
+    /** Server-owned designation for this exact member ID; unrelated to KYC or display text. */
+    val verification: AccountVerificationDto? = null,
 )
 
 @JsonClass(generateAdapter = false)

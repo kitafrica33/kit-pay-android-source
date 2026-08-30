@@ -154,8 +154,8 @@ data class GroupPaymentRequestsProtocolDto(
 ) {
     val supportsAndroidV1: Boolean
         get() = ready == true && version == "v1" && partialContributions == true &&
-            progressBasisPointsMax == 10_000 && minimumAndroidVersion == "0.2.35" &&
-            minimumAndroidVersionCode == 46
+            progressBasisPointsMax == 10_000 && minimumAndroidVersion == "0.2.36" &&
+            minimumAndroidVersionCode == 47
 }
 
 @JsonClass(generateAdapter = false)
@@ -166,8 +166,8 @@ data class ScheduledChatPaymentsProtocolDto(
     @Json(name = "minimum_android_version_code") val minimumAndroidVersionCode: Int? = null,
 ) {
     val supportsAndroidV1: Boolean
-        get() = ready == true && version == "v1" && minimumAndroidVersion == "0.2.35" &&
-            minimumAndroidVersionCode == 46
+        get() = ready == true && version == "v1" && minimumAndroidVersion == "0.2.36" &&
+            minimumAndroidVersionCode == 47
 }
 
 @JsonClass(generateAdapter = false)
@@ -180,8 +180,8 @@ data class ScheduledGroupPaymentsProtocolDto(
     @Json(name = "maximum_horizon_seconds") val maximumHorizonSeconds: Int? = null,
 ) {
     val supportsAndroidV1: Boolean
-        get() = ready == true && version == "v1" && minimumAndroidVersion == "0.2.35" &&
-            minimumAndroidVersionCode == 46 && minimumLeadSeconds == 60 &&
+        get() = ready == true && version == "v1" && minimumAndroidVersion == "0.2.36" &&
+            minimumAndroidVersionCode == 47 && minimumLeadSeconds == 60 &&
             maximumHorizonSeconds == 31_536_000
 }
 
@@ -244,6 +244,12 @@ data class CapabilitiesDto(
     val features: Map<String, Boolean?>? = null,
     val authentication: Map<String, Boolean?>? = null,
     val protocols: ProtocolsDto? = null,
+    /** Caller-scoped policy. Omitted only by the anonymous capabilities response. */
+    @Json(name = "communication_access")
+    val communicationAccess: SessionCommunicationAccessDto? = null,
+    /** Caller-scoped policy. Omitted only by the anonymous capabilities response. */
+    @Json(name = "financial_access")
+    val financialAccess: SessionFinancialAccessDto? = null,
 )
 
 /**
@@ -480,10 +486,29 @@ data class LoginUnlockAssuranceDto(
 )
 
 @JsonClass(generateAdapter = false)
+data class SessionCommunicationAccessDto(
+    val allowed: Boolean,
+    val basis: String,
+    @Json(name = "required_action") val requiredAction: String?,
+)
+
+@JsonClass(generateAdapter = false)
+data class SessionFinancialAccessDto(
+    val allowed: Boolean,
+    @Json(name = "read_only") val readOnly: Boolean,
+    val basis: String,
+    @Json(name = "required_action") val requiredAction: String?,
+)
+
+@JsonClass(generateAdapter = false)
 data class SessionAssuranceDto(
     @Json(name = "device_identity") val deviceIdentity: DeviceIdentityAssuranceDto,
     @Json(name = "login_unlock") val loginUnlock: LoginUnlockAssuranceDto,
     val access: String,
+    @Json(name = "communication_access")
+    val communicationAccess: SessionCommunicationAccessDto? = null,
+    @Json(name = "financial_access")
+    val financialAccess: SessionFinancialAccessDto? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -537,6 +562,12 @@ data class SessionDto(
 )
 
 @JsonClass(generateAdapter = false)
+data class AccountVerificationDto(
+    val designation: String? = null,
+    val since: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
 data class UserDto(
     val id: String,
     // Some legacy phone-created profiles can explicitly serialize a null name. Normalize that
@@ -570,6 +601,8 @@ data class UserDto(
     @Json(name = "phone_verified") val phoneVerified: Boolean? = null,
     @Json(name = "profile_setup_required") val profileSetupRequired: Boolean? = null,
     @Json(name = "avatar_url") val avatarUrl: String? = null,
+    /** Server-owned blue-seal metadata; deliberately separate from KYC and legal-name fields. */
+    val verification: AccountVerificationDto? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -702,6 +735,10 @@ data class BootstrapDto(
     val wallets: List<WalletDto> = emptyList(),
     val devices: List<DeviceDto> = emptyList(),
     @Json(name = "selected_wallet_id") val selectedWalletId: String? = null,
+    @Json(name = "communication_access")
+    val communicationAccess: SessionCommunicationAccessDto? = null,
+    @Json(name = "financial_access")
+    val financialAccess: SessionFinancialAccessDto? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -750,6 +787,9 @@ data class CounterpartyDto(
     val name: String? = null,
     val phone: String? = null,
     @Json(name = "account_number") val accountNumber: String? = null,
+    @Json(name = "avatar_url") val avatarUrl: String? = null,
+    /** Optional forward-compatible server designation for this exact public account ID. */
+    val verification: AccountVerificationDto? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -851,6 +891,8 @@ data class ContactDto(
     val status: String? = null,
     val tag: String? = null,
     @Json(name = "avatar_url") val avatarUrl: String? = null,
+    /** Server-owned blue-seal metadata for the linked Kit account, or null for no designation. */
+    val verification: AccountVerificationDto? = null,
     @Json(name = "receiving_wallet_id") val receivingWalletId: String? = null,
 )
 
@@ -953,6 +995,16 @@ data class CallPageDto(
     val page: CursorPageDto? = null,
 )
 
+/** Optional first-sighting presentation for one exact call participant. */
+@JsonClass(generateAdapter = false)
+data class CallParticipantDto(
+    @Json(name = "user_id") val userId: String? = null,
+    val name: String? = null,
+    @Json(name = "avatar_url") val avatarUrl: String? = null,
+    /** Server-owned designation; unknown or malformed values never produce a badge. */
+    val verification: AccountVerificationDto? = null,
+)
+
 @JsonClass(generateAdapter = false)
 data class CallDto(
     val id: String,
@@ -961,6 +1013,11 @@ data class CallDto(
     // call usable with a neutral presentation label until that user completes profile setup.
     val name: String? = null,
     @Json(name = "participant_user_ids") val participantUserIds: List<String>? = null,
+    /**
+     * Rich participant presentation added after the original ID-only contract. Legacy IDs remain
+     * authoritative routing data and are merged with these rows by exact public account ID.
+     */
+    val participants: List<CallParticipantDto?>? = null,
     val direction: String,
     val type: String,
     val video: Boolean? = null,

@@ -5,6 +5,7 @@ import com.kit.wallet.data.repository.kycVerificationStateOf
 import com.kit.wallet.data.local.ProfileEntity
 import com.kit.wallet.data.local.WalletEntity
 import com.kit.wallet.data.local.WalletTransactionEntity
+import com.kit.wallet.data.media.isTrustedProfileAvatarUrl
 import com.kit.wallet.data.auth.hasVerifiedLegalName
 import com.kit.wallet.data.auth.requiresProfileSetup
 import com.kit.wallet.data.auth.profileNameOrPlaceholder
@@ -18,6 +19,7 @@ import com.kit.wallet.ui.model.TransferClaimActor
 import com.kit.wallet.ui.model.TransferClaimStatus
 import com.kit.wallet.ui.model.TxStatus
 import com.kit.wallet.ui.model.TxType
+import com.kit.wallet.ui.model.AccountVerification
 import com.kit.wallet.ui.model.UserProfile
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -44,6 +46,10 @@ object DecimalMoney {
 
 fun UserDto.toEntity(nowEpochMillis: Long): ProfileEntity {
     val verifiedLegalName = legalName?.takeIf(String::isNotBlank)
+    val accountVerification = AccountVerification.fromServerValues(
+        designation = verification?.designation,
+        since = verification?.since,
+    )
     return ProfileEntity(
         userId = id,
         // The placeholder stands in for a missing *display* name only. It is never written over
@@ -63,6 +69,8 @@ fun UserDto.toEntity(nowEpochMillis: Long): ProfileEntity {
         // assuming either answer.
         usernameRequired = usernameRequired ?: !hasVerifiedLegalName(verifiedLegalName),
         updatedAtEpochMillis = nowEpochMillis,
+        verificationDesignation = accountVerification?.designation?.serverValue,
+        verificationSince = accountVerification?.since,
     )
 }
 
@@ -77,6 +85,10 @@ fun ProfileEntity.toUiModel(): UserProfile = UserProfile(
     avatarUrl = avatarUrl,
     legalName = legalName,
     usernameRequired = usernameRequired,
+    accountVerification = AccountVerification.fromServerValues(
+        designation = verificationDesignation,
+        since = verificationSince,
+    ),
 )
 
 fun WalletDto.toEntity(nowEpochMillis: Long): WalletEntity {
@@ -99,6 +111,10 @@ fun WalletDto.toEntity(nowEpochMillis: Long): WalletEntity {
 fun TransactionDto.toEntity(defaultWalletUuid: String): WalletTransactionEntity {
     val scale = currency.scale.toInt()
     val absoluteMinor = abs(DecimalMoney.toMinor(amount, scale))
+    val counterpartyVerification = AccountVerification.fromServerValues(
+        designation = counterparty?.verification?.designation,
+        since = counterparty?.verification?.since,
+    )
     val signedMinor = when (direction.lowercase()) {
         "credit", "in", "incoming", "receive" -> absoluteMinor
         else -> -absoluteMinor
@@ -117,6 +133,13 @@ fun TransactionDto.toEntity(defaultWalletUuid: String): WalletTransactionEntity 
             ?: counterparty?.phone
             ?: counterparty?.accountNumber
             ?: "Kit Pay",
+        counterpartyUserId = counterparty?.id?.trim()?.takeIf(String::isNotEmpty),
+        counterpartyAvatarUrl = counterparty?.avatarUrl
+            ?.trim()
+            ?.takeIf(::isTrustedProfileAvatarUrl),
+        counterpartyVerificationDesignation =
+            counterpartyVerification?.designation?.serverValue,
+        counterpartyVerificationSince = counterpartyVerification?.since,
         note = note,
         occurredAtEpochMillis = occurredAt.toEpochMillisOrNull() ?: 0L,
     )
@@ -197,6 +220,12 @@ fun WalletTransactionEntity.toUiModel(
         // with debits, so the starter checklist reads the originals to refuse them.
         rawType = type,
         rawDirection = direction,
+        counterpartyUserId = counterpartyUserId,
+        counterpartyAvatarUrl = counterpartyAvatarUrl,
+        accountVerification = AccountVerification.fromServerValues(
+            counterpartyVerificationDesignation,
+            counterpartyVerificationSince,
+        ),
     )
 }
 

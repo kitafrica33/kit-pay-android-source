@@ -19,7 +19,7 @@ import org.junit.Test
 
 class PaymentSchedulingCapabilityTest {
     @Test
-    fun `all additive payment gates require their exact Android 46 handshake`() {
+    fun `all additive payment gates require their exact Android 47 handshake`() {
         val capabilities = CapabilitiesDto(
             currency = CurrencyDto("UGX", "0"),
             features = mapOf(
@@ -35,13 +35,13 @@ class PaymentSchedulingCapabilityTest {
             protocols = ProtocolsDto(
                 payments = PaymentProtocolsDto(
                     groupPaymentRequests = GroupPaymentRequestsProtocolDto(
-                        "v1", true, true, 10_000, "0.2.35", 46,
+                        "v1", true, true, 10_000, "0.2.36", 47,
                     ),
                     scheduledChatPayments = ScheduledChatPaymentsProtocolDto(
-                        "v1", true, "0.2.35", 46,
+                        "v1", true, "0.2.36", 47,
                     ),
                     scheduledGroupPayments = ScheduledGroupPaymentsProtocolDto(
-                        "v1", true, "0.2.35", 46, 60, 31_536_000,
+                        "v1", true, "0.2.36", 47, 60, 31_536_000,
                     ),
                 ),
             ),
@@ -55,7 +55,7 @@ class PaymentSchedulingCapabilityTest {
                 protocols = capabilities.protocols?.copy(
                     payments = capabilities.protocols.payments?.copy(
                         groupPaymentRequests = capabilities.protocols.payments
-                            ?.groupPaymentRequests?.copy(minimumAndroidVersionCode = 45),
+                            ?.groupPaymentRequests?.copy(minimumAndroidVersionCode = 46),
                     ),
                 ),
             ).groupPaymentRequestsAvailable(),
@@ -70,7 +70,7 @@ class PaymentSchedulingCapabilityTest {
             .build()
         val decoded = requireNotNull(
             moshi.adapter(CapabilitiesDto::class.java).fromJson(
-                """{"currency":{"code":"UGX","scale":"0"},"features":{"wallets":true,"internal_transfers":true,"group_payment_requests_v1":true},"protocols":{"payments":{"group_payment_requests":{"version":"v1","ready":"yes","partial_contributions":true,"progress_basis_points_max":10000,"minimum_android_version":"0.2.35","minimum_android_version_code":46}}}}""",
+                """{"currency":{"code":"UGX","scale":"0"},"features":{"wallets":true,"internal_transfers":true,"group_payment_requests_v1":true},"protocols":{"payments":{"group_payment_requests":{"version":"v1","ready":"yes","partial_contributions":true,"progress_basis_points_max":10000,"minimum_android_version":"0.2.36","minimum_android_version_code":47}}}}""",
             ),
         )
 

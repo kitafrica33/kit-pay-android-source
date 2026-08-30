@@ -1,5 +1,6 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.remote.AccountVerificationDto
 import com.kit.wallet.data.remote.DeviceDto
 import com.kit.wallet.data.remote.DeviceListDto
 import com.kit.wallet.data.remote.ENCRYPTED_MESSAGE_KIND
@@ -90,6 +91,70 @@ class SecureMessagingTransportValidatorTest {
         assertEquals("Amina", validated.single().peerName)
         assertEquals("owner", validated.single().currentUserRole)
         assertFalse(validated.single().isGroup)
+    }
+
+    @Test
+    fun `conversation members keep only structurally valid first sighting identity metadata`() {
+        val avatar = "https://pay.kit.africa/media/profile/$OTHER_USER_ID"
+        val peerIndex = 1
+        val enriched = directConversation().let { conversation ->
+            conversation.copy(
+                members = conversation.members.orEmpty().mapIndexed { index, member ->
+                    if (index == peerIndex) {
+                        member?.copy(
+                            avatarUrl = " $avatar ",
+                            verification = AccountVerificationDto(
+                                designation = "official",
+                                since = "2026-08-29T10:11:12Z",
+                            ),
+                        )
+                    } else {
+                        member
+                    }
+                },
+            )
+        }
+
+        val peer = SecureMessagingTransportValidator.validateConversations(
+            MessagingConversationListDto(listOf(enriched)),
+            CURRENT_USER_ID,
+        ).single().others.single()
+
+        assertEquals(avatar, peer.avatarUrl)
+        assertEquals("official", peer.verification?.designation)
+        assertEquals("2026-08-29T10:11:12Z", peer.verification?.since)
+    }
+
+    @Test
+    fun `malformed optional member metadata is dropped without hiding the conversation`() {
+        val variants = listOf(
+            Triple("http://attacker.example/avatar", "Official", "2026-08-29T10:11:12Z"),
+            Triple("https://attacker.example/avatar", "verified", "not-an-instant"),
+        )
+        variants.forEach { (avatarUrl, designation, since) ->
+            val conversation = directConversation().let { direct ->
+                direct.copy(
+                    members = direct.members.orEmpty().mapIndexed { index, member ->
+                        if (index == 1) {
+                            member?.copy(
+                                avatarUrl = avatarUrl,
+                                verification = AccountVerificationDto(designation, since),
+                            )
+                        } else {
+                            member
+                        }
+                    },
+                )
+            }
+
+            val validated = SecureMessagingTransportValidator.validateConversations(
+                MessagingConversationListDto(listOf(conversation)),
+                CURRENT_USER_ID,
+            ).single()
+
+            assertNull(validated.others.single().avatarUrl)
+            assertNull(validated.others.single().verification)
+        }
     }
 
     @Test
@@ -613,6 +678,178 @@ class SecureMessagingTransportValidatorTest {
     }
 
     @Test
+    fun `created group request is an empty open request snapshot`() {
+        val event = groupPaymentRequestEvent(
+            type = "group_payment_request.created",
+            resourceType = "group_payment_request",
+            resourceId = MESSAGE_ID,
+            status = "open",
+            contributedAmountMinor = "0",
+            remainingAmountMinor = "10000",
+            progressBasisPoints = 0,
+            contributionId = null,
+            contributorUserId = null,
+            contributionAmountMinor = null,
+        )
+
+        val validated = validateFinancialEvent(event)
+
+        assertEquals(MESSAGE_ID, validated.paymentId)
+        assertNull(validated.contributionId)
+        assertNull(validated.contributorUserId)
+        assertNull(validated.contributionAmountMinor)
+
+        listOf(
+            event.copy(resourceType = "group_payment_request_contribution"),
+            event.copy(resourceId = OTHER_MESSAGE_ID),
+            event.copy(data = event.data?.copy(status = "completed")),
+            event.copy(
+                data = event.data?.copy(
+                    contributedAmountMinor = "3000",
+                    remainingAmountMinor = "7000",
+                    progressBasisPoints = 3_000,
+                ),
+            ),
+            event.copy(data = event.data?.copy(contributionId = OTHER_MESSAGE_ID)),
+            event.copy(data = event.data?.copy(contributorUserId = OTHER_USER_ID)),
+            event.copy(data = event.data?.copy(contributionAmountMinor = "1")),
+        ).forEach { mismatch -> assertRejected { validateFinancialEvent(mismatch) } }
+    }
+
+    @Test
+    fun `group request event target is bounded by the shared maximum minor amount`() {
+        val atMaximum = groupPaymentRequestEvent(
+            type = "group_payment_request.created",
+            resourceType = "group_payment_request",
+            resourceId = MESSAGE_ID,
+            status = "open",
+            targetAmountMinor = "1000000000000",
+            contributedAmountMinor = "0",
+            remainingAmountMinor = "1000000000000",
+            progressBasisPoints = 0,
+            contributionId = null,
+            contributorUserId = null,
+            contributionAmountMinor = null,
+        )
+
+        validateFinancialEvent(atMaximum)
+
+        assertRejected {
+            validateFinancialEvent(
+                atMaximum.copy(
+                    data = atMaximum.data?.copy(
+                        targetAmountMinor = "1000000000001",
+                        remainingAmountMinor = "1000000000001",
+                    ),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun `completed group request is request scoped and carries its closing contribution`() {
+        val event = groupPaymentRequestEvent(
+            type = "group_payment_request.completed",
+            resourceType = "group_payment_request",
+            resourceId = MESSAGE_ID,
+            status = "completed",
+            contributedAmountMinor = "10000",
+            remainingAmountMinor = "0",
+            progressBasisPoints = 10_000,
+        )
+
+        val validated = validateFinancialEvent(event)
+
+        assertEquals(MESSAGE_ID, validated.paymentId)
+        assertEquals(OTHER_MESSAGE_ID, validated.contributionId)
+        assertEquals(OTHER_USER_ID, validated.contributorUserId)
+        assertEquals("7000", validated.contributionAmountMinor)
+
+        listOf(
+            event.copy(resourceType = "group_payment_request_contribution"),
+            event.copy(resourceId = OTHER_MESSAGE_ID),
+            event.copy(data = event.data?.copy(groupPaymentRequestId = THIRD_MESSAGE_ID)),
+            event.copy(data = event.data?.copy(contributionId = null)),
+            event.copy(data = event.data?.copy(contributorUserId = null)),
+            event.copy(data = event.data?.copy(contributionAmountMinor = null)),
+            event.copy(data = event.data?.copy(contributorUserId = CURRENT_USER_ID)),
+            event.copy(data = event.data?.copy(contributionAmountMinor = "10001")),
+            event.copy(data = event.data?.copy(status = "open")),
+            event.copy(
+                data = event.data?.copy(
+                    contributedAmountMinor = "7000",
+                    remainingAmountMinor = "3000",
+                    progressBasisPoints = 7_000,
+                ),
+            ),
+        ).forEach { mismatch -> assertRejected { validateFinancialEvent(mismatch) } }
+    }
+
+    @Test
+    fun `contributed group request remains contribution scoped`() {
+        val event = groupPaymentRequestEvent(
+            type = "group_payment_request.contributed",
+            resourceType = "group_payment_request_contribution",
+            resourceId = OTHER_MESSAGE_ID,
+            status = "open",
+            contributedAmountMinor = "3000",
+            remainingAmountMinor = "7000",
+            progressBasisPoints = 3_000,
+            contributionAmountMinor = "3000",
+        )
+
+        val validated = validateFinancialEvent(event)
+
+        assertEquals(MESSAGE_ID, validated.paymentId)
+        assertEquals(OTHER_MESSAGE_ID, validated.contributionId)
+
+        validateFinancialEvent(event.copy(data = event.data?.copy(status = "completed")))
+
+        listOf(
+            event.copy(resourceType = "group_payment_request"),
+            event.copy(resourceId = MESSAGE_ID),
+            event.copy(data = event.data?.copy(contributionId = THIRD_MESSAGE_ID)),
+            event.copy(data = event.data?.copy(status = "cancelled")),
+            event.copy(data = event.data?.copy(contributionId = null)),
+            event.copy(data = event.data?.copy(contributorUserId = null)),
+            event.copy(data = event.data?.copy(contributionAmountMinor = null)),
+            event.copy(data = event.data?.copy(contributorUserId = CURRENT_USER_ID)),
+            event.copy(data = event.data?.copy(contributionAmountMinor = "3001")),
+        ).forEach { mismatch -> assertRejected { validateFinancialEvent(mismatch) } }
+    }
+
+    @Test
+    fun `cancelled and expired group requests match status and omit contribution fields`() {
+        listOf("cancelled", "expired").forEach { action ->
+            val event = groupPaymentRequestEvent(
+                type = "group_payment_request.$action",
+                resourceType = "group_payment_request",
+                resourceId = MESSAGE_ID,
+                status = action,
+                contributedAmountMinor = "3000",
+                remainingAmountMinor = "7000",
+                progressBasisPoints = 3_000,
+                contributionId = null,
+                contributorUserId = null,
+                contributionAmountMinor = null,
+            )
+
+            val validated = validateFinancialEvent(event)
+            assertEquals(MESSAGE_ID, validated.paymentId)
+            assertNull(validated.contributionId)
+
+            listOf(
+                event.copy(resourceType = "group_payment_request_contribution"),
+                event.copy(resourceId = OTHER_MESSAGE_ID),
+                event.copy(data = event.data?.copy(status = "open")),
+                event.copy(data = event.data?.copy(contributionId = OTHER_MESSAGE_ID)),
+                event.copy(data = event.data?.copy(contributorUserId = OTHER_USER_ID)),
+                event.copy(data = event.data?.copy(contributionAmountMinor = "1")),
+            ).forEach { mismatch -> assertRejected { validateFinancialEvent(mismatch) } }
+        }
+    }
+
+    @Test
     fun `sync permits an empty filtered page only when its opaque cursor advances`() {
         val page = SecureMessagingTransportValidator.validateSyncPage(
             response = MessagingSyncDto(
@@ -641,6 +878,170 @@ class SecureMessagingTransportValidatorTest {
                 requestedLimit = 50,
             )
         }
+    }
+
+    @Test
+    fun `scheduled direct terminal metadata is complete and status coherent`() {
+        val event = MessagingSyncEventDto(
+            id = "14",
+            type = "scheduled_payment.completed",
+            conversationId = CONVERSATION_ID,
+            resourceType = "scheduled_payment",
+            resourceId = MESSAGE_ID,
+            data = MessagingSyncEventDataDto(
+                schema = "kit.scheduled-payment.v1",
+                conversationId = CONVERSATION_ID,
+                scheduledPaymentId = MESSAGE_ID,
+                senderUserId = CURRENT_USER_ID,
+                recipientUserId = OTHER_USER_ID,
+                status = "completed",
+                amountMinor = "250000",
+                currency = "UGX",
+                currencyScale = 2,
+                note = "School fees",
+                scheduledFor = CREATED_AT,
+                walletTransactionId = OTHER_MESSAGE_ID,
+                completedAt = UPDATED_AT,
+            ),
+            occurredAt = UPDATED_AT,
+        )
+        fun validate(value: MessagingSyncEventDto): ValidatedMessagingSyncEvent.FinancialMetadata =
+            SecureMessagingTransportValidator.validateSyncPage(
+                MessagingSyncDto(listOf(value), CursorPageDto("next", false, 1)),
+                CURRENT_USER_ID, CURRENT_DEVICE_ID, "old", 1, 13,
+            ).events.single() as ValidatedMessagingSyncEvent.FinancialMetadata
+
+        val validated = validate(event)
+        assertEquals(250000L, validated.amountMinor)
+        assertEquals(OTHER_USER_ID, validated.recipientUserId)
+        assertEquals(Instant.parse(CREATED_AT), validated.scheduledFor)
+        assertRejected { validate(event.copy(data = event.data?.copy(walletTransactionId = null))) }
+        assertRejected { validate(event.copy(data = event.data?.copy(status = "failed"))) }
+        assertRejected { validate(event.copy(data = event.data?.copy(completedAt = null))) }
+    }
+
+    @Test
+    fun `scheduled group terminal metadata binds result and terminal timestamp`() {
+        val event = MessagingSyncEventDto(
+            id = "14",
+            type = "scheduled_group_payment.completed",
+            conversationId = GROUP_ID,
+            resourceType = "scheduled_group_payment",
+            resourceId = MESSAGE_ID,
+            data = MessagingSyncEventDataDto(
+                schema = "kit.scheduled-group-payment.v1",
+                conversationId = GROUP_ID,
+                scheduledGroupPaymentId = MESSAGE_ID,
+                status = "completed",
+                scheduledFor = CREATED_AT,
+                groupPaymentId = OTHER_MESSAGE_ID,
+                completedAt = UPDATED_AT,
+            ),
+            occurredAt = UPDATED_AT,
+        )
+        fun validate(value: MessagingSyncEventDto): ValidatedMessagingSyncEvent.FinancialMetadata =
+            SecureMessagingTransportValidator.validateSyncPage(
+                MessagingSyncDto(listOf(value), CursorPageDto("next", false, 1)),
+                CURRENT_USER_ID, CURRENT_DEVICE_ID, "old", 1, 13,
+            ).events.single() as ValidatedMessagingSyncEvent.FinancialMetadata
+
+        assertEquals(OTHER_MESSAGE_ID, validate(event).groupPaymentId)
+        assertRejected { validate(event.copy(data = event.data?.copy(groupPaymentId = null))) }
+        assertRejected { validate(event.copy(data = event.data?.copy(cancelledAt = UPDATED_AT))) }
+    }
+
+    @Test
+    fun `scheduled group failure accepts legacy backend and coherent enriched payloads`() {
+        // This is the exact content-minimal shape emitted by ScheduledGroupPaymentEventService:
+        // failed state and completion time, with no failure_code or failure_message members.
+        val legacy = MessagingSyncEventDto(
+            id = "14",
+            type = "scheduled_group_payment.failed",
+            conversationId = GROUP_ID,
+            resourceType = "scheduled_group_payment",
+            resourceId = MESSAGE_ID,
+            data = MessagingSyncEventDataDto(
+                schema = "kit.scheduled-group-payment.v1",
+                conversationId = GROUP_ID,
+                scheduledGroupPaymentId = MESSAGE_ID,
+                status = "failed",
+                scheduledFor = CREATED_AT,
+                completedAt = UPDATED_AT,
+            ),
+            occurredAt = UPDATED_AT,
+        )
+        fun validate(value: MessagingSyncEventDto): ValidatedMessagingSyncEvent.FinancialMetadata =
+            SecureMessagingTransportValidator.validateSyncPage(
+                MessagingSyncDto(listOf(value), CursorPageDto("next", false, 1)),
+                CURRENT_USER_ID, CURRENT_DEVICE_ID, "old", 1, 13,
+            ).events.single() as ValidatedMessagingSyncEvent.FinancialMetadata
+
+        val legacyValidated = validate(legacy)
+        assertNull(legacyValidated.failureCode)
+        assertNull(legacyValidated.failureMessage)
+
+        val enriched = legacy.copy(
+            data = legacy.data?.copy(
+                failureCode = "SCHEDULED_GROUP_PAYMENT_FAILED",
+                failureMessage = "The source wallet could not fund every recipient.",
+            ),
+        )
+        assertEquals("SCHEDULED_GROUP_PAYMENT_FAILED", validate(enriched).failureCode)
+
+        // A future server must enrich atomically; partial, blank, or unsafe hints fail closed.
+        assertRejected {
+            validate(enriched.copy(data = enriched.data?.copy(failureMessage = null)))
+        }
+        assertRejected {
+            validate(enriched.copy(data = enriched.data?.copy(failureCode = null)))
+        }
+        assertRejected {
+            validate(enriched.copy(data = enriched.data?.copy(failureMessage = "   ")))
+        }
+        assertRejected {
+            validate(enriched.copy(data = enriched.data?.copy(failureMessage = "x".repeat(501))))
+        }
+    }
+
+    @Test
+    fun `scheduled direct failure permits an omitted message but rejects a blank one`() {
+        val event = MessagingSyncEventDto(
+            id = "14",
+            type = "scheduled_payment.failed",
+            conversationId = CONVERSATION_ID,
+            resourceType = "scheduled_payment",
+            resourceId = MESSAGE_ID,
+            data = MessagingSyncEventDataDto(
+                schema = "kit.scheduled-payment.v1",
+                conversationId = CONVERSATION_ID,
+                scheduledPaymentId = MESSAGE_ID,
+                senderUserId = CURRENT_USER_ID,
+                recipientUserId = OTHER_USER_ID,
+                status = "failed",
+                amountMinor = "250000",
+                currency = "UGX",
+                currencyScale = 2,
+                scheduledFor = CREATED_AT,
+                failureCode = "PROVIDER_UNAVAILABLE",
+                completedAt = UPDATED_AT,
+            ),
+            occurredAt = UPDATED_AT,
+        )
+        fun validate(value: MessagingSyncEventDto): ValidatedMessagingSyncEvent.FinancialMetadata =
+            SecureMessagingTransportValidator.validateSyncPage(
+                MessagingSyncDto(listOf(value), CursorPageDto("next", false, 1)),
+                CURRENT_USER_ID, CURRENT_DEVICE_ID, "old", 1, 13,
+            ).events.single() as ValidatedMessagingSyncEvent.FinancialMetadata
+
+        assertNull(validate(event).failureMessage)
+        assertEquals(
+            "Provider did not answer",
+            validate(event.copy(data = event.data?.copy(
+                failureMessage = "Provider did not answer",
+            ))).failureMessage,
+        )
+        assertRejected { validate(event.copy(data = event.data?.copy(failureMessage = ""))) }
+        assertRejected { validate(event.copy(data = event.data?.copy(failureMessage = " \t"))) }
     }
 
     @Test
@@ -1102,6 +1503,58 @@ class SecureMessagingTransportValidatorTest {
         data = MessagingSyncEventDataDto(userId = userId, role = role),
         occurredAt = READ_AT,
     )
+
+    private fun groupPaymentRequestEvent(
+        type: String,
+        resourceType: String,
+        resourceId: String,
+        status: String,
+        contributedAmountMinor: String,
+        remainingAmountMinor: String,
+        progressBasisPoints: Int,
+        targetAmountMinor: String = "10000",
+        contributionId: String? = OTHER_MESSAGE_ID,
+        contributorUserId: String? = OTHER_USER_ID,
+        contributionAmountMinor: String? = "7000",
+    ) = MessagingSyncEventDto(
+        id = "14",
+        type = type,
+        conversationId = GROUP_ID,
+        resourceType = resourceType,
+        resourceId = resourceId,
+        data = MessagingSyncEventDataDto(
+            schema = "kit.group-payment-request.v1",
+            groupPaymentRequestId = MESSAGE_ID,
+            conversationId = GROUP_ID,
+            requesterUserId = CURRENT_USER_ID,
+            status = status,
+            targetAmountMinor = targetAmountMinor,
+            contributedAmountMinor = contributedAmountMinor,
+            remainingAmountMinor = remainingAmountMinor,
+            currency = "UGX",
+            currencyScale = 2,
+            progressBasisPoints = progressBasisPoints,
+            contributionId = contributionId,
+            contributorUserId = contributorUserId,
+            contributionAmountMinor = contributionAmountMinor,
+        ),
+        occurredAt = UPDATED_AT,
+    )
+
+    private fun validateFinancialEvent(
+        event: MessagingSyncEventDto,
+    ): ValidatedMessagingSyncEvent.FinancialMetadata =
+        SecureMessagingTransportValidator.validateSyncPage(
+            response = MessagingSyncDto(
+                events = listOf(event),
+                page = CursorPageDto(nextCursor = "financial_cursor", hasMore = false, limit = 1),
+            ),
+            currentUserId = CURRENT_USER_ID,
+            currentDeviceId = CURRENT_DEVICE_ID,
+            requestedCursor = "old_cursor",
+            requestedLimit = 1,
+            previousEventId = 13,
+        ).events.single() as ValidatedMessagingSyncEvent.FinancialMetadata
 
     private fun deliveryReceiptEvent(id: String) = MessagingSyncEventDto(
         id = id,

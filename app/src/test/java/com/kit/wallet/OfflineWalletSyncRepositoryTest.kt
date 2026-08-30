@@ -100,6 +100,22 @@ class OfflineWalletSyncRepositoryTest {
     }
 
     @Test
+    fun `foreground authority refresh replaces a stale 3000 balance with 150000`() = runTest {
+        enqueueBalanceSnapshot("3000.00")
+
+        repository.refresh()
+
+        assertEquals(300_000L, cache.wallets.single().availableBalanceMinor)
+
+        enqueueBalanceSnapshot("150000.00")
+
+        val refreshed = repository.refresh()
+
+        assertEquals(15_000_000L, refreshed.selectedAvailableBalanceMinor)
+        assertEquals(15_000_000L, cache.wallets.single().availableBalanceMinor)
+    }
+
+    @Test
     fun `refresh is a no-op without a device session`() = runTest {
         sessions.clear()
 
@@ -213,6 +229,12 @@ class OfflineWalletSyncRepositoryTest {
         .setResponseCode(200)
         .setHeader("Content-Type", "application/json")
         .setBody(body)
+
+    private fun enqueueBalanceSnapshot(balance: String) {
+        server.enqueue(jsonResponse(BOOTSTRAP_JSON.replace("1284500.00", balance)))
+        server.enqueue(jsonResponse(WALLETS_JSON.replace("1284500.00", balance)))
+        server.enqueue(jsonResponse(TRANSACTIONS_JSON))
+    }
 
     private class FakeSessionStore(initial: SessionTokens?) : SessionStore {
         private val state = MutableStateFlow(initial)

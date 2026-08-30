@@ -97,7 +97,7 @@ class KycVerificationStateTest {
         assertEquals("Verification in review", prompt.title)
         assertFalse(prompt.detail.contains("Didit"))
         assertEquals(
-            "Didit verification in review",
+            "Identity verification in review",
             identityVerificationPresentation("KYC pending").title,
         )
     }

@@ -6,6 +6,7 @@ import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.VerifyStepUpChallengeRequest
 import com.kit.wallet.data.remote.VerifyBiometricStepUpRequest
 import com.kit.wallet.data.auth.BiometricPaymentApprover
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
@@ -28,9 +29,10 @@ class PaymentAuthorizer @Inject constructor(
         intent: Map<String, Any?>,
         paymentPin: String,
         biometricReason: String = "Confirm this Kit Pay payment",
+        expectedOwner: SessionFence? = null,
     ): String {
         val challenge = apiCalls.execute {
-            api.createStepUpChallenge(stepUpChallengeBody(purpose, intent))
+            api.createStepUpChallenge(stepUpChallengeBody(purpose, intent), expectedOwner)
         }
         val methods = challenge.methods.orEmpty()
         val session = sessions?.current()
@@ -62,6 +64,7 @@ class PaymentAuthorizer @Inject constructor(
                 api.verifyBiometricStepUpChallenge(
                     challenge.id,
                     VerifyBiometricStepUpRequest(challenge.nonce, signature),
+                    expectedOwner,
                 )
             }.also {
                 check(it.method.equals("biometric_signature", ignoreCase = true)) {
@@ -74,7 +77,11 @@ class PaymentAuthorizer @Inject constructor(
             "Enter the four-digit wallet PIN"
         }
         return apiCalls.execute {
-            api.verifyStepUpChallenge(challenge.id, VerifyStepUpChallengeRequest(paymentPin))
+            api.verifyStepUpChallenge(
+                challenge.id,
+                VerifyStepUpChallengeRequest(paymentPin),
+                expectedOwner,
+            )
         }.stepUpToken
     }
 

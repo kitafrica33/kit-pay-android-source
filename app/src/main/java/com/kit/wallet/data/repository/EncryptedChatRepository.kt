@@ -18,6 +18,9 @@ import com.kit.wallet.data.messaging.KitChatMediaKind
 import com.kit.wallet.data.messaging.KitEditMessage
 import com.kit.wallet.data.messaging.KitGroupPaymentAction
 import com.kit.wallet.data.messaging.KitGroupPaymentMessage
+import com.kit.wallet.data.messaging.KitScheduledGroupPaymentOutcomeMessage
+import com.kit.wallet.data.messaging.KitScheduledPaymentAction
+import com.kit.wallet.data.messaging.KitScheduledPaymentMessage
 import com.kit.wallet.data.messaging.KitMediaFamily
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitMediaMessageV2
@@ -38,6 +41,8 @@ import com.kit.wallet.data.messaging.MediaAttachmentStreamCipher
 import com.kit.wallet.data.messaging.MessageReplyQuotes
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.ScheduledSendStore
+import com.kit.wallet.data.messaging.SCHEDULED_PAYMENT_SYSTEM_EVENT_TYPES
+import com.kit.wallet.data.messaging.deterministicUuid
 import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaCache
 import com.kit.wallet.data.messaging.SecureMediaFile
@@ -91,6 +96,7 @@ import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.di.ApplicationScope
+import com.kit.wallet.ui.model.AccountVerification
 import com.kit.wallet.ui.model.ChatMember
 import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.model.ChatPreview
@@ -158,6 +164,9 @@ internal data class AuthenticatedConversationMember(
     val userId: String,
     val name: String?,
     val role: String,
+    /** Presentation metadata remains bound to this exact authenticated member ID. */
+    val avatarUrl: String? = null,
+    val accountVerification: AccountVerification? = null,
 )
 
 /**
@@ -1851,7 +1860,16 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         viewerUserId = viewerUserId,
         currentUserRole = currentUserRole,
         members = members.map {
-            AuthenticatedConversationMember(userId = it.userId, name = it.name, role = it.role)
+            AuthenticatedConversationMember(
+                userId = it.userId,
+                name = it.name,
+                role = it.role,
+                avatarUrl = it.avatarUrl,
+                accountVerification = AccountVerification.fromServerValues(
+                    it.verificationDesignation,
+                    it.verificationSince,
+                ),
+            )
         },
         description = description,
         photoUrl = photoUrl,
@@ -3637,6 +3655,8 @@ class EncryptedChatRepository @Inject internal constructor(
                     avatarUrl = member?.avatarUrl ?: contact?.avatarUrl,
                     deliveredAtEpochMillis = recipient.deliveredAt?.toEpochMilli() ?: 0,
                     readAtEpochMillis = recipient.readAt?.toEpochMilli() ?: 0,
+                    accountVerification = contact?.accountVerification
+                        ?: member?.accountVerification,
                 )
             },
         )
@@ -3813,7 +3833,7 @@ class EncryptedChatRepository @Inject internal constructor(
         // A group that has been joined but not yet spoken in still has a timeline: its membership
         // lines are the whole of it, so the transcript is keyed by more than what has ciphertext.
         val timelineConversationIds = orderedByConversation.keys +
-            membershipHistory.keys.filter { conversationsById[it]?.isGroup == true } +
+            membershipHistory.keys.filter { it in conversationsById } +
             visiblePending.map(ImmediateSendIntent::conversationId) +
             visibleStaging.map(StagingMedia::conversationId)
         val messageLists = timelineConversationIds.associateWith { conversationId ->
@@ -3861,27 +3881,49 @@ class EncryptedChatRepository @Inject internal constructor(
                 .toList()
             // Server-readable membership and financial events are durable timeline annotations.
             // Financial rows remain hints; the conversation ViewModel exact-fetches API state.
-            val notices = conversation?.takeIf(AuthenticatedConversation::isGroup)?.let { group ->
+            val notices = conversation?.let { chat ->
                 membershipHistory[conversationId].orEmpty().mapNotNull { event ->
-                    if (event.type in GROUP_PAYMENT_REQUEST_SYSTEM_EVENT_TYPES) {
-                        toGroupPaymentRequestSystemMessage(event, group.viewerUserId)
-                    } else {
+                    when {
+                    event.type in GROUP_PAYMENT_REQUEST_SYSTEM_EVENT_TYPES && chat.isGroup ->
+                        toGroupPaymentRequestSystemMessage(event, chat.viewerUserId)
+                    event.type in SCHEDULED_PAYMENT_SYSTEM_EVENT_TYPES ->
+                        toScheduledPaymentSystemMessage(event, chat)
+                    chat.isGroup -> {
                         val subject = event.userId ?: return@mapNotNull null
                         toSystemMessage(
                             event = event,
-                            isViewer = subject.equals(group.viewerUserId, ignoreCase = true),
+                            isViewer = subject.equals(chat.viewerUserId, ignoreCase = true),
                             // A removed member has already left the roster by the time this reads
                             // it, so the address book is what usually names them.
                             name = savedNames[subject.lowercase()]
-                                ?: group.memberNamed(subject)?.name.safeChatContactName(),
+                                ?: chat.memberNamed(subject)?.name.safeChatContactName(),
                         )
+                    }
+                    else -> null
                     }
                 }
             }.orEmpty()
+            // A group-request mutation has two delivery paths by design: an encrypted KITGREQ1
+            // hint for peers that do not consume the financial sync log, and an authenticated
+            // server event for current clients. Once the latter is durable it owns this device's
+            // row. Deriving the match from the two persisted inputs keeps the choice stable across
+            // arrival order and process death without suppressing the descriptor on the wire.
+            val authoritativeGroupRequestIdentities = notices.asSequence()
+                .flatMap { it.authoritativeGroupRequestPublicationIdentities().asSequence() }
+                .toSet()
+            val coalescedBubbles = if (authoritativeGroupRequestIdentities.isEmpty()) {
+                bubbles
+            } else {
+                bubbles.filterNot { bubble ->
+                    bubble.groupPaymentRequestPublicationIdentity()
+                        ?.let(authoritativeGroupRequestIdentities::contains) == true
+                }
+            }
             // sortedBy is stable, so the authenticated bubbles keep their order exactly and a
             // notice slots in after anything sent in the same millisecond.
             MessageReplyQuotes.resolve(
-                (bubbles + localMedia + preparingMedia + notices).sortedBy { it.sortEpochMillis },
+                (coalescedBubbles + localMedia + preparingMedia + notices)
+                    .sortedBy { it.sortEpochMillis },
             )
         }
         // Neither a reaction nor a correction is a bubble, a chat preview or an unread of its
@@ -3903,10 +3945,33 @@ class EncryptedChatRepository @Inject internal constructor(
                 }
             }
             .toMap()
+        val rosterAvatars = conversations.asSequence()
+            .flatMap { it.members.asSequence() }
+            .mapNotNull { member ->
+                member.avatarUrl?.trim()?.takeIf(String::isNotEmpty)?.let {
+                    member.userId.lowercase() to it
+                }
+            }
+            .toMap()
         // The remembered photos come first and the freshly loaded contacts overwrite them, so a
-        // chat list drawn before — or entirely without — a contacts fetch still shows faces, and a
-        // photo that has since changed is corrected the moment the network says so.
-        val avatarsByUser = profilePhotos?.currentPhotos().orEmpty() + contactAvatars
+        // chat list drawn before — or entirely without — a contacts fetch still shows faces.
+        // Conversation members are an authenticated first-sighting source; an already-loaded
+        // contact may replace that presentation only for the same exact public account ID.
+        val avatarsByUser = profilePhotos?.currentPhotos().orEmpty() +
+            rosterAvatars + contactAvatars
+        val rosterVerifications = conversations.asSequence()
+            .flatMap { it.members.asSequence() }
+            .mapNotNull { member ->
+                member.accountVerification?.let { member.userId.lowercase() to it }
+            }
+            .toMap()
+        val contactVerifications = localContacts.asSequence()
+            .filter { it.isKitUser && it.id.isNotBlank() }
+            .mapNotNull { contact ->
+                contact.accountVerification?.let { contact.id.lowercase() to it }
+            }
+            .toMap()
+        val accountVerificationsByUser = rosterVerifications + contactVerifications
         // A group is named by its server-visible title; a direct chat by whoever is on the other
         // end, preferring the local address book.
         fun AuthenticatedConversation.displayName(): String = if (isGroup) {
@@ -3941,6 +4006,15 @@ class EncryptedChatRepository @Inject internal constructor(
                     conversation.peerUserId?.let { avatarsByUser[it.lowercase()] }
                 },
                 description = conversation.description,
+                // Groups cannot inherit a member's designation. A direct chat receives a seal
+                // only from the peer's structured contact payload, matched by authenticated ID.
+                accountVerification = if (conversation.isGroup) {
+                    null
+                } else {
+                    conversation.peerUserId?.let {
+                        accountVerificationsByUser[it.lowercase()]
+                    }
+                },
             )
         }
         // Participant lists are ordered the way the group reads them: whoever can act on the
@@ -3960,6 +4034,7 @@ class EncryptedChatRepository @Inject internal constructor(
                         isSelf = member.userId == conversation.viewerUserId,
                         avatarUrl = avatarsByUser[member.userId.lowercase()],
                         savedInDevice = savedNames.containsKey(member.userId.lowercase()),
+                        accountVerification = accountVerificationsByUser[member.userId.lowercase()],
                     )
                 }.sortedWith(
                     compareBy<ChatMember> { it.role }
@@ -3971,7 +4046,7 @@ class EncryptedChatRepository @Inject internal constructor(
             chats = chats,
             messagesByConversation = messageLists,
             membersByConversation = membersByConversation,
-            learnedProfilePhotos = contactAvatars,
+            learnedProfilePhotos = rosterAvatars + contactAvatars,
         )
     }
 
@@ -4095,6 +4170,106 @@ class EncryptedChatRepository @Inject internal constructor(
             groupPaymentRequestId = requestId,
             groupPaymentRequestAction = action.wire,
             groupPaymentRequestContributionId = event.contributionId,
+            sortEpochMillis = event.occurredAt.toEpochMilli(),
+        )
+    }
+
+    /** Stable semantic identity shared by a KITGREQ1 hint and its server-owned timeline row. */
+    private data class GroupPaymentRequestPublicationIdentity(
+        val requestId: String,
+        val action: KitGroupPaymentRequestAction,
+        val contributionId: String?,
+    )
+
+    private fun Message.groupPaymentRequestPublicationIdentity():
+        GroupPaymentRequestPublicationIdentity? {
+        if (kind != MessageKind.GROUP_PAYMENT_REQUEST &&
+            kind != MessageKind.GROUP_PAYMENT_REQUEST_EVENT
+        ) return null
+        val requestId = groupPaymentRequestId ?: return null
+        val action = groupPaymentRequestAction
+            ?.let(KitGroupPaymentRequestAction::fromWire) ?: return null
+        val contributionId = when (action) {
+            KitGroupPaymentRequestAction.CONTRIBUTED ->
+                groupPaymentRequestContributionId ?: return null
+            KitGroupPaymentRequestAction.COMPLETED -> groupPaymentRequestContributionId
+            else -> null
+        }
+        return GroupPaymentRequestPublicationIdentity(requestId, action, contributionId)
+    }
+
+    /**
+     * Completion is the final contribution's sole server-visible transition. Current senders
+     * still publish that immutable contribution as a CONTRIBUTED KITGREQ1 hint, while legacy
+     * senders may publish a request-scoped COMPLETED hint. Both aliases therefore resolve to the
+     * richer COMPLETED authority, whose exact contribution ID remains on the rendered message.
+     */
+    private fun Message.authoritativeGroupRequestPublicationIdentities():
+        Set<GroupPaymentRequestPublicationIdentity> {
+        val primary = groupPaymentRequestPublicationIdentity() ?: return emptySet()
+        if (primary.action != KitGroupPaymentRequestAction.COMPLETED ||
+            primary.contributionId == null
+        ) return setOf(primary)
+        return setOf(
+            primary,
+            primary.copy(contributionId = null),
+            primary.copy(action = KitGroupPaymentRequestAction.CONTRIBUTED),
+        )
+    }
+
+    /** Converts only descriptors created after an exact authoritative terminal read. */
+    private fun toScheduledPaymentSystemMessage(
+        event: ConversationSystemEvent,
+        conversation: AuthenticatedConversation,
+    ): Message? {
+        val text = event.projectionText ?: return null
+        val direct = KitScheduledPaymentMessage.parse(text)
+        if (direct != null) {
+            val sender = event.userId ?: return null
+            return Message(
+                id = direct.deterministicMessageId(),
+                text = direct.reason.orEmpty(),
+                time = formatChatTime(event.occurredAt),
+                fromMe = sender.equals(conversation.viewerUserId, ignoreCase = true),
+                senderUserId = sender,
+                kind = MessageKind.SCHEDULED_PAYMENT_EVENT,
+                mediaDescriptor = text,
+                amountMinor = direct.amountMinor,
+                paymentNote = direct.note,
+                paymentReason = direct.reason,
+                paymentCurrencyCode = direct.currencyCode,
+                paymentCurrencyScale = direct.currencyScale,
+                scheduledAtEpochMillis = direct.scheduledAtEpochSeconds * 1_000L,
+                sortEpochMillis = event.occurredAt.toEpochMilli(),
+            )
+        }
+        val group = KitGroupPaymentMessage.parse(text)
+        if (group?.action == KitGroupPaymentAction.SENT) {
+            val sender = event.userId ?: return null
+            return Message(
+                id = deterministicUuid("scheduled-group-payment|${event.paymentId}|${group.groupPaymentId}"),
+                text = group.note.orEmpty(),
+                time = formatChatTime(event.occurredAt),
+                fromMe = sender.equals(conversation.viewerUserId, ignoreCase = true),
+                senderUserId = sender,
+                senderName = conversation.memberNamed(sender)?.name.safeChatContactName(),
+                kind = MessageKind.GROUP_PAYMENT,
+                mediaDescriptor = text,
+                groupPaymentId = group.groupPaymentId,
+                groupPaymentEvent = GroupPaymentEventKind.ANNOUNCED,
+                sortEpochMillis = event.occurredAt.toEpochMilli(),
+            )
+        }
+        val outcome = KitScheduledGroupPaymentOutcomeMessage.parse(text) ?: return null
+        return Message(
+            id = outcome.deterministicMessageId(),
+            text = "",
+            time = formatChatTime(event.occurredAt),
+            fromMe = true,
+            senderUserId = conversation.viewerUserId,
+            kind = MessageKind.SCHEDULED_GROUP_PAYMENT_EVENT,
+            mediaDescriptor = text,
+            scheduledAtEpochMillis = outcome.scheduledAtEpochSeconds * 1_000L,
             sortEpochMillis = event.occurredAt.toEpochMilli(),
         )
     }
@@ -4350,6 +4525,14 @@ class EncryptedChatRepository @Inject internal constructor(
         // resolved. The chat list says what happened without pretending to know who to.
         MessageKind.GROUP_PAYMENT -> "💛 Group payment"
         MessageKind.GROUP_PAYMENT_EVENT -> "💛 Group payment update"
+        MessageKind.SCHEDULED_PAYMENT_EVENT -> mediaDescriptor
+            ?.let(KitScheduledPaymentMessage::parse)
+            ?.let { "💸 Scheduled payment ${it.action.wire}" }
+            ?: "💸 Scheduled payment update"
+        MessageKind.SCHEDULED_GROUP_PAYMENT_EVENT -> mediaDescriptor
+            ?.let(KitScheduledGroupPaymentOutcomeMessage::parse)
+            ?.let { "💛 Scheduled group payment ${it.action.wire}" }
+            ?: "💛 Scheduled group payment update"
         else -> text
     }
 

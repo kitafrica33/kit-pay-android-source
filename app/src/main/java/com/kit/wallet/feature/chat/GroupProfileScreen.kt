@@ -515,6 +515,7 @@ private fun GroupMemberRow(
             size = 46.dp,
             online = member.online,
             avatarUrl = member.avatarUrl,
+            accountVerification = member.accountVerification,
         )
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {

@@ -11,6 +11,7 @@ import com.kit.wallet.data.notifications.PushMessagingTransport
 import com.kit.wallet.data.notifications.PushTokenCoordinator
 import com.kit.wallet.data.realtime.KitRealtimeCoordinator
 import com.kit.wallet.feature.calls.KitTelecomBridge
+import com.kit.wallet.worker.ForegroundWalletRefreshCoordinator
 import com.kit.wallet.worker.WalletRefreshScheduler
 import dagger.hilt.android.HiltAndroidApp
 import javax.inject.Inject
@@ -24,6 +25,8 @@ class KitApplication : Application(), Configuration.Provider, ImageLoaderFactory
     @Inject lateinit var pushTokens: dagger.Lazy<PushTokenCoordinator>
     @Inject lateinit var telecomBridge: dagger.Lazy<KitTelecomBridge>
     @Inject internal lateinit var realtime: dagger.Lazy<KitRealtimeCoordinator>
+    @Inject internal lateinit var foregroundWalletRefresh:
+        dagger.Lazy<ForegroundWalletRefreshCoordinator>
     @Inject lateinit var messageBackups: dagger.Lazy<MessageBackupService>
 
     override val workManagerConfiguration: Configuration
@@ -50,5 +53,8 @@ class KitApplication : Application(), Configuration.Provider, ImageLoaderFactory
         // is opened until the app is foregrounded, a session exists, and the server
         // actually advertises the transport.
         realtime.get().start()
+        // Room stays available immediately; this reconciles it only on genuine process-level
+        // foreground transitions and when a login is adopted while already foregrounded.
+        foregroundWalletRefresh.get().start()
     }
 }

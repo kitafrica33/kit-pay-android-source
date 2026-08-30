@@ -38,6 +38,7 @@ import com.kit.wallet.data.remote.ScheduledGroupPaymentPlanDto
 import com.kit.wallet.data.remote.ScheduledPaymentDto
 import com.kit.wallet.data.remote.ScheduledPaymentStatus
 import com.kit.wallet.data.remote.CreateScheduledPaymentRequest
+import com.kit.wallet.data.remote.CurrencyDto
 import com.kit.wallet.data.remote.PreviewScheduledGroupPaymentRequest
 import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.remote.isKitInsufficientFundsError
@@ -45,14 +46,17 @@ import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatPaymentRequest
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
+import com.kit.wallet.data.repository.DefinitiveFinancialMutationRejection
 import com.kit.wallet.data.repository.GroupPaymentDraftPolicy
 import com.kit.wallet.data.repository.GroupPaymentRepository
+import com.kit.wallet.data.repository.GroupPaymentRequestContributionResolution
 import com.kit.wallet.data.repository.GroupPaymentRequestRepository
 import com.kit.wallet.data.repository.ServerScheduledPaymentRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.data.repository.WalletSyncResult
 import com.kit.wallet.data.repository.canonicalTransferClaimReason
+import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.model.ChatPreview
@@ -130,6 +134,366 @@ internal data class ServerSchedulePreview(
     val currencyScale: Int,
     val recipientNames: List<String>,
 )
+
+internal sealed interface ServerScheduleCreation {
+    data class Direct(val payment: ScheduledPaymentDto) : ServerScheduleCreation
+    data class Group(val payment: ScheduledGroupPaymentDto) : ServerScheduleCreation
+}
+
+/** Executes one frozen schedule and persists the ambiguity boundary immediately before its POST. */
+internal suspend fun executePendingServerSchedule(
+    repository: ServerScheduledPaymentRepository,
+    store: PendingServerScheduleStore,
+    operation: PendingServerSchedule,
+    paymentPin: String,
+    now: Instant,
+    onSubmitted: (PendingServerSchedule) -> Unit = {},
+): ServerScheduleCreation = try {
+    val expectedOwner = store.requireOwner(operation)
+    val created = when (operation) {
+        is PendingServerSchedule.Group -> {
+            check(operation.phase == PendingServerSchedulePhase.SUBMITTED ||
+                operation.plan.isStructurallyValid(now)
+            ) { "This scheduled group payment preview expired. Review it again." }
+            val key = {
+                store.markSubmitted(operation).also(onSubmitted).idempotencyKey
+            }
+            ServerScheduleCreation.Group(
+                if (operation.phase == PendingServerSchedulePhase.SUBMITTED) {
+                    repository.replayGroup(operation.plan, key, paymentPin, expectedOwner)
+                } else {
+                    repository.createGroup(operation.plan, key, paymentPin, expectedOwner)
+                },
+            )
+        }
+        is PendingServerSchedule.Direct -> {
+            if (operation.phase == PendingServerSchedulePhase.PREPARED) {
+                val scheduledAt = Instant.parse(operation.request.scheduledFor).toEpochMilli()
+                ScheduledSend.schedulingError(scheduledAt, now.toEpochMilli())?.let(::error)
+            }
+            ServerScheduleCreation.Direct(
+                repository.createDirect(
+                    request = operation.request,
+                    currencyCode = operation.currencyCode,
+                    idempotencyKey = {
+                        store.markSubmitted(operation).also(onSubmitted).idempotencyKey
+                    },
+                    paymentPin = paymentPin,
+                    expectedOwner = expectedOwner,
+                ),
+            )
+        }
+    }
+    store.complete(operation)
+    created
+} catch (error: DefinitiveFinancialMutationRejection) {
+    val legacyExpiredDirectRejection = operation is PendingServerSchedule.Direct &&
+        operation.phase == PendingServerSchedulePhase.SUBMITTED &&
+        error.rejection.statusCode == 422 &&
+        ScheduledSend.schedulingError(
+            Instant.parse(operation.request.scheduledFor).toEpochMilli(),
+            now.toEpochMilli(),
+        ) != null
+    // Older servers checked freshness before idempotency replay. During rollout skew, their 422
+    // cannot prove whether the original POST committed, so the submitted identity must survive.
+    if (legacyExpiredDirectRejection) {
+        throw IllegalStateException(
+            "This submitted scheduled payment cannot be confirmed yet. Try again later.",
+            error.rejection,
+        )
+    }
+    store.complete(operation)
+    throw error.rejection
+}
+
+/**
+ * One durable identity for a group-request creation whose server result may already exist.
+ *
+ * A request does not have an ID until the server answers, so an ambiguous response cannot be
+ * reconciled with a GET. Persist the complete immutable intent and reuse its idempotency key until
+ * the resulting chat descriptor is durably queued. A changed intent is a different operation and
+ * must wait for the unresolved one instead of silently minting a second request.
+ */
+internal class GroupPaymentRequestCreationRetryStore(
+    private val state: SavedStateHandle,
+) {
+    private data class Intent(
+        val conversationId: String,
+        val destinationWalletId: String,
+        val amountMinor: Long,
+        val currencyScale: Int,
+        val note: String?,
+    )
+
+    private data class Pending(val intent: Intent, val key: String)
+
+    private var pending: Pending? = state.get<ArrayList<String>>(STATE_KEY)?.let { restored ->
+        check(restored.size == ENCODED_FIELD_COUNT) {
+            "Invalid saved group request creation retry"
+        }
+        val amount = restored[2].toLongOrNull()
+        val scale = restored[3].toIntOrNull()
+        val note = when (restored[4]) {
+            "0" -> null
+            "1" -> restored[5]
+            else -> error("Invalid saved group request creation retry")
+        }
+        val key = restored[6]
+        check(restored[0].isNotBlank() && restored[1].isNotBlank() &&
+            amount != null && amount > 0L && scale != null && scale in 0..6 &&
+            (note == null || note.isNotBlank() && note.length <= 280) &&
+            key.matches(RETRY_KEY)
+        ) { "Invalid saved group request creation retry" }
+        Pending(
+            Intent(restored[0].lowercase(), restored[1].lowercase(), amount, scale, note),
+            key,
+        )
+    }
+
+    fun keyFor(
+        conversationId: String,
+        destinationWalletId: String,
+        amountMinor: Long,
+        currencyScale: Int,
+        note: String?,
+    ): String {
+        val intent = intent(conversationId, destinationWalletId, amountMinor, currencyScale, note)
+        pending?.let { existing ->
+            check(existing.intent == intent) {
+                "Resolve the pending group payment request before changing its amount or note"
+            }
+            return existing.key
+        }
+        return "group-request:${UUID.randomUUID()}".also { key ->
+            pending = Pending(intent, key)
+            persist()
+        }
+    }
+
+    fun complete(
+        conversationId: String,
+        destinationWalletId: String,
+        amountMinor: Long,
+        currencyScale: Int,
+        note: String?,
+    ) {
+        val existing = pending ?: return
+        check(existing.intent == intent(
+            conversationId,
+            destinationWalletId,
+            amountMinor,
+            currencyScale,
+            note,
+        )) { "A different group payment request is still unresolved" }
+        pending = null
+        persist()
+    }
+
+    internal fun snapshot(): List<String>? = pending?.let { value ->
+        listOf(
+            value.intent.conversationId,
+            value.intent.destinationWalletId,
+            value.intent.amountMinor.toString(),
+            value.intent.currencyScale.toString(),
+            if (value.intent.note == null) "0" else "1",
+            value.intent.note.orEmpty(),
+            value.key,
+        )
+    }
+
+    private fun intent(
+        conversationId: String,
+        destinationWalletId: String,
+        amountMinor: Long,
+        currencyScale: Int,
+        note: String?,
+    ): Intent {
+        require(conversationId.isNotBlank() && destinationWalletId.isNotBlank())
+        require(amountMinor > 0L && currencyScale in 0..6)
+        require(note == null || note.isNotBlank() && note.length <= 280)
+        return Intent(
+            conversationId.lowercase(),
+            destinationWalletId.lowercase(),
+            amountMinor,
+            currencyScale,
+            note,
+        )
+    }
+
+    private fun persist() {
+        val encoded = snapshot()
+        if (encoded == null) state.remove<ArrayList<String>>(STATE_KEY)
+        else state[STATE_KEY] = ArrayList(encoded)
+    }
+
+    private companion object {
+        const val STATE_KEY = "pendingGroupPaymentRequestCreation"
+        const val ENCODED_FIELD_COUNT = 7
+        val RETRY_KEY = Regex("^[A-Za-z0-9._:-]{16,128}$")
+    }
+}
+
+/** Executes the retry-safe server half; the caller retires the key after durable chat sharing. */
+internal suspend fun executeGroupPaymentRequestCreation(
+    repository: GroupPaymentRequestRepository,
+    retryKeys: GroupPaymentRequestCreationRetryStore,
+    conversationId: String,
+    destinationWalletId: String,
+    amountMinor: Long,
+    currencyScale: Int,
+    note: String?,
+): GroupPaymentRequestDto = try {
+    repository.create(
+        conversationId = conversationId,
+        request = CreateCollaborativeGroupPaymentRequest(
+            destinationWalletId = destinationWalletId,
+            totalAmount = BigDecimal.valueOf(amountMinor, currencyScale).toPlainString(),
+            note = note,
+        ),
+        idempotencyKey = {
+            retryKeys.keyFor(
+                conversationId,
+                destinationWalletId,
+                amountMinor,
+                currencyScale,
+                note,
+            )
+        },
+    )
+} catch (error: DefinitiveFinancialMutationRejection) {
+    retryKeys.complete(
+        conversationId,
+        destinationWalletId,
+        amountMinor,
+        currencyScale,
+        note,
+    )
+    throw error.rejection
+}
+
+/** Saved retry identities for contribution POSTs whose result may still be ambiguous. */
+internal class GroupPaymentContributionRetryStore(
+    private val state: SavedStateHandle,
+) {
+    private data class Intent(
+        val requestId: String,
+        val sourceWalletId: String,
+        val amountMinor: Long,
+    )
+
+    private val keys = linkedMapOf<Intent, String>().apply {
+        val restored = state.get<ArrayList<String>>(STATE_KEY).orEmpty()
+        check(restored.size <= MAX_PENDING) { "Too many saved group contribution retries" }
+        restored.forEach { encoded ->
+            val fields = encoded.split('|', limit = 4)
+            val amount = fields.getOrNull(2)?.toLongOrNull()
+            val key = fields.getOrNull(3)
+            check(fields.size == 4 && fields[0].isNotBlank() && fields[1].isNotBlank() &&
+                amount != null && amount > 0L &&
+                key != null && key.matches(RETRY_KEY)
+            ) { "Invalid saved group contribution retry" }
+            val intent = Intent(fields[0].lowercase(), fields[1].lowercase(), amount)
+            check(keys.none { it.requestId == intent.requestId }) {
+                "Conflicting saved group contribution retries"
+            }
+            put(intent, key)
+        }
+    }
+
+    fun keyFor(requestId: String, sourceWalletId: String, amountMinor: Long): String {
+        val intent = intent(requestId, sourceWalletId, amountMinor)
+        requireCompatibleIfPending(intent)
+        keys.entries.firstOrNull { it.key.requestId == intent.requestId }?.let { pending ->
+            return pending.value
+        }
+        check(keys.size < MAX_PENDING) { "Too many unresolved group contributions" }
+        return keys.getOrPut(intent) { "group-contribution:${UUID.randomUUID()}" }
+            .also { persist() }
+    }
+
+    /** Checks a retry against an ambiguous intent without allocating a new identity. */
+    fun requireCompatibleIfPending(
+        requestId: String,
+        sourceWalletId: String,
+        amountMinor: Long,
+    ) {
+        requireCompatibleIfPending(intent(requestId, sourceWalletId, amountMinor))
+    }
+
+    fun complete(requestId: String, sourceWalletId: String, amountMinor: Long) {
+        keys.remove(Intent(requestId.lowercase(), sourceWalletId.lowercase(), amountMinor))
+        persist()
+    }
+
+    fun reconcile(requestId: String) {
+        val canonical = requestId.lowercase()
+        keys.keys.removeAll { it.requestId == canonical }
+        persist()
+    }
+
+    internal fun snapshot(): List<String> = keys.map { (intent, key) ->
+        "${intent.requestId}|${intent.sourceWalletId}|${intent.amountMinor}|$key"
+    }
+
+    private fun intent(requestId: String, sourceWalletId: String, amountMinor: Long): Intent {
+        require(requestId.isNotBlank() && sourceWalletId.isNotBlank() && amountMinor > 0L)
+        return Intent(requestId.lowercase(), sourceWalletId.lowercase(), amountMinor)
+    }
+
+    private fun requireCompatibleIfPending(intent: Intent) {
+        keys.keys.firstOrNull { it.requestId == intent.requestId }?.let { pending ->
+            check(pending == intent) {
+                "Resolve the pending contribution before changing its wallet or amount"
+            }
+        }
+    }
+
+    private fun persist() {
+        state[STATE_KEY] = ArrayList(snapshot())
+    }
+
+    private companion object {
+        const val STATE_KEY = "pendingGroupContributionRetryKeys"
+        const val MAX_PENDING = 32
+        val RETRY_KEY = Regex("^[A-Za-z0-9._:-]{16,128}$")
+    }
+}
+
+/** Runs one contribution attempt and retires its identity only after exact resolution. */
+internal suspend fun executeGroupPaymentRequestContribution(
+    repository: GroupPaymentRequestRepository,
+    retryKeys: GroupPaymentContributionRetryStore,
+    requestId: String,
+    sourceWalletId: String,
+    amountMinor: Long,
+    amount: String,
+    paymentPin: String,
+): GroupPaymentRequestContributionResolution {
+    // Exact preflight can reconcile a changed request without ever asking for the key. Prove the
+    // user's current intent first so that outcome cannot erase a different ambiguous operation.
+    retryKeys.requireCompatibleIfPending(requestId, sourceWalletId, amountMinor)
+    val resolution = try {
+        repository.contribute(
+            requestId = requestId,
+            sourceWalletId = sourceWalletId,
+            amount = amount,
+            idempotencyKey = {
+                retryKeys.keyFor(requestId, sourceWalletId, amountMinor)
+            },
+            paymentPin = paymentPin,
+        )
+    } catch (error: DefinitiveFinancialMutationRejection) {
+        retryKeys.reconcile(requestId)
+        throw error.rejection
+    }
+    when (resolution) {
+        is GroupPaymentRequestContributionResolution.Confirmed ->
+            retryKeys.complete(requestId, sourceWalletId, amountMinor)
+        is GroupPaymentRequestContributionResolution.Reconciled ->
+            retryKeys.reconcile(requestId)
+    }
+    return resolution
+}
 
 /**
  * Tracks the visible-conversation sound baseline across messaging epoch recovery. Projections
@@ -275,7 +639,12 @@ class ConversationViewModel @Inject internal constructor(
     private val scheduledSends: ScheduledSendStore? = null,
     private val scheduledDispatcher: ScheduledSendDispatcher? = null,
     private val clock: Clock = Clock.systemUTC(),
+    private val sessions: SessionStore? = null,
 ) : ViewModel() {
+
+    private val groupRequestCreationRetryKeys =
+        GroupPaymentRequestCreationRetryStore(savedStateHandle)
+    private val groupContributionRetryKeys = GroupPaymentContributionRetryStore(savedStateHandle)
 
     /** Current authenticated public ID; used only to bind server claims to this direct chat. */
     val currentAccountId: String?
@@ -287,6 +656,14 @@ class ConversationViewModel @Inject internal constructor(
     private val chatId: String = savedStateHandle.get<String>("chatId")
         ?.trim()
         .orEmpty()
+
+    private val pendingServerSchedules = PendingServerScheduleStore(savedStateHandle) {
+        sessions?.current()?.fence()
+    }
+    private val mutableServerScheduleApproval = MutableStateFlow(
+        pendingServerSchedules.restore(chatId, clock.millis())?.preview(),
+    )
+    internal val serverScheduleApproval = mutableServerScheduleApproval.asStateFlow()
 
     /** Exact login that owns every send-later action initiated by this conversation instance. */
     private val scheduledOwner = scheduledSends?.currentOwnerFence()
@@ -600,21 +977,12 @@ class ConversationViewModel @Inject internal constructor(
     private val mutableServerScheduledGroup =
         MutableStateFlow<List<ScheduledGroupPaymentDto>>(emptyList())
     val serverScheduledGroup = mutableServerScheduledGroup.asStateFlow()
-    private var directScheduleCursor: String? = null
-    private var groupScheduleCursor: String? = null
     private val mutableServerSchedulesHaveMore = MutableStateFlow(false)
     val serverSchedulesHaveMore = mutableServerSchedulesHaveMore.asStateFlow()
 
-    private data class PendingServerSchedule(
-        val chatId: String,
-        val amountMinor: Long,
-        val note: String?,
-        val scheduledAtEpochMillis: Long,
-        val idempotencyKey: String,
-        var groupPlan: ScheduledGroupPaymentPlanDto? = null,
-    )
-
-    private var pendingServerSchedule: PendingServerSchedule? = null
+    /** One logical cancellation keeps one key until the server confirms its terminal row. */
+    private val serverScheduleCancellationKeys = mutableMapOf<String, String>()
+    private val groupRequestCancellationKeys = mutableMapOf<String, String>()
 
     fun setServerSchedulingEnabled(direct: Boolean, group: Boolean) {
         val changed = direct != scheduledChatPaymentsEnabled || group != scheduledGroupPaymentsEnabled
@@ -627,7 +995,9 @@ class ConversationViewModel @Inject internal constructor(
 
     private data class UnsharedGroupPaymentRequest(
         val chatId: String,
+        val destinationWalletId: String,
         val amountMinor: Long,
+        val currencyScale: Int,
         val note: String?,
         val request: GroupPaymentRequestDto,
     )
@@ -653,6 +1023,14 @@ class ConversationViewModel @Inject internal constructor(
     val restoredDraft = mutableRestoredDraft.asStateFlow()
 
     init {
+        sessions?.let { sessionStore ->
+            viewModelScope.launch {
+                sessionStore.session.collect {
+                    mutableServerScheduleApproval.value =
+                        pendingServerSchedules.current(chatId)?.preview()
+                }
+            }
+        }
         if (chatId.isNotBlank()) {
             viewModelScope.launch {
                 mutableRestoredDraft.value =
@@ -1846,6 +2224,9 @@ class ConversationViewModel @Inject internal constructor(
             }
         }
         if (hydrated.isNotEmpty()) mutableGroupPaymentRequests.value = hydrated
+        hydrated.values.filter {
+            it.knownStatus != GroupPaymentRequestStatus.OPEN || !it.canContribute
+        }.forEach { groupContributionRetryKeys.reconcile(it.id) }
 
         val exact = hydrated.values.flatMap(GroupPaymentRequestDto::contributions)
             .associateBy { it.id.lowercase() }.toMutableMap()
@@ -1867,36 +2248,25 @@ class ConversationViewModel @Inject internal constructor(
         mutableGroupPaymentRequestContributions.value = exact
     }
 
-    private suspend fun refreshServerSchedules(replace: Boolean) {
+    private suspend fun refreshServerSchedules(@Suppress("UNUSED_PARAMETER") replace: Boolean) {
         val repo = serverScheduledPaymentRepo ?: return
         val selectedChat = chat.value ?: return
         if (!historyAvailable.value) return
         try {
             if (selectedChat.isGroup) {
                 if (!scheduledGroupPaymentsEnabled) return
-                val page = repo.groupPage(
-                    conversationId = selectedChat.id,
-                    status = ScheduledPaymentStatus.SCHEDULED,
-                    before = if (replace) null else groupScheduleCursor,
+                mutableServerScheduledGroup.value = repo.recoverGroup(
+                    selectedChat.id,
+                    mutableServerScheduledGroup.value,
                 )
-                mutableServerScheduledGroup.value = if (replace) page.items else {
-                    (mutableServerScheduledGroup.value + page.items).distinctBy { it.id }
-                }
-                groupScheduleCursor = page.nextBefore
-                mutableServerSchedulesHaveMore.value = page.hasMore
             } else {
                 if (!scheduledChatPaymentsEnabled) return
-                val page = repo.directPage(
-                    conversationId = selectedChat.id,
-                    status = ScheduledPaymentStatus.SCHEDULED,
-                    before = if (replace) null else directScheduleCursor,
+                mutableServerScheduledDirect.value = repo.recoverDirect(
+                    selectedChat.id,
+                    mutableServerScheduledDirect.value,
                 )
-                mutableServerScheduledDirect.value = if (replace) page.items else {
-                    (mutableServerScheduledDirect.value + page.items).distinctBy { it.id }
-                }
-                directScheduleCursor = page.nextBefore
-                mutableServerSchedulesHaveMore.value = page.hasMore
             }
+            mutableServerSchedulesHaveMore.value = false
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
@@ -1919,11 +2289,25 @@ class ConversationViewModel @Inject internal constructor(
             mutableError.value = null
             try {
                 if (group) {
-                    repo.cancelGroup(id, "scheduled-group-cancel:${UUID.randomUUID()}")
+                    val operation = "group:${id.lowercase()}"
+                    repo.cancelGroup(
+                        id,
+                        serverScheduleCancellationKeys.getOrPut(operation) {
+                            "scheduled-group-cancel:${UUID.randomUUID()}"
+                        },
+                    )
+                    serverScheduleCancellationKeys.remove(operation)
                     mutableServerScheduledGroup.value =
                         mutableServerScheduledGroup.value.filterNot { it.id == id }
                 } else {
-                    repo.cancelDirect(id, "scheduled-direct-cancel:${UUID.randomUUID()}")
+                    val operation = "direct:${id.lowercase()}"
+                    repo.cancelDirect(
+                        id,
+                        serverScheduleCancellationKeys.getOrPut(operation) {
+                            "scheduled-direct-cancel:${UUID.randomUUID()}"
+                        },
+                    )
+                    serverScheduleCancellationKeys.remove(operation)
                     mutableServerScheduledDirect.value =
                         mutableServerScheduledDirect.value.filterNot { it.id == id }
                 }
@@ -1937,7 +2321,7 @@ class ConversationViewModel @Inject internal constructor(
         }
     }
 
-    /** Resolves the exact direct destination or freezes a group roster before approval is shown. */
+    /** Resolves and freezes the exact direct intent before approval is shown. */
     internal fun prepareServerSchedule(
         amountMinor: Long,
         note: String?,
@@ -1947,9 +2331,10 @@ class ConversationViewModel @Inject internal constructor(
     ) {
         val selectedChat = chat.value ?: return
         val repo = serverScheduledPaymentRepo
+        val expectedOwner = sessions?.current()?.fence()
         val capabilityReady = if (selectedChat.isGroup) scheduledGroupPaymentsEnabled
         else scheduledChatPaymentsEnabled
-        if (!enabled || !capabilityReady || repo == null || mutableSending.value ||
+        if (!enabled || !capabilityReady || repo == null || expectedOwner == null || mutableSending.value ||
             !historyAvailable.value || amountMinor <= 0
         ) return
         ScheduledSend.schedulingError(scheduledAtEpochMillis, clock.millis())?.let {
@@ -1964,53 +2349,38 @@ class ConversationViewModel @Inject internal constructor(
                 val source = walletRepo.spendingSource()
                 val amount = BigDecimal.valueOf(amountMinor, source.currencyScale).toPlainString()
                 val scheduledFor = Instant.ofEpochMilli(scheduledAtEpochMillis).toString()
-                val operation = PendingServerSchedule(
-                    selectedChat.id,
-                    amountMinor,
-                    normalizedNote,
-                    scheduledAtEpochMillis,
-                    "server-schedule:${UUID.randomUUID()}",
-                )
-                val names = if (selectedChat.isGroup) {
-                    val plan = repo.previewGroup(
-                        selectedChat.id,
-                        PreviewScheduledGroupPaymentRequest(
+                check(!selectedChat.isGroup) { "Use the group schedule composer for a group" }
+                val peerId = selectedChat.peerUserId ?: error("This chat has no payment recipient")
+                var contact = contactRepo?.contacts?.value?.firstOrNull { it.id == peerId }
+                if (contact?.receivingWalletId == null) {
+                    contactRepo?.refresh()
+                    contact = contactRepo?.contacts?.value?.firstOrNull { it.id == peerId }
+                }
+                val destinationWalletId = contact?.receivingWalletId
+                    ?: error("This contact cannot receive a scheduled payment")
+                val operation = pendingServerSchedules.stage(
+                    PendingServerSchedule.Direct(
+                        chatId = selectedChat.id,
+                        idempotencyKey = "server-schedule:${UUID.randomUUID()}",
+                        phase = PendingServerSchedulePhase.PREPARED,
+                        request = CreateScheduledPaymentRequest(
                             sourceWalletId = source.walletId,
-                            splitMode = "even",
-                            audience = "all",
-                            totalAmount = amount,
+                            destinationWalletId = destinationWalletId,
+                            amount = amount,
                             note = normalizedNote,
                             scheduledFor = scheduledFor,
+                            conversationId = selectedChat.id,
                         ),
-                    )
-                    operation.groupPlan = plan
-                    plan.recipients.map { row ->
-                        groupMembers.value.firstOrNull { it.userId == row.userId }?.name
-                            ?: "Kit Pay member"
-                    }
-                } else {
-                    val peerId = selectedChat.peerUserId ?: error("This chat has no payment recipient")
-                    var contact = contactRepo?.contacts?.value?.firstOrNull { it.id == peerId }
-                    if (contact?.receivingWalletId == null) {
-                        contactRepo?.refresh()
-                        contact = contactRepo?.contacts?.value?.firstOrNull { it.id == peerId }
-                    }
-                    checkNotNull(contact?.receivingWalletId) {
-                        "This contact cannot receive a scheduled payment"
-                    }
-                    listOf(contact.name)
-                }
-                pendingServerSchedule = operation
-                onReady(
-                    ServerSchedulePreview(
-                        amountMinor,
-                        normalizedNote,
-                        scheduledAtEpochMillis,
-                        source.currencyCode,
-                        source.currencyScale,
-                        names,
+                        currencyCode = source.currencyCode,
+                        currencyScale = source.currencyScale,
+                        amountMinor = amountMinor,
+                        recipientName = contact.name,
                     ),
+                    expectedOwner,
                 )
+                val preview = operation.preview()
+                mutableServerScheduleApproval.value = preview
+                onReady(preview)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -2021,11 +2391,100 @@ class ConversationViewModel @Inject internal constructor(
         }
     }
 
-    /** Creates a backend-owned money schedule; local send-later storage is never involved. */
-    fun createServerSchedule(
-        amountMinor: Long,
+    /** Builds and verifies the complete group draft before its frozen plan is shown for approval. */
+    internal fun prepareServerGroupSchedule(
+        splitMode: GroupPaymentSplitMode,
+        audience: GroupPaymentAudience,
+        selected: List<GroupPaymentDraftPolicy.Member>,
+        totalInput: String,
+        customAmounts: Map<String, String>,
         note: String?,
         scheduledAtEpochMillis: Long,
+        idempotencyKey: String,
+        enabled: Boolean,
+        onReady: (ServerSchedulePreview) -> Unit,
+    ): Boolean {
+        val selectedChat = chat.value ?: return false
+        val repo = serverScheduledPaymentRepo ?: return false
+        val expectedOwner = sessions?.current()?.fence() ?: return false
+        if (!selectedChat.isGroup || !enabled || !scheduledGroupPaymentsEnabled ||
+            mutableSending.value || !historyAvailable.value
+        ) return false
+        ScheduledSend.schedulingError(scheduledAtEpochMillis, clock.millis())?.let {
+            mutableError.value = it
+            return false
+        }
+        mutableSending.value = true
+        mutableError.value = null
+        viewModelScope.launch {
+            try {
+                val source = walletRepo.spendingSource()
+                val drafted = GroupPaymentDraftPolicy.draft(
+                    sourceWalletId = source.walletId,
+                    splitMode = splitMode,
+                    audience = audience,
+                    selected = selected,
+                    totalInput = totalInput,
+                    customAmounts = customAmounts,
+                    note = note,
+                    scale = source.currencyScale,
+                    availableBalanceMinor = source.availableBalanceMinor,
+                )
+                val request = when (drafted) {
+                    is GroupPaymentDraftPolicy.Outcome.Ready -> drafted.request
+                    is GroupPaymentDraftPolicy.Outcome.Problem -> error(drafted.message)
+                }
+                val scheduledFor = Instant.ofEpochMilli(scheduledAtEpochMillis).toString()
+                val preview = PreviewScheduledGroupPaymentRequest(
+                    sourceWalletId = request.sourceWalletId,
+                    splitMode = request.splitMode,
+                    audience = request.audience,
+                    totalAmount = request.totalAmount,
+                    note = request.note,
+                    recipients = request.recipients,
+                    scheduledFor = scheduledFor,
+                )
+                val allowed = groupMembers.value.filterNot(ChatMember::isSelf)
+                    .map { it.userId.lowercase() }.toSet()
+                val plan = repo.previewGroup(
+                    selectedChat.id,
+                    preview,
+                    CurrencyDto(source.currencyCode, source.currencyScale.toString()),
+                    allowed,
+                    expectedOwner,
+                )
+                val scale = plan.currency.scale.toInt()
+                val operation = pendingServerSchedules.stage(
+                    PendingServerSchedule.Group(
+                        chatId = selectedChat.id,
+                        idempotencyKey = idempotencyKey,
+                        phase = PendingServerSchedulePhase.PREPARED,
+                        plan = plan,
+                        amountMinor = plan.totalAmount.toBigDecimal().movePointRight(scale)
+                            .longValueExact(),
+                        recipientNames = plan.recipients.map { row ->
+                            groupMembers.value.firstOrNull { it.userId == row.userId }?.name
+                                ?: error("Kit returned a recipient outside this group")
+                        },
+                    ),
+                    expectedOwner,
+                )
+                val approval = operation.preview()
+                mutableServerScheduleApproval.value = approval
+                onReady(approval)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                mutableError.value = error.message ?: "The scheduled group payment could not be previewed"
+            } finally {
+                mutableSending.value = false
+            }
+        }
+        return true
+    }
+
+    /** Creates a backend-owned money schedule; local send-later storage is never involved. */
+    fun createServerSchedule(
         paymentPin: String,
         enabled: Boolean,
         onDone: () -> Unit = {},
@@ -2037,83 +2496,53 @@ class ConversationViewModel @Inject internal constructor(
         } else {
             scheduledChatPaymentsEnabled
         }
-        if (!enabled || !capabilityReady || repo == null || mutableSending.value ||
-            !historyAvailable.value || amountMinor <= 0
+        val operation = pendingServerSchedules.current(selectedChat.id)
+        if (!enabled || !capabilityReady || repo == null || operation == null ||
+            mutableSending.value || !historyAvailable.value
         ) return
-        ScheduledSend.schedulingError(scheduledAtEpochMillis, clock.millis())?.let {
-            mutableError.value = it
-            return
-        }
-        val normalizedNote = note?.trim()?.takeIf(String::isNotBlank)?.take(280)
-        val retained = pendingServerSchedule?.takeIf {
-            it.chatId == selectedChat.id && it.amountMinor == amountMinor &&
-                it.note == normalizedNote && it.scheduledAtEpochMillis == scheduledAtEpochMillis &&
-                (!selectedChat.isGroup || it.groupPlan?.isStructurallyValid(clock.instant()) != false)
-        }
-        val operation = retained ?: PendingServerSchedule(
-            selectedChat.id,
-            amountMinor,
-            normalizedNote,
-            scheduledAtEpochMillis,
-            "server-schedule:${UUID.randomUUID()}",
-        ).also { pendingServerSchedule = it }
         viewModelScope.launch {
             mutableSending.value = true
             mutableError.value = null
             try {
-                val source = walletRepo.spendingSource()
-                val amount = BigDecimal.valueOf(amountMinor, source.currencyScale).toPlainString()
-                val scheduledFor = Instant.ofEpochMilli(scheduledAtEpochMillis).toString()
-                if (selectedChat.isGroup) {
-                    val plan = operation.groupPlan ?: repo.previewGroup(
-                        selectedChat.id,
-                        PreviewScheduledGroupPaymentRequest(
-                            sourceWalletId = source.walletId,
-                            splitMode = "even",
-                            audience = "all",
-                            totalAmount = amount,
-                            note = normalizedNote,
-                            scheduledFor = scheduledFor,
-                        ),
-                    ).also { operation.groupPlan = it }
-                    val created = repo.createGroup(plan, operation.idempotencyKey, paymentPin)
-                    mutableServerScheduledGroup.value =
-                        listOf(created) + mutableServerScheduledGroup.value.filterNot { it.id == created.id }
-                } else {
-                    val peerId = selectedChat.peerUserId ?: error("This chat has no payment recipient")
-                    var contact = contactRepo?.contacts?.value?.firstOrNull { it.id == peerId }
-                    if (contact?.receivingWalletId == null) {
-                        contactRepo?.refresh()
-                        contact = contactRepo?.contacts?.value?.firstOrNull { it.id == peerId }
+                when (val created = executePendingServerSchedule(
+                    repository = repo,
+                    store = pendingServerSchedules,
+                    operation = operation,
+                    paymentPin = paymentPin,
+                    now = clock.instant(),
+                    onSubmitted = { mutableServerScheduleApproval.value = it.preview() },
+                )) {
+                    is ServerScheduleCreation.Group -> {
+                        mutableServerScheduledGroup.value = listOf(created.payment) +
+                            mutableServerScheduledGroup.value.filterNot {
+                                it.id == created.payment.id
+                            }
                     }
-                    val destinationWalletId = contact?.receivingWalletId
-                        ?: error("This contact cannot receive a scheduled payment")
-                    val created = repo.createDirect(
-                        request = CreateScheduledPaymentRequest(
-                            sourceWalletId = source.walletId,
-                            destinationWalletId = destinationWalletId,
-                            amount = amount,
-                            note = normalizedNote,
-                            scheduledFor = scheduledFor,
-                            conversationId = selectedChat.id,
-                        ),
-                        currencyCode = source.currencyCode,
-                        idempotencyKey = operation.idempotencyKey,
-                        paymentPin = paymentPin,
-                    )
-                    mutableServerScheduledDirect.value =
-                        listOf(created) + mutableServerScheduledDirect.value.filterNot { it.id == created.id }
+                    is ServerScheduleCreation.Direct -> {
+                        mutableServerScheduledDirect.value = listOf(created.payment) +
+                            mutableServerScheduledDirect.value.filterNot {
+                                it.id == created.payment.id
+                            }
+                    }
                 }
-                pendingServerSchedule = null
+                mutableServerScheduleApproval.value = null
                 onDone()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
+                mutableServerScheduleApproval.value =
+                    pendingServerSchedules.current(selectedChat.id)?.preview()
                 mutableError.value = error.message ?: "The payment could not be scheduled"
             } finally {
                 mutableSending.value = false
             }
         }
+    }
+
+    /** Only a reviewed operation is dismissible; an ambiguous POST remains visible for replay. */
+    fun dismissServerScheduleApproval() {
+        pendingServerSchedules.discardPrepared()
+        mutableServerScheduleApproval.value = pendingServerSchedules.current(chatId)?.preview()
     }
 
     /** Creates the authoritative request before mirroring its canonical encrypted card. */
@@ -2139,19 +2568,26 @@ class ConversationViewModel @Inject internal constructor(
                 val scale = destination.currencyScale
                 val normalizedNote = note?.trim()?.takeIf(String::isNotBlank)?.take(280)
                 val created = unsharedGroupPaymentRequest?.takeIf {
-                    it.chatId == selectedChat.id && it.amountMinor == amountMinor &&
+                    it.chatId == selectedChat.id &&
+                        it.destinationWalletId == destination.walletId &&
+                        it.amountMinor == amountMinor && it.currencyScale == scale &&
                         it.note == normalizedNote
-                }?.request ?: repo.create(
+                }?.request ?: executeGroupPaymentRequestCreation(
+                    repository = repo,
+                    retryKeys = groupRequestCreationRetryKeys,
                     conversationId = selectedChat.id,
-                    request = CreateCollaborativeGroupPaymentRequest(
-                        destinationWalletId = destination.walletId,
-                        totalAmount = BigDecimal.valueOf(amountMinor, scale).toPlainString(),
-                        note = normalizedNote,
-                    ),
-                    idempotencyKey = "group-request:${UUID.randomUUID()}",
+                    destinationWalletId = destination.walletId,
+                    amountMinor = amountMinor,
+                    currencyScale = scale,
+                    note = normalizedNote,
                 ).also { confirmed ->
                     unsharedGroupPaymentRequest = UnsharedGroupPaymentRequest(
-                        selectedChat.id, amountMinor, normalizedNote, confirmed,
+                        selectedChat.id,
+                        destination.walletId,
+                        amountMinor,
+                        scale,
+                        normalizedNote,
+                        confirmed,
                     )
                 }
                 mutableGroupPaymentRequests.value += created.id to created
@@ -2167,7 +2603,23 @@ class ConversationViewModel @Inject internal constructor(
                 )
                 chatRepo.sendGroupPaymentRequestEvent(selectedChat.id, descriptor.encode()) {
                     durablyShared = true
+                    groupRequestCreationRetryKeys.complete(
+                        selectedChat.id,
+                        destination.walletId,
+                        amountMinor,
+                        scale,
+                        normalizedNote,
+                    )
                 }
+                // Every production send path invokes the callback at durable commit. Retiring here
+                // as well makes the lifecycle explicit for compatible repository implementations.
+                groupRequestCreationRetryKeys.complete(
+                    selectedChat.id,
+                    destination.walletId,
+                    amountMinor,
+                    scale,
+                    normalizedNote,
+                )
                 unsharedGroupPaymentRequest = null
                 onSent()
             } catch (cancelled: CancellationException) {
@@ -2212,26 +2664,39 @@ class ConversationViewModel @Inject internal constructor(
                 check(source.currencyCode == authority.currency.code && source.currencyScale == scale) {
                     "This request uses another currency"
                 }
-                val result = repo.contribute(
+                when (val resolution = executeGroupPaymentRequestContribution(
+                    repository = repo,
+                    retryKeys = groupContributionRetryKeys,
                     requestId = authority.id,
                     sourceWalletId = source.walletId,
+                    amountMinor = amountMinor,
                     amount = BigDecimal.valueOf(amountMinor, scale).toPlainString(),
-                    idempotencyKey = "group-contribution:${UUID.randomUUID()}",
                     paymentPin = paymentPin,
-                )
-                mutableGroupPaymentRequests.value += result.request.id to result.request
-                mutableGroupPaymentRequestContributions.value +=
-                    result.contribution.id to result.contribution
-                // Keep the exact contribution id even when this row closes the request. The card's
-                // authoritative status decides whether the actor "contributed" or "completed" it.
-                KitGroupPaymentRequestMessage.create(
-                    action = KitGroupPaymentRequestAction.CONTRIBUTED,
-                    requestId = result.request.id,
-                    contributionId = result.contribution.id,
-                    amountMinor = result.contribution.amountMinor.toLong(),
-                )?.let { descriptor ->
-                    runCatching {
-                        chatRepo.sendGroupPaymentRequestEvent(selectedChat.id, descriptor.encode())
+                )) {
+                    is GroupPaymentRequestContributionResolution.Confirmed -> {
+                        val result = resolution.result
+                        mutableGroupPaymentRequests.value += result.request.id to result.request
+                        mutableGroupPaymentRequestContributions.value +=
+                            result.contribution.id to result.contribution
+                        // Keep the exact contribution id even when this row closes the request. The
+                        // authoritative status decides whether the actor contributed or completed it.
+                        KitGroupPaymentRequestMessage.create(
+                            action = KitGroupPaymentRequestAction.CONTRIBUTED,
+                            requestId = result.request.id,
+                            contributionId = result.contribution.id,
+                            amountMinor = result.contribution.amountMinor.toLong(),
+                        )?.let { descriptor ->
+                            runCatching {
+                                chatRepo.sendGroupPaymentRequestEvent(
+                                    selectedChat.id,
+                                    descriptor.encode(),
+                                )
+                            }
+                        }
+                    }
+                    is GroupPaymentRequestContributionResolution.Reconciled -> {
+                        mutableGroupPaymentRequests.value +=
+                            resolution.request.id to resolution.request
                     }
                 }
                 onDone()
@@ -2260,10 +2725,14 @@ class ConversationViewModel @Inject internal constructor(
             mutableSending.value = true
             mutableError.value = null
             try {
+                val operation = authority.id.lowercase()
                 val cancelled = repo.cancel(
                     requestId = authority.id,
-                    idempotencyKey = "group-request-cancel:${UUID.randomUUID()}",
+                    idempotencyKey = groupRequestCancellationKeys.getOrPut(operation) {
+                        "group-request-cancel:${UUID.randomUUID()}"
+                    },
                 )
+                groupRequestCancellationKeys.remove(operation)
                 mutableGroupPaymentRequests.value += cancelled.id to cancelled
                 KitGroupPaymentRequestMessage.create(
                     KitGroupPaymentRequestAction.CANCELLED,

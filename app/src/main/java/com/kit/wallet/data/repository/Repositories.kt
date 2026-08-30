@@ -6,6 +6,7 @@ import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.ui.model.Beneficiary
 import com.kit.wallet.ui.model.BillProvider
 import com.kit.wallet.ui.model.BankInstitution
+import com.kit.wallet.ui.model.AccountVerification
 import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.model.ChatMember
 import com.kit.wallet.ui.model.ChatMemberRole
@@ -711,6 +712,9 @@ data class IncomingCallDetails(
     val name: String,
     val phone: String? = null,
     val participantUserIds: List<String> = emptyList(),
+    val participants: List<CallParticipantIdentity> = emptyList(),
+    val avatarUrl: String? = null,
+    val accountVerification: AccountVerification? = null,
     val video: Boolean,
     val direction: String,
     val state: String,
@@ -734,6 +738,9 @@ data class CallConnection(
     val name: String,
     val phone: String? = null,
     val participantUserIds: List<String> = emptyList(),
+    val participants: List<CallParticipantIdentity> = emptyList(),
+    val avatarUrl: String? = null,
+    val accountVerification: AccountVerification? = null,
     val video: Boolean,
     val provider: String,
     val url: String,
@@ -747,6 +754,14 @@ data class CallConnection(
     val serverTime: String? = null,
     /** Server-reported conversation the call belongs to; null when it reported none. */
     val conversationId: String? = null,
+)
+
+/** Server-authenticated first-sighting presentation bound to one exact public account ID. */
+data class CallParticipantIdentity(
+    val userId: String,
+    val name: String? = null,
+    val avatarUrl: String? = null,
+    val accountVerification: AccountVerification? = null,
 )
 
 interface BillsRepository {

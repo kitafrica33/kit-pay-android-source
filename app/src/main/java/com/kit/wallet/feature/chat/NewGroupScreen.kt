@@ -237,7 +237,12 @@ internal fun SelectableContactRow(
             .padding(horizontal = 20.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        KitAvatar(contact.name, size = 46.dp, avatarUrl = contact.avatarUrl)
+        KitAvatar(
+            contact.name,
+            size = 46.dp,
+            avatarUrl = contact.avatarUrl,
+            accountVerification = contact.accountVerification,
+        )
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
             Text(

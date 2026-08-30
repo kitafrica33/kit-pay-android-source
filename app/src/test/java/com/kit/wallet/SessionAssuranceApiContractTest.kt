@@ -32,12 +32,16 @@ class SessionAssuranceApiContractTest {
     @After fun tearDown() = server.shutdown()
 
     @Test fun `session assurance and both unlock methods preserve wire names`() = runTest {
-        val assurance = """{"session_assurance":{"device_identity":{"status":"verified","required":true,"epoch":2,"verified_at":"2026-08-22T12:00:00Z"},"login_unlock":{"status":"unlocked","required":true,"methods":["pin","biometric_signature"],"method":"pin","unlocked_at":"2026-08-22T12:00:00Z"},"access":"full"},"method":"pin"}"""
+        val assurance = """{"session_assurance":{"device_identity":{"status":"verified","required":true,"epoch":2,"verified_at":"2026-08-22T12:00:00Z"},"login_unlock":{"status":"unlocked","required":true,"methods":["pin","biometric_signature"],"method":"pin","unlocked_at":"2026-08-22T12:00:00Z"},"access":"full","communication_access":{"allowed":true,"basis":"full_assurance","required_action":null},"financial_access":{"allowed":true,"basis":"full_assurance","required_action":null,"read_only":false}},"method":"pin"}"""
         repeat(2) { server.enqueue(ok(assurance)) }
         server.enqueue(ok("""{"challenge_id":"challenge","nonce":"nonce-value-with-at-least-32-characters","signing_payload":"payload","expires_at":"2026-08-22T13:00:00Z"}"""))
         server.enqueue(ok(assurance.replace("\"pin\"}", "\"biometric_signature\"}")))
 
-        assertEquals("full", api.sessionAssurance().data!!.sessionAssurance.access)
+        val decoded = api.sessionAssurance().data!!.sessionAssurance
+        assertEquals("full", decoded.access)
+        assertTrue(decoded.communicationAccess?.allowed == true)
+        assertEquals("full_assurance", decoded.communicationAccess?.basis)
+        assertEquals(false, decoded.financialAccess?.readOnly)
         assertEquals("/api/kit-wallet/v1/auth/session-assurance", server.takeRequest().path)
 
         api.unlockSessionWithPin(LoginUnlockPinRequest("1234"))

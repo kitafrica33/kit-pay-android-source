@@ -33,6 +33,10 @@ data class ProfileEntity(
      */
     val usernameRequired: Boolean = true,
     val updatedAtEpochMillis: Long,
+    /** Exact accepted server designation backing the public blue seal, never a KYC derivative. */
+    val verificationDesignation: String? = null,
+    /** Grant timestamp paired with [verificationDesignation], retained for faithful projection. */
+    val verificationSince: String? = null,
 ) {
     companion object {
         const val SINGLETON_ID = 1
@@ -72,6 +76,10 @@ data class WalletTransactionEntity(
     val direction: String,
     val status: String,
     val counterpartyName: String,
+    val counterpartyUserId: String? = null,
+    val counterpartyAvatarUrl: String? = null,
+    val counterpartyVerificationDesignation: String? = null,
+    val counterpartyVerificationSince: String? = null,
     val note: String?,
     val occurredAtEpochMillis: Long,
 )

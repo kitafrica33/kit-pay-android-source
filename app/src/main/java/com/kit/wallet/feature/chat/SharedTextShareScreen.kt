@@ -63,6 +63,7 @@ import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.KitGreenButton
+import com.kit.wallet.ui.model.AccountVerification
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.security.SecureScreen
@@ -95,11 +96,13 @@ internal sealed interface SharedRecipient {
     val stableId: String
     val name: String
     val avatarUrl: String?
+    val accountVerification: AccountVerification?
 
     data class Conversation(val chat: ChatPreview) : SharedRecipient {
         override val stableId: String = "conversation:${chat.id}"
         override val name: String = chat.name
         override val avatarUrl: String? = chat.avatarUrl
+        override val accountVerification: AccountVerification? = chat.accountVerification
     }
 
     data class Person(
@@ -110,6 +113,7 @@ internal sealed interface SharedRecipient {
         override val stableId: String = "contact:${contact.id}"
         override val name: String = contact.name
         override val avatarUrl: String? = contact.avatarUrl
+        override val accountVerification: AccountVerification? = contact.accountVerification
     }
 }
 
@@ -745,6 +749,7 @@ private fun RecipientRow(
             size = 44.dp,
             online = chat?.online == true,
             avatarUrl = recipient.avatarUrl,
+            accountVerification = recipient.accountVerification,
         )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
@@ -782,7 +787,12 @@ private fun SharePreview(
     ) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                KitAvatar(recipient.name, size = 36.dp, avatarUrl = recipient.avatarUrl)
+                KitAvatar(
+                    recipient.name,
+                    size = 36.dp,
+                    avatarUrl = recipient.avatarUrl,
+                    accountVerification = recipient.accountVerification,
+                )
                 Spacer(Modifier.width(10.dp))
                 Column {
                     Text("To", style = MaterialTheme.typography.labelSmall)

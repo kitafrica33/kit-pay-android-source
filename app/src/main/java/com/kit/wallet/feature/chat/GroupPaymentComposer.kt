@@ -65,6 +65,17 @@ internal typealias GroupPaymentSendHandler = (
     onSent: () -> Unit,
 ) -> Boolean
 
+internal typealias GroupPaymentReviewHandler = (
+    splitMode: GroupPaymentSplitMode,
+    audience: GroupPaymentAudience,
+    selected: List<GroupPaymentDraftPolicy.Member>,
+    totalInput: String,
+    customAmounts: Map<String, String>,
+    note: String?,
+    idempotencyKey: String,
+    onReady: () -> Unit,
+) -> Boolean
+
 /**
  * One canonical payment intent gets one payment identity and one in-flight submission.
  *
@@ -187,6 +198,10 @@ internal fun GroupPaymentComposerDialog(
     biometricsAvailable: Boolean,
     onDismiss: () -> Unit,
     onSend: GroupPaymentSendHandler,
+    title: String = "Pay the group",
+    explanation: String = "Each member claims their own share here, in this chat. Anything nobody " +
+        "claims comes back to you.",
+    onReview: GroupPaymentReviewHandler? = null,
 ) {
     // Only other people can be paid: a payment to yourself is not one, and the server refuses it.
     val payable = remember(members) { members.filterNot { it.isSelf } }
@@ -236,7 +251,7 @@ internal fun GroupPaymentComposerDialog(
 
     AlertDialog(
         onDismissRequest = { if (!sending) onDismiss() },
-        title = { Text("Pay the group") },
+        title = { Text(title) },
         text = {
             Column(
                 Modifier
@@ -245,8 +260,7 @@ internal fun GroupPaymentComposerDialog(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Text(
-                    "Each member claims their own share here, in this chat. Anything nobody " +
-                        "claims comes back to you.",
+                    explanation,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -367,34 +381,54 @@ internal fun GroupPaymentComposerDialog(
                 )
 
                 Spacer(Modifier.width(0.dp))
-                PaymentApproval(
-                    actionLabel = "Send to ${recipientCountLabel(selected.size)}",
-                    biometricsAvailable = biometricsAvailable,
-                    busy = sending,
-                    error = error,
-                    // The policy has the wallet's balance and the currency's scale, and this
-                    // screen has neither. All that is checked here is that there is something to
-                    // approve at all.
-                    enabled = selected.isNotEmpty(),
-                    onApprove = { pin ->
-                        if (submission.tryBegin()) {
-                            val accepted = onSend(
-                                splitMode,
-                                audience,
-                                selected,
-                                total,
-                                customAmounts.toMap(),
-                                note.trim().ifBlank { null },
-                                pin,
-                                submission.idempotencyKey,
-                            ) {
-                                if (submission.completeOnce()) onDismiss()
+                if (onReview == null) {
+                    PaymentApproval(
+                        actionLabel = "Send to ${recipientCountLabel(selected.size)}",
+                        biometricsAvailable = biometricsAvailable,
+                        busy = sending,
+                        error = error,
+                        enabled = selected.isNotEmpty(),
+                        onApprove = { pin ->
+                            if (submission.tryBegin()) {
+                                val accepted = onSend(
+                                    splitMode,
+                                    audience,
+                                    selected,
+                                    total,
+                                    customAmounts.toMap(),
+                                    note.trim().ifBlank { null },
+                                    pin,
+                                    submission.idempotencyKey,
+                                ) {
+                                    if (submission.completeOnce()) onDismiss()
+                                }
+                                if (!accepted) submission.releaseForRetry()
                             }
-                            if (!accepted) submission.releaseForRetry()
-                        }
-                    },
-                    pinSubtitle = "Authorizes this group payment from your wallet.",
-                )
+                        },
+                        pinSubtitle = "Authorizes this group payment from your wallet.",
+                    )
+                } else {
+                    TextButton(
+                        enabled = !sending && selected.isNotEmpty(),
+                        onClick = {
+                            if (submission.tryBegin()) {
+                                val accepted = onReview(
+                                    splitMode,
+                                    audience,
+                                    selected,
+                                    total,
+                                    customAmounts.toMap(),
+                                    note.trim().ifBlank { null },
+                                    submission.idempotencyKey,
+                                ) {
+                                    if (submission.completeOnce()) onDismiss()
+                                }
+                                if (!accepted) submission.releaseForRetry()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text(if (sending) "Checking…" else "Review scheduled payment") }
+                }
             }
         },
         confirmButton = {},

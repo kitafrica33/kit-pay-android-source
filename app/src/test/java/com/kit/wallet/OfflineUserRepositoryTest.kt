@@ -14,6 +14,7 @@ import com.kit.wallet.data.repository.OfflineUserRepository
 import com.kit.wallet.data.repository.ProfilePhotoDirectory
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
+import com.kit.wallet.ui.model.AccountVerificationDesignation
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.time.Clock
@@ -119,6 +120,27 @@ class OfflineUserRepositoryTest {
         val request = server.takeRequest()
         assertEquals("/api/kit-wallet/v1/profile", request.path)
         assertEquals("PATCH", request.method)
+    }
+
+    @Test
+    fun `profile refresh persists and publishes the server account designation`() = runTest {
+        server.enqueue(jsonResponse(OFFICIAL_PROFILE_JSON))
+        val profiles = FakeProfileDao()
+        val repository = repository(profiles)
+
+        repository.refreshProfile()
+        runCurrent()
+
+        assertEquals("official", profiles.value.value?.verificationDesignation)
+        assertEquals("2026-08-28T10:00:00Z", profiles.value.value?.verificationSince)
+        assertEquals(
+            AccountVerificationDesignation.OFFICIAL,
+            repository.profile.value.accountVerification?.designation,
+        )
+        assertEquals(
+            "2026-08-28T10:00:00Z",
+            repository.profile.value.accountVerification?.since,
+        )
     }
 
     @Test
@@ -389,6 +411,10 @@ class OfflineUserRepositoryTest {
 
         val COMPLETED_PROFILE_JSON = """
             {"ok":true,"data":{"id":"user-1","name":"Amina Yusuf","phone":"+256700000200","tag":"amina","kyc_status":"not_started","email_verified":null,"phone_verified":null,"mfa_enabled":null,"payment_pin_set":null,"profile_setup_required":false},"meta":{"request_id":"request-profile"}}
+        """.trimIndent()
+
+        val OFFICIAL_PROFILE_JSON = """
+            {"ok":true,"data":{"id":"user-1","name":"Amina Yusuf","phone":"+256700000200","tag":"amina","kyc_status":"not_started","verification":{"designation":"official","since":"2026-08-28T10:00:00Z"},"email_verified":null,"phone_verified":null,"mfa_enabled":null,"payment_pin_set":null,"profile_setup_required":false},"meta":{"request_id":"request-profile-official"}}
         """.trimIndent()
 
         /** As the API answers once the username is gone: a null tag, and `name` falling back. */

@@ -13,6 +13,8 @@ import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.FinancialOperationQuote
 import com.kit.wallet.data.repository.MobileMoneyRepository
 import com.kit.wallet.data.repository.ProfilePhotoDirectory
+import com.kit.wallet.data.repository.ProfileEmailChallenge
+import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.data.repository.WalletCurrency
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.data.repository.WalletSyncRepository
@@ -33,6 +35,7 @@ import com.kit.wallet.ui.model.MobileMoneyOperation
 import com.kit.wallet.ui.model.MobileMoneyVerificationState
 import com.kit.wallet.ui.model.TopUp
 import com.kit.wallet.ui.model.Transaction
+import com.kit.wallet.ui.model.UserProfile
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -246,6 +249,7 @@ class TopUpViewModelTest {
         wallet = wallet,
         walletSync = sync,
         contacts = EmptyContactRepository,
+        users = EmptyUserRepository,
         beneficiaryContacts = BeneficiaryContactDirectory(
             EmptyBeneficiaryContactDao,
             MutableTestSessionStore(testSession("top-up")),
@@ -258,6 +262,17 @@ class TopUpViewModelTest {
             scope,
         ),
     )
+
+    private object EmptyUserRepository : UserRepository {
+        override val profile: StateFlow<UserProfile> = MutableStateFlow(
+            UserProfile(name = "", phone = "", tag = "", kycLabel = ""),
+        )
+        override suspend fun refreshProfile() = Unit
+        override suspend fun updateProfile(name: String, tag: String) = Unit
+        override suspend fun requestEmailAttachment(email: String): ProfileEmailChallenge =
+            error("Unused")
+        override suspend fun verifyEmailAttachment(challengeId: String, code: String) = Unit
+    }
 
     private class CancellationInsensitiveWalletSync(
         private val gate: CompletableDeferred<Unit>,

@@ -15,6 +15,7 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -43,7 +44,7 @@ class SessionTokensTest {
     }
 
     @Test
-    fun `profile setup state and cache owner survive encrypted payload round trip`() {
+    fun `profile setup state cache owner and scoped access survive encrypted restart`() {
         val assurance = CachedSessionAssurance(
             access = "restricted",
             deviceIdentityStatus = "verified",
@@ -51,13 +52,23 @@ class SessionTokensTest {
             loginUnlockStatus = "locked",
             loginUnlockRequired = true,
             loginUnlockMethods = listOf("pin", "biometric_signature"),
+            communicationAccessAllowed = true,
+            communicationAccessBasis = "account_onboarding",
+            communicationRequiredAction = null,
+            financialAccessAllowed = false,
+            financialAccessBasis = "account_onboarding",
+            financialRequiredAction = "identity_verification_required",
+            financialReadOnly = false,
         )
-        val restored = tokens.copy(
+        val persisted = tokens.copy(
             accountId = "account-1",
             cacheScopeId = "account-1:session",
             profileSetupState = ProfileSetupState.REQUIRED,
             cachedAssurance = assurance,
-        ).toDiskPayload().toSessionTokens()
+        ).toDiskPayload()
+        val encryptedPayloadPlaintext = diskAdapter.toJson(persisted)
+        val restored = checkNotNull(diskAdapter.fromJson(encryptedPayloadPlaintext))
+            .toSessionTokens()
 
         assertEquals("account-1", restored.accountId)
         assertEquals("account-1:session", restored.cacheScopeId)
@@ -65,6 +76,24 @@ class SessionTokensTest {
         assertEquals(assurance, restored.cachedAssurance)
         assertEquals(tokens.refreshReplayNonce, restored.refreshReplayNonce)
         assertTrue(restored.profileSetupState.requiresSetup)
+    }
+
+    @Test
+    fun `pre scoped encrypted assurance restores with compatibility defaults`() {
+        val legacy = checkNotNull(
+            diskAdapter.fromJson(
+                """{"accessToken":"access","refreshToken":"refresh","sessionId":"legacy-session","accessTokenExpiresAtEpochSeconds":null,"cachedAssurance":{"access":"restricted","deviceIdentityStatus":"required","deviceIdentityRequired":true,"loginUnlockStatus":"locked","loginUnlockRequired":false,"loginUnlockMethods":[]}}""",
+            ),
+        ).toSessionTokens()
+
+        val assurance = checkNotNull(legacy.cachedAssurance)
+        assertNull(assurance.communicationAccessAllowed)
+        assertNull(assurance.communicationAccessBasis)
+        assertNull(assurance.communicationRequiredAction)
+        assertNull(assurance.financialAccessAllowed)
+        assertNull(assurance.financialAccessBasis)
+        assertNull(assurance.financialRequiredAction)
+        assertFalse(assurance.financialReadOnly)
     }
 
     @Test

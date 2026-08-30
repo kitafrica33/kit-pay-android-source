@@ -60,6 +60,33 @@ class NullableApiFlagsTest {
     private val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
 
     @Test
+    fun `scoped access decodes from authenticated capabilities and bootstrap`() {
+        val anonymous = decode<CapabilitiesDto>(
+            """{"currency":{"code":"UGX","scale":"2"},"features":{}}""",
+        )
+        val authenticated = decode<CapabilitiesDto>(
+            """{"currency":{"code":"UGX","scale":"2"},"features":{},"communication_access":{"allowed":true,"basis":"full_assurance","required_action":null},"financial_access":{"allowed":true,"read_only":false,"basis":"full_assurance","required_action":null}}""",
+        )
+        val onboarding = decode<BootstrapDto>(
+            """{"user":{"id":"user","name":"Amina"},"wallets":[],"devices":[],"communication_access":{"allowed":true,"basis":"account_onboarding","required_action":null},"financial_access":{"allowed":false,"read_only":false,"basis":"account_onboarding","required_action":"identity_verification_required"}}""",
+        )
+
+        assertNull(anonymous.communicationAccess)
+        assertNull(anonymous.financialAccess)
+        assertTrue(authenticated.communicationAccess?.allowed == true)
+        assertEquals("full_assurance", authenticated.communicationAccess?.basis)
+        assertTrue(authenticated.financialAccess?.allowed == true)
+        assertFalse(authenticated.financialAccess?.readOnly == true)
+        assertTrue(onboarding.communicationAccess?.allowed == true)
+        assertEquals("account_onboarding", onboarding.communicationAccess?.basis)
+        assertFalse(onboarding.financialAccess?.allowed == true)
+        assertEquals(
+            "identity_verification_required",
+            onboarding.financialAccess?.requiredAction,
+        )
+    }
+
+    @Test
     fun `all response boolean flags tolerate explicit null`() {
         val capabilities = decode<CapabilitiesDto>(
             """{"currency":{"code":"UGX","scale":"2"},"features":{"messaging":null},"authentication":null,"protocols":{"messaging":{"ready":null,"version":null,"suite":null,"post_quantum":null}}}""",
@@ -196,8 +223,24 @@ class NullableApiFlagsTest {
         )
 
         assertTrue(call.participantUserIds.orEmpty().isEmpty())
+        assertTrue(call.participants.orEmpty().isEmpty())
         assertTrue(rtc.iceServers.orEmpty().isEmpty())
         assertTrue(challenge.methods.orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `call participant presentation payload decodes beside legacy ids`() {
+        val userId = "550e8400-e29b-41d4-a716-446655440000"
+        val call = decode<CallDto>(
+            """{"id":"call","name":"Amina","participant_user_ids":["$userId"],"participants":[{"user_id":"$userId","name":"Amina","avatar_url":"https://pay.kit.africa/media/a1","verification":{"designation":"official","since":"2026-08-29T10:11:12Z"}}],"direction":"incoming","type":"voice","state":"ringing","started_at":"2026-08-29T10:00:00Z"}""",
+        )
+
+        val participant = requireNotNull(call.participants?.single())
+        assertEquals(userId, participant.userId)
+        assertEquals("Amina", participant.name)
+        assertEquals("https://pay.kit.africa/media/a1", participant.avatarUrl)
+        assertEquals("official", participant.verification?.designation)
+        assertEquals("2026-08-29T10:11:12Z", participant.verification?.since)
     }
 
     @Test

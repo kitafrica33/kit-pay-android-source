@@ -16,15 +16,18 @@ import com.kit.wallet.data.notifications.IncomingCallRelay
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.CallConnection
+import com.kit.wallet.data.repository.CallParticipantIdentity
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.IncomingCallDetails
+import com.kit.wallet.data.repository.canonicalCallUserId
 import com.kit.wallet.data.repository.initialCallPresentation
 import com.kit.wallet.data.repository.resolveCallPresentation
 import com.kit.wallet.data.repository.resolveRoomParticipant
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.ui.model.Contact
+import com.kit.wallet.ui.model.AccountVerification
 import com.twilio.audioswitch.AudioDevice
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -80,6 +83,7 @@ data class RemoteCallParticipant(
     val serverName: String? = name,
     /** This participant's profile photo, when they are someone the viewer has saved. */
     val avatarUrl: String? = null,
+    val accountVerification: AccountVerification? = null,
 )
 
 /** A second call ringing in while this call is connected (call-waiting). */
@@ -96,6 +100,7 @@ data class ActiveCallUiState(
     val name: String = "Kit Pay contact",
     /** The single matched peer's profile photo URL; null for groups or unsaved callers. */
     val avatarUrl: String? = null,
+    val accountVerification: AccountVerification? = null,
     val video: Boolean = false,
     val incoming: Boolean = false,
     val incomingVerified: Boolean = false,
@@ -125,6 +130,7 @@ internal data class ActiveCallContactPresentationSource(
     val callId: String?,
     val serverName: String?,
     val participantUserIds: List<String>,
+    val participants: List<CallParticipantIdentity> = emptyList(),
     val fallbackPhone: String? = null,
 )
 
@@ -170,6 +176,7 @@ internal fun refreshActiveCallContactPresentation(
             serverName = source.serverName,
             participantUserIds = source.participantUserIds,
             contacts = contacts,
+            participants = source.participants,
         )
     }
     val activePhone = activePresentation?.phone
@@ -193,12 +200,32 @@ internal fun refreshActiveCallContactPresentation(
             identity = participant.id,
             serverName = participant.serverName,
             contacts = contacts,
+            participants = activeSource?.participants.orEmpty(),
         )
-        participant.copy(name = presentation.name, avatarUrl = presentation.avatarUrl)
+        participant.copy(
+            name = presentation.name,
+            avatarUrl = presentation.avatarUrl ?: participant.avatarUrl,
+            accountVerification = presentation.accountVerification
+                ?: participant.accountVerification,
+        )
     }
+    val activeParticipantCount = activeSource
+        ?.let { it.participantUserIds + it.participants.map(CallParticipantIdentity::userId) }
+        ?.mapNotNull(::canonicalCallUserId)
+        ?.distinctBy(String::lowercase)
+        ?.size
     val refreshedState = state.copy(
         name = activePresentation?.name ?: state.name,
-        avatarUrl = if (activePresentation != null) activePresentation.avatarUrl else state.avatarUrl,
+        avatarUrl = when {
+            activePresentation == null -> state.avatarUrl
+            activeParticipantCount != 1 -> null
+            else -> activePresentation.avatarUrl ?: state.avatarUrl
+        },
+        accountVerification = when {
+            activePresentation == null -> state.accountVerification
+            activeParticipantCount != 1 -> null
+            else -> activePresentation.accountVerification ?: state.accountVerification
+        },
         waitingCall = refreshedWaiting,
         remoteParticipants = refreshedParticipants,
     )
@@ -263,6 +290,11 @@ class ActiveCallViewModel @Inject constructor(
                 initialPresentation.name
             },
             avatarUrl = if (incomingCallId != null) null else initialPresentation.avatarUrl,
+            accountVerification = if (incomingCallId != null) {
+                null
+            } else {
+                initialPresentation.accountVerification
+            },
             incoming = incomingCallId != null,
             phase = if (incomingCallId != null) CallPhase.VALIDATING else CallPhase.IDLE,
         ),
@@ -552,6 +584,8 @@ class ActiveCallViewModel @Inject constructor(
                 }
                 mutableState.value = mutableState.value.copy(
                     name = session.name,
+                    avatarUrl = session.avatarUrl,
+                    accountVerification = session.accountVerification,
                     video = session.video,
                     cameraEnabled = session.video,
                 )
@@ -783,6 +817,7 @@ class ActiveCallViewModel @Inject constructor(
                 identity = identity,
                 serverName = participant.name,
                 contacts = contacts.contacts.value,
+                participants = activeContactPresentationSource()?.participants.orEmpty(),
             )
             RemoteCallParticipant(
                 id = identity ?: participant.hashCode().toString(),
@@ -791,6 +826,7 @@ class ActiveCallViewModel @Inject constructor(
                 speaking = participant.isSpeaking,
                 serverName = participant.name,
                 avatarUrl = presentation.avatarUrl,
+                accountVerification = presentation.accountVerification,
             )
         }
         val showsVideo = mutableState.value.cameraEnabled ||
@@ -837,6 +873,8 @@ class ActiveCallViewModel @Inject constructor(
         // slow or temporarily offline. Only an answer/decline/terminal event may retire it.
         mutableState.value = mutableState.value.copy(
             name = "Incoming Kit Pay call",
+            avatarUrl = null,
+            accountVerification = null,
             video = false,
             incomingVerified = false,
             phase = CallPhase.VALIDATING,
@@ -849,6 +887,8 @@ class ActiveCallViewModel @Inject constructor(
                 verifiedIncomingCall = incoming
                 mutableState.value = mutableState.value.copy(
                     name = incoming.name,
+                    avatarUrl = incoming.avatarUrl,
+                    accountVerification = incoming.accountVerification,
                     video = incoming.video,
                     incomingVerified = true,
                     phase = CallPhase.INCOMING,
@@ -870,6 +910,8 @@ class ActiveCallViewModel @Inject constructor(
                 if (!terminated) {
                     mutableState.value = mutableState.value.copy(
                         name = "Incoming Kit Pay call",
+                        avatarUrl = null,
+                        accountVerification = null,
                         video = false,
                         incomingVerified = false,
                         phase = CallPhase.ERROR,
@@ -908,6 +950,7 @@ class ActiveCallViewModel @Inject constructor(
                 participantUserIds = (
                     active.participantUserIds + liveParticipantIds + listOfNotNull(target)
                 ).distinctBy(String::lowercase),
+                participants = active.participants,
                 fallbackPhone = active.phone,
             )
         }
@@ -917,6 +960,7 @@ class ActiveCallViewModel @Inject constructor(
                 serverName = incoming.name,
                 participantUserIds = (incoming.participantUserIds + liveParticipantIds)
                     .distinctBy(String::lowercase),
+                participants = incoming.participants,
                 fallbackPhone = incoming.phone,
             )
         }

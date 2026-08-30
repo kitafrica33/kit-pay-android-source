@@ -120,7 +120,12 @@ private fun TransactionDetailContent(tx: Transaction, onBack: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Spacer(Modifier.height(16.dp))
-            KitAvatar(tx.counterparty, size = 64.dp)
+            KitAvatar(
+                tx.counterparty,
+                size = 64.dp,
+                avatarUrl = tx.counterpartyAvatarUrl,
+                accountVerification = tx.accountVerification,
+            )
             Spacer(Modifier.height(12.dp))
             Text(tx.counterparty, style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(4.dp))

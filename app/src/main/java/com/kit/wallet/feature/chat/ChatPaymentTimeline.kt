@@ -3,6 +3,8 @@ package com.kit.wallet.feature.chat
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.model.PaymentEventKind
+import com.kit.wallet.data.messaging.KitScheduledPaymentAction
+import com.kit.wallet.data.messaging.KitScheduledPaymentMessage
 import kotlin.math.abs
 
 /**
@@ -139,4 +141,28 @@ internal fun paymentEventSummary(message: Message, peerName: String?): String {
     }
     val reason = message.paymentReason?.trim()?.takeIf(String::isNotBlank)
     return if (reason == null) headline else "$headline · $reason"
+}
+
+internal fun scheduledPaymentEventSummary(
+    descriptor: KitScheduledPaymentMessage,
+    fromMe: Boolean,
+    peerName: String?,
+): String {
+    val amount = Money.format(
+        descriptor.amountMinor,
+        descriptor.currencyCode,
+        descriptor.currencyScale,
+    )
+    val peer = peerName?.takeIf(String::isNotBlank) ?: "your contact"
+    return when (descriptor.action) {
+        KitScheduledPaymentAction.COMPLETED -> if (fromMe) {
+            "Scheduled payment of $amount was sent to $peer"
+        } else {
+            "Scheduled payment of $amount was received from $peer"
+        }
+        KitScheduledPaymentAction.FAILED ->
+            "Scheduled payment of $amount could not be sent" +
+                descriptor.reason?.let { " · $it" }.orEmpty()
+        KitScheduledPaymentAction.CANCELLED -> "Scheduled payment of $amount was cancelled"
+    }
 }

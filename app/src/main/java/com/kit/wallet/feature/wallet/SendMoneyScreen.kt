@@ -294,7 +294,12 @@ private fun RecipientPicker(contacts: List<Contact>, onPick: (Contact) -> Unit) 
                             )
                             .padding(4.dp),
                     ) {
-                        KitAvatar(c.name, size = 52.dp, avatarUrl = c.avatarUrl)
+                        KitAvatar(
+                            c.name,
+                            size = 52.dp,
+                            avatarUrl = c.avatarUrl,
+                            accountVerification = c.accountVerification,
+                        )
                         Spacer(Modifier.height(6.dp))
                         Text(c.name.substringBefore(" "), style = MaterialTheme.typography.labelMedium)
                     }
@@ -314,7 +319,12 @@ private fun RecipientPicker(contacts: List<Contact>, onPick: (Contact) -> Unit) 
                     .padding(horizontal = 20.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                KitAvatar(c.name, size = 46.dp, avatarUrl = c.avatarUrl)
+                KitAvatar(
+                    c.name,
+                    size = 46.dp,
+                    avatarUrl = c.avatarUrl,
+                    accountVerification = c.accountVerification,
+                )
                 Spacer(Modifier.width(14.dp))
                 Column(Modifier.weight(1f)) {
                     Text(c.name, style = MaterialTheme.typography.titleSmall)
@@ -357,7 +367,12 @@ private fun AmountEntry(
         Spacer(Modifier.height(10.dp))
         if (recipient != null) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                KitAvatar(recipient.name, size = 32.dp, avatarUrl = recipient.avatarUrl)
+                KitAvatar(
+                    recipient.name,
+                    size = 32.dp,
+                    avatarUrl = recipient.avatarUrl,
+                    accountVerification = recipient.accountVerification,
+                )
                 Spacer(Modifier.width(8.dp))
                 Text(recipient.phone, style = MaterialTheme.typography.bodyMedium)
             }
@@ -419,7 +434,12 @@ private fun ConfirmPayment(
     ) {
         Text("Confirm payment", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(20.dp))
-        KitAvatar(recipient.name, size = 64.dp, avatarUrl = recipient.avatarUrl)
+        KitAvatar(
+            recipient.name,
+            size = 64.dp,
+            avatarUrl = recipient.avatarUrl,
+            accountVerification = recipient.accountVerification,
+        )
         Spacer(Modifier.height(10.dp))
         Text(recipient.name, style = MaterialTheme.typography.titleMedium)
         Text(

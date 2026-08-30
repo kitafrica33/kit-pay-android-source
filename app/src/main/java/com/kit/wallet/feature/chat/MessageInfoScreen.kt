@@ -161,7 +161,12 @@ private fun RecipientRow(recipient: MessageDeliveryPerson, sentAtEpochMillis: Lo
                 .padding(vertical = 9.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            KitAvatar(recipient.name, size = 44.dp, avatarUrl = recipient.avatarUrl)
+            KitAvatar(
+                recipient.name,
+                size = 44.dp,
+                avatarUrl = recipient.avatarUrl,
+                accountVerification = recipient.accountVerification,
+            )
             Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
                 Text(

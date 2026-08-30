@@ -47,12 +47,16 @@ import com.kit.wallet.data.repository.SecureMessagingChatRuntime
 import com.kit.wallet.data.repository.SecureMessagingPendingPredecessorException
 import com.kit.wallet.data.repository.projectionIsFromCurrentUser
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.remote.KitGroupPaymentRequestAction
+import com.kit.wallet.data.remote.KitGroupPaymentRequestMessage
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
+import com.kit.wallet.ui.model.AccountVerification
+import com.kit.wallet.ui.model.AccountVerificationDesignation
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.MessageKind
 import com.kit.wallet.ui.model.copyablePlaintext
@@ -858,6 +862,111 @@ class EncryptedChatRepositoryTest {
 
         assertEquals("Flora from my phone", repository.chats.value.single().name)
     }
+
+    @Test
+    fun `contact designation decorates only its exact direct peer and matching group member`() =
+        runTest {
+            val runtime = FakeRuntime().apply {
+                conversations += conversation(CONVERSATION_ONE, "Registered Flora")
+                conversations += groupConversation(
+                    id = GROUP_ONE,
+                    title = "Site team",
+                    others = listOf(USER_ONE to "Registered Flora", USER_THREE to "Brian"),
+                )
+            }
+            val official = AccountVerification(
+                designation = AccountVerificationDesignation.OFFICIAL,
+                since = "2026-08-28T10:00:00Z",
+            )
+            val localContacts = MutableStateFlow(
+                listOf(
+                    Contact(
+                        id = USER_ONE.uppercase(),
+                        name = "Flora from my phone",
+                        phone = "+256700000001",
+                        isKitUser = true,
+                        savedInDevice = true,
+                        accountVerification = official,
+                    ),
+                ),
+            )
+            val repository = repository(runtime, localContacts)
+
+            runCurrent()
+
+            val direct = repository.chats.value.single { it.id == CONVERSATION_ONE }
+            val group = repository.chats.value.single { it.id == GROUP_ONE }
+            assertEquals(official, direct.accountVerification)
+            assertNull(group.accountVerification)
+            assertEquals(
+                official,
+                repository.groupMembers(GROUP_ONE).value
+                    .single { it.userId == USER_ONE }
+                    .accountVerification,
+            )
+            assertTrue(
+                repository.groupMembers(GROUP_ONE).value
+                    .filterNot { it.userId == USER_ONE }
+                    .all { it.accountVerification == null },
+            )
+        }
+
+    @Test
+    fun `authenticated roster metadata covers first sighting direct and group identities`() =
+        runTest {
+            val official = AccountVerification(
+                designation = AccountVerificationDesignation.OFFICIAL_SUPPORT,
+                since = "2026-08-29T10:00:00Z",
+            )
+            val peerAvatar = "https://pay.kit.africa/media/avatars/support"
+            val runtime = FakeRuntime().apply {
+                conversations += conversation(CONVERSATION_ONE, "Kit Customer Support").let {
+                    it.copy(
+                        members = it.members.map { member ->
+                            if (member.userId == USER_ONE) {
+                                member.copy(
+                                    avatarUrl = peerAvatar,
+                                    accountVerification = official,
+                                )
+                            } else {
+                                member
+                            }
+                        },
+                    )
+                }
+                conversations += groupConversation(
+                    id = GROUP_ONE,
+                    title = "Support team",
+                    others = listOf(USER_ONE to "Kit Customer Support", USER_THREE to "Brian"),
+                ).let {
+                    it.copy(
+                        members = it.members.map { member ->
+                            if (member.userId == USER_ONE) {
+                                member.copy(
+                                    avatarUrl = peerAvatar,
+                                    accountVerification = official,
+                                )
+                            } else {
+                                member
+                            }
+                        },
+                    )
+                }
+            }
+            val repository = repository(runtime, MutableStateFlow(emptyList()))
+
+            runCurrent()
+
+            val direct = repository.chats.value.single { it.id == CONVERSATION_ONE }
+            val group = repository.chats.value.single { it.id == GROUP_ONE }
+            val member = repository.groupMembers(GROUP_ONE).value
+                .single { it.userId == USER_ONE }
+            assertEquals(peerAvatar, direct.avatarUrl)
+            assertEquals(official, direct.accountVerification)
+            assertNull(group.accountVerification)
+            assertEquals(peerAvatar, member.avatarUrl)
+            assertEquals(official, member.accountVerification)
+        }
 
     @Test
     fun `viewer scoped peer alias stays visible until a saved contact name arrives`() = runTest {
@@ -2831,6 +2940,215 @@ class EncryptedChatRepositoryTest {
         assertEquals("", repository.chats.value.single().lastMessage)
         assertEquals(0, repository.chats.value.single().unread)
     }
+
+    @Test
+    fun `group request sync authority stays singular when its encrypted descriptor arrives later`() =
+        runTest {
+            val requestId = "00000000-0000-4000-8000-000000000031"
+            val descriptor = checkNotNull(
+                KitGroupPaymentRequestMessage.create(
+                    action = KitGroupPaymentRequestAction.REQUESTED,
+                    requestId = requestId,
+                    amountMinor = 10_000,
+                    currencyCode = "UGX",
+                    currencyScale = 2,
+                    note = "Weekend food",
+                ),
+            )
+            val runtime = FakeRuntime().apply {
+                conversations += groupConversation(
+                    id = GROUP_ONE,
+                    title = "Weekend savings",
+                    others = listOf(USER_ONE to "Aisha"),
+                )
+            }
+            val systemEvents = ConversationSystemEventStore(TestSecureMessagingStateStore())
+            systemEvents.record(
+                GROUP_ONE,
+                groupRequestEvent(
+                    id = 31,
+                    type = "group_payment_request.created",
+                    requestId = requestId,
+                    actorId = USER_TWO,
+                    at = 1_000,
+                ),
+            )
+            val repository = repository(runtime, systemEvents = systemEvents)
+            runCurrent()
+
+            assertEquals(
+                listOf("financial:31"),
+                repository.conversation(GROUP_ONE).value.map { it.id },
+            )
+
+            // The old-client hint lands after the server row. It remains in the encrypted
+            // projection, but the current client continues to render only server authority.
+            runtime.projected += message(
+                recordKey = "out:request-31",
+                conversationId = GROUP_ONE,
+                text = descriptor.encode(),
+                fromMe = true,
+                sentAt = Instant.ofEpochMilli(2_000),
+            )
+            runtime.projectionChanges.value++
+            runCurrent()
+
+            val rendered = repository.conversation(GROUP_ONE).value
+            assertEquals(listOf("financial:31"), rendered.map { it.id })
+            assertEquals(MessageKind.GROUP_PAYMENT_REQUEST, rendered.single().kind)
+            assertEquals(KitGroupPaymentRequestAction.REQUESTED.wire,
+                rendered.single().groupPaymentRequestAction)
+            assertEquals(descriptor.encode(), runtime.projected.single().text)
+        }
+
+    @Test
+    fun `group request sync authority replaces an earlier encrypted contribution descriptor`() =
+        runTest {
+            val requestId = "00000000-0000-4000-8000-000000000032"
+            val contributionId = "00000000-0000-4000-8000-000000000033"
+            val otherContributionId = "00000000-0000-4000-8000-000000000036"
+            val descriptor = checkNotNull(
+                KitGroupPaymentRequestMessage.create(
+                    action = KitGroupPaymentRequestAction.CONTRIBUTED,
+                    requestId = requestId,
+                    contributionId = contributionId,
+                    amountMinor = 2_500,
+                ),
+            )
+            val otherDescriptor = checkNotNull(
+                KitGroupPaymentRequestMessage.create(
+                    action = KitGroupPaymentRequestAction.CONTRIBUTED,
+                    requestId = requestId,
+                    contributionId = otherContributionId,
+                    amountMinor = 1_000,
+                ),
+            )
+            val runtime = FakeRuntime().apply {
+                conversations += groupConversation(
+                    id = GROUP_ONE,
+                    title = "Weekend savings",
+                    others = listOf(USER_ONE to "Aisha"),
+                )
+                projected += message(
+                    recordKey = "in:contribution-33",
+                    conversationId = GROUP_ONE,
+                    text = descriptor.encode(),
+                    fromMe = false,
+                    sentAt = Instant.ofEpochMilli(1_000),
+                )
+                projected += message(
+                    recordKey = "in:contribution-36",
+                    conversationId = GROUP_ONE,
+                    text = otherDescriptor.encode(),
+                    fromMe = false,
+                    sentAt = Instant.ofEpochMilli(1_500),
+                )
+            }
+            val systemEvents = ConversationSystemEventStore(TestSecureMessagingStateStore())
+            val repository = repository(runtime, systemEvents = systemEvents)
+            runCurrent()
+
+            assertEquals(
+                listOf("in:contribution-33", "in:contribution-36"),
+                repository.conversation(GROUP_ONE).value.map { it.id },
+            )
+
+            systemEvents.record(
+                GROUP_ONE,
+                groupRequestEvent(
+                    id = 32,
+                    type = "group_payment_request.contributed",
+                    requestId = requestId,
+                    contributionId = contributionId,
+                    actorId = USER_ONE,
+                    at = 2_000,
+                ),
+            )
+            runtime.projectionChanges.value++
+            runCurrent()
+
+            val rendered = repository.conversation(GROUP_ONE).value
+            assertEquals(listOf("in:contribution-36", "financial:32"), rendered.map { it.id })
+            val authority = rendered.last()
+            assertEquals(MessageKind.GROUP_PAYMENT_REQUEST_EVENT, authority.kind)
+            assertEquals(contributionId, authority.groupPaymentRequestContributionId)
+            assertFalse(authority.fromMe)
+        }
+
+    @Test
+    fun `group request coalescing survives process recovery and maps a final contribution to completion`() =
+        runTest {
+            val requestId = "00000000-0000-4000-8000-000000000034"
+            val contributionId = "00000000-0000-4000-8000-000000000035"
+            val descriptor = checkNotNull(
+                KitGroupPaymentRequestMessage.create(
+                    action = KitGroupPaymentRequestAction.CONTRIBUTED,
+                    requestId = requestId,
+                    contributionId = contributionId,
+                    amountMinor = 2_500,
+                ),
+            )
+            val durableState = TestSecureMessagingStateStore()
+            ConversationSystemEventStore(durableState).record(
+                GROUP_ONE,
+                groupRequestEvent(
+                    id = 34,
+                    type = "group_payment_request.completed",
+                    requestId = requestId,
+                    contributionId = contributionId,
+                    actorId = USER_ONE,
+                    at = 2_000,
+                ),
+            )
+
+            // A fresh store models process recovery after both durable paths have landed.
+            val restoredEvents = ConversationSystemEventStore(durableState)
+            val runtime = FakeRuntime(epoch = null).apply {
+                cachedConversations += groupConversation(
+                    id = GROUP_ONE,
+                    title = "Weekend savings",
+                    others = listOf(USER_ONE to "Aisha"),
+                )
+                localProjected += message(
+                    recordKey = "in:final-contribution-35",
+                    conversationId = GROUP_ONE,
+                    text = descriptor.encode(),
+                    fromMe = false,
+                    sentAt = Instant.ofEpochMilli(1_000),
+                )
+            }
+            val repository = repository(runtime, systemEvents = restoredEvents)
+            runtime.localHistoryActivations.value = localActivation()
+            runCurrent()
+
+            val rendered = repository.conversation(GROUP_ONE).value
+            assertEquals(listOf("financial:34"), rendered.map { it.id })
+            assertEquals(KitGroupPaymentRequestAction.COMPLETED.wire,
+                rendered.single().groupPaymentRequestAction)
+            assertEquals(contributionId, rendered.single().groupPaymentRequestContributionId)
+            assertEquals(descriptor.encode(), runtime.localProjected.single().text)
+            assertTrue(repository.localHistoryReady.value)
+            assertFalse(repository.readiness.value)
+        }
+
+    private fun groupRequestEvent(
+        id: Long,
+        type: String,
+        requestId: String,
+        actorId: String,
+        at: Long,
+        contributionId: String? = null,
+    ) = ConversationSystemEvent(
+        eventId = id,
+        type = type,
+        userId = USER_TWO,
+        role = null,
+        occurredAt = Instant.ofEpochMilli(at),
+        paymentId = requestId,
+        contributionId = contributionId,
+        contributorUserId = actorId.takeIf { contributionId != null },
+        contributionAmountMinor = "2500".takeIf { contributionId != null },
+    )
 
     /**
      * A genuine pre-network read authority, taken from the real guard rather than faked.

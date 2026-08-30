@@ -200,7 +200,11 @@ fun ProfileAvatarPicker(
         }
     } else {
         Row(modifier, verticalAlignment = Alignment.CenterVertically) {
-            KitAvatar(name, size = 64.dp, avatarUrl = avatarUrl)
+            KitAvatar(
+                name,
+                size = 64.dp,
+                avatarUrl = avatarUrl,
+            )
             Spacer(Modifier.width(14.dp))
             ChangeButton()
         }

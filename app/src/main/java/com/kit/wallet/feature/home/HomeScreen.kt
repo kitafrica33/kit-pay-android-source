@@ -64,6 +64,7 @@ import com.kit.wallet.data.repository.kycVerificationStateOf
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.remote.KitFeature
 import com.kit.wallet.navigation.AppCapabilities
+import com.kit.wallet.navigation.financialRouteAccessAllowed
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.SectionHeader
 import com.kit.wallet.ui.components.TransactionRow
@@ -71,6 +72,7 @@ import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.model.Transaction
 import com.kit.wallet.ui.model.UserProfile
+import com.kit.wallet.feature.wallet.runFinancialAction
 import com.kit.wallet.ui.theme.KitTheme
 import com.kit.wallet.ui.theme.KitWalletTheme
 import kotlinx.coroutines.launch
@@ -78,6 +80,8 @@ import kotlinx.coroutines.launch
 @Composable
 fun HomeScreen(
     capabilities: AppCapabilities,
+    moneyAccessAllowed: Boolean,
+    moneyReadOnly: Boolean,
     onSend: () -> Unit,
     onReceive: () -> Unit,
     onScan: () -> Unit,
@@ -91,6 +95,7 @@ fun HomeScreen(
     onAllTransactions: () -> Unit,
     onTransaction: (String) -> Unit,
     onFavorite: (String) -> Unit,
+    onVerifyIdentityRequired: () -> Unit = onKyc,
     viewModel: HomeViewModel = hiltViewModel(),
 ) {
     val profile by viewModel.profile.collectAsStateWithLifecycle()
@@ -110,6 +115,8 @@ fun HomeScreen(
         profile = profile,
         balanceMinor = balanceMinor,
         capabilities = capabilities,
+        moneyAccessAllowed = moneyAccessAllowed,
+        moneyReadOnly = moneyReadOnly,
         favorites = favorites,
         recent = recent,
         checklist = checklist,
@@ -129,6 +136,7 @@ fun HomeScreen(
         onAllTransactions = onAllTransactions,
         onTransaction = onTransaction,
         onFavorite = onFavorite,
+        onVerifyIdentityRequired = onVerifyIdentityRequired,
     )
 }
 
@@ -138,6 +146,8 @@ internal fun HomeDashboard(
     profile: UserProfile,
     balanceMinor: Long,
     capabilities: AppCapabilities,
+    moneyAccessAllowed: Boolean = true,
+    moneyReadOnly: Boolean = false,
     favorites: List<Contact>,
     recent: List<Transaction>,
     snackbarHostState: SnackbarHostState,
@@ -162,17 +172,25 @@ internal fun HomeDashboard(
     onAllTransactions: () -> Unit,
     onTransaction: (String) -> Unit,
     onFavorite: (String) -> Unit,
+    onVerifyIdentityRequired: () -> Unit = onKyc,
 ) {
     val scope = rememberCoroutineScope()
     val dispatch: (HomeAction, () -> Unit) -> Unit = { action, onAvailable ->
         val access = capabilities.homeActionAccess(action)
-        if (access.available) {
-            onAvailable()
-        } else {
+        if (!access.available) {
             scope.launch {
                 snackbarHostState.currentSnackbarData?.dismiss()
                 snackbarHostState.showSnackbar(access.unavailableMessage)
             }
+        } else if (!financialRouteAccessAllowed(
+                action.guardedRoute,
+                moneyAccessAllowed,
+                moneyReadOnly,
+            )
+        ) {
+            runFinancialAction(false, onVerifyIdentityRequired, onAvailable)
+        } else {
+            onAvailable()
         }
     }
 
@@ -184,6 +202,7 @@ internal fun HomeDashboard(
         HomeContent(
             profile = profile,
             balanceMinor = balanceMinor,
+            moneyAccessAllowed = moneyAccessAllowed,
             capabilities = capabilities,
             favorites = favorites,
             recent = recent,
@@ -223,6 +242,7 @@ internal fun HomeDashboard(
 private fun HomeContent(
     profile: UserProfile,
     balanceMinor: Long,
+    moneyAccessAllowed: Boolean,
     capabilities: AppCapabilities,
     favorites: List<Contact>,
     recent: List<Transaction>,
@@ -257,7 +277,11 @@ private fun HomeContent(
                         .padding(horizontal = 20.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    KitAvatar(profile.name, size = 40.dp, avatarUrl = profile.avatarUrl)
+                    KitAvatar(
+                        profile.name,
+                        size = 40.dp,
+                        avatarUrl = profile.avatarUrl,
+                    )
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(
@@ -288,7 +312,7 @@ private fun HomeContent(
             item {
                 BalanceCard(
                     balanceMinor = balanceMinor,
-                    balanceAvailable = walletEnabled,
+                    balanceAvailable = walletEnabled && moneyAccessAllowed,
                     onSend = onSend,
                     onReceive = onReceive,
                     onRequest = onRequest,
@@ -350,7 +374,12 @@ private fun HomeContent(
                                     .clickable { onFavorite(contact) }
                                     .padding(6.dp),
                             ) {
-                                KitAvatar(contact.name, size = 52.dp, avatarUrl = contact.avatarUrl)
+                                KitAvatar(
+                                    contact.name,
+                                    size = 52.dp,
+                                    avatarUrl = contact.avatarUrl,
+                                    accountVerification = contact.accountVerification,
+                                )
                                 Spacer(Modifier.height(6.dp))
                                 Text(
                                     contact.name.substringBefore(" "),
@@ -430,14 +459,16 @@ private fun HomeContent(
                 )
             }
 
-            items(recent.size) { i ->
-                TransactionRow(
-                    tx = recent[i],
-                    onClick = { onTransaction(recent[i].id) },
-                    modifier = Modifier.testTag(
-                        "${HomeAction.TRANSACTION_DETAIL.testTag}-${recent[i].id}",
-                    ),
-                )
+            if (moneyAccessAllowed) {
+                items(recent.size) { i ->
+                    TransactionRow(
+                        tx = recent[i],
+                        onClick = { onTransaction(recent[i].id) },
+                        modifier = Modifier.testTag(
+                            "${HomeAction.TRANSACTION_DETAIL.testTag}-${recent[i].id}",
+                        ),
+                    )
+                }
             }
 
             item { Spacer(Modifier.height(20.dp)) }
@@ -515,7 +546,7 @@ internal fun identityPromptFor(state: KycVerificationState): IdentityPrompt? =
         )
         KycVerificationState.NOT_STARTED -> IdentityPrompt(
             title = "Verify your identity",
-            detail = "Continue securely with Didit to access regulated Kit Pay services.",
+            detail = "Complete the secure identity check to access regulated Kit Pay services.",
         )
     }
 

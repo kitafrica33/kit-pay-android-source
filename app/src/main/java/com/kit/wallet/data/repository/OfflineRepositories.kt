@@ -58,6 +58,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 @Singleton
 class OfflineUserRepository @Inject constructor(
@@ -926,8 +928,10 @@ class OfflineWalletSyncRepository @Inject constructor(
     private val sessions: SessionStore,
     private val clock: Clock,
 ) : WalletSyncRepository {
-    override suspend fun refresh(): WalletSyncResult {
-        val session = sessions.current() ?: return WalletSyncResult(0, 0, false)
+    private val refreshMutex = Mutex()
+
+    override suspend fun refresh(): WalletSyncResult = refreshMutex.withLock {
+        val session = sessions.current() ?: return@withLock WalletSyncResult(0, 0, false)
         val fence = session.fence()
 
         val bootstrap = apiCalls.execute { api.bootstrap() }
@@ -944,7 +948,7 @@ class OfflineWalletSyncRepository @Inject constructor(
         val selected = sessions.withCurrentSession(fence) { current ->
             cache.selectedWallet(current.cacheScopeId)
         }
-            ?: return WalletSyncResult(wallets.size, 0, false)
+            ?: return@withLock WalletSyncResult(wallets.size, 0, false)
         val page = apiCalls.execute { api.transactions(selected.uuid, limit = PAGE_SIZE) }
         val transactions = page.items.map { it.toEntity(selected.uuid) }
         sessions.withCurrentSession(fence) { current ->
@@ -955,7 +959,7 @@ class OfflineWalletSyncRepository @Inject constructor(
                 page.page.nextCursor,
             )
         }
-        return WalletSyncResult(
+        WalletSyncResult(
             walletCount = wallets.size,
             transactionCount = transactions.size,
             hasMoreTransactions = page.page.hasMore == true,

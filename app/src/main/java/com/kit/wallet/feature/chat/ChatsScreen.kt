@@ -291,7 +291,12 @@ internal fun ChatsContent(
                             .padding(horizontal = 20.dp, vertical = 9.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        KitAvatar(contact.name, size = 40.dp, avatarUrl = contact.avatarUrl)
+                        KitAvatar(
+                            contact.name,
+                            size = 40.dp,
+                            avatarUrl = contact.avatarUrl,
+                            accountVerification = contact.accountVerification,
+                        )
                         Spacer(Modifier.width(12.dp))
                         Column {
                             Text(
@@ -355,6 +360,7 @@ internal fun ChatsContent(
                             size = 40.dp,
                             avatarUrl = hit.chat.avatarUrl,
                             isGroup = hit.chat.isGroup,
+                            accountVerification = hit.chat.accountVerification,
                         )
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
@@ -631,6 +637,7 @@ private fun ChatRow(
             online = chat.online,
             avatarUrl = chat.avatarUrl,
             isGroup = chat.isGroup,
+            accountVerification = chat.accountVerification,
         )
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {

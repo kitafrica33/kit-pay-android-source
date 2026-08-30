@@ -1,11 +1,16 @@
 package com.kit.wallet
 
+import androidx.lifecycle.SavedStateHandle
 import com.kit.wallet.data.remote.CurrencyDto
 import com.kit.wallet.data.remote.GroupPaymentRequestContributionDto
 import com.kit.wallet.data.remote.GroupPaymentRequestDto
+import com.kit.wallet.data.remote.GroupPaymentRequestContributionResultDto
 import com.kit.wallet.data.remote.GroupPaymentRequestPresentation
 import com.kit.wallet.data.remote.KitGroupPaymentRequestAction
 import com.kit.wallet.data.remote.KitGroupPaymentRequestMessage
+import com.kit.wallet.data.repository.matchesContributionIntent
+import com.kit.wallet.feature.chat.GroupPaymentContributionRetryStore
+import com.kit.wallet.feature.chat.GroupPaymentRequestContributionTarget
 import com.kit.wallet.feature.chat.groupPaymentRequestEventText
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
@@ -184,4 +189,96 @@ class GroupPaymentRequestContractTest {
         contributionsNextBefore = nextBefore,
         contributions = contributions,
     )
+
+    @Test
+    fun `dismissed and recreated contribution sheet reuses ambiguous retry identity`() {
+        val firstSheet = GroupPaymentRequestContributionTarget(
+            request(0, 0, "0", "100000000", 0, emptyList()),
+            useRemaining = false,
+        )
+        val firstState = SavedStateHandle()
+        val firstStore = GroupPaymentContributionRetryStore(firstState)
+        val firstKey = firstStore.keyFor(firstSheet.request.id, SOURCE_WALLET_ID, 25_000_000)
+
+        // Dismissing the sheet does not resolve the POST. A recreated ViewModel restores its key.
+        val reopenedSheet = firstSheet.copy()
+        val restoredState = SavedStateHandle(
+            mapOf("pendingGroupContributionRetryKeys" to ArrayList(firstStore.snapshot())),
+        )
+        val restoredStore = GroupPaymentContributionRetryStore(restoredState)
+        val retryKey = restoredStore.keyFor(
+            reopenedSheet.request.id,
+            SOURCE_WALLET_ID,
+            25_000_000,
+        )
+
+        assertEquals(firstKey, retryKey)
+        assertTrue(retryKey.startsWith("group-contribution:"))
+    }
+
+    @Test
+    fun `confirmed or terminally reconciled contribution releases its retry identity`() {
+        val store = GroupPaymentContributionRetryStore(SavedStateHandle())
+        val confirmed = store.keyFor(requestId, SOURCE_WALLET_ID, 25_000_000)
+
+        store.complete(requestId, SOURCE_WALLET_ID, 25_000_000)
+        val afterConfirmation = store.keyFor(requestId, SOURCE_WALLET_ID, 25_000_000)
+        store.reconcile(requestId)
+        val afterTerminalReconciliation = store.keyFor(
+            requestId,
+            SOURCE_WALLET_ID,
+            25_000_000,
+        )
+
+        assertFalse(confirmed == afterConfirmation)
+        assertFalse(afterConfirmation == afterTerminalReconciliation)
+    }
+
+    @Test
+    fun `ambiguous contribution blocks a changed amount until reconciliation`() {
+        val store = GroupPaymentContributionRetryStore(SavedStateHandle())
+        val first = store.keyFor(requestId, SOURCE_WALLET_ID, 25_000_000)
+
+        val changed = runCatching {
+            store.keyFor(requestId, SOURCE_WALLET_ID, 30_000_000)
+        }.exceptionOrNull()
+
+        assertTrue(changed is IllegalStateException)
+        assertEquals(first, store.keyFor(requestId, SOURCE_WALLET_ID, 25_000_000))
+    }
+
+    @Test
+    fun `restored contribution retry identities stay bounded`() {
+        val encoded = (1..40).map { index ->
+            "request-$index|wallet-$index|$index|group-contribution:key-$index"
+        }
+        assertTrue(
+            runCatching {
+                GroupPaymentContributionRetryStore(
+                    SavedStateHandle(
+                        mapOf("pendingGroupContributionRetryKeys" to ArrayList(encoded)),
+                    ),
+                )
+            }.isFailure,
+        )
+    }
+
+    @Test
+    fun `contribution response remains bound to request conversation actor and amount`() {
+        val authority = request(0, 0, "0", "100000000", 0, emptyList())
+        val row = contribution("00000000-0000-4000-8000-000000000006", "25000000")
+        val updated = request(1, 1, "25000000", "75000000", 2_500, listOf(row))
+        val result = GroupPaymentRequestContributionResultDto(updated, row)
+
+        assertTrue(result.matchesContributionIntent(authority, "25000000"))
+        assertFalse(result.matchesContributionIntent(authority, "24000000"))
+        assertFalse(result.copy(contribution = row.copy(isYours = false))
+            .matchesContributionIntent(authority, "25000000"))
+        assertFalse(result.copy(request = updated.copy(conversationId = requesterId))
+            .matchesContributionIntent(authority, "25000000"))
+    }
+
+    private companion object {
+        const val SOURCE_WALLET_ID = "00000000-0000-4000-8000-00000000000a"
+    }
 }

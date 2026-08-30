@@ -13,10 +13,12 @@ import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
 import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
+import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.ui.model.ChatMember
 import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
+import com.kit.wallet.ui.model.UserProfile
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
@@ -177,6 +179,7 @@ class NewGroupViewModel @Inject constructor(
 class GroupProfileViewModel @Inject constructor(
     private val chatRepo: ChatRepository,
     private val contactRepo: ContactRepository,
+    userRepo: UserRepository,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
     private val chatId: String = savedStateHandle.get<String>("chatId")?.trim().orEmpty()
@@ -191,11 +194,22 @@ class GroupProfileViewModel @Inject constructor(
             chatId.takeIf(String::isNotBlank)?.let(chatRepo::chat),
         )
 
-    val members: StateFlow<List<ChatMember>> = if (chatId.isBlank()) {
+    private val roster: StateFlow<List<ChatMember>> = if (chatId.isBlank()) {
         MutableStateFlow<List<ChatMember>>(emptyList()).asStateFlow()
     } else {
         chatRepo.groupMembers(chatId)
     }
+
+    val members: StateFlow<List<ChatMember>> = combine(
+        roster,
+        contactRepo.contacts,
+        userRepo.profile,
+        ::decorateGroupMemberVerification,
+    ).stateIn(
+        viewModelScope,
+        SharingStarted.Eagerly,
+        decorateGroupMemberVerification(roster.value, contactRepo.contacts.value, userRepo.profile.value),
+    )
 
     /** This account's own row, which is what decides every action offered on the others. */
     val viewer: StateFlow<ChatMember?> = members
@@ -317,6 +331,31 @@ class GroupProfileViewModel @Inject constructor(
                 mutableBusy.value = false
             }
         }
+    }
+}
+
+/**
+ * Joins badge authority by authenticated public ID. A display name, KYC label, group role or an
+ * old cached row can never mint a seal; the signed-in row comes from its profile and every other
+ * row from the exact contact identity the backend returned.
+ */
+internal fun decorateGroupMemberVerification(
+    roster: List<ChatMember>,
+    contacts: List<Contact>,
+    profile: UserProfile,
+): List<ChatMember> {
+    val contactsById = contacts.asSequence()
+        .filter { it.isKitUser && it.id.isNotBlank() }
+        .associateBy { it.id.lowercase() }
+    return roster.map { member ->
+        val matchedContact = contactsById[member.userId.lowercase()]
+        member.copy(
+            accountVerification = when {
+                member.isSelf -> profile.accountVerification
+                matchedContact != null -> matchedContact.accountVerification
+                else -> member.accountVerification
+            },
+        )
     }
 }
 

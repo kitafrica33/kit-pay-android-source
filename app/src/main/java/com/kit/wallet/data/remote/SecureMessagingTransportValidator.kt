@@ -1,5 +1,6 @@
 package com.kit.wallet.data.remote
 
+import com.kit.wallet.data.media.isTrustedProfileAvatarUrl
 import java.time.Instant
 
 /**
@@ -195,11 +196,20 @@ object SecureMessagingTransportValidator {
                 !joinedAt.isBefore(createdAt),
                 "$label member $memberIndex chronology",
             )
+            // Presentation metadata is optional and never participates in membership authority.
+            // Malformed values are discarded individually so they cannot mint a badge, trigger an
+            // off-origin image request, or make an otherwise valid encrypted conversation vanish.
+            val avatarUrl = member.avatarUrl
+                ?.trim()
+                ?.takeIf(::isTrustedProfileAvatarUrl)
+            val verification = validatedAccountVerification(member.verification)
             ValidatedConversationMember(
                 userId = userId,
                 name = member.name?.trim()?.takeIf(String::isNotEmpty),
                 role = memberRole,
                 joinedAt = joinedAt,
+                avatarUrl = avatarUrl,
+                verification = verification,
             )
         }
         requireTransport(
@@ -890,7 +900,7 @@ object SecureMessagingTransportValidator {
         val family = type.substringBeforeLast('.')
         val action = type.substringAfterLast('.')
         val expectedResource = when (family) {
-            "group_payment_request" -> if (action in setOf("contributed", "completed")) {
+            "group_payment_request" -> if (action == "contributed") {
                 "group_payment_request_contribution"
             } else "group_payment_request"
             "scheduled_payment" -> "scheduled_payment"
@@ -916,20 +926,62 @@ object SecureMessagingTransportValidator {
             val target = canonicalMinor(required(data.targetAmountMinor, "group request target"))
             val contributed = canonicalMinor(required(data.contributedAmountMinor, "group request contributed"))
             val remaining = canonicalMinor(required(data.remainingAmountMinor, "group request remaining"))
-            requireTransport(target > 0 && contributed in 0..target && remaining == target - contributed,
-                "group request totals")
+            requireTransport(
+                target in 1..GroupPaymentRequestContributionDto.MAX_MINOR &&
+                    contributed in 0..target && remaining == target - contributed,
+                "group request totals",
+            )
             requireTransport(required(data.currency, "group request currency").matches(Regex("^[A-Z]{3}$")),
                 "group request currency")
             requireTransport(data.currencyScale in 0..6, "group request currency scale")
             requireTransport(data.progressBasisPoints == if (contributed == target) 10_000 else
                 ((contributed * 10_000L) / target).toInt(), "group request progress")
-            if (action in setOf("contributed", "completed")) {
-                val contributionId = required(data.contributionId, "group request contribution ID")
-                requireUuid(contributionId, "group request contribution ID")
-                requireTransport(resourceId == contributionId, "group request contribution resource changed")
-                requireUuid(required(data.contributorUserId, "group request contributor"), "group request contributor")
-                requireTransport(canonicalMinor(required(data.contributionAmountMinor,
-                    "group request contribution amount")) > 0, "group request contribution amount")
+            when (action) {
+                "created" -> requireTransport(
+                    resourceId == primaryId && data.status == "open" && contributed == 0L &&
+                        remaining == target && data.progressBasisPoints == 0 &&
+                        data.contributionId == null && data.contributorUserId == null &&
+                        data.contributionAmountMinor == null,
+                    "created group request",
+                )
+                "contributed", "completed" -> {
+                    val contributionId = required(data.contributionId, "group request contribution ID")
+                    requireUuid(contributionId, "group request contribution ID")
+                    val expectedResourceId = if (action == "contributed") contributionId else primaryId
+                    requireTransport(
+                        resourceId == expectedResourceId,
+                        "group request contribution resource changed",
+                    )
+                    val contributor = required(data.contributorUserId, "group request contributor")
+                    requireUuid(contributor, "group request contributor")
+                    requireTransport(contributor != requester, "group request contributor")
+                    val contributionAmount = canonicalMinor(
+                        required(data.contributionAmountMinor, "group request contribution amount"),
+                    )
+                    requireTransport(
+                        contributionAmount in 1..contributed,
+                        "group request contribution amount",
+                    )
+                    if (action == "contributed") {
+                        requireTransport(
+                            data.status == "open" || data.status == "completed",
+                            "contributed group request status",
+                        )
+                    } else {
+                        requireTransport(
+                            data.status == "completed" && remaining == 0L &&
+                                data.progressBasisPoints == 10_000,
+                            "completed group request",
+                        )
+                    }
+                }
+                "cancelled", "expired" -> requireTransport(
+                    resourceId == primaryId && data.status == action &&
+                        data.contributionId == null && data.contributorUserId == null &&
+                        data.contributionAmountMinor == null,
+                    "$action group request",
+                )
+                else -> rejectTransport("group request event action")
             }
         } else {
             val expectedSchema = if (family == "scheduled_payment") {
@@ -940,19 +992,98 @@ object SecureMessagingTransportValidator {
                 "scheduled payment terminal status")
             requireTransport(action in setOf("completed", "failed", "cancelled"),
                 "scheduled payment event action")
-            requireTransport(
-                data.scheduledFor?.let { runCatching { Instant.parse(it) }.getOrNull() } != null,
-                "scheduled payment time",
-            )
-            data.groupPaymentId?.let { requireUuid(it, "completed group payment ID") }
-            data.walletTransactionId?.let { requireUuid(it, "scheduled wallet transaction ID") }
+            val scheduledFor = required(data.scheduledFor, "scheduled payment time")
+            requireTransport(runCatching { Instant.parse(scheduledFor) }.isSuccess,
+                "scheduled payment time")
+            if (family == "scheduled_payment") {
+                val sender = required(data.senderUserId, "scheduled payment sender")
+                val recipient = required(data.recipientUserId, "scheduled payment recipient")
+                requireUuid(sender, "scheduled payment sender")
+                requireUuid(recipient, "scheduled payment recipient")
+                requireTransport(sender != recipient, "scheduled payment participants")
+                requireTransport(canonicalMinor(required(data.amountMinor,
+                    "scheduled payment amount")) > 0, "scheduled payment amount")
+                requireTransport(required(data.currency,
+                    "scheduled payment currency").matches(Regex("^[A-Z]{3}$")),
+                    "scheduled payment currency")
+                requireTransport(data.currencyScale in 0..6, "scheduled payment currency scale")
+                requireTransport((data.note?.length ?: 0) <= 280 &&
+                    data.note?.any(Char::isISOControl) != true, "scheduled payment note")
+                requireTransport(data.groupPaymentId == null, "scheduled payment group result")
+                when (action) {
+                    "completed" -> {
+                        requireUuid(required(data.walletTransactionId,
+                            "scheduled wallet transaction ID"), "scheduled wallet transaction ID")
+                        requireTransport(data.failureCode == null && data.failureMessage == null &&
+                            data.completedAt.isValidInstant() && data.cancelledAt == null,
+                            "completed scheduled payment")
+                    }
+                    "failed" -> requireTransport(
+                        data.walletTransactionId == null && data.failureCode.isSafeFailureCode() &&
+                            (data.failureMessage == null || data.failureMessage.isSafeFailureMessage()) &&
+                            data.completedAt.isValidInstant() && data.cancelledAt == null,
+                        "failed scheduled payment",
+                    )
+                    "cancelled" -> requireTransport(
+                        data.walletTransactionId == null && data.failureCode == null &&
+                            data.failureMessage == null && data.completedAt == null &&
+                            data.cancelledAt.isValidInstant(),
+                        "cancelled scheduled payment",
+                    )
+                }
+            } else {
+                requireTransport(data.senderUserId == null && data.recipientUserId == null &&
+                    data.amountMinor == null && data.currency == null && data.currencyScale == null &&
+                    data.walletTransactionId == null, "scheduled group payment fields")
+                when (action) {
+                    "completed" -> {
+                        requireUuid(required(data.groupPaymentId, "completed group payment ID"),
+                            "completed group payment ID")
+                        requireTransport(data.failureCode == null && data.failureMessage == null &&
+                            data.completedAt.isValidInstant() && data.cancelledAt == null,
+                            "completed scheduled group payment")
+                    }
+                    "failed" -> {
+                        // The first deployed server emitted only the terminal state;
+                        // newer servers may enrich the same wake hint with both failure fields.
+                        // Accept those two coherent shapes only. The exact schedule read below the
+                        // transport boundary remains the authority for what actually failed.
+                        val legacyFailure = data.failureCode == null && data.failureMessage == null
+                        val enrichedFailure = data.failureCode.isSafeFailureCode() &&
+                            data.failureMessage.isSafeFailureMessage()
+                        requireTransport(
+                            data.groupPaymentId == null && data.completedAt.isValidInstant() &&
+                                data.cancelledAt == null && (legacyFailure || enrichedFailure),
+                            "failed scheduled group payment",
+                        )
+                    }
+                    "cancelled" -> requireTransport(
+                        data.groupPaymentId == null && data.completedAt == null &&
+                            data.cancelledAt.isValidInstant() && data.failureCode == null &&
+                            data.failureMessage == null, "cancelled scheduled group payment",
+                    )
+                }
+            }
         }
         return ValidatedMessagingSyncEvent.FinancialMetadata(
             eventId, conversationId, occurredAt, type, primaryId,
             requesterUserId, data.contributionId, data.contributorUserId,
-            data.contributionAmountMinor,
+            data.contributionAmountMinor, data.senderUserId, data.recipientUserId,
+            data.amountMinor?.let(::canonicalMinor), data.currency, data.currencyScale,
+            data.note, data.scheduledFor?.let(Instant::parse), data.walletTransactionId,
+            data.failureCode, data.failureMessage, data.completedAt?.let(Instant::parse),
+            data.cancelledAt?.let(Instant::parse), data.groupPaymentId,
         )
     }
+
+    private fun String?.isValidInstant(): Boolean =
+        this != null && runCatching { Instant.parse(this) }.isSuccess
+
+    private fun String?.isSafeFailureCode(): Boolean =
+        this != null && isNotBlank() && length <= 120 && none(Char::isISOControl)
+
+    private fun String?.isSafeFailureMessage(): Boolean =
+        this != null && isNotBlank() && length <= 500 && none(Char::isISOControl)
 
     private fun canonicalMinor(raw: String): Long {
         requireTransport(raw.matches(Regex("^(0|[1-9][0-9]*)$")), "financial minor amount")
@@ -1269,7 +1400,23 @@ object SecureMessagingTransportValidator {
                 uri.scheme.equals("https", ignoreCase = true) && !uri.host.isNullOrBlank()
             } == true
 
+    /** Unknown designations or malformed timestamps carry no authority and become no badge. */
+    private fun validatedAccountVerification(
+        value: AccountVerificationDto?,
+    ): ValidatedAccountVerification? {
+        value ?: return null
+        val designation = value.designation?.takeIf(VERIFICATION_DESIGNATIONS::contains)
+            ?: return null
+        val since = value.since?.let { raw ->
+            raw.takeIf(String::isNotBlank)
+                ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+                ?: return null
+        }
+        return ValidatedAccountVerification(designation, since?.toString())
+    }
+
     private const val MAX_GROUP_PHOTO_URL_LENGTH = 2_048
+    private val VERIFICATION_DESIGNATIONS = setOf("verified", "official", "official_support")
     private const val MAX_SERVER_DEVICES = 1_000
     private const val MAX_CONVERSATIONS = 10_000
     private const val MAX_SYNC_PAGE_SIZE = 100
@@ -1337,6 +1484,13 @@ data class ValidatedConversationMember(
     val name: String?,
     val role: String,
     val joinedAt: Instant,
+    val avatarUrl: String? = null,
+    val verification: ValidatedAccountVerification? = null,
+)
+
+data class ValidatedAccountVerification(
+    val designation: String,
+    val since: String?,
 )
 
 data class ValidatedConversation(
@@ -1495,6 +1649,19 @@ sealed interface ValidatedMessagingSyncEvent {
         val contributionId: String?,
         val contributorUserId: String?,
         val contributionAmountMinor: String?,
+        val senderUserId: String?,
+        val recipientUserId: String?,
+        val amountMinor: Long?,
+        val currency: String?,
+        val currencyScale: Int?,
+        val note: String?,
+        val scheduledFor: Instant?,
+        val walletTransactionId: String?,
+        val failureCode: String?,
+        val failureMessage: String?,
+        val completedAt: Instant?,
+        val cancelledAt: Instant?,
+        val groupPaymentId: String?,
     ) : ValidatedMessagingSyncEvent
 }
 

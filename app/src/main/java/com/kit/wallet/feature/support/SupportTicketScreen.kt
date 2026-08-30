@@ -64,6 +64,7 @@ import com.kit.wallet.data.support.SupportSenderType
 import com.kit.wallet.data.support.SupportTicket
 import com.kit.wallet.feature.auth.PaymentApproval
 import com.kit.wallet.feature.auth.rememberBiometricApprovalAvailable
+import com.kit.wallet.feature.wallet.runFinancialAction
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.model.Money
 import com.kit.wallet.ui.theme.KitTheme
@@ -86,6 +87,8 @@ private const val REPLY_MAX = 4_000
 @Composable
 fun SupportTicketScreen(
     supportPaymentsUsable: Boolean,
+    moneyMovementAllowed: Boolean,
+    onVerifyIdentityRequired: () -> Unit,
     companyBeneficiaryName: String?,
     onBack: () -> Unit,
     viewModel: SupportTicketViewModel = hiltViewModel(),
@@ -97,6 +100,12 @@ fun SupportTicketScreen(
 
     var showCloseDialog by rememberSaveable { mutableStateOf(false) }
     var showPaymentSheet by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(moneyMovementAllowed) {
+        if (!moneyMovementAllowed) {
+            viewModel.dismissPayment()
+            showPaymentSheet = false
+        }
+    }
 
     // Poll only while the screen is actually visible; a backgrounded app or a
     // covered entry on the back stack must not keep hitting the network.
@@ -126,7 +135,14 @@ fun SupportTicketScreen(
                 },
                 actions = {
                     if (canPay) {
-                        IconButton(onClick = { showPaymentSheet = true }) {
+                        IconButton(
+                            onClick = {
+                                runFinancialAction(
+                                    moneyMovementAllowed,
+                                    onVerifyIdentityRequired,
+                                ) { showPaymentSheet = true }
+                            },
+                        ) {
                             Icon(
                                 Icons.Rounded.Payments,
                                 contentDescription = "Pay Kit Pay",
@@ -247,12 +263,20 @@ fun SupportTicketScreen(
         )
     }
 
-    if (showPaymentSheet && canPay && companyBeneficiaryName != null) {
+    if (showPaymentSheet && canPay) {
         SupportPaymentSheet(
-            beneficiaryName = companyBeneficiaryName,
+            beneficiaryName = checkNotNull(companyBeneficiaryName),
             state = payment,
-            onReview = viewModel::reviewPayment,
-            onApprove = viewModel::confirmPayment,
+            onReview = { amount, note ->
+                runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                    viewModel.reviewPayment(amount, note)
+                }
+            },
+            onApprove = { pin ->
+                runFinancialAction(moneyMovementAllowed, onVerifyIdentityRequired) {
+                    viewModel.confirmPayment(pin)
+                }
+            },
             onDone = {
                 viewModel.dismissPayment()
                 showPaymentSheet = false

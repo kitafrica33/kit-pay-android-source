@@ -4,10 +4,53 @@ import com.kit.wallet.data.messaging.KitMediaFamily
 import com.kit.wallet.data.messaging.UNSUPPORTED_ATTACHMENT_LABEL
 import com.kit.wallet.data.messaging.mediaAlbumPreviewLabel
 import com.kit.wallet.data.messaging.mediaAlbumQuoteLabel
+import java.time.Instant
 
 /**
  * Presentation-shaped UI models populated by the Room/Retrofit repository layer.
  */
+
+/**
+ * A server-granted public account designation. This is deliberately unrelated to KYC: only the
+ * exact value inside the backend's structured `verification` object may create a blue seal.
+ */
+enum class AccountVerificationDesignation(
+    val serverValue: String,
+    val contentDescription: String,
+) {
+    VERIFIED("verified", "Verified account"),
+    OFFICIAL("official", "Official account"),
+    OFFICIAL_SUPPORT("official_support", "Official support account"),
+    ;
+
+    companion object {
+        fun fromServerValue(value: String?): AccountVerificationDesignation? = when (value) {
+            VERIFIED.serverValue -> VERIFIED
+            OFFICIAL.serverValue -> OFFICIAL
+            OFFICIAL_SUPPORT.serverValue -> OFFICIAL_SUPPORT
+            else -> null
+        }
+    }
+}
+
+data class AccountVerification(
+    val designation: AccountVerificationDesignation,
+    /** ISO-8601 grant time as supplied by the server; informational and never badge authority. */
+    val since: String?,
+) {
+    companion object {
+        fun fromServerValues(designation: String?, since: String?): AccountVerification? {
+            val acceptedDesignation = AccountVerificationDesignation.fromServerValue(designation)
+                ?: return null
+            // `since` is display-only metadata. It may be absent or malformed without vetoing the
+            // designation: the blue badge derives from verification.designation and nothing else.
+            val acceptedSince = since
+                ?.takeIf(String::isNotBlank)
+                ?.takeIf { runCatching { Instant.parse(it) }.isSuccess }
+            return AccountVerification(designation = acceptedDesignation, since = acceptedSince)
+        }
+    }
+}
 
 data class Contact(
     val id: String,
@@ -24,6 +67,8 @@ data class Contact(
     val savedInDevice: Boolean = false,
     /** Absolute URL of this member's moderated profile photo, when one is attached. */
     val avatarUrl: String? = null,
+    /** Server-owned blue-seal designation; never derived from this contact's name or KYC. */
+    val accountVerification: AccountVerification? = null,
 )
 
 data class UserProfile(
@@ -46,6 +91,8 @@ data class UserProfile(
     val legalName: String? = null,
     /** Whether a username still has to be chosen. False once a verified [legalName] exists. */
     val usernameRequired: Boolean = true,
+    /** Server-owned blue-seal designation, separate from identity-document/KYC verification. */
+    val accountVerification: AccountVerification? = null,
 ) {
     /** The name to put in front of someone in a financial context: verified first, chosen after. */
     val displayIdentityName: String
@@ -99,6 +146,12 @@ data class Transaction(
      * from money that arrived reads the authoritative wire value, never the display kind.
      */
     val rawDirection: String? = null,
+    /** Public account ID for an internal counterparty; null for banks, merchants and legacy rows. */
+    val counterpartyUserId: String? = null,
+    /** Exact-ID profile photo resolved from the authenticated account directory. */
+    val counterpartyAvatarUrl: String? = null,
+    /** Server-owned blue seal resolved only by exact public account ID. */
+    val accountVerification: AccountVerification? = null,
 )
 
 enum class DeliveryState {
@@ -153,6 +206,10 @@ enum class MessageKind {
     GROUP_PAYMENT_REQUEST,
     /** Authenticated request contribution/terminal timeline hint. */
     GROUP_PAYMENT_REQUEST_EVENT,
+    /** Exact-hydrated terminal direct schedule outcome. */
+    SCHEDULED_PAYMENT_EVENT,
+    /** Creator-only failed/cancelled scheduled group outcome. */
+    SCHEDULED_GROUP_PAYMENT_EVENT,
     VOICE_NOTE,
     IMAGE,
     VIDEO,
@@ -253,6 +310,8 @@ data class MessageDeliveryPerson(
     val avatarUrl: String? = null,
     val deliveredAtEpochMillis: Long = 0,
     val readAtEpochMillis: Long = 0,
+    /** Server-owned blue seal resolved by this authenticated recipient ID. */
+    val accountVerification: AccountVerification? = null,
 )
 
 /**
@@ -399,6 +458,8 @@ val Message.acceptsReactions: Boolean
             kind == MessageKind.GROUP_PAYMENT_EVENT ||
             kind == MessageKind.GROUP_PAYMENT_REQUEST ||
             kind == MessageKind.GROUP_PAYMENT_REQUEST_EVENT ||
+            kind == MessageKind.SCHEDULED_PAYMENT_EVENT ||
+            kind == MessageKind.SCHEDULED_GROUP_PAYMENT_EVENT ||
             kind == MessageKind.SYSTEM -> false
         else -> when (state) {
             DeliveryState.SENDING,
@@ -496,6 +557,8 @@ fun Message.replyPreviewLabel(): String = when (kind) {
     MessageKind.GROUP_PAYMENT_EVENT,
     MessageKind.GROUP_PAYMENT_REQUEST,
     MessageKind.GROUP_PAYMENT_REQUEST_EVENT,
+    MessageKind.SCHEDULED_PAYMENT_EVENT,
+    MessageKind.SCHEDULED_GROUP_PAYMENT_EVENT,
     MessageKind.CALL,
     MessageKind.SYSTEM,
     -> presentableText()
@@ -531,6 +594,8 @@ fun Message.copyablePlaintext(): String? = when (kind) {
     MessageKind.GROUP_PAYMENT_EVENT,
     MessageKind.GROUP_PAYMENT_REQUEST,
     MessageKind.GROUP_PAYMENT_REQUEST_EVENT,
+    MessageKind.SCHEDULED_PAYMENT_EVENT,
+    MessageKind.SCHEDULED_GROUP_PAYMENT_EVENT,
     MessageKind.CALL,
     MessageKind.SYSTEM,
     -> null
@@ -574,6 +639,8 @@ data class ChatPreview(
     val avatarUrl: String? = null,
     /** The group's server-visible description; null for direct chats and undescribed groups. */
     val description: String? = null,
+    /** The direct peer's server-owned blue seal; always null for a group. */
+    val accountVerification: AccountVerification? = null,
 )
 
 /** What a group grants a member. Anything the server sends that is not one of these reads as a
@@ -601,6 +668,8 @@ data class ChatMember(
     val avatarUrl: String? = null,
     /** True when this person is in the local address book, so their name is the saved one. */
     val savedInDevice: Boolean = false,
+    /** Server-owned blue seal learned from this authenticated account's contact record. */
+    val accountVerification: AccountVerification? = null,
 )
 
 enum class CallDirection { INCOMING, OUTGOING, MISSED }
@@ -622,6 +691,8 @@ data class CallEntry(
     val answered: Boolean = false,
     /** The single matched participant's profile photo URL, resolved from the local address book. */
     val avatarUrl: String? = null,
+    /** The single matched participant's server-owned blue seal; null for group/unknown calls. */
+    val accountVerification: AccountVerification? = null,
 )
 
 data class BillProvider(

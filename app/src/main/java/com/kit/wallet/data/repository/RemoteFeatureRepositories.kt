@@ -30,6 +30,7 @@ import com.kit.wallet.data.remote.EndCallRequest
 import com.kit.wallet.data.remote.ProviderProductDto
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.ui.model.BillProvider
 import com.kit.wallet.ui.model.Beneficiary
@@ -38,6 +39,7 @@ import com.kit.wallet.ui.model.BankCapability
 import com.kit.wallet.ui.model.BankOperationKind
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.CallEntry
+import com.kit.wallet.ui.model.AccountVerification
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Transaction
 import com.kit.wallet.ui.model.TxStatus
@@ -76,6 +78,31 @@ internal data class DeviceContactSyncCandidate(
     val name: String?,
     val favorite: Boolean,
 )
+
+/** Maps the server-owned contact identity without deriving a badge from any presentation field. */
+internal fun ContactDto.toContactModel(localName: String? = null): Contact {
+    val savedName = localName?.takeIf(String::isNotBlank)
+    return Contact(
+        id = id,
+        name = savedName ?: name,
+        phone = phone,
+        receivingWalletId = receivingWalletId,
+        isKitUser = isKitUser == true,
+        favorite = favorite == true,
+        status = status ?: if (isKitUser == true) "On Kit Pay" else "",
+        registeredName = name,
+        savedInDevice = savedName != null,
+        avatarUrl = avatarUrl?.takeIf(String::isNotBlank),
+        accountVerification = if (isKitUser == true) {
+            AccountVerification.fromServerValues(
+                designation = verification?.designation,
+                since = verification?.since,
+            )
+        } else {
+            null
+        },
+    )
+}
 
 /**
  * Converts an address-book snapshot into the bounded, phone-only shape accepted by contact sync.
@@ -309,11 +336,15 @@ class RemoteContactRepository @Inject constructor(
     override suspend fun searchByKitTag(query: String): List<Contact> {
         val tag = query.trim().removePrefix("@").trim()
         if (tag.length < 2) return emptyList()
+        val knownById = mutableContacts.value
+            .filter { it.isKitUser && it.id.isNotBlank() }
+            .associateBy { it.id.lowercase() }
         return apiCalls.execute {
             api.search(query = tag, types = listOf("users"), limit = 25)
         }.items.orEmpty()
             .filter { it.type == "users" }
             .map { result ->
+                val known = knownById[result.id.lowercase()]
                 Contact(
                     id = result.id,
                     name = result.title?.takeIf(String::isNotBlank) ?: "Kit Pay member",
@@ -327,7 +358,11 @@ class RemoteContactRepository @Inject constructor(
                     // Search results carry no photo of their own, but a member who is already in
                     // this account's address book has one on the device: show it rather than
                     // showing the same person as initials here and as a face one screen over.
-                    avatarUrl = profilePhotos?.photoFor(result.id),
+                    avatarUrl = known?.avatarUrl ?: profilePhotos?.photoFor(result.id),
+                    // Global search does not yet carry designation metadata. Reuse it only when
+                    // this exact public ID is already in the authenticated contact directory;
+                    // never infer a seal from the result title, subtitle or username query.
+                    accountVerification = known?.accountVerification,
                 )
             }
     }
@@ -497,20 +532,8 @@ class RemoteContactRepository @Inject constructor(
     }
 
     private fun ContactDto.toUiModel(deviceNames: Map<String, String>): Contact {
-        val registeredName = name
         val localName = deviceNames[contactNumberKey(phone)]?.takeIf(String::isNotBlank)
-        return Contact(
-            id = id,
-            name = localName ?: registeredName,
-            phone = phone,
-            receivingWalletId = receivingWalletId,
-            isKitUser = isKitUser == true,
-            favorite = favorite == true,
-            status = status ?: if (isKitUser == true) "On Kit Pay" else "",
-            registeredName = registeredName,
-            savedInDevice = localName != null,
-            avatarUrl = avatarUrl?.takeIf(String::isNotBlank),
-        )
+        return toContactModel(localName)
     }
 
     /** Matches Uganda local/international forms without conflating foreign numbers by suffix. */
@@ -618,6 +641,7 @@ class RemoteCallRepository @Inject constructor(
     private val contacts: ContactRepository,
     private val sessions: SessionStore,
     @ApplicationScope private val scope: CoroutineScope,
+    private val profilePhotos: ProfilePhotoDirectory? = null,
 ) : CallRepository {
     private val mutableCalls = MutableStateFlow<List<CallEntry>>(emptyList())
     override val calls: StateFlow<List<CallEntry>> = mutableCalls.asStateFlow()
@@ -674,6 +698,7 @@ class RemoteCallRepository @Inject constructor(
             }
             complete = pages.append(page)
         }
+        val learnedPhotos = mutableMapOf<String, String?>()
         val mapped = pages.calls.map { call ->
             val startedAt = runCatching { Instant.parse(call.startedAt) }.getOrNull()
             val answeredAt = call.answeredAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
@@ -683,10 +708,16 @@ class RemoteCallRepository @Inject constructor(
             } else {
                 0
             }
+            val participants = call.toCallParticipantIdentities()
+            participants.forEach { participant ->
+                participant.avatarUrl?.let { learnedPhotos[participant.userId] = it }
+            }
+            val participantIds = participants.map(CallParticipantIdentity::userId)
             val presentation = resolveCallPresentation(
                 serverName = call.name,
-                participantUserIds = call.participantUserIds.orEmpty(),
+                participantUserIds = participantIds,
                 contacts = contacts.contacts.value,
+                participants = participants,
             )
             CallEntry(
                 id = call.id,
@@ -698,33 +729,50 @@ class RemoteCallRepository @Inject constructor(
                     else -> CallDirection.INCOMING
                 },
                 video = call.video == true || call.type == "video",
-                participantUserIds = call.participantUserIds.orEmpty(),
+                participantUserIds = participantIds,
                 conversationId = call.conversationId,
                 startedAtEpochMillis = startedAt?.toEpochMilli() ?: 0,
                 durationSeconds = durationSeconds,
                 answered = answeredAt != null,
                 avatarUrl = presentation.avatarUrl,
+                accountVerification = presentation.accountVerification,
             )
         }
         if (!historyGate.admits(token)) return
-        sessions.withCurrentSession(fence) { mutableCalls.value = mapped }
+        sessions.withCurrentSession(fence) {
+            mutableCalls.value = mapped
+            profilePhotos?.learn(fence, learnedPhotos, complete = false)
+        }
     }
 
     override suspend fun incoming(callId: String): IncomingCallDetails {
+        val fence = sessions.current()?.fence() ?: throw SessionInvalidatedException()
         val call = apiCalls.execute { api.call(callId) }
         check(call.id == callId) { "The call lookup returned an unexpected call" }
-        val participantIds = call.participantUserIds.orEmpty()
-        val presentation = resolveCallPresentation(call.name, participantIds, contacts.contacts.value)
-        return IncomingCallDetails(
-            callId = call.id,
-            name = presentation.name,
-            phone = presentation.phone,
-            participantUserIds = participantIds,
-            video = call.video == true || call.type == "video",
-            direction = call.direction,
-            state = call.state,
-            ringExpiresAt = call.ringExpiresAt,
-        ).requireAnswerable()
+        val participants = call.toCallParticipantIdentities()
+        val participantIds = participants.map(CallParticipantIdentity::userId)
+        val presentation = resolveCallPresentation(
+            call.name,
+            participantIds,
+            contacts.contacts.value,
+            participants,
+        )
+        return sessions.withCurrentSession(fence) {
+            rememberParticipantPhotos(fence, participants)
+            IncomingCallDetails(
+                callId = call.id,
+                name = presentation.name,
+                phone = presentation.phone,
+                participantUserIds = participantIds,
+                participants = participants,
+                avatarUrl = presentation.avatarUrl,
+                accountVerification = presentation.accountVerification,
+                video = call.video == true || call.type == "video",
+                direction = call.direction,
+                state = call.state,
+                ringExpiresAt = call.ringExpiresAt,
+            ).requireAnswerable()
+        }
     }
 
     override suspend fun start(
@@ -744,6 +792,7 @@ class RemoteCallRepository @Inject constructor(
         conversationId: String?,
         clientCallId: String,
     ): CallConnection {
+        val fence = sessions.current()?.fence() ?: throw SessionInvalidatedException()
         require(recipientUserId.isNotBlank()) { "Choose a Kit Pay contact to call" }
         require(runCatching { UUID.fromString(clientCallId) }.isSuccess) {
             "The call attempt identifier is invalid"
@@ -764,7 +813,9 @@ class RemoteCallRepository @Inject constructor(
         // Reuse the current presentation and leave explicit contact/history refreshes responsible
         // for discovering address-book changes.
         refreshHistoryInBackground()
-        return session.toConnection(recipientUserId)
+        return sessions.withCurrentSession(fence) {
+            session.toConnection(listOf(recipientUserId), fence)
+        }
     }
 
     override suspend fun invite(callId: String, recipientUserIds: List<String>) {
@@ -788,12 +839,13 @@ class RemoteCallRepository @Inject constructor(
     }
 
     override suspend fun accept(callId: String): CallConnection {
+        val fence = sessions.current()?.fence() ?: throw SessionInvalidatedException()
         val session = apiCalls.execute { api.acceptCall(callId) }
         check(session.call.id == callId) {
             "The call answer returned credentials for an unexpected call"
         }
         refreshHistoryInBackground()
-        return session.toConnection()
+        return sessions.withCurrentSession(fence) { session.toConnection(owner = fence) }
     }
 
     override suspend fun decline(callId: String) {
@@ -806,20 +858,32 @@ class RemoteCallRepository @Inject constructor(
         runCatching { refreshCallList() }
     }
 
-    private fun CallSessionDto.toConnection(recipientHint: String? = null): CallConnection {
+    private fun CallSessionDto.toConnection(
+        recipientHints: List<String> = emptyList(),
+        owner: SessionFence,
+    ): CallConnection {
         check(rtc.provider.equals("livekit", ignoreCase = true)) {
             "This version of Kit Pay cannot use the configured call provider"
         }
         check(rtc.url.startsWith("wss://")) { "The call server did not provide a secure WebSocket URL" }
         check(rtc.token.isNotBlank()) { "The call server did not provide a room token" }
-        val participantIds = (call.participantUserIds.orEmpty() + listOfNotNull(recipientHint))
-            .distinctBy(String::lowercase)
-        val presentation = resolveCallPresentation(call.name, participantIds, contacts.contacts.value)
+        val participants = call.toCallParticipantIdentities(recipientHints)
+        val participantIds = participants.map(CallParticipantIdentity::userId)
+        val presentation = resolveCallPresentation(
+            call.name,
+            participantIds,
+            contacts.contacts.value,
+            participants,
+        )
+        rememberParticipantPhotos(owner, participants)
         return CallConnection(
             callId = call.id,
             name = presentation.name,
             phone = presentation.phone,
             participantUserIds = participantIds,
+            participants = participants,
+            avatarUrl = presentation.avatarUrl,
+            accountVerification = presentation.accountVerification,
             video = call.video == true || call.type == "video",
             provider = rtc.provider,
             url = rtc.url,
@@ -830,6 +894,16 @@ class RemoteCallRepository @Inject constructor(
             serverTime = serverTime,
             conversationId = call.conversationId?.trim()?.takeIf(String::isNotEmpty),
         )
+    }
+
+    private fun rememberParticipantPhotos(
+        owner: SessionFence,
+        participants: List<CallParticipantIdentity>,
+    ) {
+        val known = participants.mapNotNull { participant ->
+            participant.avatarUrl?.let { participant.userId to it }
+        }.toMap()
+        if (known.isNotEmpty()) profilePhotos?.learn(owner, known, complete = false)
     }
 
     /** Refresh address-book presentation only for an explicit call-history refresh, not call I/O. */

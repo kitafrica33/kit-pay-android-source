@@ -230,18 +230,21 @@ interface KitWalletApi {
     @POST("api/kit-wallet/v1/auth/step-up/challenges")
     suspend fun createStepUpChallenge(
         @Body request: RequestBody,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<StepUpChallengeDto>
 
     @POST("api/kit-wallet/v1/auth/step-up/challenges/{challengeId}/verify")
     suspend fun verifyStepUpChallenge(
         @Path("challengeId") challengeId: String,
         @Body request: VerifyStepUpChallengeRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<StepUpVerificationDto>
 
     @POST("api/kit-wallet/v1/auth/step-up/challenges/{challengeId}/verify")
     suspend fun verifyBiometricStepUpChallenge(
         @Path("challengeId") challengeId: String,
         @Body request: VerifyBiometricStepUpRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<StepUpVerificationDto>
 
     @GET("api/kit-wallet/v1/auth/session-assurance")
@@ -428,6 +431,7 @@ interface KitWalletApi {
         @Header("Idempotency-Key") idempotencyKey: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: CreateScheduledPaymentRequest,
+        @Tag expectedOwner: SessionFence,
     ): ApiEnvelope<ScheduledPaymentDto>
 
     @POST("api/kit-wallet/v1/payments/scheduled/{scheduledPaymentId}/cancel")
@@ -440,6 +444,7 @@ interface KitWalletApi {
     suspend fun previewScheduledGroupPayment(
         @Path("conversationId") conversationId: String,
         @Body request: PreviewScheduledGroupPaymentRequest,
+        @Tag expectedOwner: SessionFence,
     ): ApiEnvelope<ScheduledGroupPaymentPlanDto>
 
     @POST("api/kit-wallet/v1/conversations/{conversationId}/scheduled-group-payments")
@@ -448,6 +453,7 @@ interface KitWalletApi {
         @Header("Idempotency-Key") idempotencyKey: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: CreateScheduledGroupPaymentRequest,
+        @Tag expectedOwner: SessionFence,
     ): ApiEnvelope<ScheduledGroupPaymentDto>
 
     @GET("api/kit-wallet/v1/conversations/{conversationId}/scheduled-group-payments")

@@ -8,6 +8,7 @@ import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.FinancialOperationQuote
 import com.kit.wallet.data.repository.MobileMoneyRepository
 import com.kit.wallet.data.repository.ProfilePhotoDirectory
+import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.ui.model.BankCapability
@@ -54,6 +55,7 @@ class TopUpViewModel @Inject constructor(
     private val wallet: WalletRepository,
     private val walletSync: WalletSyncRepository,
     contacts: ContactRepository,
+    users: UserRepository,
     beneficiaryContacts: BeneficiaryContactDirectory,
     profilePhotos: ProfilePhotoDirectory,
 ) : ViewModel() {
@@ -114,7 +116,8 @@ class TopUpViewModel @Inject constructor(
         contacts.contacts,
         beneficiaryContacts.snapshots,
         profilePhotos.snapshots,
-    ) { saved, addressBook, linkSnapshot, photoSnapshot ->
+        users.profile,
+    ) { saved, addressBook, linkSnapshot, photoSnapshot, profile ->
         val links = beneficiaryContacts.currentLinks(linkSnapshot)
         val knownPhotos = profilePhotos.currentPhotos(photoSnapshot)
         saved
@@ -135,6 +138,7 @@ class TopUpViewModel @Inject constructor(
                         knownPhotos = knownPhotos,
                         phoneIdentityOf = beneficiaryContacts::identityForPhone,
                     ),
+                    accountVerification = profile.accountVerification,
                 )
             }
     }
@@ -144,7 +148,8 @@ class TopUpViewModel @Inject constructor(
         banking.banks,
         profilePhotos.snapshots,
         mutableRequirement,
-    ) { saved, banks, photoSnapshot, need ->
+        users.profile,
+    ) { saved, banks, photoSnapshot, need, profile ->
         val knownPhotos = profilePhotos.currentPhotos(photoSnapshot)
         val banksById = banks.associateBy(BankInstitution::id)
         eligibleBankBeneficiaries(BankOperationKind.DEPOSIT, banks, saved).map { beneficiary ->
@@ -163,6 +168,7 @@ class TopUpViewModel @Inject constructor(
                     serverAvatarUrl = beneficiary.avatarUrl,
                     knownPhotos = knownPhotos,
                 ),
+                accountVerification = profile.accountVerification,
             )
         }
     }

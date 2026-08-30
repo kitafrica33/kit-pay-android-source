@@ -240,6 +240,8 @@ class MessageReactionFoldTest {
             MessageKind.GROUP_PAYMENT_EVENT,
             MessageKind.GROUP_PAYMENT_REQUEST,
             MessageKind.GROUP_PAYMENT_REQUEST_EVENT,
+            MessageKind.SCHEDULED_PAYMENT_EVENT,
+            MessageKind.SCHEDULED_GROUP_PAYMENT_EVENT,
             MessageKind.SYSTEM,
         )
         MessageKind.entries.forEach { kind ->

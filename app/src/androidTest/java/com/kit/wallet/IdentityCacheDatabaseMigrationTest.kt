@@ -73,6 +73,42 @@ class IdentityCacheDatabaseMigrationTest {
         database.close()
     }
 
+    @Test
+    fun migration13To14AddsServerOwnedAccountVerificationWithoutInferringIt() {
+        helper.createDatabase(DATABASE_13_14, 13).close()
+
+        val database = helper.runMigrationsAndValidate(
+            DATABASE_13_14,
+            14,
+            true,
+            KitWalletDatabase.MIGRATION_13_14,
+        )
+
+        assertTrue("verificationDesignation" in database.columns("profile"))
+        assertTrue("verificationSince" in database.columns("profile"))
+        database.close()
+    }
+
+    @Test
+    fun migration14To15AddsServerOwnedCounterpartyVerificationWithoutGuessing() {
+        helper.createDatabase(DATABASE_14_15, 14).close()
+
+        val database = helper.runMigrationsAndValidate(
+            DATABASE_14_15,
+            15,
+            true,
+            KitWalletDatabase.MIGRATION_14_15,
+        )
+
+        assertTrue("counterpartyUserId" in database.columns("wallet_transactions"))
+        assertTrue("counterpartyAvatarUrl" in database.columns("wallet_transactions"))
+        assertTrue(
+            "counterpartyVerificationDesignation" in database.columns("wallet_transactions"),
+        )
+        assertTrue("counterpartyVerificationSince" in database.columns("wallet_transactions"))
+        database.close()
+    }
+
     private fun SupportSQLiteDatabase.columns(table: String): List<String> =
         query("PRAGMA table_info($table)").use { cursor ->
             val name = cursor.getColumnIndexOrThrow("name")
@@ -92,6 +128,8 @@ class IdentityCacheDatabaseMigrationTest {
 
     private companion object {
         const val DATABASE = "identity-cache-migration-11-12"
+        const val DATABASE_13_14 = "identity-cache-migration-13-14"
+        const val DATABASE_14_15 = "identity-cache-migration-14-15"
         const val OWNER_A = "scope-account-a"
     }
 }

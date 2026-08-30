@@ -1,10 +1,16 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.remote.AccountVerificationDto
+import com.kit.wallet.data.remote.CallDto
+import com.kit.wallet.data.remote.CallParticipantDto
 import com.kit.wallet.data.repository.initialCallPresentation
 import com.kit.wallet.data.repository.resolveCallPresentation
 import com.kit.wallet.data.repository.resolveRoomParticipant
 import com.kit.wallet.data.repository.resolveRoomParticipantName
+import com.kit.wallet.data.repository.toCallParticipantIdentities
 import com.kit.wallet.ui.model.Contact
+import com.kit.wallet.ui.model.AccountVerification
+import com.kit.wallet.ui.model.AccountVerificationDesignation
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -83,13 +89,108 @@ class CallPresentationTest {
 
     @Test
     fun `single matched participant carries the contact profile photo`() {
+        val official = AccountVerification(AccountVerificationDesignation.OFFICIAL, null)
         val presentation = resolveCallPresentation(
             serverName = "Flora Registered",
             participantUserIds = listOf(floraId),
-            contacts = listOf(flora.copy(avatarUrl = " https://pay.kit.africa/media/a1 ")),
+            contacts = listOf(
+                flora.copy(
+                    avatarUrl = " https://pay.kit.africa/media/a1 ",
+                    accountVerification = official,
+                ),
+            ),
         )
 
         assertEquals("https://pay.kit.africa/media/a1", presentation.avatarUrl)
+        assertEquals(official, presentation.accountVerification)
+    }
+
+    @Test
+    fun `structured call participant supplies first sighting name photo and badge`() {
+        val identities = call(
+            participantUserIds = emptyList(),
+            participants = listOf(
+                CallParticipantDto(
+                    userId = floraId.uppercase(),
+                    name = "Flora Registered",
+                    avatarUrl = "https://pay.kit.africa/media/a1",
+                    verification = AccountVerificationDto(
+                        "official",
+                        "2026-08-29T10:11:12Z",
+                    ),
+                ),
+            ),
+        ).toCallParticipantIdentities()
+
+        val presentation = resolveCallPresentation(
+            serverName = null,
+            participantUserIds = identities.map { it.userId },
+            contacts = emptyList(),
+            participants = identities,
+        )
+
+        assertEquals(listOf(floraId), identities.map { it.userId })
+        assertEquals("Flora Registered", presentation.name)
+        assertEquals("https://pay.kit.africa/media/a1", presentation.avatarUrl)
+        assertEquals(
+            AccountVerificationDesignation.OFFICIAL,
+            presentation.accountVerification?.designation,
+        )
+    }
+
+    @Test
+    fun `call participant merge is case insensitive and validates optional metadata independently`() {
+        val secondId = "86d5c9b8-4c19-4f14-91a7-28c2500049d1"
+        val identities = call(
+            participantUserIds = listOf(floraId, secondId, "not-a-user"),
+            participants = listOf(
+                CallParticipantDto(
+                    userId = floraId.uppercase(),
+                    name = "First sighting",
+                    avatarUrl = "http://attacker.example/avatar",
+                    verification = AccountVerificationDto("Official", null),
+                ),
+                CallParticipantDto(
+                    userId = secondId,
+                    name = "Second person",
+                    avatarUrl = "https://pay.kit.africa/media/a2",
+                    verification = AccountVerificationDto("verified", "not-an-instant"),
+                ),
+                CallParticipantDto(userId = "bad", name = "Forged"),
+            ),
+        ).toCallParticipantIdentities(additionalUserIds = listOf(floraId.uppercase()))
+
+        assertEquals(listOf(floraId, secondId), identities.map { it.userId })
+        assertNull(identities[0].avatarUrl)
+        assertNull(identities[0].accountVerification)
+        assertEquals("https://pay.kit.africa/media/a2", identities[1].avatarUrl)
+        assertEquals(
+            AccountVerificationDesignation.VERIFIED,
+            identities[1].accountVerification?.designation,
+        )
+        assertNull(identities[1].accountVerification?.since)
+    }
+
+    @Test
+    fun `saved name does not erase first sighting photo or badge`() {
+        val official = AccountVerification(AccountVerificationDesignation.OFFICIAL, null)
+        val participant = com.kit.wallet.data.repository.CallParticipantIdentity(
+            userId = floraId,
+            name = "Flora Registered",
+            avatarUrl = "https://pay.kit.africa/media/a1",
+            accountVerification = official,
+        )
+
+        val presentation = resolveCallPresentation(
+            serverName = "Call fallback",
+            participantUserIds = listOf(floraId),
+            contacts = listOf(flora.copy(avatarUrl = null, accountVerification = null)),
+            participants = listOf(participant),
+        )
+
+        assertEquals("Flora from my contacts", presentation.name)
+        assertEquals(participant.avatarUrl, presentation.avatarUrl)
+        assertEquals(official, presentation.accountVerification)
     }
 
     @Test
@@ -103,6 +204,21 @@ class CallPresentationTest {
                 participantUserIds = listOf(floraId, secondId),
                 contacts = listOf(flora.copy(avatarUrl = "https://pay.kit.africa/media/a1"), second),
             ).avatarUrl,
+        )
+        assertNull(
+            resolveCallPresentation(
+                serverName = null,
+                participantUserIds = listOf(floraId, secondId),
+                contacts = listOf(
+                    flora.copy(
+                        accountVerification = AccountVerification(
+                            AccountVerificationDesignation.VERIFIED,
+                            null,
+                        ),
+                    ),
+                    second,
+                ),
+            ).accountVerification,
         )
         assertNull(
             resolveCallPresentation(
@@ -148,4 +264,18 @@ class CallPresentationTest {
         assertEquals("Flora Registered", resolved.name)
         assertNull(resolved.avatarUrl)
     }
+
+    private fun call(
+        participantUserIds: List<String>,
+        participants: List<CallParticipantDto?>,
+    ) = CallDto(
+        id = "019f8c6f-cc57-720c-9a55-000000000001",
+        name = null,
+        participantUserIds = participantUserIds,
+        participants = participants,
+        direction = "incoming",
+        type = "voice",
+        state = "ringing",
+        startedAt = "2026-08-29T10:00:00Z",
+    )
 }

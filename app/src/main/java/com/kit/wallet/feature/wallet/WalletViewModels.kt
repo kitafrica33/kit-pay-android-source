@@ -20,6 +20,7 @@ import kotlin.math.abs
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -239,13 +240,14 @@ sealed interface TransactionDetailUiState {
 @HiltViewModel
 class TransactionDetailViewModel @Inject constructor(
     wallet: WalletRepository,
+    contacts: ContactRepository,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
     private val txId: String = savedStateHandle.get<String>("txId").orEmpty()
 
-    val uiState = wallet.transactions
-        .map { transactions ->
+    val uiState = combine(wallet.transactions, contacts.contacts) { transactions, directory ->
             transactions.firstOrNull { it.id == txId }
+                ?.withCounterpartyVerification(directory)
                 ?.let { TransactionDetailUiState.Ready(it) }
                 ?: TransactionDetailUiState.NotFound
         }
@@ -254,6 +256,28 @@ class TransactionDetailViewModel @Inject constructor(
             started = SharingStarted.Eagerly,
             initialValue = TransactionDetailUiState.Loading,
         )
+}
+
+/** Resolves counterparty presentation only by the backend's public user ID, never by its name. */
+internal fun Transaction.withCounterpartyVerification(contacts: List<Contact>): Transaction {
+    val userId = counterpartyUserId?.trim()?.takeIf(String::isNotEmpty) ?: return this
+    val matched = contacts.firstOrNull { contact ->
+        contact.isKitUser && contact.id.equals(userId, ignoreCase = true)
+    } ?: return this
+    val avatarUrl = matched.avatarUrl?.trim()?.takeIf(String::isNotEmpty)
+        ?: counterpartyAvatarUrl
+    val verification = matched.accountVerification ?: accountVerification
+    return if (
+        counterpartyAvatarUrl == avatarUrl &&
+        accountVerification == verification
+    ) {
+        this
+    } else {
+        copy(
+            counterpartyAvatarUrl = avatarUrl,
+            accountVerification = verification,
+        )
+    }
 }
 
 @HiltViewModel

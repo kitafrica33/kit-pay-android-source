@@ -3,6 +3,7 @@ package com.kit.wallet
 import com.kit.wallet.data.messaging.AccountArchivedMessage
 import com.kit.wallet.data.messaging.AccountMessageHistoryAccess
 import com.kit.wallet.data.messaging.CapturedAccountMessageHistory
+import com.kit.wallet.data.messaging.ConversationSystemEventStore
 import com.kit.wallet.data.messaging.FailClosedSecureMessagingCryptoTransaction
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitMediaMessageV2
@@ -11,6 +12,7 @@ import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.KitReactionAction
 import com.kit.wallet.data.messaging.KitReactionMessage
+import com.kit.wallet.data.messaging.KitScheduledPaymentMessage
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionStateReader
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
@@ -72,7 +74,11 @@ import com.kit.wallet.data.messaging.SecureMessagingTextContentBinding
 import com.kit.wallet.data.messaging.encodeSecureMessagingTextContent
 import com.kit.wallet.data.messaging.requireSecureMessagingSyncResumePosition
 import com.kit.wallet.data.repository.DefaultSecureMessagingChatRuntime
+import com.kit.wallet.data.repository.PaymentAuthorizer
 import com.kit.wallet.data.repository.SecureMessagingPendingPredecessorException
+import com.kit.wallet.data.repository.ServerScheduledPaymentRepository
+import com.kit.wallet.data.repository.WalletSyncRepository
+import com.kit.wallet.data.repository.WalletSyncResult
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.CursorPageDto
 import com.kit.wallet.data.remote.ENCRYPTED_ATTACHMENT_MESSAGE_KIND
@@ -148,6 +154,8 @@ class SecureMessagingEventProcessorTest {
     private lateinit var server: MockWebServer
     private lateinit var transport: RemoteSecureMessagingTransport
     private lateinit var moshi: Moshi
+    private lateinit var api: KitWalletApi
+    private lateinit var apiCalls: ApiCallExecutor
 
     @Before
     fun setUp() {
@@ -157,10 +165,12 @@ class SecureMessagingEventProcessorTest {
             .baseUrl(server.url("/"))
             .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
+        api = retrofit.create(KitWalletApi::class.java)
+        apiCalls = ApiCallExecutor(moshi)
         transport = RemoteSecureMessagingTransport(
-            retrofit.create(KitWalletApi::class.java),
+            api,
             retrofit.create(SecureMessagingWireApi::class.java),
-            ApiCallExecutor(moshi),
+            apiCalls,
         )
     }
 
@@ -1543,6 +1553,302 @@ class SecureMessagingEventProcessorTest {
             "committed_cursor" to null,
             requireSecureMessagingSyncResumePosition(loaded.position),
         )
+    }
+
+    @Test
+    fun `legacy scheduled group failure exact reads and advances the messaging cursor`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val systemEvents = ConversationSystemEventStore(stateStore)
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+            systemEvents = systemEvents,
+            scheduledPayments = scheduledPaymentRepository(),
+        )
+        enqueueSync(listOf(scheduledGroupFailureEvent()), "legacy_group_failure_cursor")
+        server.enqueue(jsonResponse(GROUP_CONVERSATIONS))
+        server.enqueue(jsonResponse(FAILED_SCHEDULED_GROUP_PAYMENT))
+
+        processor.synchronize(session)
+
+        val cursor = checkNotNull(SecureMessagingSyncCursorStore(stateStore).load())
+        assertEquals(
+            "legacy_group_failure_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(cursor.position),
+        )
+        systemEvents.load(listOf(CONVERSATION_ID))
+        val recorded = checkNotNull(systemEvents.events.value[CONVERSATION_ID]).single()
+        assertEquals("scheduled_group_payment.failed", recorded.type)
+        assertEquals(SCHEDULED_PAYMENT_ID, recorded.paymentId)
+        assertNotNull(recorded.projectionText)
+
+        assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+        assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
+        assertEquals(
+            "/api/kit-wallet/v1/scheduled-group-payments/$SCHEDULED_PAYMENT_ID",
+            server.takeRequest().path,
+        )
+    }
+
+    @Test
+    fun `enriched scheduled group failure matches exact state and advances cursor`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+            scheduledPayments = scheduledPaymentRepository(),
+        )
+        enqueueSync(
+            listOf(
+                scheduledGroupFailureEvent(
+                    failureCode = "PROVIDER_UNAVAILABLE",
+                    failureMessage = "Provider did not answer",
+                ),
+            ),
+            "enriched_group_failure_cursor",
+        )
+        server.enqueue(jsonResponse(GROUP_CONVERSATIONS))
+        server.enqueue(jsonResponse(FAILED_SCHEDULED_GROUP_PAYMENT))
+
+        processor.synchronize(session)
+
+        val cursor = checkNotNull(SecureMessagingSyncCursorStore(stateStore).load())
+        assertEquals(
+            "enriched_group_failure_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(cursor.position),
+        )
+    }
+
+    @Test
+    fun `inconsistent enriched group failure cannot advance cursor`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+            scheduledPayments = scheduledPaymentRepository(),
+        )
+        enqueueSync(
+            listOf(
+                scheduledGroupFailureEvent(
+                    failureCode = "PROVIDER_UNAVAILABLE",
+                    failureMessage = "A different failure",
+                ),
+            ),
+            "inconsistent_group_failure_cursor",
+        )
+        server.enqueue(jsonResponse(GROUP_CONVERSATIONS))
+        server.enqueue(jsonResponse(FAILED_SCHEDULED_GROUP_PAYMENT))
+
+        val failure = runCatching { processor.synchronize(session) }.exceptionOrNull()
+
+        assertTrue(failure is IllegalStateException)
+        assertNull(SecureMessagingSyncCursorStore(stateStore).load())
+    }
+
+    @Test
+    fun `direct failure with no event message hydrates exact reason and advances cursor`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val systemEvents = ConversationSystemEventStore(stateStore)
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+            systemEvents = systemEvents,
+            scheduledPayments = scheduledPaymentRepository(),
+        )
+        enqueueSync(listOf(scheduledDirectFailureEvent()), "direct_failure_cursor")
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        server.enqueue(jsonResponse(FAILED_SCHEDULED_DIRECT_PAYMENT))
+
+        processor.synchronize(session)
+
+        val cursor = checkNotNull(SecureMessagingSyncCursorStore(stateStore).load())
+        assertEquals(
+            "direct_failure_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(cursor.position),
+        )
+        systemEvents.load(listOf(CONVERSATION_ID))
+        val recorded = checkNotNull(systemEvents.events.value[CONVERSATION_ID]).single()
+        val projected = checkNotNull(KitScheduledPaymentMessage.parse(recorded.projectionText!!))
+        assertEquals("Provider did not answer", projected.reason)
+    }
+
+    @Test
+    fun `scheduled event for an authoritatively absent conversation advances without projection`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            val stateStore = TestSecureMessagingStateStore()
+            val systemEvents = ConversationSystemEventStore(stateStore)
+            val processor = processor(
+                stateStore = stateStore,
+                crypto = PersistingDecryptionEngine(stateStore),
+                systemEvents = systemEvents,
+                scheduledPayments = scheduledPaymentRepository(),
+            )
+            enqueueSync(listOf(scheduledDirectFailureEvent()), "deleted_chat_cursor")
+            server.enqueue(jsonResponse(EMPTY_CONVERSATIONS))
+            server.enqueue(jsonResponse(FAILED_SCHEDULED_DIRECT_PAYMENT))
+
+            processor.synchronize(session)
+
+            val cursor = checkNotNull(SecureMessagingSyncCursorStore(stateStore).load())
+            assertEquals(
+                "deleted_chat_cursor" to 10L,
+                requireSecureMessagingSyncResumePosition(cursor.position),
+            )
+            systemEvents.load(listOf(CONVERSATION_ID))
+            assertTrue(systemEvents.events.value[CONVERSATION_ID].orEmpty().isEmpty())
+            assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+            assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
+            assertEquals(
+                "/api/kit-wallet/v1/payments/scheduled/$SCHEDULED_PAYMENT_ID",
+                server.takeRequest().path,
+            )
+        }
+
+    @Test
+    fun `missing conversation cannot hide an unresolved scheduled authority read`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+            scheduledPayments = scheduledPaymentRepository(),
+        )
+        enqueueSync(listOf(scheduledDirectFailureEvent()), "unresolved_deleted_chat_cursor")
+        server.enqueue(jsonResponse(EMPTY_CONVERSATIONS))
+        server.enqueue(
+            MockResponse().setResponseCode(503).setHeader("Content-Type", "application/json")
+                .setBody("""{"ok":false,"error":{"code":"temporary","message":"retry"}}"""),
+        )
+
+        assertTrue(runCatching { processor.synchronize(session) }.isFailure)
+        assertNull(SecureMessagingSyncCursorStore(stateStore).load())
+    }
+
+    @Test
+    fun `completed group event for a recipient who left advances after exact 404`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val systemEvents = ConversationSystemEventStore(stateStore)
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+            systemEvents = systemEvents,
+            scheduledPayments = scheduledPaymentRepository(),
+        )
+        enqueueSync(listOf(scheduledGroupCompletedEvent()), "left_group_cursor")
+        server.enqueue(jsonResponse(EMPTY_CONVERSATIONS))
+        server.enqueue(
+            MockResponse().setResponseCode(404).setHeader("Content-Type", "application/json")
+                .setBody(
+                    """{"ok":false,"error":{"code":"SCHEDULED_GROUP_PAYMENT_NOT_FOUND","message":"not visible"}}""",
+                ),
+        )
+
+        processor.synchronize(session)
+
+        val cursor = checkNotNull(SecureMessagingSyncCursorStore(stateStore).load())
+        assertEquals(
+            "left_group_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(cursor.position),
+        )
+        systemEvents.load(listOf(CONVERSATION_ID))
+        assertTrue(systemEvents.events.value[CONVERSATION_ID].orEmpty().isEmpty())
+        assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+        assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
+        assertEquals(
+            "/api/kit-wallet/v1/scheduled-group-payments/$SCHEDULED_PAYMENT_ID",
+            server.takeRequest().path,
+        )
+    }
+
+    @Test
+    fun `completed group event for a recipient who left retains cursor on exact 503`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+            scheduledPayments = scheduledPaymentRepository(),
+        )
+        enqueueSync(listOf(scheduledGroupCompletedEvent()), "left_group_transient_cursor")
+        server.enqueue(jsonResponse(EMPTY_CONVERSATIONS))
+        server.enqueue(
+            MockResponse().setResponseCode(503).setHeader("Content-Type", "application/json")
+                .setBody("""{"ok":false,"error":{"code":"temporary","message":"retry"}}"""),
+        )
+
+        assertTrue(runCatching { processor.synchronize(session) }.isFailure)
+        assertNull(SecureMessagingSyncCursorStore(stateStore).load())
+    }
+
+    @Test
+    fun `completed direct event cannot swap creator into recipient role`() = runTest {
+        assertSwappedCompletedDirectionRejected(
+            COMPLETED_SCHEDULED_DIRECT_PAYMENT_CREATOR,
+            senderUserId = PEER_USER_ID,
+            recipientUserId = CURRENT_USER_ID,
+        )
+    }
+
+    @Test
+    fun `completed direct event cannot swap recipient into sender role`() = runTest {
+        assertSwappedCompletedDirectionRejected(
+            COMPLETED_SCHEDULED_DIRECT_PAYMENT_RECIPIENT,
+            senderUserId = CURRENT_USER_ID,
+            recipientUserId = PEER_USER_ID,
+        )
+    }
+
+    @Test
+    fun `scheduled exact read cannot record into replacement activation`() = runTest {
+        val (session, lifecycle, _) = openSyncingSession()
+        val delegate = TestSecureMessagingStateStore()
+        val stateStore = LifecycleLeasedStateStore(delegate)
+        stateStore.allowForActiveSession()
+        val systemEvents = ConversationSystemEventStore(stateStore)
+        val exactEntered = CountDownLatch(1)
+        val exactRelease = CountDownLatch(1)
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                "/api/kit-wallet/v1/messaging/sync?limit=50" -> syncResponse(
+                    listOf(scheduledDirectFailureEvent()),
+                    "stale_scheduled_cursor",
+                )
+                "/api/kit-wallet/v1/messaging/conversations" -> jsonResponse(DIRECT_CONVERSATIONS)
+                "/api/kit-wallet/v1/payments/scheduled/$SCHEDULED_PAYMENT_ID" -> {
+                    exactEntered.countDown()
+                    if (exactRelease.await(5, TimeUnit.SECONDS)) {
+                        jsonResponse(FAILED_SCHEDULED_DIRECT_PAYMENT)
+                    } else {
+                        MockResponse().setResponseCode(503)
+                    }
+                }
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(delegate),
+            systemEvents = systemEvents,
+            scheduledPayments = scheduledPaymentRepository(),
+        )
+        val staleSync = async(Dispatchers.IO) {
+            runCatching { processor.synchronize(session) }.exceptionOrNull()
+        }
+
+        assertTrue(exactEntered.await(5, TimeUnit.SECONDS))
+        replaceWithFreshActivation(lifecycle, stateStore, "scheduled-replacement")
+        exactRelease.countDown()
+
+        assertTrue(staleSync.await() is IllegalStateException)
+        systemEvents.load(listOf(CONVERSATION_ID))
+        assertTrue(systemEvents.events.value[CONVERSATION_ID].orEmpty().isEmpty())
+        assertNull(SecureMessagingSyncCursorStore(stateStore).load())
     }
 
     @Test
@@ -3171,6 +3477,130 @@ class SecureMessagingEventProcessorTest {
         )
     }
 
+    private fun scheduledGroupFailureEvent(
+        failureCode: String? = null,
+        failureMessage: String? = null,
+    ) = MessagingSyncEventDto(
+        id = "10",
+        type = "scheduled_group_payment.failed",
+        conversationId = CONVERSATION_ID,
+        resourceType = "scheduled_group_payment",
+        resourceId = SCHEDULED_PAYMENT_ID,
+        data = MessagingSyncEventDataDto(
+            schema = "kit.scheduled-group-payment.v1",
+            conversationId = CONVERSATION_ID,
+            scheduledGroupPaymentId = SCHEDULED_PAYMENT_ID,
+            status = "failed",
+            scheduledFor = TIMESTAMP,
+            failureCode = failureCode,
+            failureMessage = failureMessage,
+            completedAt = TIMESTAMP,
+        ),
+        occurredAt = TIMESTAMP,
+    )
+
+    private fun scheduledGroupCompletedEvent() = MessagingSyncEventDto(
+        id = "10",
+        type = "scheduled_group_payment.completed",
+        conversationId = CONVERSATION_ID,
+        resourceType = "scheduled_group_payment",
+        resourceId = SCHEDULED_PAYMENT_ID,
+        data = MessagingSyncEventDataDto(
+            schema = "kit.scheduled-group-payment.v1",
+            conversationId = CONVERSATION_ID,
+            scheduledGroupPaymentId = SCHEDULED_PAYMENT_ID,
+            status = "completed",
+            scheduledFor = TIMESTAMP,
+            groupPaymentId = GROUP_PAYMENT_ID,
+            completedAt = TIMESTAMP,
+        ),
+        occurredAt = TIMESTAMP,
+    )
+
+    private fun scheduledDirectFailureEvent() = MessagingSyncEventDto(
+        id = "10",
+        type = "scheduled_payment.failed",
+        conversationId = CONVERSATION_ID,
+        resourceType = "scheduled_payment",
+        resourceId = SCHEDULED_PAYMENT_ID,
+        data = MessagingSyncEventDataDto(
+            schema = "kit.scheduled-payment.v1",
+            conversationId = CONVERSATION_ID,
+            scheduledPaymentId = SCHEDULED_PAYMENT_ID,
+            senderUserId = CURRENT_USER_ID,
+            recipientUserId = PEER_USER_ID,
+            status = "failed",
+            amountMinor = "250000",
+            currency = "UGX",
+            currencyScale = 2,
+            scheduledFor = TIMESTAMP,
+            failureCode = "PROVIDER_UNAVAILABLE",
+            // The deployed direct event can carry JSON null. Exact state supplies presentation.
+            failureMessage = null,
+            completedAt = TIMESTAMP,
+        ),
+        occurredAt = TIMESTAMP,
+    )
+
+    private fun scheduledDirectCompletedEvent(
+        senderUserId: String,
+        recipientUserId: String,
+    ) = MessagingSyncEventDto(
+        id = "10",
+        type = "scheduled_payment.completed",
+        conversationId = CONVERSATION_ID,
+        resourceType = "scheduled_payment",
+        resourceId = SCHEDULED_PAYMENT_ID,
+        data = MessagingSyncEventDataDto(
+            schema = "kit.scheduled-payment.v1",
+            conversationId = CONVERSATION_ID,
+            scheduledPaymentId = SCHEDULED_PAYMENT_ID,
+            senderUserId = senderUserId,
+            recipientUserId = recipientUserId,
+            status = "completed",
+            amountMinor = "250000",
+            currency = "UGX",
+            currencyScale = 2,
+            scheduledFor = TIMESTAMP,
+            walletTransactionId = WALLET_TRANSACTION_ID,
+            completedAt = TIMESTAMP,
+        ),
+        occurredAt = TIMESTAMP,
+    )
+
+    private suspend fun assertSwappedCompletedDirectionRejected(
+        authority: String,
+        senderUserId: String,
+        recipientUserId: String,
+    ) {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = PersistingDecryptionEngine(stateStore),
+            scheduledPayments = scheduledPaymentRepository(),
+        )
+        enqueueSync(
+            listOf(scheduledDirectCompletedEvent(senderUserId, recipientUserId)),
+            "swapped_direction_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        server.enqueue(jsonResponse(authority))
+
+        assertTrue(runCatching { processor.synchronize(session) }.isFailure)
+        assertNull(SecureMessagingSyncCursorStore(stateStore).load())
+    }
+
+    private fun scheduledPaymentRepository() = ServerScheduledPaymentRepository(
+        api = api,
+        apiCalls = apiCalls,
+        paymentAuthorizer = PaymentAuthorizer(api, apiCalls),
+        walletSync = object : WalletSyncRepository {
+            override suspend fun refresh() = WalletSyncResult(0, 0, false)
+            override suspend fun clearCachedUserData(ownerScopeId: String?) = Unit
+        },
+    )
+
     private suspend fun openSyncingSession(): Triple<
         RemoteSecureMessagingTransport.Session,
         SecureMessagingLifecycleGuard,
@@ -3238,6 +3668,8 @@ class SecureMessagingEventProcessorTest {
             SecureMessagingHistoryContinuationScheduler { },
         walletRefresh: com.kit.wallet.data.repository.WalletRefreshTrigger =
             com.kit.wallet.data.messaging.NoOpWalletRefreshTrigger,
+        systemEvents: ConversationSystemEventStore? = null,
+        scheduledPayments: ServerScheduledPaymentRepository? = null,
     ) = SecureMessagingEventProcessor(
         crypto,
         projections,
@@ -3246,6 +3678,8 @@ class SecureMessagingEventProcessorTest {
         currentActivationRevocation,
         historyContinuationScheduler,
         walletRefresh,
+        systemEvents,
+        scheduledPayments,
     )
 
     private fun projectionStore(stateStore: SecureMessagingStateStore) =
@@ -4540,6 +4974,12 @@ class SecureMessagingEventProcessorTest {
         const val INCOMING_MESSAGE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         const val OUTBOUND_SERVER_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         const val SECOND_OUTBOUND_SERVER_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        const val SCHEDULED_PAYMENT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        const val SOURCE_WALLET_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        const val DESTINATION_WALLET_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        const val PAYMENT_EXECUTION_ID = "12121212-1212-4212-8212-121212121212"
+        const val WALLET_TRANSACTION_ID = "13131313-1313-4313-8313-131313131313"
+        const val GROUP_PAYMENT_ID = "14141414-1414-4414-8414-141414141414"
         const val SELF_AUTHORED_HISTORY_TEXT = "self-authored retained history"
         const val TIMESTAMP = "2026-07-20T12:00:00Z"
         val ORIGINAL_HISTORY_ROSTER = "v1:sha256:${"f".repeat(64)}"
@@ -4577,6 +5017,61 @@ class SecureMessagingEventProcessorTest {
             "joined_at":"$TIMESTAMP"},{"user_id":"$PEER_USER_ID","name":"Peer",
             "role":"member","joined_at":"$TIMESTAMP"}],"created_at":"$TIMESTAMP",
             "updated_at":"$TIMESTAMP"}]}}
+        """
+        const val EMPTY_CONVERSATIONS = """
+            {"ok":true,"data":{"items":[]}}
+        """
+        const val GROUP_CONVERSATIONS = """
+            {"ok":true,"data":{"items":[
+            {"id":"$CONVERSATION_ID","type":"group","title":"Operations",
+            "parent_id":null,"created_by":"$CURRENT_USER_ID","role":"owner","members":[
+            {"user_id":"$CURRENT_USER_ID","name":"Current User","role":"owner",
+            "joined_at":"$TIMESTAMP"},{"user_id":"$PEER_USER_ID","name":"Peer",
+            "role":"member","joined_at":"$TIMESTAMP"}],"created_at":"$TIMESTAMP",
+            "updated_at":"$TIMESTAMP"}]}}
+        """
+        const val FAILED_SCHEDULED_GROUP_PAYMENT = """
+            {"ok":true,"data":{"id":"$SCHEDULED_PAYMENT_ID",
+            "type":"scheduled_group_payment","conversation_id":"$CONVERSATION_ID",
+            "status":"failed","source_wallet_id":"$SOURCE_WALLET_ID",
+            "split_mode":"even","audience":"all","total_amount":"2500.00",
+            "currency":{"code":"UGX","scale":"2"},"note":null,"recipient_count":1,
+            "recipients":[{"user_id":"$PEER_USER_ID","name":"Peer","amount":"2500.00"}],
+            "group_payment_id":null,"failure":{"code":"PROVIDER_UNAVAILABLE",
+            "message":"Provider did not answer"},"scheduled_for":"$TIMESTAMP",
+            "queued_at":null,"started_at":null,"completed_at":"$TIMESTAMP",
+            "cancelled_at":null,"created_at":"$TIMESTAMP"}}
+        """
+        const val FAILED_SCHEDULED_DIRECT_PAYMENT = """
+            {"ok":true,"data":{"id":"$SCHEDULED_PAYMENT_ID","type":"scheduled_payment",
+            "status":"failed","conversation_id":"$CONVERSATION_ID",
+            "source_wallet_id":"$SOURCE_WALLET_ID",
+            "destination_wallet_id":"$DESTINATION_WALLET_ID","amount":"2500.00",
+            "currency":{"code":"UGX","scale":"2"},"note":null,
+            "scheduled_for":"$TIMESTAMP","payment_execution_id":"$PAYMENT_EXECUTION_ID",
+            "wallet_transaction_id":null,"failure":{"code":"PROVIDER_UNAVAILABLE",
+            "message":"Provider did not answer"},"completed_at":"$TIMESTAMP",
+            "cancelled_at":null,"created_at":"$TIMESTAMP"}}
+        """
+        const val COMPLETED_SCHEDULED_DIRECT_PAYMENT_CREATOR = """
+            {"ok":true,"data":{"id":"$SCHEDULED_PAYMENT_ID","type":"scheduled_payment",
+            "status":"completed","conversation_id":"$CONVERSATION_ID",
+            "source_wallet_id":"$SOURCE_WALLET_ID",
+            "destination_wallet_id":"$DESTINATION_WALLET_ID","amount":"2500.00",
+            "currency":{"code":"UGX","scale":"2"},"note":null,
+            "scheduled_for":"$TIMESTAMP","payment_execution_id":"$PAYMENT_EXECUTION_ID",
+            "wallet_transaction_id":"$WALLET_TRANSACTION_ID","failure":null,
+            "completed_at":"$TIMESTAMP","cancelled_at":null,"created_at":"$TIMESTAMP"}}
+        """
+        const val COMPLETED_SCHEDULED_DIRECT_PAYMENT_RECIPIENT = """
+            {"ok":true,"data":{"id":"$SCHEDULED_PAYMENT_ID","type":"scheduled_payment",
+            "status":"completed","conversation_id":"$CONVERSATION_ID",
+            "source_wallet_id":null,
+            "destination_wallet_id":"$DESTINATION_WALLET_ID","amount":"2500.00",
+            "currency":{"code":"UGX","scale":"2"},"note":null,
+            "scheduled_for":"$TIMESTAMP","payment_execution_id":null,
+            "wallet_transaction_id":"$WALLET_TRANSACTION_ID","failure":null,
+            "completed_at":"$TIMESTAMP","cancelled_at":null,"created_at":"$TIMESTAMP"}}
         """
     }
 }

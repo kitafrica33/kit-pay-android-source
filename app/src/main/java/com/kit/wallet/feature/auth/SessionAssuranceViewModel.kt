@@ -11,9 +11,13 @@ import com.kit.wallet.data.remote.LoginBiometricAssertionRequest
 import com.kit.wallet.data.remote.SessionAssuranceDto
 import com.kit.wallet.data.remote.SessionAssuranceSignal
 import com.kit.wallet.data.remote.SetPaymentPinRequest
+import com.kit.wallet.data.repository.KycVerificationState
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.CachedSessionAssurance
 import com.kit.wallet.data.auth.toCachedSessionAssurance
+import com.kit.wallet.feature.wallet.ScopedAccessPosture
+import com.kit.wallet.feature.wallet.ScopedAccessState
+import com.kit.wallet.feature.wallet.scopedAccessPosture
 import dagger.hilt.android.lifecycle.HiltViewModel
 import java.time.Instant
 import javax.inject.Inject
@@ -43,6 +47,16 @@ data class SessionAssuranceUiState(
     val deviceIdentityRequired: Boolean = false,
     /** Raw device-identity status (required/pending/review/failed/verified) for gate copy. */
     val deviceIdentityStatus: String? = null,
+    /** Whether a real login-unlock step is still outstanding, independently of KYC. */
+    val loginUnlockRequired: Boolean = false,
+    /** Scoped server decisions. Null means the pre-scope compatibility policy must be used. */
+    val communicationAccessAllowed: Boolean? = null,
+    val communicationAccessBasis: String? = null,
+    val communicationRequiredAction: String? = null,
+    val financialAccessAllowed: Boolean? = null,
+    val financialAccessBasis: String? = null,
+    val financialReadOnly: Boolean = false,
+    val financialRequiredAction: String? = null,
 )
 
 @HiltViewModel
@@ -285,6 +299,15 @@ class SessionAssuranceViewModel @Inject constructor(
             } == true,
             deviceIdentityRequired = !identityReady,
             deviceIdentityStatus = assurance.deviceIdentity.status,
+            loginUnlockRequired = assurance.loginUnlock.required &&
+                !assurance.loginUnlock.status.equals("unlocked", ignoreCase = true),
+            communicationAccessAllowed = assurance.communicationAccess?.allowed,
+            communicationAccessBasis = assurance.communicationAccess?.basis,
+            communicationRequiredAction = assurance.communicationAccess?.requiredAction,
+            financialAccessAllowed = assurance.financialAccess?.allowed,
+            financialAccessBasis = assurance.financialAccess?.basis,
+            financialReadOnly = assurance.financialAccess?.readOnly == true,
+            financialRequiredAction = assurance.financialAccess?.requiredAction,
         )
     }
 
@@ -305,6 +328,15 @@ class SessionAssuranceViewModel @Inject constructor(
             } == true,
             deviceIdentityRequired = !identityReady,
             deviceIdentityStatus = cached.deviceIdentityStatus,
+            loginUnlockRequired = cached.loginUnlockRequired &&
+                !cached.loginUnlockStatus.equals("unlocked", ignoreCase = true),
+            communicationAccessAllowed = cached.communicationAccessAllowed,
+            communicationAccessBasis = cached.communicationAccessBasis,
+            communicationRequiredAction = cached.communicationRequiredAction,
+            financialAccessAllowed = cached.financialAccessAllowed,
+            financialAccessBasis = cached.financialAccessBasis,
+            financialReadOnly = cached.financialReadOnly,
+            financialRequiredAction = cached.financialRequiredAction,
         )
     }
 }
@@ -320,3 +352,46 @@ internal fun CachedSessionAssurance.grantsFullAccess(): Boolean =
     access.equals("full", ignoreCase = true) &&
         (!deviceIdentityRequired || deviceIdentityStatus.equals("verified", ignoreCase = true)) &&
         (!loginUnlockRequired || loginUnlockStatus.equals("unlocked", ignoreCase = true))
+
+/**
+ * Decides whether the full-screen session gate must cover the authenticated app.
+ *
+ * A scoped server answer wins when present. The compatibility fallback only admits messaging for
+ * an account whose KYC state is authoritatively unfinished and whose *only* outstanding assurance
+ * dimension is device identity. A verified account on a new/suspicious device, a PIN/biometric
+ * login lock, an unknown KYC state, or any other restricted state remains fail-closed.
+ */
+internal fun shouldPresentSessionUnlockGate(
+    state: SessionAssuranceUiState,
+    accountState: KycVerificationState,
+    scopedAccess: ScopedAccessState = state.scopedAccessState(),
+): Boolean {
+    when (scopedAccessPosture(scopedAccess)) {
+        ScopedAccessPosture.ACCOUNT_ONBOARDING,
+        ScopedAccessPosture.FULL_ASSURANCE,
+        ScopedAccessPosture.APP_REVIEW,
+        -> return false
+        ScopedAccessPosture.VERIFY_DEVICE_IDENTITY,
+        ScopedAccessPosture.UNLOCK_SESSION,
+        ScopedAccessPosture.INVALID,
+        -> return true
+        ScopedAccessPosture.ABSENT -> Unit
+    }
+    if (!state.required) return false
+    if (state.loginUnlockRequired || !state.deviceIdentityRequired) return true
+    return accountState !in setOf(
+        KycVerificationState.NOT_STARTED,
+        KycVerificationState.IN_REVIEW,
+        KycVerificationState.ACTION_NEEDED,
+    )
+}
+
+internal fun SessionAssuranceUiState.scopedAccessState() = ScopedAccessState(
+    communicationAllowed = communicationAccessAllowed,
+    communicationBasis = communicationAccessBasis,
+    communicationRequiredAction = communicationRequiredAction,
+    financialAllowed = financialAccessAllowed,
+    financialReadOnly = financialReadOnly,
+    financialBasis = financialAccessBasis,
+    financialRequiredAction = financialRequiredAction,
+)

@@ -1,5 +1,8 @@
 package com.kit.wallet.feature.calls
 
+import com.kit.wallet.data.repository.CallParticipantIdentity
+import com.kit.wallet.ui.model.AccountVerification
+import com.kit.wallet.ui.model.AccountVerificationDesignation
 import com.kit.wallet.ui.model.Contact
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -147,6 +150,53 @@ class ActiveCallContactPresentationTest {
             contacts = listOf(flora, contact(WAITING_USER_ID, "Amina saved", "+256700000002")),
         )
         assertNull(grouped.state.avatarUrl)
+    }
+
+    @Test
+    fun `empty contact metadata cannot erase authenticated first sighting identity`() {
+        val official = AccountVerification(AccountVerificationDesignation.OFFICIAL, null)
+        val participant = CallParticipantIdentity(
+            userId = ACTIVE_USER_ID,
+            name = "Flora Registered",
+            avatarUrl = "https://pay.kit.africa/media/a1",
+            accountVerification = official,
+        )
+        val source = ActiveCallContactPresentationSource(
+            callId = ACTIVE_CALL_ID,
+            serverName = "Flora Registered",
+            participantUserIds = listOf(ACTIVE_USER_ID),
+            participants = listOf(participant),
+        )
+        val initial = ActiveCallUiState(
+            name = "Flora Registered",
+            avatarUrl = participant.avatarUrl,
+            accountVerification = official,
+            phase = CallPhase.CONNECTED,
+            remoteParticipants = listOf(
+                RemoteCallParticipant(
+                    id = "$ACTIVE_USER_ID:device",
+                    name = "Flora Registered",
+                    serverName = "Flora Registered",
+                    avatarUrl = participant.avatarUrl,
+                    accountVerification = official,
+                ),
+            ),
+        )
+
+        val refreshed = refreshActiveCallContactPresentation(
+            state = initial,
+            activeSource = source,
+            contacts = listOf(contact(ACTIVE_USER_ID, "Flora saved", "+256700000001")),
+        )
+
+        assertEquals("Flora saved", refreshed.state.name)
+        assertEquals(participant.avatarUrl, refreshed.state.avatarUrl)
+        assertEquals(official, refreshed.state.accountVerification)
+        assertEquals(participant.avatarUrl, refreshed.state.remoteParticipants.single().avatarUrl)
+        assertEquals(
+            official,
+            refreshed.state.remoteParticipants.single().accountVerification,
+        )
     }
 
     private fun contact(id: String, name: String, phone: String) = Contact(

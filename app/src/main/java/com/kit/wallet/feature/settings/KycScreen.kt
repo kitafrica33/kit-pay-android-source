@@ -14,7 +14,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Badge
-import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -45,7 +44,6 @@ import com.kit.wallet.data.repository.KycStatus
 import com.kit.wallet.data.repository.KycVerificationState
 import com.kit.wallet.ui.components.KitGreenButton
 import com.kit.wallet.ui.components.StatusChip
-import com.kit.wallet.ui.theme.KitTheme
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -143,7 +141,7 @@ fun KycScreen(
             if (accountVerified) {
                 Text(
                     "Your identity is verified. Your wallet limits will update automatically.",
-                    color = KitTheme.colors.success,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontWeight = FontWeight.SemiBold,
                 )
             }
@@ -279,18 +277,16 @@ internal fun verificationSummaryLabel(status: KycStatus?): String = when {
 @Composable
 private fun VerificationSummary(status: KycStatus?) {
     val value = verificationSummaryLabel(status)
-    val approved = status?.accountState == KycVerificationState.VERIFIED
     Surface(
         shape = MaterialTheme.shapes.large,
-        color = if (approved) KitTheme.colors.successContainer
-        else MaterialTheme.colorScheme.surface,
+        color = MaterialTheme.colorScheme.surface,
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(Modifier.padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(
-                if (approved) Icons.Rounded.CheckCircle else Icons.Rounded.Badge,
+                Icons.Rounded.Badge,
                 contentDescription = null,
-                tint = if (approved) KitTheme.colors.success else MaterialTheme.colorScheme.primary,
+                tint = MaterialTheme.colorScheme.primary,
             )
             Column(Modifier.padding(start = 12.dp).weight(1f)) {
                 Text("Identity", style = MaterialTheme.typography.labelMedium)

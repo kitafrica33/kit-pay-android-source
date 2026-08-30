@@ -830,6 +830,13 @@ internal fun com.kit.wallet.data.remote.SessionAssuranceDto.toCachedSessionAssur
         loginUnlockStatus = loginUnlock.status,
         loginUnlockRequired = loginUnlock.required,
         loginUnlockMethods = loginUnlock.methods,
+        communicationAccessAllowed = communicationAccess?.allowed,
+        communicationAccessBasis = communicationAccess?.basis,
+        communicationRequiredAction = communicationAccess?.requiredAction,
+        financialAccessAllowed = financialAccess?.allowed,
+        financialAccessBasis = financialAccess?.basis,
+        financialRequiredAction = financialAccess?.requiredAction,
+        financialReadOnly = financialAccess?.readOnly == true,
     )
 
 internal fun challengeLifetimeMillis(expiresAt: Instant?, serverTime: Instant?): Long? {

@@ -2,6 +2,7 @@ package com.kit.wallet.data.messaging
 
 import com.kit.wallet.data.repository.AuthenticatedConversation
 import com.kit.wallet.data.repository.AuthenticatedConversationMember
+import com.kit.wallet.ui.model.AccountVerification
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -135,6 +136,9 @@ internal class ConversationRosterStore @Inject constructor(
                 data.writeUTF(member.userId)
                 data.writeUTF(member.name.orEmpty())
                 data.writeUTF(member.role)
+                data.writeUTF(member.avatarUrl.orEmpty())
+                data.writeUTF(member.accountVerification?.designation?.serverValue.orEmpty())
+                data.writeUTF(member.accountVerification?.since.orEmpty())
             }
         }
         return out.toByteArray()
@@ -148,7 +152,7 @@ internal class ConversationRosterStore @Inject constructor(
                 // A record written before group identity existed still names its chat offline;
                 // it simply has no description or photo until the next authenticated load.
                 val version = data.readByte()
-                if (version != VERSION && version != LEGACY_VERSION) {
+                if (version !in setOf(VERSION, GROUP_IDENTITY_VERSION, LEGACY_VERSION)) {
                     null
                 } else {
                     val id = data.readUTF()
@@ -156,12 +160,12 @@ internal class ConversationRosterStore @Inject constructor(
                     val title = data.readUTF().takeIf(String::isNotEmpty)
                     val viewerUserId = data.readUTF()
                     val currentUserRole = data.readUTF()
-                    val description = if (version == VERSION) {
+                    val description = if (version >= GROUP_IDENTITY_VERSION) {
                         data.readUTF().takeIf(String::isNotEmpty)
                     } else {
                         null
                     }
-                    val photoUrl = if (version == VERSION) {
+                    val photoUrl = if (version >= GROUP_IDENTITY_VERSION) {
                         data.readUTF().takeIf(String::isNotEmpty)
                     } else {
                         null
@@ -177,10 +181,33 @@ internal class ConversationRosterStore @Inject constructor(
                             viewerUserId = viewerUserId,
                             currentUserRole = currentUserRole,
                             members = (0 until count).map {
+                                val userId = data.readUTF()
+                                val name = data.readUTF().takeIf(String::isNotEmpty)
+                                val role = data.readUTF()
+                                val avatarUrl = if (version >= VERSION) {
+                                    data.readUTF().takeIf(String::isNotEmpty)
+                                } else {
+                                    null
+                                }
+                                val verificationDesignation = if (version >= VERSION) {
+                                    data.readUTF().takeIf(String::isNotEmpty)
+                                } else {
+                                    null
+                                }
+                                val verificationSince = if (version >= VERSION) {
+                                    data.readUTF().takeIf(String::isNotEmpty)
+                                } else {
+                                    null
+                                }
                                 AuthenticatedConversationMember(
-                                    userId = data.readUTF(),
-                                    name = data.readUTF().takeIf(String::isNotEmpty),
-                                    role = data.readUTF(),
+                                    userId = userId,
+                                    name = name,
+                                    role = role,
+                                    avatarUrl = avatarUrl,
+                                    accountVerification = AccountVerification.fromServerValues(
+                                        verificationDesignation,
+                                        verificationSince,
+                                    ),
                                 )
                             },
                             description = description,
@@ -204,7 +231,8 @@ internal class ConversationRosterStore @Inject constructor(
 
     private companion object {
         const val NAMESPACE = "conversation-roster-v1"
-        const val VERSION: Byte = 0x02
+        const val VERSION: Byte = 0x03
+        const val GROUP_IDENTITY_VERSION: Byte = 0x02
         const val LEGACY_VERSION: Byte = 0x01
 
         /** Matches the chat list's own display bound, so the cache can never outgrow the screen. */

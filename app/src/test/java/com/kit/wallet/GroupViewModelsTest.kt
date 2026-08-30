@@ -5,6 +5,8 @@ import com.kit.wallet.data.remote.MAX_GROUP_MEMBERS
 import com.kit.wallet.data.remote.MAX_GROUP_TITLE_LENGTH
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
+import com.kit.wallet.data.repository.ProfileEmailChallenge
+import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.feature.chat.GroupProfileViewModel
 import com.kit.wallet.feature.chat.NewGroupViewModel
 import com.kit.wallet.ui.model.ChatMember
@@ -12,6 +14,9 @@ import com.kit.wallet.ui.model.ChatMemberRole
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Message
+import com.kit.wallet.ui.model.UserProfile
+import com.kit.wallet.ui.model.AccountVerification
+import com.kit.wallet.ui.model.AccountVerificationDesignation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -200,6 +205,7 @@ class GroupViewModelsTest {
             val viewModel = GroupProfileViewModel(
                 chats,
                 FakeContactRepository(directory(2)),
+                FakeUserRepository(),
                 SavedStateHandle(mapOf("chatId" to GROUP_ID)),
             )
 
@@ -216,6 +222,7 @@ class GroupViewModelsTest {
         val viewModel = GroupProfileViewModel(
             FakeChatRepository(members = roster),
             FakeContactRepository(directory(3)),
+            FakeUserRepository(),
             SavedStateHandle(mapOf("chatId" to GROUP_ID)),
         )
 
@@ -233,6 +240,7 @@ class GroupViewModelsTest {
         val viewModel = GroupProfileViewModel(
             chats,
             FakeContactRepository(directory(1)),
+            FakeUserRepository(),
             SavedStateHandle(mapOf("chatId" to GROUP_ID)),
         )
 
@@ -250,6 +258,7 @@ class GroupViewModelsTest {
         val viewModel = GroupProfileViewModel(
             chats,
             FakeContactRepository(directory(1)),
+            FakeUserRepository(),
             SavedStateHandle(mapOf("chatId" to GROUP_ID)),
         )
         var left = false
@@ -266,6 +275,7 @@ class GroupViewModelsTest {
         val viewModel = GroupProfileViewModel(
             chats,
             FakeContactRepository(directory(1)),
+            FakeUserRepository(),
             SavedStateHandle(),
         )
         var left = false
@@ -280,10 +290,56 @@ class GroupViewModelsTest {
         assertEquals(emptyList<ChatMember>(), viewModel.members.value)
     }
 
+    @Test
+    fun `group rows join verification by account id and profile authority`() = runTest {
+        val verified = AccountVerification(AccountVerificationDesignation.VERIFIED, null)
+        val official = AccountVerification(AccountVerificationDesignation.OFFICIAL, null)
+        val contact = contact(0).copy(accountVerification = verified)
+        val roster = listOf(
+            ChatMember("me", "You", isSelf = true),
+            ChatMember(contact.id.uppercase(), "Server name"),
+            ChatMember("lookalike", contact.name),
+        )
+        val viewModel = GroupProfileViewModel(
+            FakeChatRepository(members = roster),
+            FakeContactRepository(listOf(contact)),
+            FakeUserRepository(
+                UserProfile(
+                    name = "Me",
+                    phone = "+256700000000",
+                    tag = "me",
+                    kycLabel = "KYC verified",
+                    accountVerification = official,
+                ),
+            ),
+            SavedStateHandle(mapOf("chatId" to GROUP_ID)),
+        )
+
+        assertEquals(official, viewModel.members.value[0].accountVerification)
+        assertEquals(verified, viewModel.members.value[1].accountVerification)
+        assertNull(viewModel.members.value[2].accountVerification)
+    }
+
     private class FakeContactRepository(initial: List<Contact>) : ContactRepository {
         override val contacts: StateFlow<List<Contact>> = MutableStateFlow(initial).asStateFlow()
         override suspend fun refresh() = Unit
         override suspend fun syncDeviceContacts() = Unit
+    }
+
+    private class FakeUserRepository(
+        initial: UserProfile = UserProfile(
+            name = "Me",
+            phone = "+256700000000",
+            tag = "me",
+            kycLabel = "",
+        ),
+    ) : UserRepository {
+        override val profile: StateFlow<UserProfile> = MutableStateFlow(initial)
+        override suspend fun refreshProfile() = Unit
+        override suspend fun updateProfile(name: String, tag: String) = Unit
+        override suspend fun requestEmailAttachment(email: String): ProfileEmailChallenge =
+            error("Unused")
+        override suspend fun verifyEmailAttachment(challengeId: String, code: String) = Unit
     }
 
     private class FakeChatRepository(

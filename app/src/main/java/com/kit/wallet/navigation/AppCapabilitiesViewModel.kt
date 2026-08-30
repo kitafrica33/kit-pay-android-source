@@ -6,6 +6,8 @@ import com.kit.wallet.data.messaging.SecureMessagingContract
 import com.kit.wallet.data.notifications.PushMessagingTransport
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.KitWalletApi
+import com.kit.wallet.data.remote.SessionCommunicationAccessDto
+import com.kit.wallet.data.remote.SessionFinancialAccessDto
 import com.kit.wallet.data.realtime.KitNetworkEvent
 import com.kit.wallet.data.realtime.KitNetworkSource
 import com.kit.wallet.data.remote.KitFeature
@@ -56,6 +58,9 @@ data class AppCapabilities(
     val groupPaymentRequestsReady: Boolean = false,
     val scheduledChatPaymentsReady: Boolean = false,
     val scheduledGroupPaymentsReady: Boolean = false,
+    /** Present only for an authenticated caller; anonymous capability discovery omits both. */
+    val communicationAccess: SessionCommunicationAccessDto? = null,
+    val financialAccess: SessionFinancialAccessDto? = null,
     /**
      * The support protocol negotiated from the last successful capability response, or null
      * when the server advertised none or anything this build does not speak exactly. Support
@@ -321,6 +326,8 @@ class AppCapabilitiesViewModel @Inject constructor(
                     groupPaymentRequestsReady = false,
                     scheduledChatPaymentsReady = false,
                     scheduledGroupPaymentsReady = false,
+                    communicationAccess = null,
+                    financialAccess = null,
                     supportProtocol = null,
                 )
             }
@@ -348,6 +355,8 @@ class AppCapabilitiesViewModel @Inject constructor(
                         groupPaymentRequestsReady = response.groupPaymentRequestsAvailable(),
                         scheduledChatPaymentsReady = response.scheduledChatPaymentsAvailable(),
                         scheduledGroupPaymentsReady = response.scheduledGroupPaymentsAvailable(),
+                        communicationAccess = response.communicationAccess,
+                        financialAccess = response.financialAccess,
                         supportProtocol = SupportContract.negotiate(response.protocols?.support),
                     )
                 }
@@ -373,6 +382,8 @@ class AppCapabilitiesViewModel @Inject constructor(
                         groupPaymentRequestsReady = false,
                         scheduledChatPaymentsReady = false,
                         scheduledGroupPaymentsReady = false,
+                        communicationAccess = null,
+                        financialAccess = null,
                         supportProtocol = null,
                     )
                 }

@@ -96,6 +96,28 @@ class ConversationSystemEventStoreTest {
         assertEquals("25000000", event.contributionAmountMinor)
     }
 
+    @Test fun `exact scheduled projection survives restart`() = runTest {
+        val state = TestSecureMessagingStateStore()
+        val store = ConversationSystemEventStore(state)
+        val projection = "KITSGRP1:v=1&a=cancelled&id=00000000-0000-4000-8000-000000000003&at=42"
+        store.record(
+            CONVERSATION_ID,
+            ConversationSystemEvent(
+                eventId = 9,
+                type = "scheduled_group_payment.cancelled",
+                userId = MEMBER_ID,
+                role = null,
+                occurredAt = Instant.ofEpochMilli(9_000),
+                paymentId = "00000000-0000-4000-8000-000000000003",
+                projectionText = projection,
+            ),
+        )
+
+        val restarted = ConversationSystemEventStore(state)
+        restarted.load(listOf(CONVERSATION_ID))
+        assertEquals(projection, restarted.events.value.getValue(CONVERSATION_ID).single().projectionText)
+    }
+
     @Test fun `history stays bounded, keeping the most recent changes`() = runTest {
         val state = TestSecureMessagingStateStore()
         val store = ConversationSystemEventStore(state)

@@ -321,7 +321,12 @@ private fun SourceRow(source: TopUpSource, selected: Boolean, onClick: () -> Uni
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        KitAvatar(source.title, size = 40.dp, avatarUrl = source.avatarUrl)
+        KitAvatar(
+            source.title,
+            size = 40.dp,
+            avatarUrl = source.avatarUrl,
+            accountVerification = source.accountVerification,
+        )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(source.title, style = MaterialTheme.typography.titleSmall)

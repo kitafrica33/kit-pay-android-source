@@ -114,10 +114,9 @@ data class KitExtendedColors(
     val goldSheenStart: Color,
     val goldSheenEnd: Color,
     /**
-     * Verified-organization blue worn only by official Kit Pay support identities
-     * (server designation `official_support`). Deliberately not the green
-     * KYC/success family: a badge about who is talking must never look like a
-     * claim about the customer's own verification.
+     * Account-verification blue worn only for an accepted server designation. Deliberately not
+     * the green KYC/success family: a public account seal must never look like a claim about the
+     * customer's identity-document verification.
      */
     val verifiedBadge: Color,
     val verifiedBadgeContainer: Color,

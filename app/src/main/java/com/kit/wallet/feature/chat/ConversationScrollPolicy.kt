@@ -94,4 +94,6 @@ internal fun conversationScrollDecision(
 
 private val MessageKind.isGroupPaymentRow: Boolean
     get() = this == MessageKind.GROUP_PAYMENT || this == MessageKind.GROUP_PAYMENT_EVENT ||
-        this == MessageKind.GROUP_PAYMENT_REQUEST || this == MessageKind.GROUP_PAYMENT_REQUEST_EVENT
+        this == MessageKind.GROUP_PAYMENT_REQUEST || this == MessageKind.GROUP_PAYMENT_REQUEST_EVENT ||
+        this == MessageKind.SCHEDULED_PAYMENT_EVENT ||
+        this == MessageKind.SCHEDULED_GROUP_PAYMENT_EVENT

@@ -165,6 +165,9 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val userId: String,
             val name: String?,
             val role: String,
+            val avatarUrl: String? = null,
+            val verificationDesignation: String? = null,
+            val verificationSince: String? = null,
         )
 
         /** Opaque authority for one exact, server-validated device roster. */
@@ -300,6 +303,19 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val contributionId: String?,
             val contributorUserId: String?,
             val contributionAmountMinor: String?,
+            val senderUserId: String?,
+            val recipientUserId: String?,
+            val amountMinor: Long?,
+            val currency: String?,
+            val currencyScale: Int?,
+            val note: String?,
+            val scheduledFor: Instant?,
+            val walletTransactionId: String?,
+            val failureCode: String?,
+            val failureMessage: String?,
+            val completedAt: Instant?,
+            val cancelledAt: Instant?,
+            val groupPaymentId: String?,
         ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt)
 
         class SyncBatch internal constructor(
@@ -2037,7 +2053,14 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 peerName = validated.peerName,
                 currentUserRole = validated.currentUserRole,
                 members = validated.members.map {
-                    ConversationMember(userId = it.userId, name = it.name, role = it.role)
+                    ConversationMember(
+                        userId = it.userId,
+                        name = it.name,
+                        role = it.role,
+                        avatarUrl = it.avatarUrl,
+                        verificationDesignation = it.verification?.designation,
+                        verificationSince = it.verification?.since,
+                    )
                 },
             )
             synchronized(issuanceLock) {
@@ -2478,6 +2501,19 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
                 contributionId = validated.contributionId,
                 contributorUserId = validated.contributorUserId,
                 contributionAmountMinor = validated.contributionAmountMinor,
+                senderUserId = validated.senderUserId,
+                recipientUserId = validated.recipientUserId,
+                amountMinor = validated.amountMinor,
+                currency = validated.currency,
+                currencyScale = validated.currencyScale,
+                note = validated.note,
+                scheduledFor = validated.scheduledFor,
+                walletTransactionId = validated.walletTransactionId,
+                failureCode = validated.failureCode,
+                failureMessage = validated.failureMessage,
+                completedAt = validated.completedAt,
+                cancelledAt = validated.cancelledAt,
+                groupPaymentId = validated.groupPaymentId,
             )
         }
 

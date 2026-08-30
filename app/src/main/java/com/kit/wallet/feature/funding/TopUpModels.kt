@@ -1,5 +1,7 @@
 package com.kit.wallet.feature.funding
 
+import com.kit.wallet.ui.model.AccountVerification
+
 /** Where topped-up money is pulled from. */
 enum class TopUpChannel {
     MOBILE_MONEY,
@@ -29,6 +31,8 @@ data class TopUpSource(
     val currencyScale: Int,
     /** The face to draw beside the row, when this device can establish one honestly. */
     val avatarUrl: String? = null,
+    /** The signed-in owner's server designation, when the source is linked to that account. */
+    val accountVerification: AccountVerification? = null,
 )
 
 /** How far along a top-up is. */
