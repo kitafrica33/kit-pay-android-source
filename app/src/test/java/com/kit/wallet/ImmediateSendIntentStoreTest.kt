@@ -110,6 +110,58 @@ class ImmediateSendIntentStoreTest {
         }
     }
 
+    @Test fun `preparing media round trips without pretending ciphertext already exists`() {
+        val single = ImmediateSendIntent(
+            id = ID_ONE,
+            conversationId = CONVERSATION_ID,
+            kind = ImmediateSendKind.MEDIA,
+            createdAtEpochMillis = NOW,
+            state = ImmediateSendState.PREPARING,
+            mediaType = "image/jpeg",
+            mediaPlaintextBytes = 1_024,
+        )
+        val album = ImmediateSendIntent(
+            id = ID_TWO,
+            conversationId = CONVERSATION_ID,
+            kind = ImmediateSendKind.MEDIA_V2,
+            createdAtEpochMillis = NOW,
+            state = ImmediateSendState.PREPARING,
+            mediaItems = listOf(
+                ImmediateSendMediaItem(
+                    attachmentId = ATTACHMENT_ONE,
+                    mediaType = "image/jpeg",
+                    plaintextBytes = 1_024,
+                    ciphertextBytes = 0,
+                    keyBase64 = "",
+                    ciphertextSha256Hex = "",
+                ),
+                ImmediateSendMediaItem(
+                    attachmentId = ATTACHMENT_TWO,
+                    mediaType = "video/mp4",
+                    plaintextBytes = 2_048,
+                    ciphertextBytes = 0,
+                    keyBase64 = "",
+                    ciphertextSha256Hex = "",
+                ),
+            ),
+        )
+
+        listOf(
+            single,
+            album,
+            single.copy(state = ImmediateSendState.FAILED),
+            album.copy(state = ImmediateSendState.FAILED),
+        ).forEach { intent ->
+            val encoded = ImmediateSendIntentCodec.encode(intent)
+            assertEquals(intent, ImmediateSendIntentCodec.decode(encoded))
+            encoded.fill(0)
+        }
+        assertEquals(0, ImmediateSendState.WAITING.ordinal)
+        assertEquals(1, ImmediateSendState.RETRY_REQUIRED.ordinal)
+        assertEquals(2, ImmediateSendState.FAILED.ordinal)
+        assertEquals(3, ImmediateSendState.PREPARING.ordinal)
+    }
+
     @Test fun `pre-album queue records are still read exactly as written`() {
         val withReply = textIntent().copy(replyToMessageId = TARGET_ID)
         assertEquals(withReply, ImmediateSendIntentCodec.decode(legacyRecord(2, TARGET_ID)))
@@ -140,6 +192,17 @@ class ImmediateSendIntentStoreTest {
         val restarted = ImmediateSendIntentStore(disk, sessions)
         restarted.loadForCurrentOwner()
         assertEquals(listOf(intent), restarted.items.value)
+    }
+
+    @Test fun `same millisecond accepts keep queue lock order within a conversation`() = runTest {
+        val store = ImmediateSendIntentStore(disk, sessions)
+        val owner = checkNotNull(sessions.current()).fence()
+
+        store.enqueueForOwner(owner, textIntent(ID_THREE))
+        store.enqueueForOwner(owner, textIntent(ID_ONE).copy(text = "accepted second"))
+
+        assertEquals(listOf(ID_THREE, ID_ONE), store.items.value.map(ImmediateSendIntent::id))
+        assertEquals(listOf(NOW, NOW + 1), store.items.value.map { it.createdAtEpochMillis })
     }
 
     @Test fun `retry state and removal are durable across restart`() = runTest {

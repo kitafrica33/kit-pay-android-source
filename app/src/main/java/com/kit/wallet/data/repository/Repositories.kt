@@ -499,8 +499,9 @@ interface ChatRepository {
     /**
      * Sends one attachment end-to-end encrypted; the server stores only opaque ciphertext.
      *
-     * [source] is opened at send time and streamed through the cipher, so an attachment never has
-     * to fit in heap and the plaintext is never copied onto this app's own storage on the way out.
+     * [source] is opened at send time and never has to fit in heap. Implementations may first
+     * retain an atomic local-device copy so the bubble renders immediately and remains available
+     * offline while ciphertext upload continues in the background.
      */
     suspend fun sendMediaMessage(
         chatId: String,

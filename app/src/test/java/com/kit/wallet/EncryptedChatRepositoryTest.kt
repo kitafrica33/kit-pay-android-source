@@ -7,6 +7,7 @@ import com.kit.wallet.data.messaging.ConversationSystemEvent
 import com.kit.wallet.data.messaging.ConversationSystemEventStore
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.KitEditMessage
+import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitMediaMessageV2
 import com.kit.wallet.data.messaging.KitMediaMessageV2Item
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
@@ -64,6 +65,7 @@ import com.kit.wallet.ui.model.replyPreviewLabel
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
@@ -71,6 +73,7 @@ import java.util.Base64
 import java.util.UUID
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -1213,6 +1216,379 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `selected media is locally readable before encryption and after descriptor promotion`() =
+        runTest {
+            val encryptionStarted = CompletableDeferred<Unit>()
+            val releaseEncryption = CompletableDeferred<Unit>()
+            val spoolDirectory = Files.createTempDirectory("kit-local-media-preview-test").toFile()
+            val cacheDirectory = Files.createTempDirectory("kit-local-media-preview-cache").toFile()
+            val bytes = "selected photo survives promotion".toByteArray()
+            try {
+                val spool = ImmediateMediaSpool(
+                    directory = spoolDirectory,
+                    beforeEncryption = {
+                        encryptionStarted.complete(Unit)
+                        releaseEncryption.await()
+                    },
+                )
+                val runtime = FakeRuntime().apply {
+                    conversations += conversation(CONVERSATION_ONE, "Grace")
+                }
+                val authentication = MutableTestSessionStore(
+                    testSession(USER_TWO, sessionId = "session-one"),
+                )
+                val queue = ImmediateSendIntentStore(
+                    TestSecureMessagingStateStore(),
+                    authentication,
+                )
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = queue,
+                    immediateMediaSpool = spool,
+                    secureMediaCache = SecureMediaCache(cacheDirectory),
+                )
+                runCurrent()
+
+                repository.sendImageMessage(
+                    CONVERSATION_ONE,
+                    bytes,
+                    "image/jpeg",
+                    "Receipt",
+                )
+                runCurrent()
+
+                val preparing = repository.conversation(CONVERSATION_ONE).value.single()
+                assertTrue(preparing.mediaPlaintextBytes > 0)
+                assertEquals(ImmediateSendState.PREPARING, queue.items.value.single().state)
+                val local = repository.openImageMessage(
+                    CONVERSATION_ONE,
+                    checkNotNull(preparing.mediaDescriptor),
+                )
+                assertTrue(local.file.readBytes().contentEquals(bytes))
+
+                val dispatch = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
+                    ImmediateSendDispatcher(queue, spool, repository).dispatch()
+                }
+                encryptionStarted.await()
+                assertEquals(ImmediateSendState.PREPARING, queue.items.value.single().state)
+                releaseEncryption.complete(Unit)
+                assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatch.await())
+                runCurrent()
+                val promotedDescriptor = runtime.sendAttempts.single().second
+                spoolDirectory.listFiles().orEmpty().forEach(File::delete)
+
+                // The wire descriptor changed, but its authenticated attachment id did not. The
+                // sender therefore reuses the selected local file without a server round trip.
+                val reopened = repository.openImageMessage(CONVERSATION_ONE, promotedDescriptor)
+                assertEquals(local.file, reopened.file)
+                assertTrue(reopened.file.readBytes().contentEquals(bytes))
+            } finally {
+                releaseEncryption.complete(Unit)
+                bytes.fill(0)
+                spoolDirectory.deleteRecursively()
+                cacheDirectory.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `retained preparing media survives process death and completes from its local copy`() =
+        runTest {
+            val disk = TestSecureMessagingStateStore()
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val firstQueue = ImmediateSendIntentStore(disk, authentication)
+            val spoolDirectory = Files.createTempDirectory("kit-preparing-restart-spool").toFile()
+            val cacheDirectory = Files.createTempDirectory("kit-preparing-restart-cache").toFile()
+            try {
+                val runtime = FakeRuntime().apply {
+                    conversations += conversation(CONVERSATION_ONE, "Grace")
+                }
+                val firstRepository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = firstQueue,
+                    immediateMediaSpool = ImmediateMediaSpool(spoolDirectory),
+                    secureMediaCache = SecureMediaCache(cacheDirectory),
+                )
+                runCurrent()
+
+                firstRepository.sendImageMessage(
+                    CONVERSATION_ONE,
+                    "survives before encryption".toByteArray(),
+                    "image/jpeg",
+                    "Receipt",
+                )
+                runCurrent()
+
+                val preparing = firstQueue.items.value.single()
+                assertEquals(ImmediateSendState.PREPARING, preparing.state)
+                assertTrue(spoolDirectory.listFiles().orEmpty().none { it.name.endsWith(".ciphertext") })
+
+                // A fresh queue, repository, cache and spool represent a genuine process restart.
+                val restartedQueue = ImmediateSendIntentStore(disk, authentication)
+                val restartedSpool = ImmediateMediaSpool(spoolDirectory)
+                val restartedRepository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = restartedQueue,
+                    immediateMediaSpool = restartedSpool,
+                    secureMediaCache = SecureMediaCache(cacheDirectory),
+                )
+                runCurrent()
+
+                assertEquals(
+                    ImmediateSendDispatchOutcome.COMMITTED,
+                    ImmediateSendDispatcher(
+                        restartedQueue,
+                        restartedSpool,
+                        restartedRepository,
+                    ).dispatch(),
+                )
+                assertTrue(restartedQueue.items.value.isEmpty())
+                assertEquals(listOf(preparing.id), runtime.idempotentClientIds)
+            } finally {
+                spoolDirectory.deleteRecursively()
+                cacheDirectory.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `preparing media is a same conversation fifo barrier`() = runTest {
+        val encryptionStarted = CompletableDeferred<Unit>()
+        val releaseEncryption = CompletableDeferred<Unit>()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val queue = ImmediateSendIntentStore(TestSecureMessagingStateStore(), authentication)
+        val spoolDirectory = Files.createTempDirectory("kit-preparing-fifo-spool").toFile()
+        val cacheDirectory = Files.createTempDirectory("kit-preparing-fifo-cache").toFile()
+        try {
+            val spool = ImmediateMediaSpool(
+                directory = spoolDirectory,
+                beforeEncryption = {
+                    encryptionStarted.complete(Unit)
+                    releaseEncryption.await()
+                },
+            )
+            val runtime = FakeRuntime().apply {
+                conversations += conversation(CONVERSATION_ONE, "Grace")
+            }
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+                secureMediaCache = SecureMediaCache(cacheDirectory),
+            )
+            runCurrent()
+
+            repository.sendImageMessage(
+                CONVERSATION_ONE,
+                "first media".toByteArray(),
+                "image/jpeg",
+                null,
+            )
+            repository.sendMessage(CONVERSATION_ONE, "second text")
+            val queued = queue.items.value
+            assertEquals(ImmediateSendState.PREPARING, queued.first().state)
+            assertEquals("second text", queued.last().text)
+            assertTrue(queued.first().createdAtEpochMillis < queued.last().createdAtEpochMillis)
+
+            val dispatch = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
+                ImmediateSendDispatcher(queue, spool, repository).dispatch()
+            }
+            encryptionStarted.await()
+            runCurrent()
+            assertTrue(runtime.sendAttempts.isEmpty())
+
+            releaseEncryption.complete(Unit)
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatch.await())
+            assertTrue(KitMediaMessage.parse(runtime.sendAttempts.first().second) != null)
+            assertEquals("second text", runtime.sendAttempts.last().second)
+            assertTrue(queue.items.value.isEmpty())
+        } finally {
+            releaseEncryption.complete(Unit)
+            spoolDirectory.deleteRecursively()
+            cacheDirectory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `blocked media in one conversation does not delay another conversation text`() =
+        runTest {
+            val encryptionStarted = CompletableDeferred<Unit>()
+            val releaseEncryption = CompletableDeferred<Unit>()
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val queue = ImmediateSendIntentStore(TestSecureMessagingStateStore(), authentication)
+            val spoolDirectory = Files.createTempDirectory("kit-cross-chat-dispatch-spool").toFile()
+            val cacheDirectory = Files.createTempDirectory("kit-cross-chat-dispatch-cache").toFile()
+            try {
+                val spool = ImmediateMediaSpool(
+                    directory = spoolDirectory,
+                    beforeEncryption = {
+                        encryptionStarted.complete(Unit)
+                        releaseEncryption.await()
+                    },
+                )
+                val runtime = FakeRuntime().apply {
+                    conversations += conversation(CONVERSATION_ONE, "Grace")
+                    conversations += directConversation(CONVERSATION_TWO, "Emma", USER_THREE)
+                }
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = queue,
+                    immediateMediaSpool = spool,
+                    secureMediaCache = SecureMediaCache(cacheDirectory),
+                )
+                runCurrent()
+
+                repository.sendImageMessage(
+                    CONVERSATION_ONE,
+                    "large media".toByteArray(),
+                    "image/jpeg",
+                    null,
+                )
+                repository.sendMessage(CONVERSATION_ONE, "same chat waits")
+                repository.sendMessage(CONVERSATION_TWO, "other chat is instant")
+
+                val dispatch = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
+                    ImmediateSendDispatcher(queue, spool, repository).dispatch()
+                }
+                encryptionStarted.await()
+                runCurrent()
+
+                // Chat one's media is still encrypting. Chat two has nevertheless reached the
+                // encrypted outbox, while chat one's later text remains behind its media.
+                assertEquals(
+                    listOf("other chat is instant"),
+                    runtime.sendAttempts.map { it.second },
+                )
+
+                releaseEncryption.complete(Unit)
+                assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatch.await())
+                val attempts = runtime.sendAttempts.map { it.second }
+                val mediaIndex = attempts.indexOfFirst { KitMediaMessage.parse(it) != null }
+                val laterTextIndex = attempts.indexOf("same chat waits")
+                assertTrue(mediaIndex >= 0)
+                assertTrue(laterTextIndex > mediaIndex)
+                assertTrue(queue.items.value.isEmpty())
+            } finally {
+                releaseEncryption.complete(Unit)
+                spoolDirectory.deleteRecursively()
+                cacheDirectory.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `unrelated media staging cannot let later same chat text overtake idempotent media`() =
+        runTest {
+            val firstStageStarted = CompletableDeferred<Unit>()
+            val releaseFirstStage = CompletableDeferred<Unit>()
+            val secondStageStarted = CompletableDeferred<Unit>()
+            val releaseSecondStage = CompletableDeferred<Unit>()
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val owner = checkNotNull(authentication.current()).fence()
+            val queue = ImmediateSendIntentStore(TestSecureMessagingStateStore(), authentication)
+            val directory = Files.createTempDirectory("kit-idempotent-media-order-test").toFile()
+            var stageAttempt = 0
+            try {
+                val spool = ImmediateMediaSpool(
+                    directory = directory,
+                    beforeEncryption = {
+                        when (++stageAttempt) {
+                            1 -> {
+                                firstStageStarted.complete(Unit)
+                                releaseFirstStage.await()
+                            }
+                            2 -> {
+                                secondStageStarted.complete(Unit)
+                                releaseSecondStage.await()
+                            }
+                        }
+                    },
+                )
+                val runtime = FakeRuntime().apply {
+                    conversations += conversation(CONVERSATION_ONE, "Grace")
+                    conversations += directConversation(CONVERSATION_TWO, "Emma", USER_THREE)
+                }
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = queue,
+                    immediateMediaSpool = spool,
+                )
+                runCurrent()
+
+                val firstMedia = backgroundScope.launch(
+                    UnconfinedTestDispatcher(testScheduler),
+                ) {
+                    repository.sendIdempotentMediaMessageForOwner(
+                        owner = owner,
+                        chatId = CONVERSATION_ONE,
+                        source = SecureMediaSource.ofBytes("other chat media".toByteArray()),
+                        mediaType = "image/jpeg",
+                        clientMessageId = OUTBOX_ID_ONE,
+                    )
+                }
+                firstStageStarted.await()
+
+                val secondMedia = backgroundScope.launch(
+                    UnconfinedTestDispatcher(testScheduler),
+                ) {
+                    repository.sendIdempotentMediaMessageForOwner(
+                        owner = owner,
+                        chatId = CONVERSATION_TWO,
+                        source = SecureMediaSource.ofBytes("first in this chat".toByteArray()),
+                        mediaType = "image/jpeg",
+                        clientMessageId = OUTBOX_ID_TWO,
+                    )
+                }
+                runCurrent()
+                val laterText = backgroundScope.launch(
+                    UnconfinedTestDispatcher(testScheduler),
+                ) {
+                    repository.sendMessage(CONVERSATION_TWO, "second in this chat")
+                }
+                runCurrent()
+
+                // Chat two reached its own staging barrier despite chat one's stalled media. Its
+                // later text is consequently waiting on chat two's acceptance lock, not queued
+                // ahead of the attachment as it was behind the former process-wide media lock.
+                assertTrue(secondStageStarted.isCompleted)
+                assertTrue(queue.items.value.none { it.conversationId == CONVERSATION_TWO })
+
+                releaseSecondStage.complete(Unit)
+                secondMedia.join()
+                laterText.join()
+                val chatTwoQueue = queue.items.value.filter {
+                    it.conversationId == CONVERSATION_TWO
+                }
+                assertEquals(
+                    listOf(ImmediateSendKind.MEDIA, ImmediateSendKind.TEXT),
+                    chatTwoQueue.map(ImmediateSendIntent::kind),
+                )
+                assertTrue(
+                    chatTwoQueue.first().createdAtEpochMillis <
+                        chatTwoQueue.last().createdAtEpochMillis,
+                )
+
+                releaseFirstStage.complete(Unit)
+                firstMedia.join()
+            } finally {
+                releaseFirstStage.complete(Unit)
+                releaseSecondStage.complete(Unit)
+                directory.deleteRecursively()
+            }
+        }
+
+    @Test
     fun `local first send survives promotion crash and is committed only once`() = runTest {
         val disk = TestSecureMessagingStateStore()
         val authentication = MutableTestSessionStore(
@@ -1428,16 +1804,17 @@ class EncryptedChatRepositoryTest {
             // Process death: a fresh store over the same disk restores the identical record.
             val restartedQueue = ImmediateSendIntentStore(disk, authentication)
             restartedQueue.loadForCurrentOwner()
+            val restartedSpool = ImmediateMediaSpool(directory)
             val restartedRepository = repository(
                 runtime,
                 authenticationSessions = authentication,
                 immediateSends = restartedQueue,
-                immediateMediaSpool = spool,
+                immediateMediaSpool = restartedSpool,
             )
             runCurrent()
             val outcome = ImmediateSendDispatcher(
                 restartedQueue,
-                spool,
+                restartedSpool,
                 restartedRepository,
             ).dispatch()
 
@@ -1486,6 +1863,72 @@ class EncryptedChatRepositoryTest {
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun `idempotent album resume accepts unknown declared sizes without reopening sources`() =
+        runTest {
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val owner = checkNotNull(authentication.current()).fence()
+            val queue = ImmediateSendIntentStore(TestSecureMessagingStateStore(), authentication)
+            val directory = Files.createTempDirectory("kit-album-unknown-size-resume-test").toFile()
+            try {
+                val runtime = FakeRuntime().apply {
+                    conversations += conversation(CONVERSATION_ONE, "Grace")
+                }
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = queue,
+                    immediateMediaSpool = ImmediateMediaSpool(directory),
+                )
+                runCurrent()
+                repository.sendIdempotentMediaAlbumMessageForOwner(
+                    owner = owner,
+                    chatId = CONVERSATION_ONE,
+                    attachments = albumSources("first photo bytes", "second photo bytes"),
+                    clientMessageId = OUTBOX_ID_ONE,
+                    caption = "Two for you",
+                )
+                val original = queue.items.value.single()
+                var reopenedSources = 0
+                val unknownLengthSources = listOf(
+                    SecureMediaAlbumSource(
+                        SecureMediaSource(0L) {
+                            reopenedSources += 1
+                            error("An already durable album must not reopen its source")
+                        },
+                        "image/jpeg",
+                    ),
+                    SecureMediaAlbumSource(
+                        SecureMediaSource(-1L) {
+                            reopenedSources += 1
+                            error("An already durable album must not reopen its source")
+                        },
+                        "image/jpeg",
+                    ),
+                )
+
+                repository.sendIdempotentMediaAlbumMessageForOwner(
+                    owner = owner,
+                    chatId = CONVERSATION_ONE,
+                    attachments = unknownLengthSources,
+                    clientMessageId = OUTBOX_ID_ONE,
+                    caption = "Two for you",
+                )
+
+                assertEquals(0, reopenedSources)
+                assertEquals(listOf(original.id), queue.items.value.map(ImmediateSendIntent::id))
+                assertEquals(original.mediaItems, queue.items.value.single().mediaItems)
+                assertEquals(
+                    2,
+                    directory.listFiles().orEmpty().count { it.name.endsWith(".ciphertext") },
+                )
+            } finally {
+                directory.deleteRecursively()
+            }
+        }
 
     @Test
     fun `a one item album delegates to the legacy media message unchanged`() = runTest {
@@ -1666,12 +2109,13 @@ class EncryptedChatRepositoryTest {
         val cacheDirectory = Files.createTempDirectory("kit-album-open-cache").toFile()
         try {
             val spool = ImmediateMediaSpool(directory)
+            val cache = SecureMediaCache(cacheDirectory)
             val repository = repository(
                 runtime,
                 authenticationSessions = authentication,
                 immediateSends = queue,
                 immediateMediaSpool = spool,
-                secureMediaCache = SecureMediaCache(cacheDirectory),
+                secureMediaCache = cache,
             )
             runCurrent()
             repository.sendMediaAlbumMessage(
@@ -1680,12 +2124,19 @@ class EncryptedChatRepositoryTest {
                 caption = "Two for you",
             )
             runCurrent()
-            val queued = queue.items.value.single()
+            val owner = checkNotNull(authentication.current()).fence()
+            val preparing = queue.items.value.single()
+            val queued = repository.prepareImmediateMediaCiphertext(owner, preparing)
+            assertTrue(queue.replaceForOwner(owner, preparing, queued))
+            repository.releaseImmediateMediaRetention(owner, queued)
             val descriptor = checkNotNull(
                 repository.conversation(CONVERSATION_ONE).value
                     .first { it.kind == MessageKind.MEDIA_ALBUM }
                     .mediaDescriptor,
             )
+
+            // Remove the sender-local copies to exercise the queued-ciphertext fallback itself.
+            cache.clear()
 
             // Before any upload or network round trip, each item opens from its spooled
             // ciphertext — in pick order, each authenticated by its own key and digest.
@@ -1826,6 +2277,72 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `selected album is locally readable before its first item is encrypted`() = runTest {
+        val encryptionStarted = CompletableDeferred<Unit>()
+        val releaseEncryption = CompletableDeferred<Unit>()
+        val spoolDirectory = Files.createTempDirectory("kit-album-local-preview-test").toFile()
+        val cacheDirectory = Files.createTempDirectory("kit-album-local-preview-cache").toFile()
+        try {
+            val spool = ImmediateMediaSpool(
+                directory = spoolDirectory,
+                beforeEncryption = {
+                    encryptionStarted.complete(Unit)
+                    releaseEncryption.await()
+                },
+            )
+            val runtime = FakeRuntime().apply {
+                conversations += conversation(CONVERSATION_ONE, "Grace")
+            }
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val queue = ImmediateSendIntentStore(TestSecureMessagingStateStore(), authentication)
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+                secureMediaCache = SecureMediaCache(cacheDirectory),
+            )
+            runCurrent()
+
+            repository.sendMediaAlbumMessage(
+                CONVERSATION_ONE,
+                albumSources("first photo bytes", "second photo bytes"),
+                caption = "Two for you",
+            )
+            runCurrent()
+
+            val preparing = repository.conversation(CONVERSATION_ONE).value.single()
+            assertEquals(ImmediateSendState.PREPARING, queue.items.value.single().state)
+            assertEquals(2, preparing.mediaItems.size)
+            assertTrue(preparing.mediaItems.all { it.plaintextBytes > 0 })
+            assertTrue(preparing.mediaItems.none { it.attachmentId.startsWith("staging:") })
+            val opened = preparing.mediaItems.map { item ->
+                repository.openAlbumItemMessage(
+                    CONVERSATION_ONE,
+                    checkNotNull(preparing.mediaDescriptor),
+                    item.attachmentId,
+                ).file.readBytes().decodeToString()
+            }
+            assertEquals(listOf("first photo bytes", "second photo bytes"), opened)
+
+            val dispatch = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
+                ImmediateSendDispatcher(queue, spool, repository).dispatch()
+            }
+            encryptionStarted.await()
+            releaseEncryption.complete(Unit)
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatch.await())
+            runCurrent()
+            assertTrue(queue.items.value.isEmpty())
+        } finally {
+            releaseEncryption.complete(Unit)
+            spoolDirectory.deleteRecursively()
+            cacheDirectory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `received album items download once each and then reopen from cache`() = runTest {
         val runtime = FakeRuntime().apply {
             conversations += conversation(CONVERSATION_ONE, "Grace")
@@ -1838,12 +2355,13 @@ class EncryptedChatRepositoryTest {
         val cacheDirectory = Files.createTempDirectory("kit-album-received-cache").toFile()
         try {
             val spool = ImmediateMediaSpool(directory)
+            val cache = SecureMediaCache(cacheDirectory)
             val repository = repository(
                 runtime,
                 authenticationSessions = authentication,
                 immediateSends = queue,
                 immediateMediaSpool = spool,
-                secureMediaCache = SecureMediaCache(cacheDirectory),
+                secureMediaCache = cache,
             )
             runCurrent()
             // A queued album is the honest way to mint a wire descriptor: seal the exact
@@ -1854,7 +2372,9 @@ class EncryptedChatRepositoryTest {
                 caption = "Two for you",
             )
             runCurrent()
-            var sealed = queue.items.value.single()
+            val owner = checkNotNull(authentication.current()).fence()
+            val preparing = queue.items.value.single()
+            var sealed = repository.prepareImmediateMediaCiphertext(owner, preparing)
             sealed.mediaItems.forEach { item ->
                 sealed = sealed.withAlbumItemStorageKey(
                     item.attachmentId,
@@ -1863,6 +2383,9 @@ class EncryptedChatRepositoryTest {
             }
             val descriptorText = sealed.buildAlbumDescriptor()
             val (first, second) = sealed.mediaItems.map { it.attachmentId }
+            // This test models another device receiving the descriptor, not the sender retaining
+            // its own selected files under these stable attachment ids.
+            cache.clear()
             runtime.albumOpenPayloads = mapOf(
                 first to "alpha payload".toByteArray(),
                 second to "beta payload".toByteArray(),
@@ -3577,6 +4100,36 @@ class EncryptedChatRepositoryTest {
                     "injected failure before durable encryption commit",
                 )
             }
+        }
+
+        override suspend fun prepareMediaDescriptor(
+            session: SecureMessagingChatSession,
+            conversationId: String,
+            attachmentId: String,
+            ciphertext: File,
+            mediaType: String,
+            keyMaterialBase64: String,
+            plaintextBytes: Int,
+            caption: String?,
+        ): String {
+            requireCurrent(session)
+            check(conversations.any { it.id == conversationId })
+            check(ciphertext.isFile && ciphertext.length() > 0L)
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(ciphertext.readBytes())
+                .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            return KitMediaMessage(
+                attachmentId = attachmentId,
+                storageKey = UUID.nameUUIDFromBytes(
+                    "storage:$attachmentId".toByteArray(),
+                ).toString(),
+                mediaType = mediaType,
+                ciphertextByteSize = ciphertext.length(),
+                ciphertextSha256 = digest,
+                keyMaterialBase64 = keyMaterialBase64,
+                plaintextByteSize = plaintextBytes,
+                caption = caption,
+            ).encode()
         }
 
         override suspend fun assertMediaAlbumSendable(

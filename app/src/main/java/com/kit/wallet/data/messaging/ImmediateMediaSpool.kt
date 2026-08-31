@@ -25,7 +25,7 @@ internal data class ImmediateMediaMaterial(
 internal class ImmediateMediaSpoolUnavailableException(message: String) :
     IllegalStateException(message)
 
-/** App-private ciphertext spool for local-first media sends; plaintext is never written to disk. */
+/** App-private ciphertext spool; it never writes plaintext into the queued network outbox. */
 @Singleton
 internal class ImmediateMediaSpool internal constructor(
     private val directory: File,

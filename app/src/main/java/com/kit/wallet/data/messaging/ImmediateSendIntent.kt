@@ -54,6 +54,11 @@ internal data class ImmediateSendMediaItem(
     val ciphertextSha256Hex: String,
     val storageKey: String? = null,
 ) {
+    /** True while this item names only the retained device-local plaintext copy. */
+    val isPreparing: Boolean
+        get() = ciphertextBytes == 0L && keyBase64.isEmpty() &&
+            ciphertextSha256Hex.isEmpty() && storageKey == null
+
     init {
         require(ImmediateSendIntent.CANONICAL_UUID.matches(attachmentId)) {
             "Invalid queued album attachment ID"
@@ -64,18 +69,20 @@ internal data class ImmediateSendMediaItem(
         require(plaintextBytes in 1..MAX_IMAGE_PLAINTEXT_BYTES) {
             "Invalid queued album item size"
         }
-        // Cipher layout is IV(16) + CBC/PKCS7 + HMAC(32); a pair that disagrees describes a blob
-        // that cannot exist, exactly as the descriptor codec reads it.
-        require(
-            ciphertextBytes == plaintextBytes.toLong() + 64L - (plaintextBytes.toLong() % 16L),
-        ) { "Queued album item sizes disagree" }
-        require(
-            hasCanonicalBase64Size(keyBase64, MediaAttachmentCipher.KEY_MATERIAL_BYTES),
-        ) { "Invalid queued album key" }
-        require(SHA256_HEX.matches(ciphertextSha256Hex)) { "Invalid queued album digest" }
-        storageKey?.let {
-            require(ImmediateSendIntent.CANONICAL_UUID.matches(it)) {
-                "Invalid queued album storage key"
+        if (!isPreparing) {
+            // Cipher layout is IV(16) + CBC/PKCS7 + HMAC(32); a pair that disagrees describes a
+            // blob that cannot exist, exactly as the descriptor codec reads it.
+            require(
+                ciphertextBytes == plaintextBytes.toLong() + 64L - (plaintextBytes.toLong() % 16L),
+            ) { "Queued album item sizes disagree" }
+            require(
+                hasCanonicalBase64Size(keyBase64, MediaAttachmentCipher.KEY_MATERIAL_BYTES),
+            ) { "Invalid queued album key" }
+            require(SHA256_HEX.matches(ciphertextSha256Hex)) { "Invalid queued album digest" }
+            storageKey?.let {
+                require(ImmediateSendIntent.CANONICAL_UUID.matches(it)) {
+                    "Invalid queued album storage key"
+                }
             }
         }
     }
@@ -102,7 +109,17 @@ internal enum class ImmediateSendState {
      * conversation behind it. Appended last: persisted records store the ordinal.
      */
     FAILED,
+
+    /**
+     * The complete plaintext copy is durable on this device, but ciphertext has not yet been
+     * committed to the media spool. Appended to preserve every previously persisted ordinal.
+     */
+    PREPARING,
 }
+
+/** A retained plaintext preparation vanished before the background cipher could adopt it. */
+internal class ImmediateMediaPreparationUnavailableException(message: String) :
+    IllegalStateException(message)
 
 /**
  * One hardware-encrypted local-first send intent.
@@ -197,22 +214,33 @@ internal data class ImmediateSendIntent(
                     "Invalid queued media type"
                 }
                 require(mediaPlaintextBytes in 1..MAX_IMAGE_PLAINTEXT_BYTES)
-                require(mediaCiphertextBytes > 0)
-                require(hasDecodedSize(mediaKeyBase64, MediaAttachmentCipher.KEY_MATERIAL_BYTES)) {
-                    "Invalid queued media key"
-                }
-                require(hasDecodedSize(mediaSha256Base64, SHA256_BYTES)) {
-                    "Invalid queued media digest"
-                }
                 require(
                     caption == null ||
                         caption.toByteArray(StandardCharsets.UTF_8).size <= MAX_CAPTION_UTF8_BYTES,
                 ) { "Queued media caption is too large" }
-                preparedMediaDescriptor?.let {
-                    require(KitMediaMessage.parse(it) != null) {
-                        "Invalid prepared queued-media descriptor"
+                val unencrypted = mediaCiphertextBytes == 0 && mediaKeyBase64 == null &&
+                    mediaSha256Base64 == null && preparedMediaDescriptor == null
+                if (unencrypted) {
+                    require(state == ImmediateSendState.PREPARING || state == ImmediateSendState.FAILED) {
+                        "Unencrypted queued media must still be preparing or have failed"
                     }
-                    requireStandardSecureMessagingText(it)
+                } else {
+                    require(state != ImmediateSendState.PREPARING) {
+                        "Preparing queued media cannot carry ciphertext metadata"
+                    }
+                    require(mediaCiphertextBytes > 0)
+                    require(hasDecodedSize(mediaKeyBase64, MediaAttachmentCipher.KEY_MATERIAL_BYTES)) {
+                        "Invalid queued media key"
+                    }
+                    require(hasDecodedSize(mediaSha256Base64, SHA256_BYTES)) {
+                        "Invalid queued media digest"
+                    }
+                    preparedMediaDescriptor?.let {
+                        require(KitMediaMessage.parse(it) != null) {
+                            "Invalid prepared queued-media descriptor"
+                        }
+                        requireStandardSecureMessagingText(it)
+                    }
                 }
             }
             ImmediateSendKind.MEDIA_V2 -> {
@@ -229,14 +257,34 @@ internal data class ImmediateSendIntent(
                     mediaItems.mapTo(mutableSetOf(), ImmediateSendMediaItem::attachmentId).size ==
                         mediaItems.size,
                 ) { "Queued album attachment ids must be unique" }
-                val storageKeys = mediaItems.mapNotNull(ImmediateSendMediaItem::storageKey)
-                require(storageKeys.size == storageKeys.toSet().size) {
-                    "Queued album storage keys must be unique"
+                val unencrypted = mediaItems.all(ImmediateSendMediaItem::isPreparing)
+                require(unencrypted || mediaItems.none(ImmediateSendMediaItem::isPreparing)) {
+                    "Queued album preparation cannot be partial"
                 }
-                require(
-                    mediaItems.sumOf(ImmediateSendMediaItem::ciphertextBytes) <=
-                        KitMediaMessageV2.MAX_AGGREGATE_CIPHERTEXT_BYTES,
-                ) { "Queued media album is too large" }
+                if (unencrypted) {
+                    require(state == ImmediateSendState.PREPARING || state == ImmediateSendState.FAILED) {
+                        "Unencrypted queued album must still be preparing or have failed"
+                    }
+                    require(preparedMediaDescriptor == null)
+                    require(
+                        mediaItems.sumOf {
+                            it.plaintextBytes.toLong() + 64L -
+                                (it.plaintextBytes.toLong() % 16L)
+                        } <= KitMediaMessageV2.MAX_AGGREGATE_CIPHERTEXT_BYTES,
+                    ) { "Queued media album is too large" }
+                } else {
+                    require(state != ImmediateSendState.PREPARING) {
+                        "Preparing queued album cannot carry ciphertext metadata"
+                    }
+                    val storageKeys = mediaItems.mapNotNull(ImmediateSendMediaItem::storageKey)
+                    require(storageKeys.size == storageKeys.toSet().size) {
+                        "Queued album storage keys must be unique"
+                    }
+                    require(
+                        mediaItems.sumOf(ImmediateSendMediaItem::ciphertextBytes) <=
+                            KitMediaMessageV2.MAX_AGGREGATE_CIPHERTEXT_BYTES,
+                    ) { "Queued media album is too large" }
+                }
                 // Already in exact wire form: enqueue normalizes with the contract's
                 // six-codepoint strip, so a caption that decodes differently than it will be
                 // sent cannot sit in the queue.
@@ -260,6 +308,9 @@ internal data class ImmediateSendIntent(
                     }
                 }
             }
+        }
+        require(state != ImmediateSendState.PREPARING || kind in MEDIA_KINDS) {
+            "Only queued media can be preparing"
         }
     }
 
@@ -338,6 +389,7 @@ internal data class ImmediateSendIntent(
             "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         )
         private val CONVERSATION_ID = Regex("^[A-Za-z0-9._:@-]{1,64}$")
+        private val MEDIA_KINDS = setOf(ImmediateSendKind.MEDIA, ImmediateSendKind.MEDIA_V2)
 
         private fun decodeBase64(value: String?): ByteArray? = value?.let {
             runCatching { Base64.getDecoder().decode(it) }.getOrNull()

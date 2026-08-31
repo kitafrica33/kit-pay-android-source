@@ -26,10 +26,12 @@ import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
+import com.kit.wallet.ui.model.MessageMediaItem
 import com.kit.wallet.ui.model.PaymentEventKind
 import com.kit.wallet.ui.model.Transaction
 import com.kit.wallet.ui.model.TransferClaim
 import com.kit.wallet.ui.model.TransferClaimStatus
+import com.kit.wallet.ui.model.albumItemMediaKey
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -533,6 +535,230 @@ class ConversationViewModelTest {
             viewModel.mediaFiles.value.keys,
         )
         assertTrue(repository.mediaFile("descriptor-1").isFile)
+        repository.deleteMediaScratch()
+    }
+
+    @Test
+    fun `visible conversation preloads only five newest attachments`() = runTest {
+        val projected = (1..7).map { index ->
+            Message(
+                id = "message-$index",
+                text = "Photo",
+                time = "12:00",
+                fromMe = false,
+                kind = MessageKind.IMAGE,
+                mediaDescriptor = "descriptor-$index",
+                mediaPlaintextBytes = index,
+            )
+        }
+        val repository = FakeChatRepository(
+            media = (1..7).associate { index ->
+                "descriptor-$index" to byteArrayOf(index.toByte())
+            },
+        )
+        val viewModel = viewModel(repository)
+
+        repository.messages.value = projected
+        runCurrent()
+        assertEquals(0, repository.mediaOpenRequests)
+
+        viewModel.setConversationVisible(true)
+        runCurrent()
+
+        assertEquals(
+            (7 downTo 3).map { "descriptor-$it" },
+            repository.openedSingleMedia,
+        )
+        assertEquals(
+            (3..7).map { "message-$it" }.toSet(),
+            viewModel.mediaFiles.value.keys,
+        )
+
+        viewModel.setConversationVisible(false)
+        repository.deleteMediaScratch()
+    }
+
+    @Test
+    fun `automatic preload stays serialized and does not duplicate projected or manual opens`() =
+        runTest {
+            val releaseFirst = CompletableDeferred<Unit>()
+            val projected = (1..5).map { index ->
+                Message(
+                    id = "message-$index",
+                    text = "Photo",
+                    time = "12:00",
+                    fromMe = false,
+                    kind = MessageKind.IMAGE,
+                    mediaDescriptor = "descriptor-$index",
+                    mediaPlaintextBytes = index,
+                )
+            }
+            val repository = FakeChatRepository(
+                mediaBlockUntil = releaseFirst,
+                media = (1..5).associate { index ->
+                    "descriptor-$index" to byteArrayOf(index.toByte())
+                },
+            )
+            val viewModel = viewModel(repository)
+            repository.messages.value = projected
+
+            viewModel.setConversationVisible(true)
+            runCurrent()
+            assertEquals(listOf("descriptor-5"), repository.openedSingleMedia)
+
+            // The target set changes as a flow value but still projects the same five media rows.
+            repository.messages.value = projected + Message(
+                id = "text-only",
+                text = "new captionless message",
+                time = "12:01",
+                fromMe = false,
+            )
+            viewModel.openMedia(projected.last())
+            runCurrent()
+            assertEquals(1, repository.mediaOpenRequests)
+
+            releaseFirst.complete(Unit)
+            runCurrent()
+
+            assertEquals(
+                (5 downTo 1).map { "descriptor-$it" },
+                repository.openedSingleMedia,
+            )
+            assertEquals(5, repository.mediaOpenRequests)
+            assertEquals(1, repository.maximumConcurrentMediaOpens)
+
+            viewModel.setConversationVisible(false)
+            repository.deleteMediaScratch()
+        }
+
+    @Test
+    fun `queued preload stops when hidden while manual open remains available`() = runTest {
+        val releaseBlockingOpen = CompletableDeferred<Unit>()
+        val blockingRepository = FakeChatRepository(
+            mediaBlockUntil = releaseBlockingOpen,
+            media = mapOf("blocking-descriptor" to byteArrayOf(1)),
+        )
+        val blockingViewModel = viewModel(blockingRepository)
+        blockingViewModel.openMedia(
+            Message(
+                id = "blocking-message",
+                text = "Photo",
+                time = "12:00",
+                fromMe = false,
+                mediaDescriptor = "blocking-descriptor",
+            ),
+        )
+        runCurrent()
+        assertEquals(1, blockingRepository.mediaOpenRequests)
+
+        val target = Message(
+            id = "preload-message",
+            text = "Photo",
+            time = "12:01",
+            fromMe = false,
+            kind = MessageKind.IMAGE,
+            mediaDescriptor = "preload-descriptor",
+            mediaPlaintextBytes = 1,
+        )
+        val repository = FakeChatRepository(
+            media = mapOf("preload-descriptor" to byteArrayOf(2)),
+        )
+        val viewModel = viewModel(repository)
+        repository.messages.value = listOf(target)
+
+        viewModel.setConversationVisible(true)
+        runCurrent()
+        assertTrue(target.id in viewModel.mediaLoading.value)
+        assertEquals(0, repository.mediaOpenRequests)
+
+        viewModel.setConversationVisible(false)
+        releaseBlockingOpen.complete(Unit)
+        runCurrent()
+
+        assertEquals(0, repository.mediaOpenRequests)
+        assertTrue(viewModel.mediaLoading.value.isEmpty())
+        assertTrue(viewModel.mediaErrors.value.isEmpty())
+
+        // Explicit user intent remains valid even while the lifecycle-driven preloader is off.
+        viewModel.openMedia(target)
+        runCurrent()
+        assertEquals(1, repository.mediaOpenRequests)
+        assertTrue(target.id in viewModel.mediaFiles.value)
+
+        blockingRepository.deleteMediaScratch()
+        repository.deleteMediaScratch()
+    }
+
+    @Test
+    fun `preload waits for positive plaintext sizes and skips staging album items`() = runTest {
+        val single = Message(
+            id = "single",
+            text = "Photo",
+            time = "12:00",
+            fromMe = false,
+            kind = MessageKind.IMAGE,
+            mediaDescriptor = "single-descriptor",
+            mediaPlaintextBytes = 0,
+        )
+        val delayedAlbumItem = MessageMediaItem("album-delayed", "image/jpeg", 0)
+        val stagingAlbumItem = MessageMediaItem("staging:pending", "image/jpeg", 12)
+        val readyAlbumItem = MessageMediaItem("album-ready", "image/jpeg", 12)
+        val album = Message(
+            id = "album",
+            text = "Album",
+            time = "12:01",
+            fromMe = false,
+            kind = MessageKind.MEDIA_ALBUM,
+            mediaDescriptor = "album-descriptor",
+            mediaItems = listOf(delayedAlbumItem, stagingAlbumItem, readyAlbumItem),
+        )
+        val repository = FakeChatRepository(
+            media = mapOf("single-descriptor" to byteArrayOf(1)),
+            albumMedia = mapOf(
+                ("album-descriptor" to "album-delayed") to byteArrayOf(2),
+                ("album-descriptor" to "album-ready") to byteArrayOf(3),
+            ),
+        )
+        val viewModel = viewModel(repository)
+        repository.messages.value = listOf(single, album)
+
+        viewModel.setConversationVisible(true)
+        runCurrent()
+
+        assertEquals(
+            listOf("album-descriptor" to "album-ready"),
+            repository.openedAlbumMedia,
+        )
+        assertTrue(repository.openedSingleMedia.isEmpty())
+        assertTrue(viewModel.mediaErrors.value.isEmpty())
+
+        repository.messages.value = listOf(
+            single.copy(mediaPlaintextBytes = 1),
+            album.copy(
+                mediaItems = listOf(
+                    delayedAlbumItem.copy(plaintextBytes = 2),
+                    stagingAlbumItem,
+                    readyAlbumItem,
+                ),
+            ),
+        )
+        runCurrent()
+
+        assertEquals(listOf("single-descriptor"), repository.openedSingleMedia)
+        assertEquals(
+            listOf(
+                "album-descriptor" to "album-ready",
+                "album-descriptor" to "album-delayed",
+            ),
+            repository.openedAlbumMedia,
+        )
+        assertFalse(
+            albumItemMediaKey(album.id, stagingAlbumItem.attachmentId) in
+                viewModel.mediaFiles.value,
+        )
+        assertTrue(viewModel.mediaErrors.value.isEmpty())
+
+        viewModel.setConversationVisible(false)
         repository.deleteMediaScratch()
     }
 
@@ -1314,6 +1540,7 @@ class ConversationViewModelTest {
         initiallyReady: Boolean = true,
         private val mediaBlockUntil: CompletableDeferred<Unit>? = null,
         private val media: Map<String, ByteArray> = emptyMap(),
+        private val albumMedia: Map<Pair<String, String>, ByteArray> = emptyMap(),
     ) : ChatRepository {
         // Attachments are handed to the UI as files now, so the fake writes real ones into a
         // scratch directory the test tears down; nothing here can pass while production still
@@ -1346,6 +1573,8 @@ class ConversationViewModelTest {
         var mediaOpenRequests = 0
         var maximumConcurrentMediaOpens = 0
         private var concurrentMediaOpens = 0
+        val openedSingleMedia = mutableListOf<String>()
+        val openedAlbumMedia = mutableListOf<Pair<String, String>>()
 
         fun publishChat() {
             mutableChats.value = listOf(preview)
@@ -1435,6 +1664,31 @@ class ConversationViewModelTest {
             chatId: String,
             mediaDescriptor: String,
         ): SecureMediaFile {
+            openedSingleMedia += mediaDescriptor
+            return openMediaFixture(
+                fileName = mediaDescriptor,
+                plaintext = { checkNotNull(media[mediaDescriptor]) },
+            )
+        }
+
+        override suspend fun openAlbumItemMessage(
+            chatId: String,
+            mediaDescriptor: String,
+            attachmentId: String,
+        ): SecureMediaFile {
+            openedAlbumMedia += mediaDescriptor to attachmentId
+            return openMediaFixture(
+                fileName = "$mediaDescriptor-$attachmentId",
+                plaintext = {
+                    checkNotNull(albumMedia[mediaDescriptor to attachmentId])
+                },
+            )
+        }
+
+        private suspend fun openMediaFixture(
+            fileName: String,
+            plaintext: () -> ByteArray,
+        ): SecureMediaFile {
             mediaOpenRequests++
             concurrentMediaOpens++
             maximumConcurrentMediaOpens = maxOf(
@@ -1443,9 +1697,9 @@ class ConversationViewModelTest {
             )
             return try {
                 mediaBlockUntil?.await()
-                val plaintext = checkNotNull(media[mediaDescriptor])
-                val file = mediaFile(mediaDescriptor)
-                file.writeBytes(plaintext)
+                val bytes = plaintext()
+                val file = mediaFile(fileName)
+                file.writeBytes(bytes)
                 SecureMediaFile(file, "image/jpeg", file.length().toLong())
             } finally {
                 concurrentMediaOpens--

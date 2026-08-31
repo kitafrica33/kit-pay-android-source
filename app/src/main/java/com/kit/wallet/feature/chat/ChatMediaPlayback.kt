@@ -1,15 +1,17 @@
 package com.kit.wallet.feature.chat
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
-import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Build
-import android.system.Os
-import com.kit.wallet.data.messaging.chatMediaFileExtension
+import androidx.core.content.FileProvider
+import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.SecureMediaLease
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,7 +23,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileInputStream
-import java.util.UUID
 import kotlin.math.max
 
 /** The note the player is currently on, with everything the floating bar needs to name it. */
@@ -51,9 +52,8 @@ internal data class VoiceNotePlaybackState(
 /**
  * One-at-a-time voice-note playback with observable progress, seeking, and a life of its own.
  *
- * Plays the opened attachment through a descriptor this process holds open, so nothing is ever
- * read from a world-readable path and the note keeps playing even if the media cache evicts its
- * entry mid-listen. The player deliberately outlives
+ * Plays the authenticated attachment through a descriptor this process holds open, so the note
+ * keeps playing even if the media cache evicts its entry mid-listen. The player deliberately outlives
  * the bubble that started it: the note keeps playing when the thread is scrolled past it, when the
  * chat is left, and when Kit Pay is put in the background — the same expectation a call sets.
  * [VoiceNotePlaybackService] holds the foreground notification for exactly that window, and the
@@ -333,50 +333,34 @@ internal fun videoPosterFrame(file: File): Bitmap? {
     }
 }
 
-/**
- * Presents an opened attachment under a name a viewer can show, for a short-lived hand-off.
- *
- * The bytes are already decrypted in app-private storage; what an external viewer additionally
- * needs is a path this app's FileProvider is willing to grant and a filename worth reading. A
- * hard link gives both without duplicating the file, which at a 200 MB cap is the difference
- * between opening a document and running the phone out of space; a copy is the fallback for the
- * rare case the two directories are not on one filesystem.
- *
- * Because the link is its own reference to the data, the cache is free to evict its entry while
- * the viewer is still reading. The caller deletes this file when the viewer closes, mirroring iOS
- * temp-file hygiene.
- */
-internal fun writeChatMediaTempFile(
+/** Opens a stable no-copy pathname for in-app video playback. */
+internal fun chatMediaPlaybackLease(
     context: Context,
-    source: File,
-    mediaType: String,
-    displayName: String?,
-): File {
-    val directory = File(context.cacheDir, "chat-media/${UUID.randomUUID()}")
-    check(directory.mkdirs()) { "The media viewer could not prepare storage" }
-    val sanitized = displayName
-        ?.replace(Regex("[/\\\\:]"), "-")
-        ?.trim()
-        ?.takeIf(String::isNotEmpty)
-        ?.take(120)
-        ?: "Kit-media.${chatMediaFileExtension(mediaType)}"
-    val named = if (sanitized.contains('.')) {
-        sanitized
-    } else {
-        "$sanitized.${chatMediaFileExtension(mediaType)}"
-    }
-    val file = File(directory, named)
-    val linked = runCatching { Os.link(source.absolutePath, file.absolutePath) }.isSuccess
-    if (!linked) {
-        source.inputStream().use { input -> file.outputStream().use(input::copyTo) }
-    }
-    return file
-}
+    media: SecureMediaFile,
+): SecureMediaLease = SecureMediaLease.forPlayback(context.applicationContext, media)
 
-internal fun deleteChatMediaTempFile(file: File) {
-    runCatching {
-        file.delete()
-        file.parentFile?.takeIf { it.name.length == 36 }?.delete()
+/**
+ * Gives a document viewer/share target a stable URI without duplicating the attachment.
+ *
+ * A successful activity launch detaches the lease for bounded asynchronous use. A launch failure
+ * closes it immediately; later process-start/lease maintenance removes detached artifacts.
+ */
+internal fun launchWithChatMediaUri(
+    context: Context,
+    media: SecureMediaFile,
+    launch: (Uri) -> Unit,
+) {
+    val lease = SecureMediaLease.forExternalHandoff(context.applicationContext, media)
+    try {
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.chatmedia",
+            lease.file,
+        )
+        launch(uri)
+        lease.detachForExternalConsumer()
+    } finally {
+        lease.close()
     }
 }
 
@@ -388,14 +372,15 @@ internal fun formatVoiceNoteTime(fractionOrMillis: Long): String {
 /**
  * Plaintext scratch left behind when the process died with a viewer or a capture open.
  *
- * Both directories hold decrypted attachments the app wrote for something outside itself — a
- * document viewer, the media picker's transcoder, the camera's encoder — and both are cleaned up
- * by their owners in the normal case. The abnormal case is a kill, and at a 200 MB cap that leaves
- * real megabytes of plaintext sitting in the cache with nobody left who remembers them.
+ * Both cache directories hold decrypted attachments the app wrote for capture/transcoding and are
+ * cleaned up by their owners in the normal case. The abnormal case is a kill, and at a 200 MB cap
+ * that leaves real megabytes of plaintext sitting in the cache with nobody left who remembers
+ * them. Retained-media playback/handoff leases live beside the persistent store instead: process
+ * cleanup drops abandoned player leases but preserves recent URIs already granted to other apps.
  *
  * This runs once per process, not once per Activity: a viewer in another app still holds a
- * content URI into `chat-media` across a configuration change, and pulling the file out from
- * under it would break an open document for no reason.
+ * content URI across a configuration change, and pulling its lease out from under it would break
+ * an open document for no reason.
  */
 internal object ChatMediaScratch {
     private val purged = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -407,5 +392,6 @@ internal object ChatMediaScratch {
         for (name in DIRECTORY_NAMES) {
             runCatching { File(context.cacheDir, name).deleteRecursively() }
         }
+        SecureMediaLease.purgeAfterProcessRestart(context.applicationContext)
     }
 }

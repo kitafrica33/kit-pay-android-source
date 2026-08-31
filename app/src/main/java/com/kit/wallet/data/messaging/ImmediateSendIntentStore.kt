@@ -93,7 +93,7 @@ internal class ImmediateSendIntentStore @Inject constructor(
         withOwner(expectedOwner) {
             loadLocked()
             check(live[intent.id] == null) { "An immediate send already uses this identity" }
-            writeLocked(intent)
+            writeLocked(intent.withNormalizedCreatedAtLocked())
             publishLocked()
         }
     }
@@ -114,7 +114,7 @@ internal class ImmediateSendIntentStore @Inject constructor(
             loadLocked()
             val existing = live[intent.id]
             if (existing == null) {
-                writeLocked(intent)
+                writeLocked(intent.withNormalizedCreatedAtLocked())
             } else {
                 check(existing.sameUserIntentAs(intent)) {
                     "An immediate-send identity belongs to different content"
@@ -126,8 +126,10 @@ internal class ImmediateSendIntentStore @Inject constructor(
                     // recorded before the encrypted outbox takes over — so sharing the same
                     // content again is a fresh attempt. Adopt the caller's newly staged items
                     // wholesale, under the same stable identity.
-                    ImmediateSendState.FAILED -> writeLocked(intent)
-                    ImmediateSendState.WAITING -> Unit
+                    ImmediateSendState.FAILED -> writeLocked(intent.withNormalizedCreatedAtLocked())
+                    ImmediateSendState.WAITING,
+                    ImmediateSendState.PREPARING,
+                    -> Unit
                 }
             }
             publishLocked()
@@ -152,11 +154,15 @@ internal class ImmediateSendIntentStore @Inject constructor(
     suspend fun markRetryRequiredForOwner(
         expectedOwner: SessionFence,
         expected: ImmediateSendIntent,
-    ): Boolean = replaceForOwner(
-        expectedOwner,
-        expected,
-        expected.copy(state = ImmediateSendState.RETRY_REQUIRED),
-    )
+    ): Boolean = if (expected.state == ImmediateSendState.PREPARING) {
+        false
+    } else {
+        replaceForOwner(
+            expectedOwner,
+            expected,
+            expected.copy(state = ImmediateSendState.RETRY_REQUIRED),
+        )
+    }
 
     suspend fun rearmForOwner(expectedOwner: SessionFence, id: String): Boolean =
         withOwner(expectedOwner) {
@@ -164,8 +170,12 @@ internal class ImmediateSendIntentStore @Inject constructor(
             val existing = live[id] ?: return@withOwner false
             if (existing.state == ImmediateSendState.WAITING) return@withOwner true
             // Lost ciphertext cannot come back: rearming a failed record would only fail it
-            // again. The bubble already tells the person to send the content afresh.
-            if (existing.state == ImmediateSendState.FAILED) return@withOwner false
+            // again. A preparation already owned by the worker must likewise stay in that state.
+            // The bubble already tells the person to send the content afresh after failure.
+            if (
+                existing.state == ImmediateSendState.FAILED ||
+                existing.state == ImmediateSendState.PREPARING
+            ) return@withOwner false
             writeLocked(existing.copy(state = ImmediateSendState.WAITING))
             publishLocked()
             true
@@ -245,6 +255,20 @@ internal class ImmediateSendIntentStore @Inject constructor(
         } finally {
             encoded.fill(0)
         }
+    }
+
+    /**
+     * Queue lock order is the acceptance order. Wall clocks can move backwards and two taps can
+     * share one millisecond, so neither the raw clock nor a random UUID is a safe FIFO tie-breaker.
+     * Clamping only new records keeps the existing wire/storage shape and every retry identity.
+     */
+    private fun ImmediateSendIntent.withNormalizedCreatedAtLocked(): ImmediateSendIntent {
+        val latest = live.values.asSequence()
+            .filter { it.conversationId == conversationId && it.id != id }
+            .maxOfOrNull(ImmediateSendIntent::createdAtEpochMillis)
+            ?: return this
+        check(latest < Long.MAX_VALUE) { "Immediate-send conversation order is exhausted" }
+        return if (createdAtEpochMillis > latest) this else copy(createdAtEpochMillis = latest + 1L)
     }
 
     private suspend fun tombstoneLocked(id: String) {

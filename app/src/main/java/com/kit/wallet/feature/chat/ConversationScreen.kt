@@ -4156,8 +4156,9 @@ private fun formatCallDuration(seconds: Long): String {
 }
 
 /**
- * An end-to-end encrypted photo bubble. A user tap starts its serialized ciphertext download; the
- * decrypted copy stays in app-private, no-backup storage and is decoded straight from there.
+ * An end-to-end encrypted photo bubble. Recent media is preloaded serially; a tap remains the
+ * fallback. The authenticated plaintext copy stays in Kit Pay's Android media directory (or its
+ * private-storage fallback) and is decoded straight from there on subsequent views.
  */
 @Composable
 private fun SecureImageContent(

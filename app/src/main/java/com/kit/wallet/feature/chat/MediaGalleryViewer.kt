@@ -39,6 +39,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -63,8 +64,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.core.content.FileProvider
 import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.SecureMediaLease
 import com.kit.wallet.data.messaging.chatMediaFileExtension
 import com.kit.wallet.ui.model.Message
 import com.kit.wallet.ui.model.MessageKind
@@ -233,7 +234,7 @@ internal fun ConversationMediaGallery(
                         val message = current ?: return@IconButton
                         val media = currentMedia ?: return@IconButton
                         actionNotice = runCatching {
-                            shareGalleryMedia(context, message, media.file)
+                            shareGalleryMedia(context, message, media)
                             null
                         }.getOrElse { "This media could not be shared" }
                     },
@@ -438,11 +439,19 @@ private fun ZoomableGalleryImage(messageId: String, media: SecureMediaFile) {
     }
 }
 
-/** Full-screen playback for one decrypted video from a private temp file, cleaned on leave. */
+/** Full-screen playback through a stable lease on the local copy, without a second large file. */
 @Composable
 private fun GalleryVideoPage(message: Message, media: SecureMediaFile) {
     val context = LocalContext.current
     var playing by remember(message.id) { mutableStateOf(false) }
+    var playbackLease by remember(message.id) {
+        mutableStateOf<SecureMediaLease?>(null)
+    }
+    var playbackFailed by remember(message.id) { mutableStateOf(false) }
+    DisposableEffect(playbackLease) {
+        val heldLease = playbackLease
+        onDispose { heldLease?.close() }
+    }
     // A video the user started is theirs until it ends: leaving Kit Pay hands it to the system's
     // floating window instead of cutting it off, and the window goes when the video does.
     ChatVideoPictureInPictureEffect(isPlaying = playing)
@@ -450,7 +459,11 @@ private fun GalleryVideoPage(message: Message, media: SecureMediaFile) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             val poster by produceState<ImageBitmap?>(initialValue = null, message.id) {
                 value = withContext(Dispatchers.Default) {
-                    videoPosterFrame(media.file)?.asImageBitmap()
+                    runCatching {
+                        chatMediaPlaybackLease(context, media).use { lease ->
+                            videoPosterFrame(lease.file)?.asImageBitmap()
+                        }
+                    }.getOrNull()
                 }
             }
             poster?.let {
@@ -469,43 +482,51 @@ private fun GalleryVideoPage(message: Message, media: SecureMediaFile) {
                         detectTapGestures {
                             // Two things must never share the audio route.
                             VoiceNotePlayer.stop()
-                            playing = true
+                            playbackFailed = false
+                            runCatching { chatMediaPlaybackLease(context, media) }
+                                .onSuccess { lease ->
+                                    playbackLease = lease
+                                    playing = true
+                                }
+                                .onFailure { playbackFailed = true }
                         }
                     },
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    Icons.Rounded.PlayArrow,
-                    contentDescription = "Play video",
-                    tint = Color.White,
-                    modifier = Modifier.size(40.dp),
-                )
+                if (playbackFailed) {
+                    Text(
+                        "Retry",
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                } else {
+                    Icon(
+                        Icons.Rounded.PlayArrow,
+                        contentDescription = "Play video",
+                        tint = Color.White,
+                        modifier = Modifier.size(40.dp),
+                    )
+                }
             }
         }
     } else {
-        val file = remember(message.id) {
-            writeChatMediaTempFile(
-                context = context,
-                source = media.file,
-                mediaType = message.mediaType ?: "video/mp4",
-                displayName = null,
-            )
-        }
-        androidx.compose.runtime.DisposableEffect(message.id) {
-            onDispose { deleteChatMediaTempFile(file) }
-        }
+        val lease = playbackLease ?: return
         AndroidView(
             factory = { viewContext ->
                 VideoView(viewContext).apply {
-                    setVideoPath(file.absolutePath)
+                    setVideoPath(lease.file.absolutePath)
                     setMediaController(android.widget.MediaController(viewContext).also {
                         it.setAnchorView(this)
                     })
                     setOnPreparedListener { player -> player.start() }
                     // The end of the video is the end of the floating window.
-                    setOnCompletionListener { playing = false }
+                    setOnCompletionListener {
+                        playing = false
+                        playbackLease = null
+                    }
                     setOnErrorListener { _, _, _ ->
                         playing = false
+                        playbackLease = null
                         false
                     }
                 }
@@ -543,21 +564,21 @@ private fun GalleryStatePage(text: String?, actionLabel: String?, onAction: () -
 private fun shareGalleryMedia(
     context: android.content.Context,
     message: Message,
-    source: File,
+    media: SecureMediaFile,
 ) {
     val mediaType = message.mediaType
         ?: if (message.kind == MessageKind.VIDEO) "video/mp4" else "image/jpeg"
-    val file = writeChatMediaTempFile(context, source, mediaType, displayName = null)
-    val uri = FileProvider.getUriForFile(context, "${context.packageName}.chatmedia", file)
-    context.startActivity(
-        Intent.createChooser(
-            Intent(Intent.ACTION_SEND)
-                .setType(mediaType)
-                .putExtra(Intent.EXTRA_STREAM, uri)
-                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
-            null,
-        ),
-    )
+    launchWithChatMediaUri(context, media) { uri ->
+        context.startActivity(
+            Intent.createChooser(
+                Intent(Intent.ACTION_SEND)
+                    .setType(mediaType)
+                    .putExtra(Intent.EXTRA_STREAM, uri)
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                null,
+            ),
+        )
+    }
 }
 
 /** Saves the decrypted media into the public gallery via MediaStore (API 29+ scoped storage). */

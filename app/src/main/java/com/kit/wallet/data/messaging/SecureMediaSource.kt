@@ -9,9 +9,9 @@ import java.io.InputStream
  *
  * A 200 MB video already exists somewhere the user put it — in the gallery, in another app's
  * share, in a capture file. Handing the send path a way to *open* it, rather than a `ByteArray`
- * of it, is what lets the outbox keep its promise that plaintext is never copied onto our own
- * disk: the bytes go straight from their original home through the cipher into the ciphertext
- * spool, and a heap-sized attachment stops being a heap-sized problem.
+ * of it, lets the local-first pipeline stream it into the device media store and then stream that
+ * durable copy through the cipher. A heap-sized attachment therefore never becomes a heap-sized
+ * problem, while the sender keeps an immediately reusable local copy.
  *
  * A source may be opened more than once, so an implementation must return a fresh stream each
  * time rather than handing back one it has already drained.

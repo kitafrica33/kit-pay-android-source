@@ -64,9 +64,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
-import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.SecureMediaLease
 import com.kit.wallet.data.messaging.mediaAlbumPreviewLabel
 import com.kit.wallet.ui.components.kitNameAccent
 import com.kit.wallet.ui.model.Message
@@ -250,8 +250,8 @@ private fun VoiceNoteWaveform(
 }
 
 /**
- * An end-to-end encrypted video bubble: poster frame with a play badge, then a full-screen
- * player fed from a private, named link to the opened file that is dropped when the player closes.
+ * An end-to-end encrypted video bubble: poster frame with a play badge, then a full-screen player
+ * fed through a stable no-copy lease on the authenticated local file.
  */
 @Composable
 internal fun SecureVideoContent(
@@ -264,10 +264,17 @@ internal fun SecureVideoContent(
     onOpenViewer: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
-    var playerFile by remember(msg.id) { mutableStateOf<File?>(null) }
+    var playerLease by remember(msg.id) { mutableStateOf<SecureMediaLease?>(null) }
+    var playbackError by remember(msg.id) { mutableStateOf<String?>(null) }
     val poster by produceState<ImageBitmap?>(initialValue = null, media) {
         value = media?.let { opened ->
-            withContext(Dispatchers.Default) { videoPosterFrame(opened.file)?.asImageBitmap() }
+            withContext(Dispatchers.Default) {
+                runCatching {
+                    chatMediaPlaybackLease(context, opened).use { lease ->
+                        videoPosterFrame(lease.file)?.asImageBitmap()
+                    }
+                }.getOrNull()
+            }
         }
     }
     Column {
@@ -281,14 +288,14 @@ internal fun SecureVideoContent(
                         mediaError != null -> onRetryMedia()
                         media == null -> onOpenMedia()
                         onOpenViewer != null -> onOpenViewer()
-                        else -> playerFile = runCatching {
-                            writeChatMediaTempFile(
-                                context = context,
-                                source = media.file,
-                                mediaType = msg.mediaType ?: "video/mp4",
-                                displayName = null,
-                            )
-                        }.getOrNull()
+                        else -> {
+                            playbackError = null
+                            runCatching { chatMediaPlaybackLease(context, media) }
+                                .onSuccess { playerLease = it }
+                                .onFailure {
+                                    playbackError = "This video could not be opened"
+                                }
+                        }
                     }
                 },
             contentAlignment = Alignment.Center,
@@ -324,11 +331,12 @@ internal fun SecureVideoContent(
         Text(
             when {
                 mediaError != null -> mediaError
+                playbackError != null -> playbackError.orEmpty()
                 media != null -> "Play"
                 else -> chatMediaByteLabel(msg.mediaPlaintextBytes).ifEmpty { "Video" }
             },
             style = MaterialTheme.typography.labelSmall,
-            color = if (mediaError != null) {
+            color = if (mediaError != null || playbackError != null) {
                 MaterialTheme.colorScheme.error
             } else {
                 LocalContentColor.current.copy(alpha = 0.7f)
@@ -336,16 +344,18 @@ internal fun SecureVideoContent(
             modifier = Modifier.padding(top = 4.dp),
         )
     }
-    playerFile?.let { file ->
-        SecureVideoPlayerDialog(file = file, onDismiss = {
-            deleteChatMediaTempFile(file)
-            playerFile = null
+    playerLease?.let { lease ->
+        SecureVideoPlayerDialog(lease = lease, onDismiss = {
+            playerLease = null
         })
     }
 }
 
 @Composable
-private fun SecureVideoPlayerDialog(file: File, onDismiss: () -> Unit) {
+private fun SecureVideoPlayerDialog(lease: SecureMediaLease, onDismiss: () -> Unit) {
+    DisposableEffect(lease) {
+        onDispose { lease.close() }
+    }
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -358,7 +368,7 @@ private fun SecureVideoPlayerDialog(file: File, onDismiss: () -> Unit) {
             AndroidView(
                 factory = { viewContext ->
                     VideoView(viewContext).apply {
-                        setVideoPath(file.absolutePath)
+                        setVideoPath(lease.file.absolutePath)
                         setOnPreparedListener { player -> player.start() }
                     }
                 },
@@ -404,22 +414,13 @@ internal fun SecureDocumentContent(
                     openError = null
                     val result = runCatching {
                         val mediaType = msg.mediaType ?: "application/octet-stream"
-                        val file = writeChatMediaTempFile(
-                            context = context,
-                            source = media.file,
-                            mediaType = mediaType,
-                            displayName = msg.text.takeIf { it.isNotBlank() && it != "Document" },
-                        )
-                        val uri = FileProvider.getUriForFile(
-                            context,
-                            "${context.packageName}.chatmedia",
-                            file,
-                        )
-                        context.startActivity(
-                            Intent(Intent.ACTION_VIEW)
-                                .setDataAndType(uri, mediaType)
-                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
-                        )
+                        launchWithChatMediaUri(context, media) { uri ->
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW)
+                                    .setDataAndType(uri, mediaType)
+                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                            )
+                        }
                     }
                     result.exceptionOrNull()?.let { error ->
                         openError = if (error is ActivityNotFoundException) {
@@ -821,13 +822,18 @@ private fun MediaAlbumVisualTile(
     val loading = itemKey in mediaLoading
     val failed = mediaErrors.containsKey(itemKey)
     val isVideo = item.mediaType.substringBefore('/') == "video"
-    var viewerFile by remember(itemKey) { mutableStateOf<File?>(null) }
+    var viewerLease by remember(itemKey) { mutableStateOf<SecureMediaLease?>(null) }
+    var playbackError by remember(itemKey) { mutableStateOf(false) }
     var imageViewerOpen by remember(itemKey) { mutableStateOf(false) }
     val thumbnail by produceState<ImageBitmap?>(initialValue = null, itemKey, media) {
         value = media?.let { opened ->
             withContext(Dispatchers.Default) {
                 if (isVideo) {
-                    videoPosterFrame(opened.file)?.asImageBitmap()
+                    runCatching {
+                        chatMediaPlaybackLease(context, opened).use { lease ->
+                            videoPosterFrame(lease.file)?.asImageBitmap()
+                        }
+                    }.getOrNull()
                 } else {
                     decodeBoundedSecureImage(opened.file)
                 }
@@ -842,14 +848,12 @@ private fun MediaAlbumVisualTile(
                 when {
                     failed -> onRetryItem(item)
                     media == null -> onOpenItem(item)
-                    isVideo -> viewerFile = runCatching {
-                        writeChatMediaTempFile(
-                            context = context,
-                            source = media.file,
-                            mediaType = item.mediaType,
-                            displayName = null,
-                        )
-                    }.getOrNull()
+                    isVideo -> {
+                        playbackError = false
+                        runCatching { chatMediaPlaybackLease(context, media) }
+                            .onSuccess { viewerLease = it }
+                            .onFailure { playbackError = true }
+                    }
                     else -> imageViewerOpen = true
                 }
             },
@@ -867,6 +871,11 @@ private fun MediaAlbumVisualTile(
             loading -> CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
             failed -> Text(
                 "Retry",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+            playbackError -> Text(
+                "Could not open",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.error,
             )
@@ -890,10 +899,9 @@ private fun MediaAlbumVisualTile(
             }
         }
     }
-    viewerFile?.let { file ->
-        SecureVideoPlayerDialog(file = file, onDismiss = {
-            deleteChatMediaTempFile(file)
-            viewerFile = null
+    viewerLease?.let { lease ->
+        SecureVideoPlayerDialog(lease = lease, onDismiss = {
+            viewerLease = null
         })
     }
     if (imageViewerOpen && media != null) {
@@ -1050,22 +1058,13 @@ private fun MediaAlbumDocumentRow(
                     else -> {
                         openError = null
                         val result = runCatching {
-                            val file = writeChatMediaTempFile(
-                                context = context,
-                                source = media.file,
-                                mediaType = item.mediaType,
-                                displayName = null,
-                            )
-                            val uri = FileProvider.getUriForFile(
-                                context,
-                                "${context.packageName}.chatmedia",
-                                file,
-                            )
-                            context.startActivity(
-                                Intent(Intent.ACTION_VIEW)
-                                    .setDataAndType(uri, item.mediaType)
-                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
-                            )
+                            launchWithChatMediaUri(context, media) { uri ->
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW)
+                                        .setDataAndType(uri, item.mediaType)
+                                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                                )
+                            }
                         }
                         result.exceptionOrNull()?.let { error ->
                             openError = if (error is ActivityNotFoundException) {
@@ -1111,7 +1110,7 @@ private fun MediaAlbumDocumentRow(
     }
 }
 
-/** Full-screen viewer for one decrypted album photo; the bytes never leave app-private storage. */
+/** Full-screen viewer for one authenticated album photo retained in Kit Pay's local media store. */
 @Composable
 private fun SecureAlbumImageDialog(file: File, onDismiss: () -> Unit) {
     val image by produceState<ImageBitmap?>(initialValue = null, file) {

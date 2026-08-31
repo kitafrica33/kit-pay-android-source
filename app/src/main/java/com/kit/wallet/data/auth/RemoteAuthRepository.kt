@@ -614,7 +614,7 @@ class RemoteAuthRepository @Inject constructor(
                 // Decrypted attachments outlive a single conversation on purpose, so they have to
                 // be dropped here: the encrypted originals stay on the server and are re-fetched
                 // by whoever signs in next.
-                secureMediaCache?.clear()
+                secureMediaCache?.clear(target.cacheScopeId)
             } catch (mediaFailure: Exception) {
                 sessionFailure?.addSuppressed(mediaFailure)
                 if (sessionFailure == null) sessionFailure = mediaFailure
@@ -665,7 +665,7 @@ class RemoteAuthRepository @Inject constructor(
             if (sessionFailure == null) sessionFailure = keyFailure
         }
         try {
-            secureMediaCache?.clear()
+            secureMediaCache?.clear(expected.cacheScopeId)
         } catch (mediaFailure: Exception) {
             sessionFailure?.addSuppressed(mediaFailure)
             if (sessionFailure == null) sessionFailure = mediaFailure

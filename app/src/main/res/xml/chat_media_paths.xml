@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
+    <!-- Persistent authenticated media; never expose another Android/media subtree. -->
+    <external-media-path name="retained-chat-media" path="Kit Pay/Media/" />
+    <!-- Private fallback when shared media storage is unavailable. -->
+    <files-path name="retained-chat-media-private" path="Kit Pay/Media/" />
     <!-- Short-lived decrypted chat media for external viewers and camera capture handoff. -->
     <cache-path name="chat-media" path="chat-media/" />
     <cache-path name="chat-capture" path="chat-capture/" />

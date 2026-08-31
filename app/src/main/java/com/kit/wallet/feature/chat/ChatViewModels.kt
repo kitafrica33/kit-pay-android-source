@@ -939,6 +939,22 @@ class ConversationViewModel @Inject internal constructor(
     private var foregroundSyncJob: Job? = null
     private var idleTimerJob: Job? = null
 
+    private sealed interface MediaPreloadTarget {
+        val key: String
+        val mediaDescriptor: String
+
+        data class Single(
+            override val key: String,
+            override val mediaDescriptor: String,
+        ) : MediaPreloadTarget
+
+        data class AlbumItem(
+            override val key: String,
+            override val mediaDescriptor: String,
+            val attachmentId: String,
+        ) : MediaPreloadTarget
+    }
+
     /**
      * Live state of the held Kit → Kit transfers this account is a party to, keyed by claim id.
      *
@@ -1041,6 +1057,58 @@ class ConversationViewModel @Inject internal constructor(
                 // activation. This is what makes the thread show its scheduled entries even when
                 // the conversation is opened before that has happened.
                 viewModelScope.launch { runCatching { queue.load() } }
+            }
+            viewModelScope.launch {
+                combine(
+                    mutableConversationVisible,
+                    historyAvailable,
+                    chat,
+                    conversationMessages,
+                ) { visible, historyReady, selectedChat, projected ->
+                    if (visible && historyReady && selectedChat != null) {
+                        selectedChat to mediaPreloadTargets(projected)
+                    } else {
+                        null
+                    }
+                }.collect { preload ->
+                    val (selectedChat, targets) = preload ?: return@collect
+                    for (target in targets) {
+                        if (
+                            !mutableConversationVisible.value ||
+                            !historyAvailable.value ||
+                            chat.value?.id != selectedChat.id
+                        ) break
+                        if (!claimMedia(target.key)) continue
+                        when (target) {
+                            is MediaPreloadTarget.Single -> hydrateMedia(
+                                key = target.key,
+                                fallbackError = "The secure photo could not be opened",
+                                shouldStart = {
+                                    isCurrentPreloadTarget(selectedChat.id, target)
+                                },
+                            ) {
+                                chatRepo.openImageMessage(
+                                    selectedChat.id,
+                                    target.mediaDescriptor,
+                                )
+                            }
+
+                            is MediaPreloadTarget.AlbumItem -> hydrateMedia(
+                                key = target.key,
+                                fallbackError = "The secure attachment could not be opened",
+                                shouldStart = {
+                                    isCurrentPreloadTarget(selectedChat.id, target)
+                                },
+                            ) {
+                                chatRepo.openAlbumItemMessage(
+                                    selectedChat.id,
+                                    target.mediaDescriptor,
+                                    target.attachmentId,
+                                )
+                            }
+                        }
+                    }
+                }
             }
             viewModelScope.launch {
                 combine(
@@ -2798,9 +2866,9 @@ class ConversationViewModel @Inject internal constructor(
         sendMedia(bytes, mediaType, caption = null, onSent = onSent)
 
     /**
-     * Sends an attachment the user picked but this app never copied: a gallery video, a shared
-     * document, anything the platform will hand us a stream for. The bytes go from where they
-     * already live, straight through the cipher, into the ciphertext spool.
+     * Sends an attachment the platform hands us as a stream: a gallery video, shared document or
+     * another large item. The repository first adopts it into the durable local media store, then
+     * streams that copy through encryption into the background outbox.
      */
     fun sendMedia(
         source: SecureMediaSource,
@@ -2982,33 +3050,10 @@ class ConversationViewModel @Inject internal constructor(
         val selectedChat = chat.value ?: return
         val descriptor = message.mediaDescriptor ?: return
         if (!historyAvailable.value) return
-        // A handle whose file the on-disk cache has since evicted is not an open attachment; it
-        // has to be fetched again rather than handed to a player that would find nothing there.
-        if (
-            mutableMediaFiles.value[message.id]?.exists == true ||
-            message.id in mutableMediaLoading.value ||
-            mutableMediaErrors.value.containsKey(message.id)
-        ) return
-        mutableMediaLoading.value = mutableMediaLoading.value + message.id
+        if (!claimMedia(message.id)) return
         viewModelScope.launch {
-            try {
-                // Download and decrypt still stream through one fixed buffer each, but they do
-                // read and write whole attachments; serializing keeps two large receives from
-                // competing for the same disk and the same cache budget.
-                val opened = secureMediaOpenMutex.withLock {
-                    withContext(NonCancellable) {
-                        chatRepo.openImageMessage(selectedChat.id, descriptor)
-                    }
-                }
-                coroutineContext.ensureActive()
-                cacheMedia(message.id, opened)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                mutableMediaErrors.value = mutableMediaErrors.value +
-                    (message.id to (error.message ?: "The secure photo could not be opened"))
-            } finally {
-                mutableMediaLoading.value = mutableMediaLoading.value - message.id
+            hydrateMedia(message.id, "The secure photo could not be opened") {
+                chatRepo.openImageMessage(selectedChat.id, descriptor)
             }
         }
     }
@@ -3031,32 +3076,14 @@ class ConversationViewModel @Inject internal constructor(
         // record with real attachment ids replaces them.
         if (item.attachmentId.startsWith("staging:")) return
         val key = albumItemMediaKey(message.id, item.attachmentId)
-        if (
-            mutableMediaFiles.value[key]?.exists == true ||
-            key in mutableMediaLoading.value ||
-            mutableMediaErrors.value.containsKey(key)
-        ) return
-        mutableMediaLoading.value = mutableMediaLoading.value + key
+        if (!claimMedia(key)) return
         viewModelScope.launch {
-            try {
-                val opened = secureMediaOpenMutex.withLock {
-                    withContext(NonCancellable) {
-                        chatRepo.openAlbumItemMessage(
-                            selectedChat.id,
-                            descriptor,
-                            item.attachmentId,
-                        )
-                    }
-                }
-                coroutineContext.ensureActive()
-                cacheMedia(key, opened)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                mutableMediaErrors.value = mutableMediaErrors.value +
-                    (key to (error.message ?: "The secure attachment could not be opened"))
-            } finally {
-                mutableMediaLoading.value = mutableMediaLoading.value - key
+            hydrateMedia(key, "The secure attachment could not be opened") {
+                chatRepo.openAlbumItemMessage(
+                    selectedChat.id,
+                    descriptor,
+                    item.attachmentId,
+                )
             }
         }
     }
@@ -3066,6 +3093,91 @@ class ConversationViewModel @Inject internal constructor(
         discardMedia(key)
         mutableMediaErrors.value = mutableMediaErrors.value - key
         openAlbumItem(message, item)
+    }
+
+    /** Claims [key] before any coroutine is launched, so automatic and tapped opens cannot race. */
+    private fun claimMedia(key: String): Boolean {
+        // A handle whose file the on-disk cache has since evicted is not an open attachment; it
+        // has to be fetched again rather than handed to a player that would find nothing there.
+        if (
+            mutableMediaFiles.value[key]?.exists == true ||
+            key in mutableMediaLoading.value ||
+            mutableMediaErrors.value.containsKey(key)
+        ) return false
+        mutableMediaLoading.value = mutableMediaLoading.value + key
+        return true
+    }
+
+    /** Runs one claimed receive through the process-wide gate, then publishes its cache handle. */
+    private suspend fun hydrateMedia(
+        key: String,
+        fallbackError: String,
+        shouldStart: () -> Boolean = { true },
+        open: suspend () -> SecureMediaFile,
+    ) {
+        try {
+            // Download and decrypt still stream through one fixed buffer each, but they do read
+            // and write whole attachments; serializing keeps large receives from competing for
+            // the same disk and the same cache budget.
+            val opened = secureMediaOpenMutex.withLock {
+                // An automatic open may have waited behind another conversation for a long time.
+                // Re-prove its lifecycle and projection only after it owns the gate, immediately
+                // before the non-cancellable receive begins. Tapped opens use the default `true`.
+                if (!shouldStart()) return@withLock null
+                withContext(NonCancellable) { open() }
+            } ?: return
+            coroutineContext.ensureActive()
+            cacheMedia(key, opened)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            mutableMediaErrors.value = mutableMediaErrors.value +
+                (key to (error.message ?: fallbackError))
+        } finally {
+            mutableMediaLoading.value = mutableMediaLoading.value - key
+        }
+    }
+
+    private fun isCurrentPreloadTarget(
+        selectedChatId: String,
+        target: MediaPreloadTarget,
+    ): Boolean =
+        mutableConversationVisible.value &&
+            historyAvailable.value &&
+            chat.value?.id == selectedChatId &&
+            target in mediaPreloadTargets(conversationMessages.value)
+
+    /** Newest eligible single attachments and album items, capped across both message shapes. */
+    private fun mediaPreloadTargets(projected: List<Message>): List<MediaPreloadTarget> {
+        val targets = ArrayList<MediaPreloadTarget>(MAX_MEDIA_PRELOAD_ENTRIES)
+        for (message in projected.asReversed()) {
+            val descriptor = message.mediaDescriptor ?: continue
+            when (message.kind) {
+                MessageKind.IMAGE,
+                MessageKind.VIDEO,
+                MessageKind.VOICE_NOTE,
+                MessageKind.DOCUMENT,
+                -> if (message.mediaPlaintextBytes > 0) {
+                    targets += MediaPreloadTarget.Single(message.id, descriptor)
+                }
+
+                MessageKind.MEDIA_ALBUM -> for (item in message.mediaItems) {
+                    if (item.plaintextBytes <= 0 || item.attachmentId.startsWith("staging:")) {
+                        continue
+                    }
+                    targets += MediaPreloadTarget.AlbumItem(
+                        key = albumItemMediaKey(message.id, item.attachmentId),
+                        mediaDescriptor = descriptor,
+                        attachmentId = item.attachmentId,
+                    )
+                    if (targets.size == MAX_MEDIA_PRELOAD_ENTRIES) return targets
+                }
+
+                else -> Unit
+            }
+            if (targets.size == MAX_MEDIA_PRELOAD_ENTRIES) return targets
+        }
+        return targets
     }
 
     /**
@@ -3146,6 +3258,7 @@ class ConversationViewModel @Inject internal constructor(
         // Only handles are held here, so this bounds a scroll window rather than a heap budget;
         // the bytes are bounded on disk by SecureMediaCache.
         const val MAX_OPEN_MEDIA_ENTRIES = 24
+        const val MAX_MEDIA_PRELOAD_ENTRIES = 5
 
         // A poll re-reads one payment per request. Long-lived groups accumulate them, and the
         // cards a member can still act on are the recent ones; older announcements stay readable
