@@ -41,4 +41,44 @@ class MediaPipelineProfilerTest {
 
         assertEquals(1L, measurements.single().elapsedMillis)
     }
+
+    @Test
+    fun `each milestone emits only its first observation`() {
+        var now = 1_000_000L
+        val measurements = mutableListOf<MediaPipelineMeasurement>()
+        val profiler = MediaPipelineProfiler(
+            nanoTime = { now },
+            emit = { _, measurement -> measurements += measurement },
+        )
+        profiler.begin("media", "audio/mp4")
+
+        now = 2_000_000L
+        profiler.mark("media", MediaPipelineMilestone.LOCAL_PLAYABLE)
+        now = 9_000_000L
+        profiler.mark("media", MediaPipelineMilestone.LOCAL_PLAYABLE)
+
+        assertEquals(
+            listOf(MediaPipelineMeasurement(MediaPipelineMilestone.LOCAL_PLAYABLE, 1)),
+            measurements,
+        )
+    }
+
+    @Test
+    fun `unfinished measurements are bounded and evict the oldest`() {
+        var now = 1_000_000L
+        val observedKinds = mutableListOf<String>()
+        val profiler = MediaPipelineProfiler(
+            nanoTime = { now },
+            emit = { kind, _ -> observedKinds += kind },
+        )
+
+        repeat(257) { index ->
+            profiler.begin("media-$index", "kind-$index/file")
+            now += 1_000_000L
+        }
+        profiler.mark("media-0", MediaPipelineMilestone.LOCAL_PLAYABLE)
+        profiler.mark("media-256", MediaPipelineMilestone.LOCAL_PLAYABLE)
+
+        assertEquals(listOf("kind-256"), observedKinds)
+    }
 }

@@ -2,7 +2,6 @@ package com.kit.wallet.data.messaging
 
 import android.util.Log
 import com.kit.wallet.BuildConfig
-import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -45,9 +44,14 @@ internal class MediaPipelineProfiler internal constructor(
         },
     )
 
-    private data class Started(val mediaKind: String, val atNanos: Long)
+    private data class Started(
+        val mediaKind: String,
+        val atNanos: Long,
+        val observedMilestones: MutableSet<MediaPipelineMilestone> = mutableSetOf(),
+    )
 
-    private val started = ConcurrentHashMap<String, Started>()
+    private val started = linkedMapOf<String, Started>()
+    private val lock = Any()
 
     fun begin(
         mediaId: String,
@@ -57,26 +61,36 @@ internal class MediaPipelineProfiler internal constructor(
         val now = nanoTime()
         // A forged/future timestamp must not produce negative or unbounded diagnostics.
         val origin = originatedAtNanos.takeIf { it in 1L..now } ?: now
-        started.putIfAbsent(mediaId, Started(mediaType.substringBefore('/'), origin))
+        synchronized(lock) {
+            if (started.containsKey(mediaId)) return
+            if (started.size >= MAX_TRACKED_MEDIA) {
+                started.entries.firstOrNull()?.key?.let(started::remove)
+            }
+            started[mediaId] = Started(mediaType.substringBefore('/'), origin)
+        }
     }
 
     fun mark(mediaId: String, milestone: MediaPipelineMilestone) {
-        val origin = started[mediaId] ?: return
-        emit(
-            origin.mediaKind,
-            MediaPipelineMeasurement(
-                milestone = milestone,
-                elapsedMillis = ((nanoTime() - origin.atNanos).coerceAtLeast(0L)) / 1_000_000L,
-            ),
-        )
-        if (milestone == MediaPipelineMilestone.UPLOADED) started.remove(mediaId, origin)
+        val observation = synchronized(lock) {
+            val origin = started[mediaId] ?: return
+            // UI recomposition, reopening local media, or a repeated worker callback must not turn
+            // one send into several latency samples. The first observation is the user-facing fact.
+            if (!origin.observedMilestones.add(milestone)) return
+            if (milestone == MediaPipelineMilestone.UPLOADED) started.remove(mediaId)
+            origin.mediaKind to MediaPipelineMeasurement(
+                milestone,
+                ((nanoTime() - origin.atNanos).coerceAtLeast(0L)) / 1_000_000L,
+            )
+        }
+        emit(observation.first, observation.second)
     }
 
     fun forget(mediaId: String) {
-        started.remove(mediaId)
+        synchronized(lock) { started.remove(mediaId) }
     }
 
     private companion object {
         const val TAG = "KitMediaPipeline"
+        const val MAX_TRACKED_MEDIA = 256
     }
 }
