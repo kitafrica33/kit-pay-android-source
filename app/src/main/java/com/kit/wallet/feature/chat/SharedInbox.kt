@@ -166,9 +166,9 @@ internal object SharedInboxPolicy {
     /**
      * What a shared file will travel as.
      *
-     * Images are the exception to the allowlist: a camera-native HEIC is assigned the JPEG wire
-     * type, while its untouched original is retained locally and converted only by the durable
-     * background preparation worker.
+     * Images and videos are the exceptions to the allowlist. A camera-native HEIC is assigned the
+     * JPEG wire type; every provider-declared video is assigned canonical MP4. The untouched
+     * originals remain local while the durable background worker derives truthful wire bytes.
      * Anything else the wire does not accept is sent as a document, which is lossless and works
      * through the profile's generic document type.
      */
@@ -181,6 +181,9 @@ internal object SharedInboxPolicy {
         // Every still image follows the normal composer path: decode, orient, resize and re-encode
         // to JPEG. Besides bounding the image, that strips EXIF/location metadata consistently.
         if (normalized.startsWith("image/")) return "image/jpeg"
+        // Provider MIME is only a routing hint. The background worker inspects compressed tracks
+        // and writes a real MP4, so QuickTime bytes can never merely be relabelled as MP4.
+        if (normalized.startsWith("video/")) return "video/mp4"
         if (normalized in ALLOWED_MEDIA_TYPES) return normalized
         return FALLBACK_MEDIA_TYPE
     }
@@ -192,6 +195,15 @@ internal object SharedInboxPolicy {
             .trim()
             .lowercase(Locale.US)
         return normalized.startsWith("image/")
+    }
+
+    /** True when a provider-routed video must be content-validated and remuxed before upload. */
+    fun requiresVideoCanonicalization(raw: String?): Boolean {
+        val normalized = raw.orEmpty()
+            .substringBefore(';')
+            .trim()
+            .lowercase(Locale.US)
+        return normalized.startsWith("video/")
     }
 
     fun fits(byteCount: Long): Boolean = byteCount > 0 && byteCount <= MAXIMUM_BYTES

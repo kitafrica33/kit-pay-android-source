@@ -2,6 +2,7 @@ package com.kit.wallet
 
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
+import com.kit.wallet.data.messaging.normalizeLocalMediaType
 import com.kit.wallet.feature.chat.SharedInboxPolicy
 import com.kit.wallet.feature.chat.SharedInboxItem
 import com.kit.wallet.feature.chat.orderedDistinctIncomingShareItems
@@ -80,9 +81,16 @@ class SharedInboxTest {
     // What a shared file travels as
 
     @Test
-    fun `known media types are kept exactly`() {
+    fun `known document types are kept and videos use canonical MP4`() {
         assertEquals("application/pdf", SharedInboxPolicy.normalizedMediaType("application/pdf"))
         assertEquals("video/mp4", SharedInboxPolicy.normalizedMediaType("VIDEO/MP4"))
+        assertEquals("video/mp4", SharedInboxPolicy.normalizedMediaType("video/quicktime"))
+        assertEquals("video/mp4", SharedInboxPolicy.normalizedMediaType("video/webm"))
+        assertTrue(SharedInboxPolicy.requiresVideoCanonicalization("VIDEO/QUICKTIME"))
+        assertTrue(SharedInboxPolicy.requiresVideoCanonicalization("video/mp4; codecs=avc1"))
+        assertFalse(SharedInboxPolicy.requiresVideoCanonicalization("application/pdf"))
+        assertEquals("video/x-matroska", normalizeLocalMediaType("VIDEO/X-MATROSKA"))
+        assertNull(normalizeLocalMediaType("video/../../private"))
         assertEquals(
             "text/plain",
             SharedInboxPolicy.normalizedMediaType("text/plain; charset=utf-8"),

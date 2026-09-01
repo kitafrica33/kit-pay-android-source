@@ -84,13 +84,14 @@ internal data class ImmediateSendMediaItem(
         require(originalPlaintextBytes in 0..MAX_LOCAL_MEDIA_ORIGINAL_BYTES) {
             "Invalid queued album original size"
         }
-        require(processingPlan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4) {
-            "Queued albums do not yet carry per-video edit plans"
-        }
         require(
             processingPlan != SecureMediaProcessingPlan.CHAT_IMAGE_JPEG ||
                 mediaType == "image/jpeg" && localMediaType.startsWith("image/"),
         ) { "Invalid queued album image processing plan" }
+        require(
+            processingPlan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4 ||
+                mediaType == "video/mp4" && localMediaType.startsWith("video/"),
+        ) { "Invalid queued album video processing plan" }
         require(
             durationMillis == null ||
                 durationMillis in 1..MAX_LOCAL_MEDIA_DURATION_MILLIS &&
@@ -272,9 +273,9 @@ internal data class ImmediateSendIntent(
                         mediaType == "image/jpeg" && localMediaType.startsWith("image/"),
                 ) { "Invalid queued image processing plan" }
                 require(
-                    (mediaProcessingPlan == SecureMediaProcessingPlan.CHAT_VIDEO_MP4) ==
-                        (mediaVideoEditPlan != null),
-                ) { "A queued video processing plan needs exact edit parameters" }
+                    mediaVideoEditPlan == null ||
+                        mediaProcessingPlan == SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
+                ) { "Queued video edits require the canonical MP4 processing plan" }
                 require(
                     mediaProcessingPlan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4 ||
                         mediaType == "video/mp4" && localMediaType.startsWith("video/"),

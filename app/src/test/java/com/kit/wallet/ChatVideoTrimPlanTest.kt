@@ -73,27 +73,10 @@ class ChatVideoTrimPlanTest {
     }
 
     @Test
-    fun `an edited video re-muxes to MP4 and an untouched one keeps its own container`() {
-        // Trimming and muting both go through MediaMuxer, whose output is MP4 regardless of
-        // what came in — so the label must follow the bytes, not the source.
-        assertEquals(
-            "video/mp4",
-            videoSendMediaType(edited = true, sourceMediaType = "video/webm"),
-        )
-        assertEquals(
-            "video/mp4",
-            videoSendMediaType(edited = true, sourceMediaType = "video/quicktime"),
-        )
-        // An untouched library pick is sent byte-for-byte; relabeling it would hand the
-        // recipient bytes that do not match their name.
-        assertEquals(
-            "video/quicktime",
-            videoSendMediaType(edited = false, sourceMediaType = "video/quicktime"),
-        )
-        assertEquals(
-            "video/mp4",
-            videoSendMediaType(edited = false, sourceMediaType = "video/mp4"),
-        )
+    fun `every video wire representation is a real canonical MP4`() {
+        // The retained sender original keeps its own bytes. The background plan content-validates
+        // and remuxes both untouched and edited sends before this wire label is used.
+        assertEquals("video/mp4", videoSendMediaType())
     }
 
     @Test

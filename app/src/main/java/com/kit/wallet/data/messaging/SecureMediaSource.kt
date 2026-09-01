@@ -3,6 +3,7 @@ package com.kit.wallet.data.messaging
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.InputStream
+import java.util.Locale
 
 /** Durable, device-only work applied to an original before its E2EE upload representation. */
 enum class SecureMediaProcessingPlan(internal val persistenceCode: Int) {
@@ -12,7 +13,7 @@ enum class SecureMediaProcessingPlan(internal val persistenceCode: Int) {
     /** Decode/orient/downscale and encode a metadata-free JPEG in background work. */
     CHAT_IMAGE_JPEG(1),
 
-    /** Remux the selected trim/mute window to MP4 in durable background work. */
+    /** Content-validate and remux the complete video or selected edit window to real MP4. */
     CHAT_VIDEO_MP4(2),
 
     ;
@@ -54,11 +55,16 @@ internal const val MAX_LOCAL_MEDIA_DURATION_MILLIS = 24L * 60L * 60L * 1_000L
 
 /** MIME types valid for a local original even when the cross-platform wire needs a JPEG. */
 internal fun normalizeLocalMediaType(value: String): String? {
-    val normalized = value.substringBefore(';').trim().lowercase()
+    val normalized = value.substringBefore(';').trim().lowercase(Locale.US)
     return normalized.takeIf {
-        it in KitMediaMessage.SUPPORTED_MEDIA_TYPES || it in LOCAL_ONLY_IMAGE_MEDIA_TYPES
+        it in KitMediaMessage.SUPPORTED_MEDIA_TYPES ||
+            it in LOCAL_ONLY_IMAGE_MEDIA_TYPES ||
+            SAFE_LOCAL_VIDEO_MEDIA_TYPE.matches(it)
     }
 }
+
+/** Unknown video subtypes stay truthful locally while their bytes face canonical wire checks. */
+private val SAFE_LOCAL_VIDEO_MEDIA_TYPE = Regex("^video/[a-z0-9][a-z0-9.+_-]{0,126}$")
 
 private val LOCAL_ONLY_IMAGE_MEDIA_TYPES = setOf(
     "image/heic",
@@ -96,7 +102,7 @@ class SecureMediaSource(
     internal val durationMillis: Long? = null,
     /** Restart-safe processing the background worker applies before encryption. */
     internal val processingPlan: SecureMediaProcessingPlan = SecureMediaProcessingPlan.PASSTHROUGH,
-    /** Dynamic video edit parameters, present exactly for [SecureMediaProcessingPlan.CHAT_VIDEO_MP4]. */
+    /** Optional trim/mute parameters; null means canonicalize the complete retained video. */
     internal val videoEditPlan: SecureMediaVideoEditPlan? = null,
     /**
      * Optional seekable original already owned by the caller. The sender UI may play this file
@@ -107,9 +113,8 @@ class SecureMediaSource(
 ) {
     init {
         require(
-            (processingPlan == SecureMediaProcessingPlan.CHAT_VIDEO_MP4) ==
-                (videoEditPlan != null),
-        ) { "A video processing plan needs exact edit parameters" }
+            videoEditPlan == null || processingPlan == SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
+        ) { "Video edits require the canonical MP4 processing plan" }
         require(durationMillis == null || durationMillis in 1..MAX_LOCAL_MEDIA_DURATION_MILLIS) {
             "A media duration is out of range"
         }

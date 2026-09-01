@@ -113,6 +113,48 @@ class OfflineWalletSyncRepositoryTest {
     }
 
     @Test
+    fun `refresh drops a valid projection returned for another wallet`() = runTest {
+        server.enqueue(jsonResponse(BOOTSTRAP_JSON))
+        server.enqueue(jsonResponse(WALLETS_JSON))
+        server.enqueue(
+            jsonResponse(
+                TRANSACTIONS_JSON.replace(
+                    "\"wallet_id\":\"wallet-uuid\"",
+                    "\"wallet_id\":\"wallet-other\"",
+                ),
+            ),
+        )
+
+        val result = repository.refresh()
+
+        assertEquals(0, result.transactionCount)
+        assertTrue(cache.transactions.isEmpty())
+    }
+
+    @Test
+    fun `refresh drops a valid projection in another currency or scale`() = runTest {
+        listOf(
+            TRANSACTIONS_JSON.replace(
+                "\"currency\":{\"code\":\"UGX\",\"scale\":\"2\"}",
+                "\"currency\":{\"code\":\"USD\",\"scale\":\"2\"}",
+            ),
+            TRANSACTIONS_JSON.replace(
+                "\"currency\":{\"code\":\"UGX\",\"scale\":\"2\"}",
+                "\"currency\":{\"code\":\"UGX\",\"scale\":\"0\"}",
+            ),
+        ).forEach { response ->
+            server.enqueue(jsonResponse(BOOTSTRAP_JSON))
+            server.enqueue(jsonResponse(WALLETS_JSON))
+            server.enqueue(jsonResponse(response))
+
+            val result = repository.refresh()
+
+            assertEquals(0, result.transactionCount)
+            assertTrue(cache.transactions.isEmpty())
+        }
+    }
+
+    @Test
     fun `refresh never caches an institutional counterparty from a service movement`() = runTest {
         server.enqueue(jsonResponse(BOOTSTRAP_JSON))
         server.enqueue(jsonResponse(WALLETS_JSON))

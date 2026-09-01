@@ -52,6 +52,7 @@ import com.kit.wallet.data.repository.GroupPaymentDraftPolicy
 import com.kit.wallet.data.repository.GroupPaymentRepository
 import com.kit.wallet.data.repository.GroupPaymentRequestContributionResolution
 import com.kit.wallet.data.repository.GroupPaymentRequestRepository
+import com.kit.wallet.data.repository.SecureMediaStillPreparingException
 import com.kit.wallet.data.repository.ServerScheduledPaymentRepository
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.data.repository.WalletSyncRepository
@@ -3135,6 +3136,12 @@ class ConversationViewModel @Inject internal constructor(
             cacheMedia(key, opened)
         } catch (cancelled: CancellationException) {
             throw cancelled
+        } catch (stillPreparing: SecureMediaStillPreparingException) {
+            // Not a failure: the send queue simply has no servable bytes yet, and nothing about
+            // this attachment needs the person's attention. Remembering it here would paint a
+            // dead retry tile over a healthy send and refuse every later claim — including the
+            // automatic one that succeeds once the import copy publishes. Released quietly, the
+            // next projection pass or tap re-proves it against the queue's current truth.
         } catch (error: Exception) {
             mutableMediaErrors.value = mutableMediaErrors.value +
                 (key to (error.message ?: fallbackError))

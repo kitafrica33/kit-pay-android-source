@@ -309,7 +309,7 @@ class OfflineWalletRepository @Inject constructor(
 
     override val walletCurrency: StateFlow<WalletCurrency> = selectedWallet
         .map { selected ->
-            selected?.wallet?.let { WalletCurrency(it.currencyCode, it.currencyScale) }
+            selected?.wallet?.let { WalletCurrency(it.currencyCode, it.currencyScale, it.uuid) }
                 ?: WalletCurrency()
         }
         .stateIn(scope, SharingStarted.Eagerly, WalletCurrency())
@@ -323,12 +323,16 @@ class OfflineWalletRepository @Inject constructor(
                     selected.ownerScopeId,
                     AUTHENTICATED_CACHE_OWNER_KEY,
                     selected.wallet.uuid,
-                )
+                ).map { rows ->
+                    rows.filter {
+                        it.isCustomerVisibleWalletTransaction(
+                            selected.wallet.uuid,
+                            selected.wallet.currencyCode,
+                            selected.wallet.currencyScale,
+                        )
+                    }.map { it.toUiModel() }
+                }
             }
-        }
-        .map { rows ->
-            rows.filter { it.isCustomerVisibleWalletTransaction() }
-                .map { it.toUiModel() }
         }
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
 
@@ -409,7 +413,11 @@ class OfflineWalletRepository @Inject constructor(
         }
         walletSync.refresh()
         return SentTransfer(
-            transaction = transaction.toEntity(source.uuid).toUiModel(),
+            transaction = transaction.toEntity(
+                source.uuid,
+                source.currencyCode,
+                source.currencyScale,
+            ).toUiModel(),
             claim = transaction.claim?.toUiModel(),
         )
     }
@@ -958,8 +966,16 @@ class OfflineWalletSyncRepository @Inject constructor(
             ?: return@withLock WalletSyncResult(wallets.size, 0, false)
         val page = apiCalls.execute { api.transactions(selected.uuid, limit = PAGE_SIZE) }
         val transactions = page.items
-            .filter { it.hasVerifiedCustomerProjection() }
-            .map { it.toEntity(selected.uuid) }
+            .filter {
+                it.hasVerifiedCustomerProjection(
+                    selected.uuid,
+                    selected.currencyCode,
+                    selected.currencyScale,
+                )
+            }
+            .map {
+                it.toEntity(selected.uuid, selected.currencyCode, selected.currencyScale)
+            }
         sessions.withCurrentSession(fence) { current ->
             cache.replaceTransactions(
                 current.cacheScopeId,

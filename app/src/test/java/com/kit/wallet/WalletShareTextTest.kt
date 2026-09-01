@@ -2,6 +2,7 @@ package com.kit.wallet
 
 import com.kit.wallet.data.local.WalletTransactionEntity
 import com.kit.wallet.data.mapper.toUiModel
+import com.kit.wallet.data.repository.WalletCurrency
 import com.kit.wallet.feature.wallet.receiptShareText
 import com.kit.wallet.feature.wallet.receiveDetailsShareText
 import com.kit.wallet.ui.model.Transaction
@@ -41,6 +42,10 @@ class WalletShareTextTest {
             type = TxType.SEND,
             status = TxStatus.PENDING,
             reference = "KIT-123",
+            walletId = WALLET_ID,
+            rawType = "internal_transfer",
+            rawDirection = "debit",
+            customerProjectionVerified = true,
         )
 
         assertEquals(
@@ -50,7 +55,7 @@ class WalletShareTextTest {
                 "Status: Pending\n" +
                 "Reference: KIT-123\n" +
                 "Date: Today, 14:05",
-            receiptShareText("Amina", transaction),
+            receiptShareText("Amina", transaction, WalletCurrency("UGX", 2, WALLET_ID)),
         )
     }
 
@@ -68,7 +73,11 @@ class WalletShareTextTest {
             reference = "BANK-123",
             currencyCode = "KES",
             currencyScale = 0,
+            walletId = WALLET_ID,
             customerDebitMinor = 21_000,
+            rawType = "bank_transfer",
+            rawDirection = "debit",
+            customerProjectionVerified = true,
         )
 
         assertEquals(
@@ -78,7 +87,7 @@ class WalletShareTextTest {
                 "Status: Completed\n" +
                 "Reference: BANK-123\n" +
                 "Date: Today, 14:05",
-            receiptShareText("Amina", transaction),
+            receiptShareText("Amina", transaction, WalletCurrency("KES", 0, WALLET_ID)),
         )
     }
 
@@ -117,7 +126,43 @@ class WalletShareTextTest {
                     now = Instant.parse("2026-08-29T12:00:00Z"),
                     zoneId = ZoneOffset.UTC,
                 ),
+                WalletCurrency("UGX", 0, "wallet-1"),
             ),
         )
+    }
+
+    @Test
+    fun `receipt fails closed for unverified wrong currency and internal rows`() {
+        val safe = Transaction(
+            id = "tx-safe",
+            counterparty = "Amina",
+            note = null,
+            amountMinor = -1_000,
+            time = "14:05",
+            dateGroup = "Today",
+            type = TxType.SEND,
+            reference = "KIT-SAFE",
+            walletId = WALLET_ID,
+            rawType = "internal_transfer",
+            rawDirection = "debit",
+            customerProjectionVerified = true,
+        )
+
+        val authority = WalletCurrency("UGX", 2, WALLET_ID)
+        assertEquals(
+            null,
+            receiptShareText("Amina", safe.copy(customerProjectionVerified = false), authority),
+        )
+        assertEquals(null, receiptShareText("Amina", safe.copy(walletId = "other"), authority))
+        assertEquals(null, receiptShareText("Amina", safe.copy(currencyCode = "USD"), authority))
+        assertEquals(
+            null,
+            receiptShareText("Amina", safe.copy(rawType = "bank_outbound_commission"), authority),
+        )
+        assertEquals(null, receiptShareText("Amina", safe.copy(rawDirection = "credit"), authority))
+    }
+
+    private companion object {
+        const val WALLET_ID = "wallet-current"
     }
 }

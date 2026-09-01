@@ -248,9 +248,10 @@ internal class IncomingShareRequestPersistence(private val root: File) {
                 item.processingPlan != SecureMediaProcessingPlan.CHAT_IMAGE_JPEG ||
                     item.mediaType == "image/jpeg" && item.localMediaType.startsWith("image/"),
             )
-            require(item.processingPlan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4) {
-                "Shared video items cannot carry an editor-only processing plan"
-            }
+            require(
+                item.processingPlan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4 ||
+                    item.mediaType == "video/mp4" && item.localMediaType.startsWith("video/"),
+            )
             require(item.displayName.isNotBlank() && item.displayName.length <= 120)
             require(SharedInboxPolicy.fits(item.byteCount.toLong()))
         }

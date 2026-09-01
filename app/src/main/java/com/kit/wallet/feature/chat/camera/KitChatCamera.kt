@@ -81,7 +81,7 @@ import com.kit.wallet.data.messaging.KitChatMediaLimits
 import com.kit.wallet.data.messaging.SecureMediaProcessingPlan
 import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.messaging.SecureMediaVideoEditPlan
-import com.kit.wallet.data.messaging.KitMediaMessage
+import com.kit.wallet.data.messaging.normalizeLocalMediaType
 import com.kit.wallet.feature.chat.CHAT_IMAGE_MAX_DIMENSION
 import java.io.File
 import java.io.FileOutputStream
@@ -272,7 +272,9 @@ internal fun stageLibraryVideoForEditing(
         }
         return LibraryVideoDraft(
             file = staged,
-            mediaType = KitMediaMessage.normalizeMediaType(resolvedMediaType) ?: "video/mp4",
+            mediaType = normalizeLocalMediaType(resolvedMediaType)
+                ?.takeIf { it.startsWith("video/") }
+                ?: "video/mp4",
             originatedAtNanos = originatedAtNanos,
         )
     } catch (error: Exception) {
@@ -472,14 +474,12 @@ private fun encodeVideoDraft(
             originatedAtNanos = sourceOriginNanos,
             originalMediaType = sourceMediaType,
             durationMillis = durationMillis,
-            processingPlan = if (editPlan == null) {
-                SecureMediaProcessingPlan.PASSTHROUGH
-            } else {
-                SecureMediaProcessingPlan.CHAT_VIDEO_MP4
-            },
+            // Untouched videos are canonicalized too. Provider MIME and extensions cannot prove
+            // that the retained bytes are MP4, while the sender continues to play this original.
+            processingPlan = SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
             videoEditPlan = editPlan,
         ),
-        mediaType = videoSendMediaType(edited = !untouched, sourceMediaType = sourceMediaType),
+        mediaType = videoSendMediaType(),
         caption = spec.caption,
         release = { payload.delete() },
     )

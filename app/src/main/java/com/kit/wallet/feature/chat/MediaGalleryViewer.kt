@@ -174,7 +174,16 @@ internal fun ConversationMediaGallery(
                         actionLabel = "Tap to retry",
                         onAction = { onRetry(message) },
                     )
-                    else -> GalleryStatePage(text = null, actionLabel = null, onAction = {})
+                    // The quiet page can outlive its moment: a probe released as "still
+                    // preparing" leaves no error and no file, and nothing re-fires the
+                    // neighbour loader until the page or list changes. A tap re-proves the
+                    // attachment against the queue's current truth; while a load is genuinely
+                    // in flight, the claim makes it a no-op.
+                    else -> GalleryStatePage(
+                        text = null,
+                        actionLabel = null,
+                        onAction = { onLoad(message) },
+                    )
                 }
             }
 
@@ -539,7 +548,13 @@ private fun GalleryVideoPage(message: Message, media: SecureMediaFile) {
 
 @Composable
 private fun GalleryStatePage(text: String?, actionLabel: String?, onAction: () -> Unit) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+    // The spinner page shows no action label, so the whole surface takes the tap.
+    val tappable = if (text == null) {
+        Modifier.pointerInput(Unit) { detectTapGestures { onAction() } }
+    } else {
+        Modifier
+    }
+    Box(Modifier.fillMaxSize().then(tappable), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             if (text == null) {
                 CircularProgressIndicator(color = Color.White)

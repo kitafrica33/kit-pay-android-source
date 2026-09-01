@@ -4,6 +4,7 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.repository.CallRepository
 import com.kit.wallet.data.repository.ChatRepository
+import com.kit.wallet.data.repository.SecureMediaStillPreparingException
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
@@ -759,6 +760,87 @@ class ConversationViewModelTest {
         assertTrue(viewModel.mediaErrors.value.isEmpty())
 
         viewModel.setConversationVisible(false)
+        repository.deleteMediaScratch()
+    }
+
+    @Test
+    fun `an early tap on a still preparing attachment never blocks the automatic open`() = runTest {
+        val pending = Message(
+            id = "pending-photo",
+            text = "Photo",
+            time = "12:00",
+            fromMe = true,
+            state = DeliveryState.SENDING,
+            kind = MessageKind.IMAGE,
+            mediaDescriptor = "local-descriptor",
+            mediaPlaintextBytes = 0,
+        )
+        val repository = FakeChatRepository(media = mapOf("local-descriptor" to byteArrayOf(7)))
+        repository.preparingMedia += "local-descriptor"
+        val viewModel = viewModel(repository)
+        repository.messages.value = listOf(pending)
+
+        // Tapped while the import is still copying: the probe reaches the repository and is told
+        // "not yet". That answer must leave no trace — a remembered error here used to refuse
+        // every later claim, leaving a finished send unplayable until a manual retry.
+        viewModel.openMedia(pending)
+        runCurrent()
+        assertEquals(listOf("local-descriptor"), repository.openedSingleMedia)
+        assertTrue(viewModel.mediaErrors.value.isEmpty())
+        assertTrue(viewModel.mediaLoading.value.isEmpty())
+        assertFalse(pending.id in viewModel.mediaFiles.value)
+
+        // The queue advances and the projection re-emits with a real byte count; the preloader
+        // must now claim the same attachment by itself and hand the bubble a playable file.
+        repository.preparingMedia.clear()
+        repository.messages.value = listOf(pending.copy(mediaPlaintextBytes = 1))
+        viewModel.setConversationVisible(true)
+        runCurrent()
+
+        assertEquals(listOf("local-descriptor", "local-descriptor"), repository.openedSingleMedia)
+        assertTrue(pending.id in viewModel.mediaFiles.value)
+        assertTrue(viewModel.mediaErrors.value.isEmpty())
+
+        viewModel.setConversationVisible(false)
+        repository.deleteMediaScratch()
+    }
+
+    @Test
+    fun `a still preparing album item leaves no sticky error and opens once it advances`() = runTest {
+        val item = MessageMediaItem("item-1", "image/jpeg", 12)
+        val album = Message(
+            id = "pending-album",
+            text = "Album",
+            time = "12:00",
+            fromMe = true,
+            state = DeliveryState.SENDING,
+            kind = MessageKind.MEDIA_ALBUM,
+            mediaDescriptor = "album-descriptor",
+            mediaItems = listOf(item),
+        )
+        val repository = FakeChatRepository(
+            albumMedia = mapOf(("album-descriptor" to "item-1") to byteArrayOf(9)),
+        )
+        repository.preparingMedia += "album-descriptor"
+        val viewModel = viewModel(repository)
+        repository.messages.value = listOf(album)
+        val key = albumItemMediaKey(album.id, item.attachmentId)
+
+        viewModel.openAlbumItem(album, item)
+        runCurrent()
+        assertEquals(listOf("album-descriptor" to "item-1"), repository.openedAlbumMedia)
+        assertTrue(viewModel.mediaErrors.value.isEmpty())
+        assertTrue(viewModel.mediaLoading.value.isEmpty())
+
+        // Once the album's spool lands, the very same tap must succeed — no retry affordance
+        // exists for a tile that was never allowed to look broken.
+        repository.preparingMedia.clear()
+        viewModel.openAlbumItem(album, item)
+        runCurrent()
+
+        assertTrue(key in viewModel.mediaFiles.value)
+        assertTrue(viewModel.mediaErrors.value.isEmpty())
+
         repository.deleteMediaScratch()
     }
 
@@ -1575,6 +1657,8 @@ class ConversationViewModelTest {
         private var concurrentMediaOpens = 0
         val openedSingleMedia = mutableListOf<String>()
         val openedAlbumMedia = mutableListOf<Pair<String, String>>()
+        /** Descriptors whose queue rows are still importing or encrypting; opens answer "not yet". */
+        val preparingMedia = mutableSetOf<String>()
 
         fun publishChat() {
             mutableChats.value = listOf(preview)
@@ -1667,6 +1751,7 @@ class ConversationViewModelTest {
             fromCurrentUser: Boolean?,
         ): SecureMediaFile {
             openedSingleMedia += mediaDescriptor
+            if (mediaDescriptor in preparingMedia) throw SecureMediaStillPreparingException()
             return openMediaFixture(
                 fileName = mediaDescriptor,
                 plaintext = { checkNotNull(media[mediaDescriptor]) },
@@ -1681,6 +1766,7 @@ class ConversationViewModelTest {
             fromCurrentUser: Boolean?,
         ): SecureMediaFile {
             openedAlbumMedia += mediaDescriptor to attachmentId
+            if (mediaDescriptor in preparingMedia) throw SecureMediaStillPreparingException()
             return openMediaFixture(
                 fileName = "$mediaDescriptor-$attachmentId",
                 plaintext = {

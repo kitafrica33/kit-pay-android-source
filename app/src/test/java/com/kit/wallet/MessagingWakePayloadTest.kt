@@ -108,6 +108,33 @@ class MessagingWakePayloadTest {
     }
 
     @Test
+    fun `urgent message wake is never coalesced behind ordinary maintenance work`() {
+        val coalescer = SecureMessagingWakeCoalescer()
+        var ordinary = 0
+        var urgent = 0
+
+        coalescer.enqueueOnce(urgent = false) { ordinary++ }
+        coalescer.enqueueOnce(urgent = false) { ordinary++ }
+        coalescer.enqueueOnce(urgent = true) { urgent++ }
+        coalescer.enqueueOnce(urgent = true) { urgent++ }
+
+        assertEquals(1, ordinary)
+        assertEquals(1, urgent)
+
+        // Starting one lane releases only that lane. A running maintenance worker must not consume
+        // the follow-up wake promised to a newly delivered high-priority message, or vice versa.
+        coalescer.workerStarted(urgent = false)
+        coalescer.enqueueOnce(urgent = false) { ordinary++ }
+        coalescer.enqueueOnce(urgent = true) { urgent++ }
+        assertEquals(2, ordinary)
+        assertEquals(1, urgent)
+
+        coalescer.workerStarted(urgent = true)
+        coalescer.enqueueOnce(urgent = true) { urgent++ }
+        assertEquals(2, urgent)
+    }
+
+    @Test
     fun `app foreground catch up runs only for an authenticated session`() {
         var schedules = 0
 

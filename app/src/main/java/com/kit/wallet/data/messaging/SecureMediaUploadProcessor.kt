@@ -91,26 +91,36 @@ internal class AndroidSecureMediaUploadProcessor @Inject constructor(
                 check(original.mediaType.startsWith("video/")) {
                     "The retained video has an invalid media type"
                 }
-                val edit = requireNotNull(videoEditPlan) {
-                    "The retained video has no edit plan"
-                }
                 check(directory.isDirectory || directory.mkdirs()) {
                     "Secure media processing storage is unavailable"
                 }
                 directory.deleteStaleScratch()
                 val output = File(directory, ".${UUID.randomUUID()}.mp4.partial")
                 try {
+                    // A null edit means the complete retained original. Even an untouched clip is
+                    // remuxed: provider MIME and filename extensions are presentation hints, not
+                    // proof that the bytes are MP4. MediaVideoRemuxer inspects the actual tracks
+                    // and accepts only H.264 with optional AAC before MediaMuxer writes real MP4.
+                    val remuxPlan = videoEditPlan?.let { edit ->
+                        MediaVideoRemuxPlan(
+                            edit.startMicros,
+                            edit.endMicros,
+                            edit.keepAudio,
+                        )
+                    } ?: MediaVideoRemuxPlan(
+                        startMicros = 0L,
+                        endMicros = Long.MAX_VALUE,
+                        keepAudio = true,
+                    )
                     check(
                         MediaVideoRemuxer.remux(
                             source = original.file,
                             destination = output,
-                            plan = MediaVideoRemuxPlan(
-                                edit.startMicros,
-                                edit.endMicros,
-                                edit.keepAudio,
-                            ),
+                            plan = remuxPlan,
                         ),
-                    ) { "The selected video could not be prepared" }
+                    ) {
+                        "This video format cannot be sent safely. Choose an H.264 video with AAC audio."
+                    }
                     check(output.length() in 1..maximumPlaintextBytes.toLong()) {
                         "This attachment is too large to send"
                     }

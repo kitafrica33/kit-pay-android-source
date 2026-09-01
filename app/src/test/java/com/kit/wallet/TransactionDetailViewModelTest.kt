@@ -2,6 +2,7 @@ package com.kit.wallet
 
 import androidx.lifecycle.SavedStateHandle
 import com.kit.wallet.data.repository.WalletRepository
+import com.kit.wallet.data.repository.WalletCurrency
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.feature.wallet.TransactionDetailUiState
 import com.kit.wallet.feature.wallet.TransactionDetailViewModel
@@ -135,6 +136,23 @@ class TransactionDetailViewModelTest {
         assertEquals(TransactionDetailUiState.NotFound, viewModel.uiState.value)
     }
 
+    @Test
+    fun `detail route rejects unverified cross wallet currency and internal projections`() =
+        runTest {
+            val safe = transaction("target")
+            listOf(
+                safe.copy(customerProjectionVerified = false),
+                safe.copy(walletId = "wallet-other"),
+                safe.copy(currencyCode = "USD"),
+                safe.copy(currencyScale = 0),
+                safe.copy(rawType = "bank_outbound_commission"),
+                safe.copy(rawDirection = "credit"),
+            ).forEach { unsafe ->
+                val viewModel = viewModel(FakeWalletRepository(listOf(unsafe)), unsafe.id)
+                assertEquals(unsafe.toString(), TransactionDetailUiState.NotFound, viewModel.uiState.value)
+            }
+        }
+
     private fun viewModel(repository: WalletRepository, transactionId: String) =
         TransactionDetailViewModel(
             wallet = repository,
@@ -157,12 +175,18 @@ class TransactionDetailViewModelTest {
         dateGroup = "Today",
         type = TxType.SEND,
         reference = "TEST-$id",
+        walletId = WALLET_ID,
+        rawType = "internal_transfer",
+        rawDirection = "debit",
+        customerProjectionVerified = true,
     )
 
     private class FakeWalletRepository(initial: List<Transaction>) : WalletRepository {
         private val mutableTransactions = MutableStateFlow(initial)
 
         override val balanceMinor: StateFlow<Long> = MutableStateFlow(0L)
+        override val walletCurrency: StateFlow<WalletCurrency> =
+            MutableStateFlow(WalletCurrency("UGX", 2, WALLET_ID))
         override val transactions: StateFlow<List<Transaction>> = mutableTransactions
         override val beneficiaries: StateFlow<List<Beneficiary>> = MutableStateFlow(emptyList())
 
@@ -196,5 +220,9 @@ class TransactionDetailViewModelTest {
             amountMinor: Long,
             paymentPin: String,
         ): Transaction = error("Not used")
+    }
+
+    private companion object {
+        const val WALLET_ID = "wallet-current"
     }
 }

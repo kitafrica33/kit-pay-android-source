@@ -32,13 +32,15 @@ class TransactionIdentityMappingTest {
                     "2026-08-29T10:11:12Z",
                 ),
             ),
-        ).toEntity(WALLET_ID)
+        ).toEntity(WALLET_ID, "UGX", 0)
         val presented = entity.toUiModel()
 
         assertEquals(USER_ID, entity.counterpartyUserId)
         assertEquals(true, entity.customerProjectionVerified)
         assertEquals("https://pay.kit.africa/media/amina", entity.counterpartyAvatarUrl)
         assertEquals("verified", entity.counterpartyVerificationDesignation)
+        assertEquals(WALLET_ID, presented.walletId)
+        assertTrue(presented.customerProjectionVerified)
         assertEquals(USER_ID, presented.counterpartyUserId)
         assertEquals(entity.counterpartyAvatarUrl, presented.counterpartyAvatarUrl)
         assertEquals(
@@ -72,7 +74,8 @@ class TransactionIdentityMappingTest {
             "referral_reward",
             "referral_reward_reversal",
         ).forEach { type ->
-            val entity = transaction(serviceCounterparty).copy(type = type).toEntity(WALLET_ID)
+            val entity = transaction(serviceCounterparty).copy(type = type)
+                .toEntity(WALLET_ID, "UGX", 0)
             val presented = entity.toUiModel()
 
             assertEquals(type, "Kit Pay", entity.counterpartyName)
@@ -106,7 +109,8 @@ class TransactionIdentityMappingTest {
             "merchant_payment",
             "merchant_refund",
         ).forEach { type ->
-            val entity = transaction(publicCounterparty).copy(type = type).toEntity(WALLET_ID)
+            val entity = transaction(publicCounterparty).copy(type = type)
+                .toEntity(WALLET_ID, "UGX", 0)
 
             assertEquals(type, "Amina", entity.counterpartyName)
             assertEquals(type, USER_ID, entity.counterpartyUserId)
@@ -127,7 +131,7 @@ class TransactionIdentityMappingTest {
                     "2026-08-29T10:11:12Z",
                 ),
             ),
-        ).toEntity(WALLET_ID).copy(
+        ).toEntity(WALLET_ID, "UGX", 0).copy(
             type = "bank_transfer",
             counterpartyName = "Kit institutional commission",
             counterpartyUserId = USER_ID,
@@ -168,7 +172,7 @@ class TransactionIdentityMappingTest {
                 avatarUrl = "https://attacker.example/track",
                 verification = AccountVerificationDto("Official", "not-an-instant"),
             ),
-        ).toEntity(WALLET_ID)
+        ).toEntity(WALLET_ID, "UGX", 0)
 
         assertNull(entity.counterpartyAvatarUrl)
         assertNull(entity.counterpartyVerificationDesignation)
@@ -191,7 +195,7 @@ class TransactionIdentityMappingTest {
 
         assertFalse(transaction.hasVerifiedCustomerProjection())
         assertThrows(IllegalArgumentException::class.java) {
-            transaction.toEntity(WALLET_ID)
+            transaction.toEntity(WALLET_ID, "UGX", 0)
         }
     }
 
@@ -201,8 +205,41 @@ class TransactionIdentityMappingTest {
 
         assertFalse(transaction.hasVerifiedCustomerProjection())
         assertThrows(IllegalArgumentException::class.java) {
-            transaction.toEntity(WALLET_ID)
+            transaction.toEntity(WALLET_ID, "UGX", 0)
         }
+    }
+
+    @Test
+    fun `customer projection is bound to the selected wallet and currency`() {
+        val transaction = transaction(CounterpartyDto(name = "Amina"))
+
+        assertTrue(transaction.hasVerifiedCustomerProjection(WALLET_ID, "UGX", 0))
+        assertFalse(transaction.hasVerifiedCustomerProjection("wallet-other", "UGX", 0))
+        assertFalse(transaction.hasVerifiedCustomerProjection(WALLET_ID, "USD", 0))
+        assertFalse(transaction.hasVerifiedCustomerProjection(WALLET_ID, "UGX", 2))
+        assertThrows(IllegalArgumentException::class.java) {
+            transaction.copy(walletId = "wallet-other").toEntity(WALLET_ID, "UGX", 0)
+        }
+    }
+
+    @Test
+    fun `cached projection is bound again before customer display`() {
+        val cached = transaction(CounterpartyDto(name = "Amina"))
+            .toEntity(WALLET_ID, "UGX", 0)
+
+        assertTrue(cached.isCustomerVisibleWalletTransaction(WALLET_ID, "UGX", 0))
+        assertFalse(
+            cached.copy(walletUuid = "wallet-other")
+                .isCustomerVisibleWalletTransaction(WALLET_ID, "UGX", 0),
+        )
+        assertFalse(
+            cached.copy(currencyCode = "USD")
+                .isCustomerVisibleWalletTransaction(WALLET_ID, "UGX", 0),
+        )
+        assertFalse(
+            cached.copy(currencyScale = 2)
+                .isCustomerVisibleWalletTransaction(WALLET_ID, "UGX", 0),
+        )
     }
 
     @Test
@@ -233,7 +270,7 @@ class TransactionIdentityMappingTest {
 
         assertEquals("0.00", decoded.totals?.added)
         assertEquals("56000.00", decoded.totals?.deducted)
-        assertEquals(-5_600_000L, decoded.toEntity(WALLET_ID).amountMinor)
+        assertEquals(-5_600_000L, decoded.toEntity(WALLET_ID, "UGX", 2).amountMinor)
     }
 
     private fun transaction(counterparty: CounterpartyDto) = TransactionDto(

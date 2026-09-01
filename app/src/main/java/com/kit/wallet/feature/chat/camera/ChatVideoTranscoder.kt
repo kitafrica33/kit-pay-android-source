@@ -49,12 +49,10 @@ internal fun planVideoTrim(
 }
 
 /**
- * The wire type a video leaves with. Any edit — trim or mute — re-muxes into MP4; an untouched
- * clip keeps its own container, because relabeling a QuickTime or WebM file as video/mp4 would
- * hand the recipient bytes that do not match their name.
+ * The wire type a video leaves with. Every outbound video takes the canonical remux plan, so this
+ * label describes MediaMuxer's real MP4 output rather than a provider's MIME or a filename.
  */
-internal fun videoSendMediaType(edited: Boolean, sourceMediaType: String): String =
-    if (edited) "video/mp4" else sourceMediaType
+internal fun videoSendMediaType(): String = "video/mp4"
 
 /**
  * Stream-copies compressed samples from a recorded clip into a trimmed MP4 without

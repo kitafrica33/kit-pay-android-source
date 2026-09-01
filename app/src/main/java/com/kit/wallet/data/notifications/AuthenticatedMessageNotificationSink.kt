@@ -152,6 +152,12 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
             MessageReplyReceiver.replyIntent(
                 context = context,
                 conversationId = notification.conversationId,
+                sessionEpoch = notification.sessionEpoch,
+                clientMessageId = MessageReplyPolicy.deliveryMessageId(
+                    conversationId = notification.conversationId,
+                    sourceMessageId = notification.messageId,
+                    sessionEpoch = notification.sessionEpoch,
+                ),
                 notificationTag = notificationTag,
                 notificationId = NOTIFICATION_ID,
             ).setData(

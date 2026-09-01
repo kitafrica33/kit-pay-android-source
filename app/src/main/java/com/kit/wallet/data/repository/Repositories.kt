@@ -89,6 +89,8 @@ interface UserRepository {
 data class WalletCurrency(
     val code: String = Money.SYMBOL,
     val scale: Int = Money.SCALE,
+    /** Selected-wallet authority for customer-history/detail/receipt projections. */
+    val walletId: String? = null,
 )
 
 /**
@@ -452,6 +454,20 @@ interface ChatRepository {
         text: String,
         clientMessageId: String,
     ): Unit = error("Idempotent owner-pinned secure messaging is unavailable")
+
+    /**
+     * Durably captures authenticated notification text before the chat projection is hydrated.
+     *
+     * The notification itself proves which conversation supplied the reply action. Implementations
+     * must still bind the intent to [owner], validate its text and stable identity, and revalidate
+     * conversation membership before promotion to the encrypted outbox.
+     */
+    suspend fun captureNotificationReplyForOwner(
+        owner: SessionFence,
+        chatId: String,
+        text: String,
+        clientMessageId: String,
+    ): Unit = error("Durable notification-reply capture is unavailable")
 
     /** Sends a canonical descriptor produced by a payment flow, never by a text composer. */
     suspend fun sendPaymentEvent(

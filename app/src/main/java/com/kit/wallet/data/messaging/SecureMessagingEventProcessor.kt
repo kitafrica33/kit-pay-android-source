@@ -7,6 +7,7 @@ import com.kit.wallet.data.repository.GroupPaymentRepository
 import com.kit.wallet.data.repository.ServerScheduledPaymentRepository
 import com.kit.wallet.data.repository.WalletRefreshTrigger
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.remote.SecureMessagingWireValidationException
 import java.io.IOException
 import java.time.Instant
 import javax.inject.Inject
@@ -125,6 +126,20 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             null
         val historicalPlans = mutableMapOf<HistoricalRosterKey, HistoricalRosterPlan>()
 
+        /**
+         * Conversation IDs a fresh authoritative list still omitted, remembered for the current
+         * batch so one departed conversation's event backlog costs a single refetch on the serial
+         * sync path instead of one per event.
+         */
+        val absentConversations = mutableSetOf<String>()
+
+        /**
+         * Historical rosters the transport refused to certify, remembered for the current batch
+         * so a backlog sealed under one dead revision costs a single refused fetch instead of one
+         * per envelope.
+         */
+        val rejectedRosters = mutableSetOf<HistoricalRosterKey>()
+
         fun beginBatch(value: RemoteSecureMessagingTransport.Session.SyncBatch) {
             check(batch == null && eventIndex == 0 && deliveryTokens.isEmpty()) {
                 "Secure-messaging batch state was not fully finalized"
@@ -141,11 +156,15 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             deliveryTokens.clear()
             persistedBatchPosition = null
             pendingDecryption = null
+            absentConversations.clear()
+            rejectedRosters.clear()
         }
 
         fun invalidateConversation(conversationId: String) {
             conversations = null
+            absentConversations.clear()
             historicalPlans.keys.removeAll { it.conversationId == conversationId }
+            rejectedRosters.removeAll { it.conversationId == conversationId }
         }
     }
 
@@ -631,10 +650,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         state: SessionState,
         event: RemoteSecureMessagingTransport.Session.FinancialMetadataEvent,
     ) {
-        val conversations = state.conversations ?: state.session.conversations()
-            .associateBy(RemoteSecureMessagingTransport.Session.SecureConversation::conversationId)
-            .also { state.conversations = it }
-        val conversation = conversations[event.conversationId]
+        val conversation = authoritativeConversations(state)[event.conversationId]
         val scheduleRepository = checkNotNull(scheduledPayments) {
             "Scheduled-payment authority is unavailable"
         }
@@ -1180,7 +1196,13 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             if (durable == null) {
                 val pending = state.pendingDecryption
                 val request = if (pending == null) {
-                    val historical = historicalPlan(state, envelope)
+                    // A null plan is the settled answer that no certified roster will ever exist
+                    // for this envelope: the account left or deleted the chat before the queued
+                    // event was consumed, or the stored roster for its revision failed
+                    // verification. Consume the event without touching the ratchet or
+                    // acknowledging delivery rather than wedging every other conversation's
+                    // synchronization behind it forever.
+                    val historical = historicalPlan(state, envelope) ?: return
                     state.session.decryptionRequest(
                         envelope,
                         historical.roster,
@@ -1281,7 +1303,11 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             if (wrapper == null) {
                 val pending = state.pendingDecryption
                 val request = if (pending == null) {
-                    val historical = historicalPlan(state, envelope)
+                    // Same consume-without-recreating rule as processIncoming: a history transfer
+                    // whose conversation is authoritatively gone, or whose stored roster failed
+                    // verification, has no certified roster to decrypt against and must not stall
+                    // the stream.
+                    val historical = historicalPlan(state, envelope) ?: return
                     state.session.decryptionRequest(
                         envelope,
                         historical.roster,
@@ -1457,6 +1483,15 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         // Resolve the sender only after the message is locally visible. A temporary conversation
         // lookup failure can delay the alert, but can no longer produce an alert-only state.
         val notificationSender = authenticatedNotificationSender(state, durable)
+        if (notificationSender == null) {
+            // A fresh authoritative conversation list refused to name this sender: the chat is
+            // gone from this account, or the sender sits outside its membership. The message is
+            // already committed and locally visible; only the shade needed a name, and naming
+            // stays fail-closed. Consume the pending marker so one silent alert can never stall
+            // or replay against account-wide synchronization.
+            state.withProjectionLease { completeInboundNotificationPublication(durable) }
+            return
+        }
         // Re-enter the exact activation lease for the external publication. Erasure drains this
         // phase before cancelAll, so an obsolete activation cannot notify after logout/replacement.
         state.withProjectionLease {
@@ -1485,24 +1520,20 @@ internal class SecureMessagingEventProcessor @Inject constructor(
     /** Who the shade may name, resolved only from authenticated conversation membership. */
     private data class NotificationSender(val name: String?, val groupTitle: String?)
 
-    /** Resolves display identity only from the authenticated conversation membership. */
+    /**
+     * Resolves display identity only from the authenticated conversation membership, or null when
+     * the authoritative list no longer contains the conversation or the sender.
+     */
     private suspend fun authenticatedNotificationSender(
         state: SessionState,
         durable: LibSignalCompanionRecord,
-    ): NotificationSender {
-        val conversations = state.conversations ?: state.session.conversations()
-            .associateBy(RemoteSecureMessagingTransport.Session.SecureConversation::conversationId)
-            .also { state.conversations = it }
-        val conversation = checkNotNull(conversations[durable.conversationId]) {
-            "Incoming secure message belongs to an unavailable conversation"
-        }
+    ): NotificationSender? {
+        val conversation = authoritativeConversation(state, durable.conversationId) ?: return null
         // Membership, not peer equality: a group has many authentic senders, and the shade must
         // name the one who actually sent this. A sender outside the membership is still refused.
-        val sender = checkNotNull(
-            conversation.members.firstOrNull {
-                it.userId.equals(durable.sender.userId, ignoreCase = true)
-            },
-        ) { "Incoming secure message sender is not an authenticated conversation member" }
+        val sender = conversation.members.firstOrNull {
+            it.userId.equals(durable.sender.userId, ignoreCase = true)
+        } ?: return null
         return NotificationSender(
             name = sender.name,
             groupTitle = conversation.title.takeIf { conversation.isGroup },
@@ -1615,12 +1646,11 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         state: SessionState,
         event: RemoteSecureMessagingTransport.Session.ReadReceiptEvent,
     ) {
-        val conversations = state.conversations ?: state.session.conversations()
-            .associateBy(RemoteSecureMessagingTransport.Session.SecureConversation::conversationId)
-            .also { state.conversations = it }
-        val conversation = checkNotNull(conversations[event.conversationId]) {
-            "Read receipt belongs to an unavailable conversation"
-        }
+        // A receipt only annotates messages this account already has. When the authoritative
+        // conversation list omits its chat even after a fresh look — left or deleted before this
+        // queued event was consumed — there is nothing the marker may honestly move: skip the
+        // annotation instead of stalling every other conversation's synchronization behind it.
+        val conversation = authoritativeConversation(state, event.conversationId) ?: return
         if (event.readerUserId == state.session.binding.userId) {
             // The backend broadcasts this account's marker to every enrolled device. It is not
             // peer-read evidence for self-authored bubbles, but it does clear authenticated inbound
@@ -1635,8 +1665,10 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             }
             return
         }
-        check(conversation.contains(event.readerUserId)) {
-            "Read receipt actor is not an authenticated conversation member"
+        if (!conversation.contains(event.readerUserId)) {
+            // A reader outside the authenticated membership proves nothing about this account's
+            // bubbles. Refuse the annotation without wedging the stream behind it.
+            return
         }
         state.withProjectionLease {
             markAuthoredReadThrough(
@@ -1654,22 +1686,70 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         }
     }
 
+    /**
+     * The session-scoped authoritative conversation map, fetched on first use and after any
+     * membership invalidation.
+     */
+    private suspend fun authoritativeConversations(
+        state: SessionState,
+    ): Map<String, RemoteSecureMessagingTransport.Session.SecureConversation> =
+        state.conversations ?: state.session.conversations()
+            .associateBy(RemoteSecureMessagingTransport.Session.SecureConversation::conversationId)
+            .also { state.conversations = it }
+
+    /**
+     * Resolves one conversation against the authoritative list, refetching the cached map once
+     * when a list fetched earlier omits it: a conversation created after the cache was populated
+     * must never be mistaken for one this account left. Null therefore means a list fetched fresh
+     * from the server still omits the conversation — the server's own statement that this account
+     * no longer sees it — remembered for the rest of the batch so a departed conversation's
+     * backlog drains at one refetch, not one per event. Transport and server failures still throw
+     * and pin the cursor.
+     */
+    private suspend fun authoritativeConversation(
+        state: SessionState,
+        conversationId: String,
+    ): RemoteSecureMessagingTransport.Session.SecureConversation? {
+        if (conversationId in state.absentConversations) return null
+        val cachedBefore = state.conversations != null
+        authoritativeConversations(state)[conversationId]?.let { return it }
+        if (cachedBefore) {
+            state.conversations = null
+            authoritativeConversations(state)[conversationId]?.let { return it }
+        }
+        state.absentConversations += conversationId
+        return null
+    }
+
+    /**
+     * The certified decryption inputs for one offline envelope, memoized per historical roster.
+     * Null is the settled answer that no certified roster will ever exist for it: a fresh
+     * authoritative list omits the conversation, or the transport refused to verify the stored
+     * roster for its revision. Callers must consume the event — a retry only re-proves the same
+     * refusal, wedging every conversation's synchronization behind one dead envelope.
+     */
     private suspend fun historicalPlan(
         state: SessionState,
         envelope: RemoteSecureMessagingTransport.Session.IncomingEnvelope,
-    ): HistoricalRosterPlan {
+    ): HistoricalRosterPlan? {
         val key = HistoricalRosterKey(envelope.conversationId, envelope.transferRosterRevision)
         state.historicalPlans[key]?.let { return it }
-        val conversations = state.conversations ?: state.session.conversations()
-            .associateBy(RemoteSecureMessagingTransport.Session.SecureConversation::conversationId)
-            .also { state.conversations = it }
-        val conversation = checkNotNull(conversations[envelope.conversationId]) {
-            "Incoming secure message belongs to an unavailable direct conversation"
+        if (key in state.rejectedRosters) return null
+        val conversation = authoritativeConversation(state, envelope.conversationId)
+            ?: return null
+        val roster = try {
+            state.session.historicalRoster(
+                conversation,
+                envelope.transferRosterRevision,
+            )
+        } catch (_: SecureMessagingWireValidationException) {
+            // The stored roster for this revision does not verify against the conversation it
+            // claims — most ordinarily because membership moved on after the envelope was
+            // sealed. The same fetch yields the same refusal on every retry, so the envelope
+            // can never be decrypted: fail closed for this envelope, never for the stream.
+            state.rejectedRosters += key
+            return null
         }
-        val roster = state.session.historicalRoster(
-            conversation,
-            envelope.transferRosterRevision,
-        )
         return HistoricalRosterPlan(
             conversation = conversation,
             roster = roster,

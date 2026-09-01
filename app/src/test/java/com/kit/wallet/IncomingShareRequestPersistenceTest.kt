@@ -71,6 +71,38 @@ class IncomingShareRequestPersistenceTest {
     }
 
     @Test
+    fun `video original and canonical MP4 plan survive process recreation`() {
+        val root = temporary.newFolder("inbox-video-original")
+        val directory = File(root, BATCH_ONE).apply { assertTrue(mkdirs()) }
+        val bytes = "quicktime-placeholder".toByteArray()
+        File(directory, ITEM_FILE).writeBytes(bytes)
+        val batch = SharedInboxBatch(
+            id = BATCH_ONE,
+            receivedAtMillis = NOW,
+            items = listOf(
+                com.kit.wallet.feature.chat.SharedInboxItem(
+                    id = ITEM_ONE,
+                    fileName = ITEM_FILE,
+                    mediaType = "video/mp4",
+                    displayName = "Clip.mov",
+                    byteCount = bytes.size,
+                    originalMediaType = "video/quicktime",
+                    processingPlan = SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
+                    durationMillis = 12_000,
+                ),
+            ),
+            owner = SharedInboxOwner("session-a", "scope-a", OWNER),
+        )
+
+        IncomingShareRequestPersistence(root).publish(batch)
+
+        assertEquals(
+            batch,
+            accepted(IncomingShareRequestPersistence(root).claim(BATCH_ONE, nowMillis = NOW)),
+        )
+    }
+
+    @Test
     fun `shared audio duration survives process recreation`() {
         val root = temporary.newFolder("inbox-audio-duration")
         val directory = File(root, BATCH_ONE).apply { assertTrue(mkdirs()) }

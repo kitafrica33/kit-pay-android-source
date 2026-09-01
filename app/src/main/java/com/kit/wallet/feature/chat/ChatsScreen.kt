@@ -65,6 +65,7 @@ import com.kit.wallet.data.demo.DemoData
 import kotlinx.coroutines.delay
 import com.kit.wallet.data.notifications.ActiveCallPresence
 import com.kit.wallet.data.repository.MessageSearchHit
+import com.kit.wallet.feature.calls.CallAlertBlockedWarning
 import com.kit.wallet.feature.calls.formatCallDuration
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.VerifiedAccountName
@@ -261,6 +262,10 @@ internal fun ChatsContent(
                     }
                 }
             }
+            // A phone that cannot ring must say so on the surfaces people actually watch;
+            // the notification that would normally carry this warning is exactly what
+            // Android is refusing to show.
+            item { CallAlertBlockedWarning() }
             if (!messagingAvailable) {
                 // One quiet line, not a page. The chats below it are already readable; the only
                 // thing still preparing is the ability to send, and it says so where that

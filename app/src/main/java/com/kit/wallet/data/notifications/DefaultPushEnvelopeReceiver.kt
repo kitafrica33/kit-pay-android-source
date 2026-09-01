@@ -42,7 +42,10 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
             // Secure-message pushes are opaque data-only wake-ups. A malformed, decorated or
             // provider-analytics-marked wake is discarded and never reaches an alert renderer.
             if (envelope.isVerifiedMessagingWake()) {
-                messagingSync.schedule()
+                // FCM's high-priority execution window is brief. The expedited lane performs the
+                // authenticated pull/decrypt now, so the resulting locally-authenticated message
+                // notification does not wait for an OEM's ordinary background-work cadence.
+                messagingSync.scheduleUrgentMessageWake()
             }
             return
         }

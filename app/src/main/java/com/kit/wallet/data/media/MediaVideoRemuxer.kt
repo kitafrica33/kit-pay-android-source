@@ -31,16 +31,21 @@ internal object MediaVideoRemuxer {
         var muxer: MediaMuxer? = null
         return try {
             extractor.setDataSource(source.absolutePath)
-            val videoTrack = trackIndex(extractor, "video/") ?: return false
-            val audioTrack = if (plan.keepAudio) trackIndex(extractor, "audio/") else null
+            val sourceFormats = (0 until extractor.trackCount).map(extractor::getTrackFormat)
+            val selection = canonicalMp4TrackSelection(
+                sourceFormats.map { it.getString(MediaFormat.KEY_MIME) },
+                keepAudio = plan.keepAudio,
+            ) ?: return false
+            val videoTrack = selection.videoTrack
+            val audioTrack = selection.audioTrack
 
             val created = MediaMuxer(
                 destination.absolutePath,
                 MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4,
             )
             muxer = created
-            val videoFormat = extractor.getTrackFormat(videoTrack)
-            val audioFormat = audioTrack?.let(extractor::getTrackFormat)
+            val videoFormat = sourceFormats[videoTrack]
+            val audioFormat = audioTrack?.let(sourceFormats::get)
             val muxerVideoTrack = created.addTrack(videoFormat)
             val muxerAudioTrack = audioFormat?.let(created::addTrack)
             sourceRotationDegrees(source)
@@ -141,14 +146,6 @@ internal object MediaVideoRemuxer {
             runCatching { extractor.unselectTrack(sourceTrack) }
         }
         return TrackCopy(written, base ?: plan.startMicros)
-    }
-
-    private fun trackIndex(extractor: MediaExtractor, mimePrefix: String): Int? {
-        for (index in 0 until extractor.trackCount) {
-            val mime = extractor.getTrackFormat(index).getString(MediaFormat.KEY_MIME) ?: continue
-            if (mime.startsWith(mimePrefix)) return index
-        }
-        return null
     }
 
     private fun sampleBufferBytes(vararg formats: MediaFormat?): Int {

@@ -130,6 +130,8 @@ data class Transaction(
     val reference: String,
     val currencyCode: String = "UGX",
     val currencyScale: Int = Money.SCALE,
+    /** Wallet authority validated before this projection was admitted to customer UI. */
+    val walletId: String? = null,
     val feeMinor: Long? = null,
     val recipientAmountMinor: Long? = null,
     val customerDebitMinor: Long? = null,
@@ -152,6 +154,8 @@ data class Transaction(
     val counterpartyAvatarUrl: String? = null,
     /** Server-owned blue seal resolved only by exact public account ID. */
     val accountVerification: AccountVerification? = null,
+    /** True only after wallet, currency, type, direction, and aggregate totals were validated. */
+    val customerProjectionVerified: Boolean = false,
 ) {
     /**
      * The single customer-facing movement shown in rows, details, and shared receipts.

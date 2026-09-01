@@ -123,8 +123,36 @@ internal fun TransactionDto.hasVerifiedCustomerProjection(): Boolean {
     }
 }
 
+/**
+ * Binds a customer projection to the wallet whose authenticated endpoint returned it.
+ * A valid total for another wallet or currency must never enter this wallet's UI or cache.
+ */
+internal fun TransactionDto.hasVerifiedCustomerProjection(
+    expectedWalletId: String,
+    expectedCurrencyCode: String,
+    expectedCurrencyScale: Int,
+): Boolean =
+    hasVerifiedCustomerProjection() &&
+        expectedWalletId.isNotBlank() &&
+        walletId == expectedWalletId &&
+        expectedCurrencyCode.isNotBlank() &&
+        currency.code.equals(expectedCurrencyCode, ignoreCase = true) &&
+        expectedCurrencyScale in 0..9 &&
+        currency.scale.toIntOrNull() == expectedCurrencyScale
+
 internal fun WalletTransactionEntity.isCustomerVisibleWalletTransaction(): Boolean =
     customerProjectionVerified && type.isCustomerVisibleWalletTransactionType()
+
+/** Read-side defense for rows restored from an older or corrupted local cache. */
+internal fun WalletTransactionEntity.isCustomerVisibleWalletTransaction(
+    expectedWalletId: String,
+    expectedCurrencyCode: String,
+    expectedCurrencyScale: Int,
+): Boolean =
+    isCustomerVisibleWalletTransaction() &&
+        walletUuid == expectedWalletId &&
+        currencyCode.equals(expectedCurrencyCode, ignoreCase = true) &&
+        currencyScale == expectedCurrencyScale
 
 fun UserDto.toEntity(nowEpochMillis: Long): ProfileEntity {
     val verifiedLegalName = legalName?.takeIf(String::isNotBlank)
@@ -190,9 +218,19 @@ fun WalletDto.toEntity(nowEpochMillis: Long): WalletEntity {
     )
 }
 
-fun TransactionDto.toEntity(defaultWalletUuid: String): WalletTransactionEntity {
-    require(hasVerifiedCustomerProjection()) {
-        "Wallet transaction does not contain a verified customer-total projection"
+fun TransactionDto.toEntity(
+    expectedWalletUuid: String,
+    expectedCurrencyCode: String,
+    expectedCurrencyScale: Int,
+): WalletTransactionEntity {
+    require(
+        hasVerifiedCustomerProjection(
+            expectedWalletUuid,
+            expectedCurrencyCode,
+            expectedCurrencyScale,
+        ),
+    ) {
+        "Wallet transaction does not match the selected wallet's customer projection"
     }
     val scale = currency.scale.toInt()
     val normalizedDirection = direction.trim().lowercase()
@@ -214,11 +252,11 @@ fun TransactionDto.toEntity(defaultWalletUuid: String): WalletTransactionEntity 
     }
     return WalletTransactionEntity(
         id = id,
-        walletUuid = walletId.ifBlank { defaultWalletUuid },
+        walletUuid = expectedWalletUuid,
         reference = reference,
         amountMinor = signedMinor,
-        currencyCode = currency.code,
-        currencyScale = scale,
+        currencyCode = expectedCurrencyCode,
+        currencyScale = expectedCurrencyScale,
         type = type,
         direction = direction,
         status = status,
@@ -312,6 +350,7 @@ fun WalletTransactionEntity.toUiModel(
         reference = reference,
         currencyCode = currencyCode,
         currencyScale = currencyScale,
+        walletId = walletUuid,
         // The unmapped backend words survive beside the display kind: reversal and refund
         // types collapse into SEND/RECEIVE for rendering, and credits share display kinds
         // with debits, so the starter checklist reads the originals to refuse them.
@@ -327,6 +366,7 @@ fun WalletTransactionEntity.toUiModel(
         } else {
             null
         },
+        customerProjectionVerified = customerProjectionVerified,
     )
 }
 

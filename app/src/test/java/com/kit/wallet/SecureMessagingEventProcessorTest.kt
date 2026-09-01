@@ -1019,6 +1019,364 @@ class SecureMessagingEventProcessorTest {
     }
 
     @Test
+    fun `receipt for a conversation absent from a fresh authoritative list is skipped`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val processor = processor(
+                stateStore,
+                PersistingDecryptionEngine(stateStore),
+                projections,
+            )
+            enqueueSync(
+                events = listOf(
+                    readReceiptEvent(10, PEER_USER_ID),
+                    readReceiptEvent(11, PEER_USER_ID),
+                    deliveryReceiptEvent(12),
+                ),
+                nextCursor = "departed_receipt_cursor",
+            )
+            server.enqueue(jsonResponse(EMPTY_CONVERSATIONS))
+            val requestsBefore = server.requestCount
+
+            processor.synchronize(session)
+
+            assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/conversations",
+                server.takeRequest().path,
+            )
+            // Both receipts drained behind a single absence proof: one sync fetch, one
+            // conversations fetch, and nothing else.
+            assertEquals(requestsBefore + 2, server.requestCount)
+            assertTrue(projections.readPage(limit = 10).messages().isEmpty())
+            assertEquals(
+                "departed_receipt_cursor" to 12L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+        }
+
+    @Test
+    fun `receipt from an actor outside the membership is refused without stalling the stream`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val processor = processor(
+                stateStore,
+                PersistingDecryptionEngine(stateStore),
+                projections,
+            )
+            val roster = authoritativeRoster()
+            val outbound = stateStore.persistCompanionRecordForTest(
+                namespace = SecureMessagingProjectionStore.COMPANION_NAMESPACE,
+                recordKey = SecureMessagingProjectionStore.outboundRecordKey(OUTBOUND_CLIENT_ID),
+                direction = LibSignalCompanionDirection.OUTBOUND,
+                messageId = OUTBOUND_CLIENT_ID,
+                clientMessageId = OUTBOUND_CLIENT_ID,
+                conversationId = CONVERSATION_ID,
+                rosterRevision = checkNotNull(roster.rosterRevision),
+                sender = CURRENT,
+                text = "membership receipt projection",
+                envelopes = listOf(
+                    PersistedCompanionEnvelopeFixture(
+                        PEER,
+                        SecureMessagingEnvelopeKind.SESSION,
+                        byteArrayOf(7, 8, 9),
+                    ),
+                ),
+            )
+            projections.recordOutboundPending(outbound, Instant.parse(TIMESTAMP))
+            enqueueSync(
+                events = listOf(
+                    outboundEvent(roster, 10),
+                    readReceiptEvent(11, STRANGER_USER_ID),
+                    deliveryReceiptEvent(12),
+                ),
+                nextCursor = "stranger_receipt_cursor",
+            )
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+
+            processor.synchronize(session)
+
+            // The stranger's marker moved nothing; the delivery receipt behind it still applied.
+            val projected = projections.readPage(limit = 10).messages().single()
+            assertEquals(
+                SecureMessagingProjectionDeliveryState.OUTBOUND_DELIVERED,
+                projected.deliveryState,
+            )
+            assertEquals(
+                "stranger_receipt_cursor" to 12L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+        }
+
+    @Test
+    fun `envelope from a conversation newer than the cached list decrypts after one refetch`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val processor = processor(
+                stateStore,
+                PersistingDecryptionEngine(stateStore),
+                projections,
+            )
+            val roster = authoritativeRoster()
+            enqueueSync(
+                events = listOf(
+                    readReceiptEvent(10, PEER_USER_ID, conversationId = OTHER_CONVERSATION_ID),
+                    incomingEvent(roster, 11),
+                ),
+                nextCursor = "created_mid_batch_cursor",
+            )
+            // The receipt populates the session cache from a list that predates the incoming
+            // envelope's conversation. The envelope must trigger exactly one authoritative
+            // refetch instead of being consumed as departed.
+            server.enqueue(jsonResponse(OTHER_DIRECT_CONVERSATIONS))
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            enqueueRoster(roster)
+            enqueueDeliveryAcknowledgement()
+
+            processor.synchronize(session)
+
+            assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/conversations",
+                server.takeRequest().path,
+            )
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/conversations",
+                server.takeRequest().path,
+            )
+            assertTrue(server.takeRequest().path?.contains("/device-roster/v1:sha256:") == true)
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/messages/delivery-acks",
+                server.takeRequest().path,
+            )
+            assertEquals(
+                INCOMING_MESSAGE_ID,
+                projections.readPage(limit = 10).messages().single().serverMessageId,
+            )
+            assertEquals(
+                "created_mid_batch_cursor" to 11L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+        }
+
+    @Test
+    fun `envelope from an authoritatively absent conversation is consumed without wedging`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val notifications = mutableListOf<SecureMessagingIncomingNotification>()
+            val processor = SecureMessagingEventProcessor(
+                PersistingDecryptionEngine(stateStore),
+                projections,
+                SecureMessagingSyncCursorStore(stateStore),
+                SecureMessagingIncomingNotificationSink { notifications += it },
+            )
+            val roster = authoritativeRoster()
+            enqueueSync(
+                events = listOf(incomingEvent(roster, 10), deliveryReceiptEvent(11)),
+                nextCursor = "left_conversation_cursor",
+            )
+            server.enqueue(jsonResponse(EMPTY_CONVERSATIONS))
+            val requestsBefore = server.requestCount
+
+            processor.synchronize(session)
+
+            assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/conversations",
+                server.takeRequest().path,
+            )
+            // No roster fetch, no ratchet commit, no delivery acknowledgement: the envelope was
+            // consumed outright, and the event behind it still advanced the cursor.
+            assertEquals(requestsBefore + 2, server.requestCount)
+            assertNull(projections.readInbound(INCOMING_MESSAGE_ID))
+            assertTrue(projections.readPage(limit = 10).messages().isEmpty())
+            assertTrue(notifications.isEmpty())
+            assertEquals(
+                "left_conversation_cursor" to 11L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+        }
+
+    @Test
+    fun `envelope whose stored roster no longer verifies is consumed without wedging`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            val stateStore = TestSecureMessagingStateStore()
+            val projections = projectionStore(stateStore)
+            val notifications = mutableListOf<SecureMessagingIncomingNotification>()
+            val crypto = PersistingDecryptionEngine(stateStore)
+            val processor = SecureMessagingEventProcessor(
+                crypto,
+                projections,
+                SecureMessagingSyncCursorStore(stateStore),
+                SecureMessagingIncomingNotificationSink { notifications += it },
+            )
+
+            // The conversation still exists, but membership moved on after the envelope was
+            // sealed: the stored roster names the old membership, so the transport refuses to
+            // certify it — on this fetch and on every fetch after it.
+            val roster = authoritativeRoster()
+            enqueueSync(
+                events = listOf(incomingEvent(roster, 10), deliveryReceiptEvent(11)),
+                nextCursor = "unverifiable_roster_cursor",
+            )
+            server.enqueue(jsonResponse(STRANGER_MEMBER_CONVERSATIONS))
+            enqueueRoster(roster)
+            val requestsBefore = server.requestCount
+
+            processor.synchronize(session)
+
+            assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+            assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
+            assertTrue(server.takeRequest().path?.contains("/device-roster/v1:sha256:") == true)
+            // The refusal ends at the envelope: no ratchet commit, no delivery acknowledgement,
+            // and the event behind it still advanced the cursor.
+            assertEquals(requestsBefore + 3, server.requestCount)
+            assertEquals(0, crypto.openedTransactions)
+            assertNull(projections.readInbound(INCOMING_MESSAGE_ID))
+            assertTrue(projections.readPage(limit = 10).messages().isEmpty())
+            assertTrue(notifications.isEmpty())
+            assertEquals(
+                "unverifiable_roster_cursor" to 11L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+
+            // The next batch re-proves the refusal against one fresh roster fetch — the memo of
+            // refused rosters lives per batch — while the conversation list stays cached: two
+            // requests, another consumed envelope, and the stream keeps moving.
+            enqueueSync(listOf(incomingEvent(roster, 12)), "unverifiable_roster_replay_cursor")
+            enqueueRoster(roster)
+            val replayRequestsBefore = server.requestCount
+
+            processor.synchronize(session)
+
+            val resumedSync = server.takeRequest()
+            assertTrue(resumedSync.path?.contains("cursor=unverifiable_roster_cursor") == true)
+            assertTrue(resumedSync.path?.contains("limit=50") == true)
+            assertTrue(server.takeRequest().path?.contains("/device-roster/v1:sha256:") == true)
+            assertEquals(replayRequestsBefore + 2, server.requestCount)
+            assertEquals(0, crypto.openedTransactions)
+            assertTrue(projections.readPage(limit = 10).messages().isEmpty())
+            assertTrue(notifications.isEmpty())
+            assertEquals(
+                "unverifiable_roster_replay_cursor" to 12L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+        }
+
+    @Test
+    fun `committed message from a departed sender stays visible but never reaches the shade`() =
+        runTest {
+            val (firstSession, _, _) = openSyncingSession()
+            val stateStore = TestSecureMessagingStateStore()
+            val crypto = PersistingDecryptionEngine(stateStore)
+            val projections = projectionStore(stateStore)
+            val notifications = FailOnceIdempotentNotificationSink(failAfterPublish = false)
+            val roster = authoritativeRoster()
+
+            // The message commits while its sender is still a member, but the shade fails before
+            // anything becomes visible: a durable projection and a pending publication marker
+            // survive the crash, the cursor does not.
+            enqueueSync(listOf(incomingEvent(roster, 10)), "departed_sender_cursor")
+            server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+            enqueueRoster(roster)
+            val failure = runCatching {
+                processor(
+                    stateStore = stateStore,
+                    crypto = crypto,
+                    projections = projections,
+                    notifications = notifications,
+                ).synchronize(firstSession)
+            }.exceptionOrNull()
+            assertTrue(failure is SecureMessagingNotificationPublicationException)
+            assertNotNull(projections.readInbound(INCOMING_MESSAGE_ID))
+            assertNull(SecureMessagingSyncCursorStore(stateStore).load())
+            assertEquals(1, notifications.publishAttempts)
+            assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+            assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
+            assertTrue(server.takeRequest().path?.contains("/device-roster/v1:sha256:") == true)
+
+            // By the time a restart replays the pending publication, the sender has left the
+            // membership. The committed message stays readable, the shade stays silent, the
+            // marker is spent, and the event still advances the cursor.
+            val (replaySession, _, _) = openSyncingSession()
+            enqueueSync(listOf(incomingEvent(roster, 10)), "departed_sender_cursor")
+            server.enqueue(jsonResponse(STRANGER_MEMBER_CONVERSATIONS))
+            enqueueDeliveryAcknowledgement()
+            val replayRequestsBefore = server.requestCount
+            processor(
+                stateStore = stateStore,
+                crypto = crypto,
+                projections = projections,
+                notifications = notifications,
+            ).synchronize(replaySession)
+            assertEquals("/api/kit-wallet/v1/messaging/sync?limit=50", server.takeRequest().path)
+            assertEquals("/api/kit-wallet/v1/messaging/conversations", server.takeRequest().path)
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/messages/delivery-acks",
+                server.takeRequest().path,
+            )
+            assertEquals(replayRequestsBefore + 3, server.requestCount)
+            assertEquals(
+                INCOMING_MESSAGE_ID,
+                projections.readPage(limit = 10).messages().single().serverMessageId,
+            )
+            assertEquals(1, crypto.openedTransactions)
+            assertEquals(1, notifications.publishAttempts)
+            assertTrue(notifications.visibleNotifications.isEmpty())
+            assertEquals(
+                "departed_sender_cursor" to 10L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+
+            // When the server re-delivers the same durable message behind a fresh event — the
+            // only legal shape once the cursor holds event 10 — the replay finds no pending
+            // publication at all: no membership lookup, no second attempt at the shade.
+            val (secondReplaySession, _, _) = openSyncingSession()
+            enqueueSync(listOf(incomingEvent(roster, 12)), "departed_sender_replay_cursor")
+            enqueueDeliveryAcknowledgement()
+            val secondReplayRequestsBefore = server.requestCount
+            processor(
+                stateStore = stateStore,
+                crypto = crypto,
+                projections = projections,
+                notifications = notifications,
+            ).synchronize(secondReplaySession)
+            assertEquals(secondReplayRequestsBefore + 2, server.requestCount)
+            assertEquals(1, notifications.publishAttempts)
+            assertTrue(notifications.visibleNotifications.isEmpty())
+            assertEquals(1, projections.readPage(limit = 10).messages().size)
+            assertEquals(
+                "departed_sender_replay_cursor" to 12L,
+                requireSecureMessagingSyncResumePosition(
+                    checkNotNull(SecureMessagingSyncCursorStore(stateStore).load()).position,
+                ),
+            )
+        }
+
+    @Test
     fun `peer read marker includes lower UUID messages at the same server timestamp`() = runTest {
         val (session, _, _) = openSyncingSession()
         val stateStore = TestSecureMessagingStateStore()
@@ -4315,12 +4673,13 @@ class SecureMessagingEventProcessorTest {
         eventId: Long,
         userId: String,
         lastReadMessageId: String = OUTBOUND_SERVER_ID,
+        conversationId: String = CONVERSATION_ID,
     ) = MessagingSyncEventDto(
         id = eventId.toString(),
         type = "read_receipt.updated",
-        conversationId = CONVERSATION_ID,
+        conversationId = conversationId,
         resourceType = "read_receipt",
-        resourceId = "$CONVERSATION_ID:42",
+        resourceId = "$conversationId:42",
         data = MessagingSyncEventDataDto(
             userId = userId,
             lastReadMessageId = lastReadMessageId,
@@ -4963,6 +5322,8 @@ class SecureMessagingEventProcessorTest {
     private companion object {
         const val CURRENT_USER_ID = "11111111-1111-4111-8111-111111111111"
         const val PEER_USER_ID = "22222222-2222-4222-8222-222222222222"
+        const val STRANGER_USER_ID = "33333333-3333-4333-8333-333333333333"
+        const val OTHER_CONVERSATION_ID = "60606060-6060-4660-8660-606060606060"
         const val CURRENT_DEVICE_ID = "44444444-4444-4444-8444-444444444444"
         const val OWN_DONOR_DEVICE_ID = "45454545-4545-4545-8545-454545454545"
         const val PEER_DEVICE_ID = "55555555-5555-4555-8555-555555555555"
@@ -5020,6 +5381,24 @@ class SecureMessagingEventProcessorTest {
         """
         const val EMPTY_CONVERSATIONS = """
             {"ok":true,"data":{"items":[]}}
+        """
+        const val OTHER_DIRECT_CONVERSATIONS = """
+            {"ok":true,"data":{"items":[
+            {"id":"$OTHER_CONVERSATION_ID","type":"direct","title":null,"parent_id":null,
+            "created_by":"$CURRENT_USER_ID","role":"owner","members":[
+            {"user_id":"$CURRENT_USER_ID","name":"Current User","role":"owner",
+            "joined_at":"$TIMESTAMP"},{"user_id":"$PEER_USER_ID","name":"Peer",
+            "role":"member","joined_at":"$TIMESTAMP"}],"created_at":"$TIMESTAMP",
+            "updated_at":"$TIMESTAMP"}]}}
+        """
+        const val STRANGER_MEMBER_CONVERSATIONS = """
+            {"ok":true,"data":{"items":[
+            {"id":"$CONVERSATION_ID","type":"direct","title":null,"parent_id":null,
+            "created_by":"$CURRENT_USER_ID","role":"owner","members":[
+            {"user_id":"$CURRENT_USER_ID","name":"Current User","role":"owner",
+            "joined_at":"$TIMESTAMP"},{"user_id":"$STRANGER_USER_ID","name":"Stranger",
+            "role":"member","joined_at":"$TIMESTAMP"}],"created_at":"$TIMESTAMP",
+            "updated_at":"$TIMESTAMP"}]}}
         """
         const val GROUP_CONVERSATIONS = """
             {"ok":true,"data":{"items":[

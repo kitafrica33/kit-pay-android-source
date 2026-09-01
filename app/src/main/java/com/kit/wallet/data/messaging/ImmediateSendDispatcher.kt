@@ -69,8 +69,33 @@ internal class ImmediateSendDispatcher @Inject constructor(
         var current = store.itemsForOwner(owner).firstOrNull { it.id == original.id }
             ?: return PrepareOneResult.GONE
         if (current.state == ImmediateSendState.IMPORTING) {
-            val recovered = chats.recoverImmediateMediaImport(owner, current)
-                ?: return PrepareOneResult.RETRY
+            val recovered = try {
+                chats.recoverImmediateMediaImport(owner, current)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (invalidated: SessionInvalidatedException) {
+                return PrepareOneResult.GONE
+            } catch (authenticationChanged: SecureMessagingAuthenticationEpochChangedException) {
+                throw authenticationChanged
+            } catch (cryptographic: SecureMessagingCryptographicFailureException) {
+                throw cryptographic
+            } catch (error: Exception) {
+                if (error.isTransientImmediateSendFailure()) return PrepareOneResult.RETRY
+                // A reconciliation this row can never complete — an invariant the recovered
+                // bytes themselves refuse — must become the row's own visible terminal failure.
+                // Thrown onward it would crash the shared preparation worker, cancel every
+                // sibling attachment's progress with it, and repeat forever on each retry.
+                withContext(NonCancellable) {
+                    store.replaceForOwner(
+                        owner,
+                        current,
+                        current.copy(state = ImmediateSendState.FAILED),
+                    )
+                    runCatching { chats.releaseImmediateMediaRetention(owner, current) }
+                    runCatching { chats.markImmediateMediaFailure(owner, current, permanent = true) }
+                }
+                return PrepareOneResult.FAILED
+            } ?: return PrepareOneResult.RETRY
             if (!store.replaceForOwner(owner, current, recovered)) {
                 return PrepareOneResult.GONE
             }

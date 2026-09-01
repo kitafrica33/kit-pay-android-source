@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.data.demo.DemoData
+import com.kit.wallet.data.repository.WalletCurrency
 import com.kit.wallet.feature.auth.PaymentApproval
 import com.kit.wallet.feature.auth.rememberBiometricApprovalAvailable
 import com.kit.wallet.feature.funding.TopUpSheet
@@ -75,6 +76,7 @@ fun SendMoneyScreen(
 ) {
     val contacts by viewModel.contacts.collectAsStateWithLifecycle()
     val balanceMinor by viewModel.balanceMinor.collectAsStateWithLifecycle()
+    val currency by viewModel.currency.collectAsStateWithLifecycle()
     val sending by viewModel.sending.collectAsStateWithLifecycle()
     val lastSent by viewModel.lastSent.collectAsStateWithLifecycle()
     val error by viewModel.error.collectAsStateWithLifecycle()
@@ -93,6 +95,7 @@ fun SendMoneyScreen(
         initialContactId = initialContactId,
         contacts = contacts,
         balanceMinor = balanceMinor,
+        currency = currency,
         sending = sending,
         lastSent = lastSent,
         error = error,
@@ -122,6 +125,7 @@ internal fun SendMoneyContent(
     initialContactId: String?,
     contacts: List<Contact>,
     balanceMinor: Long,
+    currency: WalletCurrency,
     sending: Boolean,
     lastSent: Transaction?,
     error: String?,
@@ -223,6 +227,7 @@ internal fun SendMoneyContent(
                     recipient = recipient,
                     transaction = lastSent,
                     amountMinor = amountMinor,
+                    currency = currency,
                     onDone = onDone,
                 )
             }
@@ -507,9 +512,12 @@ private fun SendSuccess(
     recipient: Contact?,
     transaction: Transaction?,
     amountMinor: Long,
+    currency: WalletCurrency,
     onDone: () -> Unit,
 ) {
     val context = LocalContext.current
+    val safeTransaction = transaction?.takeIf { it.hasVerifiedCustomerPresentation(currency) }
+    val receipt = safeTransaction?.let { receiptShareText(recipient?.name, it, currency) }
     Column(
         Modifier
             .fillMaxSize()
@@ -540,23 +548,24 @@ private fun SendSuccess(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
         )
-        if (transaction != null) {
+        if (safeTransaction != null) {
             Spacer(Modifier.height(6.dp))
             Text(
-                "Ref ${transaction.reference} • ${transaction.dateGroup}, ${transaction.time}",
+                "Ref ${safeTransaction.reference} • " +
+                    "${safeTransaction.dateGroup}, ${safeTransaction.time}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.outline,
             )
         }
         Spacer(Modifier.weight(1f))
-        if (transaction != null) {
+        if (receipt != null) {
             KitOutlinedButton(
                 text = "Share receipt",
                 onClick = {
                     launchTextShare(
                         context = context,
                         chooserTitle = "Share Kit Pay receipt",
-                        text = receiptShareText(recipient?.name, transaction),
+                        text = receipt,
                     )
                 },
             )
@@ -583,6 +592,7 @@ private fun SendSuccessPreview() {
             recipient = DemoData.contacts[1],
             transaction = DemoData.transactions.first(),
             amountMinor = 2_500_000,
+            currency = WalletCurrency(),
             onDone = {},
         )
     }

@@ -24,6 +24,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -147,10 +148,13 @@ class ImmediateSendIntentStoreTest {
                 ImmediateSendMediaItem(
                     attachmentId = ATTACHMENT_TWO,
                     mediaType = "video/mp4",
-                    plaintextBytes = 2_048,
+                    plaintextBytes = 0,
                     ciphertextBytes = 0,
                     keyBase64 = "",
                     ciphertextSha256Hex = "",
+                    originalMediaType = "video/quicktime",
+                    originalPlaintextBytes = 2_048,
+                    processingPlan = SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
                 ),
             ),
         )
@@ -244,13 +248,40 @@ class ImmediateSendIntentStoreTest {
         }
     }
 
-    @Test fun `video processing fails closed without a matching edit recipe`() {
+    @Test fun `full video canonicalization survives without an edit recipe`() {
+        val source = SecureMediaSource.ofBytes(
+            bytes = byteArrayOf(1),
+            originalMediaType = "video/quicktime",
+            processingPlan = SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
+        )
+        val intent = ImmediateSendIntent(
+            id = ID_ONE,
+            conversationId = CONVERSATION_ID,
+            kind = ImmediateSendKind.MEDIA,
+            createdAtEpochMillis = NOW,
+            state = ImmediateSendState.PREPARING,
+            mediaType = "video/mp4",
+            mediaOriginalType = "video/quicktime",
+            mediaOriginalPlaintextBytes = 1,
+            mediaProcessingPlan = SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
+        )
+
+        assertEquals(SecureMediaProcessingPlan.CHAT_VIDEO_MP4, source.processingPlan)
+        assertNull(source.videoEditPlan)
+        assertEquals(
+            intent,
+            ImmediateSendIntentCodec.decode(ImmediateSendIntentCodec.encode(intent)),
+        )
+    }
+
+    @Test fun `an edit recipe cannot bypass canonical video processing`() {
+        val edit = SecureMediaVideoEditPlan(
+            startMicros = 0,
+            endMicros = 1_000_000,
+            keepAudio = true,
+        )
         assertThrows(IllegalArgumentException::class.java) {
-            SecureMediaSource.ofBytes(
-                bytes = byteArrayOf(1),
-                originalMediaType = "video/mp4",
-                processingPlan = SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
-            )
+            SecureMediaSource.ofBytes(bytes = byteArrayOf(1), videoEditPlan = edit)
         }
         assertThrows(IllegalArgumentException::class.java) {
             ImmediateSendIntent(
@@ -261,7 +292,7 @@ class ImmediateSendIntentStoreTest {
                 state = ImmediateSendState.PREPARING,
                 mediaType = "video/mp4",
                 mediaOriginalPlaintextBytes = 1,
-                mediaProcessingPlan = SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
+                mediaVideoEditPlan = edit,
             )
         }
     }

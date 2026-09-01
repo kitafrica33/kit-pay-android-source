@@ -35,6 +35,27 @@ internal data class IncomingCallAlertPlan(
     val useFullScreenIntent: Boolean get() = mode == IncomingCallAlertMode.FULL_SCREEN
 }
 
+/**
+ * The app-level tier of [incomingCallAlertPlan]: true when Android will render no Kit Pay
+ * notification of any shape, so an incoming call cannot make this phone ring — and the settings
+ * action that normally rides on the call notification can never appear either. Channel facts are
+ * pinned to their most permissive values because [incomingCallAlertPlan] judges these two gates
+ * first: this is true exactly when the full plan would be [IncomingCallAlertMode.BLOCKED],
+ * whatever the calls channel looks like.
+ */
+internal fun callAlertsBlocked(
+    postNotificationsGranted: Boolean,
+    appNotificationsEnabled: Boolean,
+): Boolean = incomingCallAlertPlan(
+    IncomingCallNotificationAccess(
+        postNotificationsGranted = postNotificationsGranted,
+        appNotificationsEnabled = appNotificationsEnabled,
+        channelImportance = NotificationManager.IMPORTANCE_HIGH,
+        channelHasSound = true,
+        fullScreenIntentAllowed = true,
+    ),
+).mode == IncomingCallAlertMode.BLOCKED
+
 internal fun incomingCallAlertPlan(access: IncomingCallNotificationAccess): IncomingCallAlertPlan {
     if (!access.postNotificationsGranted || !access.appNotificationsEnabled) {
         return IncomingCallAlertPlan(IncomingCallAlertMode.BLOCKED, showSettingsAction = true)

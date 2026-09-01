@@ -108,6 +108,9 @@ internal fun CallsContent(
                     )
                 }
             }
+            // A phone that cannot ring must say so where calls live, not in a notification
+            // that Android is refusing to show.
+            item { CallAlertBlockedWarning() }
             item {
                 Row(Modifier.padding(horizontal = 20.dp, vertical = 4.dp)) {
                     listOf("All", "Missed").forEach { f ->

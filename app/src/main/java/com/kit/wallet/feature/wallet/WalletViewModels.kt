@@ -38,6 +38,7 @@ class SendMoneyViewModel @Inject constructor(
 
     val contacts = contactRepo.contacts
     val balanceMinor = wallet.balanceMinor
+    val currency = wallet.walletCurrency
 
     private val _sending = MutableStateFlow(false)
     val sending = _sending.asStateFlow()
@@ -246,8 +247,14 @@ class TransactionDetailViewModel @Inject constructor(
 ) : ViewModel() {
     private val txId: String = savedStateHandle.get<String>("txId").orEmpty()
 
-    val uiState = combine(wallet.transactions, contacts.contacts) { transactions, directory ->
-            transactions.firstOrNull { it.id == txId }
+    val uiState = combine(
+        wallet.transactions,
+        contacts.contacts,
+        wallet.walletCurrency,
+    ) { transactions, directory, currency ->
+            transactions.firstOrNull {
+                it.id == txId && it.hasVerifiedCustomerPresentation(currency)
+            }
                 ?.withCounterpartyVerification(directory)
                 ?.let { TransactionDetailUiState.Ready(it) }
                 ?: TransactionDetailUiState.NotFound

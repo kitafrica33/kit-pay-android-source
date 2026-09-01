@@ -3,6 +3,7 @@ package com.kit.wallet
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import com.kit.wallet.data.repository.WalletCurrency
 import com.kit.wallet.feature.wallet.SendMoneyContent
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.theme.KitWalletTheme
@@ -59,6 +60,7 @@ class SendMoneyPreselectionComposeTest {
                     initialContactId = initialContactId,
                     contacts = contacts,
                     balanceMinor = 100_000,
+                    currency = WalletCurrency(),
                     sending = false,
                     lastSent = null,
                     error = null,

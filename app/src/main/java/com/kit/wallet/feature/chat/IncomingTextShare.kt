@@ -203,12 +203,16 @@ internal object SharedInboxStore {
         val reportedMediaType = resolver.getType(uri) ?: intentMediaType
         val mediaType = SharedInboxPolicy.normalizedMediaType(reportedMediaType)
         val requiresImageTranscode = SharedInboxPolicy.requiresImageTranscode(reportedMediaType)
-        val originalMediaType = if (requiresImageTranscode) {
-            normalizeLocalMediaType(reportedMediaType.orEmpty())
+        val requiresVideoCanonicalization =
+            SharedInboxPolicy.requiresVideoCanonicalization(reportedMediaType)
+        val originalMediaType = when {
+            requiresImageTranscode -> normalizeLocalMediaType(reportedMediaType.orEmpty())
                 ?.takeIf { it.startsWith("image/") }
                 ?: "image/jpeg"
-        } else {
-            mediaType
+            requiresVideoCanonicalization -> normalizeLocalMediaType(
+                reportedMediaType.orEmpty(),
+            )?.takeIf { it.startsWith("video/") } ?: "video/mp4"
+            else -> mediaType
         }
         val suggestedName = resolver.suggestedName(uri)
         val id = SharedInboxPolicy.newId()
@@ -255,10 +259,10 @@ internal object SharedInboxStore {
                 displayName = SharedInboxPolicy.displayName(suggestedName, mediaType),
                 byteCount = copied.toInt(),
                 originalMediaType = originalMediaType.takeUnless { it == mediaType },
-                processingPlan = if (requiresImageTranscode) {
-                    SecureMediaProcessingPlan.CHAT_IMAGE_JPEG
-                } else {
-                    SecureMediaProcessingPlan.PASSTHROUGH
+                processingPlan = when {
+                    requiresImageTranscode -> SecureMediaProcessingPlan.CHAT_IMAGE_JPEG
+                    requiresVideoCanonicalization -> SecureMediaProcessingPlan.CHAT_VIDEO_MP4
+                    else -> SecureMediaProcessingPlan.PASSTHROUGH
                 },
                 durationMillis = durationMillis,
             ),

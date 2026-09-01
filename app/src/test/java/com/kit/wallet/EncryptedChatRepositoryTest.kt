@@ -28,7 +28,9 @@ import com.kit.wallet.data.messaging.ImmediateSendDispatchOutcome
 import com.kit.wallet.data.messaging.ImmediateSendIntent
 import com.kit.wallet.data.messaging.ImmediateSendIntentStore
 import com.kit.wallet.data.messaging.ImmediateSendKind
+import com.kit.wallet.data.messaging.ImmediateSendMediaItem
 import com.kit.wallet.data.messaging.ImmediateSendState
+import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
 import com.kit.wallet.data.messaging.LocalMediaAvailabilityState
 import com.kit.wallet.data.messaging.LocalMediaCollection
 import com.kit.wallet.data.messaging.LocalMediaLibrary
@@ -53,6 +55,7 @@ import com.kit.wallet.data.repository.AuthenticatedProjectionPage
 import com.kit.wallet.data.repository.AuthenticatedTextDeliveryState
 import com.kit.wallet.data.repository.ContactRepository
 import com.kit.wallet.data.repository.EncryptedChatRepository
+import com.kit.wallet.data.repository.SecureMediaStillPreparingException
 import com.kit.wallet.data.repository.SecureMessagingChatSession
 import com.kit.wallet.data.repository.SecureMessagingChatRuntime
 import com.kit.wallet.data.repository.SecureMessagingPendingPredecessorException
@@ -77,6 +80,8 @@ import com.kit.wallet.ui.model.replyPreviewLabel
 import java.io.File
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.RandomAccessFile
 import java.nio.file.Files
 import java.security.MessageDigest
 import java.time.Clock
@@ -1169,6 +1174,68 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `notification reply is durable before hydration and replay is content bound`() = runTest {
+        val disk = TestSecureMessagingStateStore()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val owner = checkNotNull(authentication.current()).fence()
+        val firstQueue = ImmediateSendIntentStore(disk, authentication)
+        val firstRepository = repository(
+            runtime = FakeRuntime(epoch = null),
+            authenticationSessions = authentication,
+            immediateSends = firstQueue,
+        )
+
+        // No scheduler turn or chat hydration has happened. The authenticated notification is
+        // enough to capture its target; promotion will revalidate membership before transmission.
+        assertFalse(firstRepository.localHistoryReady.value)
+        firstRepository.captureNotificationReplyForOwner(
+            owner = owner,
+            chatId = CONVERSATION_ONE,
+            text = "  reply from the notification  ",
+            clientMessageId = OUTBOX_ID_ONE,
+        )
+        assertFalse(firstRepository.localHistoryReady.value)
+        assertEquals(
+            listOf(OUTBOX_ID_ONE to "reply from the notification"),
+            firstQueue.items.value.map { it.id to it.text },
+        )
+
+        // A new process restores the encrypted row. Replaying the exact action is a no-op, while
+        // reusing its stable identity for other text fails closed and preserves the first intent.
+        val restartedQueue = ImmediateSendIntentStore(disk, authentication)
+        restartedQueue.loadForCurrentOwner()
+        val restartedRepository = repository(
+            runtime = FakeRuntime(epoch = null),
+            authenticationSessions = authentication,
+            immediateSends = restartedQueue,
+        )
+        restartedRepository.captureNotificationReplyForOwner(
+            owner = owner,
+            chatId = CONVERSATION_ONE,
+            text = "reply from the notification",
+            clientMessageId = OUTBOX_ID_ONE,
+        )
+        assertEquals(1, restartedQueue.items.value.size)
+
+        val alteredReplay = runCatching {
+            restartedRepository.captureNotificationReplyForOwner(
+                owner = owner,
+                chatId = CONVERSATION_ONE,
+                text = "different reply",
+                clientMessageId = OUTBOX_ID_ONE,
+            )
+        }.exceptionOrNull()
+
+        assertTrue(alteredReplay is IllegalStateException)
+        assertEquals(
+            listOf(OUTBOX_ID_ONE to "reply from the notification"),
+            restartedQueue.items.value.map { it.id to it.text },
+        )
+    }
+
+    @Test
     fun `media bubble appears while encryption is still preparing the durable queue item`() = runTest {
         val encryptionStarted = CompletableDeferred<Unit>()
         val releaseEncryption = CompletableDeferred<Unit>()
@@ -1220,6 +1287,9 @@ class EncryptedChatRepositoryTest {
                 )
             }.exceptionOrNull()
             assertEquals("This secure attachment is still being prepared", openFailure?.message)
+            // The type is the contract: it tells the UI "come back later" instead of "give up",
+            // so the sticky media-error map never learns about a merely unfinished send.
+            assertTrue(openFailure is SecureMediaStillPreparingException)
 
             releaseEncryption.complete(Unit)
             send.join()
@@ -1973,6 +2043,334 @@ class EncryptedChatRepositoryTest {
             cacheDirectory.deleteRecursively()
         }
     }
+
+    @Test
+    fun `restart fails an oversized passthrough import visibly without crashing preparation`() =
+        runTest {
+            val disk = TestSecureMessagingStateStore()
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val owner = checkNotNull(authentication.current()).fence()
+            val oversizedId = "0f0e695f-98d2-4bd0-9c05-16d1b8dd8f65"
+            val healthyId = "e63f7a71-3a24-4437-a2a4-c81a5b8f2f7d"
+            val firstQueue = ImmediateSendIntentStore(disk, authentication)
+            firstQueue.enqueueForOwner(
+                owner,
+                ImmediateSendIntent(
+                    id = oversizedId,
+                    conversationId = CONVERSATION_ONE,
+                    kind = ImmediateSendKind.MEDIA,
+                    createdAtEpochMillis = Instant.parse("2026-07-20T12:00:00Z").toEpochMilli(),
+                    state = ImmediateSendState.IMPORTING,
+                    mediaType = "video/mp4",
+                    mediaPlaintextBytes = 0,
+                ),
+            )
+            firstQueue.enqueueForOwner(
+                owner,
+                ImmediateSendIntent(
+                    id = healthyId,
+                    conversationId = CONVERSATION_ONE,
+                    kind = ImmediateSendKind.MEDIA,
+                    createdAtEpochMillis = Instant.parse("2026-07-20T12:00:01Z").toEpochMilli(),
+                    state = ImmediateSendState.IMPORTING,
+                    mediaType = "video/mp4",
+                    mediaPlaintextBytes = 0,
+                ),
+            )
+            val spoolDirectory = Files.createTempDirectory("kit-oversized-import-spool").toFile()
+            val cacheDirectory = Files.createTempDirectory("kit-oversized-import-cache").toFile()
+            val cache = SecureMediaCache(cacheDirectory)
+            val healthyBytes = "small recovered sibling video".toByteArray()
+            try {
+                cache.store(
+                    cacheKey = "kit-media:${owner.cacheScopeId}:$CONVERSATION_ONE:$oversizedId",
+                    mediaType = "video/mp4",
+                    retainUntilReleased = true,
+                    collection = LocalMediaCollection.SENT,
+                ) { destination ->
+                    // Sparse: the length is byte-real to recovery without costing test disk.
+                    RandomAccessFile(destination, "rw").use {
+                        it.setLength(MAX_IMAGE_PLAINTEXT_BYTES.toLong() + 1L)
+                    }
+                }
+                cache.store(
+                    cacheKey = "kit-media:${owner.cacheScopeId}:$CONVERSATION_ONE:$healthyId",
+                    mediaType = "video/mp4",
+                    retainUntilReleased = true,
+                    collection = LocalMediaCollection.SENT,
+                ) { destination -> destination.writeBytes(healthyBytes) }
+
+                val restartedQueue = ImmediateSendIntentStore(disk, authentication)
+                val runtime = FakeRuntime().apply {
+                    conversations += conversation(CONVERSATION_ONE, "Grace")
+                }
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = restartedQueue,
+                    immediateMediaSpool = ImmediateMediaSpool(spoolDirectory),
+                    secureMediaCache = cache,
+                    localMediaLibrary = LocalMediaLibrary(disk, authentication),
+                )
+                runCurrent()
+
+                // The poisoned row becomes its own visible terminal failure; the sibling behind
+                // it still completes instead of being cancelled by a crashing worker.
+                assertEquals(
+                    ImmediateMediaPreparationOutcome.PREPARED,
+                    ImmediateSendDispatcher(
+                        restartedQueue,
+                        ImmediateMediaSpool(spoolDirectory),
+                        repository,
+                    ).prepareLocalMedia(),
+                )
+                val byId = restartedQueue.items.value.associateBy(ImmediateSendIntent::id)
+                assertEquals(ImmediateSendState.FAILED, checkNotNull(byId[oversizedId]).state)
+                assertEquals(ImmediateSendState.WAITING, checkNotNull(byId[healthyId]).state)
+                runCurrent()
+                val visible = repository.conversation(CONVERSATION_ONE).value
+                assertEquals(DeliveryState.FAILED, visible.first { it.id == oversizedId }.state)
+            } finally {
+                healthyBytes.fill(0)
+                spoolDirectory.deleteRecursively()
+                cacheDirectory.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `a passthrough source that outgrows its declared size fails visibly at the wire cap`() =
+        runTest {
+            val disk = TestSecureMessagingStateStore()
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val queue = ImmediateSendIntentStore(disk, authentication)
+            val spoolDirectory = Files.createTempDirectory("kit-misdeclared-spool").toFile()
+            val cacheDirectory = Files.createTempDirectory("kit-misdeclared-cache").toFile()
+            try {
+                val runtime = FakeRuntime().apply {
+                    conversations += conversation(CONVERSATION_ONE, "Grace")
+                }
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = queue,
+                    immediateMediaSpool = ImmediateMediaSpool(spoolDirectory),
+                    secureMediaCache = SecureMediaCache(cacheDirectory),
+                    localMediaLibrary = LocalMediaLibrary(disk, authentication),
+                )
+                runCurrent()
+
+                // Declares no size at all, then streams past the wire cap: exactly what a
+                // size-blind or lying provider does. The copy itself must be the boundary.
+                val overflowing = MAX_IMAGE_PLAINTEXT_BYTES.toLong() + 1L
+                val source = SecureMediaSource(declaredByteCount = 0L) {
+                    object : InputStream() {
+                        var produced = 0L
+                        override fun read(): Int = if (produced < overflowing) {
+                            produced += 1
+                            0
+                        } else {
+                            -1
+                        }
+
+                        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                            if (produced >= overflowing) return -1
+                            val count = minOf(length.toLong(), overflowing - produced).toInt()
+                            produced += count
+                            return count
+                        }
+                    }
+                }
+                val failure = runCatching {
+                    repository.sendMediaMessage(CONVERSATION_ONE, source, "video/mp4", null)
+                }.exceptionOrNull()
+                assertTrue(failure is IllegalArgumentException)
+                assertEquals(ImmediateSendState.FAILED, queue.items.value.single().state)
+                runCurrent()
+                val visible = repository.conversation(CONVERSATION_ONE).value.single()
+                assertEquals(DeliveryState.FAILED, visible.state)
+            } finally {
+                spoolDirectory.deleteRecursively()
+                cacheDirectory.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `restart fails an album whole when one recovered original exceeds the wire cap`() =
+        runTest {
+            val disk = TestSecureMessagingStateStore()
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val owner = checkNotNull(authentication.current()).fence()
+            val albumId = "5f7a3c1e-2b64-4d1a-9d3e-7c5a1b2f4e6d"
+            val smallItemId = "7b1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f"
+            val oversizedItemId = "9c2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a"
+            val firstQueue = ImmediateSendIntentStore(disk, authentication)
+            firstQueue.enqueueForOwner(
+                owner,
+                ImmediateSendIntent(
+                    id = albumId,
+                    conversationId = CONVERSATION_ONE,
+                    kind = ImmediateSendKind.MEDIA_V2,
+                    createdAtEpochMillis = Instant.parse("2026-07-20T12:00:00Z").toEpochMilli(),
+                    state = ImmediateSendState.IMPORTING,
+                    mediaItems = listOf(smallItemId, oversizedItemId).map { attachmentId ->
+                        ImmediateSendMediaItem(
+                            attachmentId = attachmentId,
+                            mediaType = "video/mp4",
+                            plaintextBytes = 0,
+                            ciphertextBytes = 0L,
+                            keyBase64 = "",
+                            ciphertextSha256Hex = "",
+                        )
+                    },
+                ),
+            )
+            val spoolDirectory = Files.createTempDirectory("kit-oversized-album-spool").toFile()
+            val cacheDirectory = Files.createTempDirectory("kit-oversized-album-cache").toFile()
+            val cache = SecureMediaCache(cacheDirectory)
+            val smallBytes = "small first album video".toByteArray()
+            try {
+                cache.store(
+                    cacheKey = "kit-media:${owner.cacheScopeId}:$CONVERSATION_ONE:$smallItemId",
+                    mediaType = "video/mp4",
+                    retainUntilReleased = true,
+                    collection = LocalMediaCollection.SENT,
+                ) { destination -> destination.writeBytes(smallBytes) }
+                cache.store(
+                    cacheKey = "kit-media:${owner.cacheScopeId}:$CONVERSATION_ONE:$oversizedItemId",
+                    mediaType = "video/mp4",
+                    retainUntilReleased = true,
+                    collection = LocalMediaCollection.SENT,
+                ) { destination ->
+                    RandomAccessFile(destination, "rw").use {
+                        it.setLength(MAX_IMAGE_PLAINTEXT_BYTES.toLong() + 1L)
+                    }
+                }
+
+                val restartedQueue = ImmediateSendIntentStore(disk, authentication)
+                val runtime = FakeRuntime().apply {
+                    conversations += conversation(CONVERSATION_ONE, "Grace")
+                }
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = restartedQueue,
+                    immediateMediaSpool = ImmediateMediaSpool(spoolDirectory),
+                    secureMediaCache = cache,
+                    localMediaLibrary = LocalMediaLibrary(disk, authentication),
+                )
+                runCurrent()
+
+                // KITMEDIA2 §7: never a partial album. One unsendable original fails the whole
+                // record in front of the person, without an exception in the shared worker.
+                assertEquals(
+                    ImmediateMediaPreparationOutcome.IDLE,
+                    ImmediateSendDispatcher(
+                        restartedQueue,
+                        ImmediateMediaSpool(spoolDirectory),
+                        repository,
+                    ).prepareLocalMedia(),
+                )
+                assertEquals(ImmediateSendState.FAILED, restartedQueue.items.value.single().state)
+                runCurrent()
+                val visible = repository.conversation(CONVERSATION_ONE).value.single()
+                assertEquals(DeliveryState.FAILED, visible.state)
+            } finally {
+                smallBytes.fill(0)
+                spoolDirectory.deleteRecursively()
+                cacheDirectory.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `an album whose recovered originals overflow the aggregate cap fails without a crash`() =
+        runTest {
+            val disk = TestSecureMessagingStateStore()
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val owner = checkNotNull(authentication.current()).fence()
+            val albumId = "2d4f6a8c-1e3b-4d5f-8a7c-9b0d1f2a3c4e"
+            val firstItemId = "4e5f6a7b-8c9d-4e1f-8a3b-5c6d7e8f9a0b"
+            val secondItemId = "6a7b8c9d-0e1f-4a2b-8c4d-7e8f9a0b1c2d"
+            val firstQueue = ImmediateSendIntentStore(disk, authentication)
+            firstQueue.enqueueForOwner(
+                owner,
+                ImmediateSendIntent(
+                    id = albumId,
+                    conversationId = CONVERSATION_ONE,
+                    kind = ImmediateSendKind.MEDIA_V2,
+                    createdAtEpochMillis = Instant.parse("2026-07-20T12:00:00Z").toEpochMilli(),
+                    state = ImmediateSendState.IMPORTING,
+                    mediaItems = listOf(firstItemId, secondItemId).map { attachmentId ->
+                        ImmediateSendMediaItem(
+                            attachmentId = attachmentId,
+                            mediaType = "video/mp4",
+                            plaintextBytes = 0,
+                            ciphertextBytes = 0L,
+                            keyBase64 = "",
+                            ciphertextSha256Hex = "",
+                        )
+                    },
+                ),
+            )
+            val spoolDirectory = Files.createTempDirectory("kit-aggregate-album-spool").toFile()
+            val cacheDirectory = Files.createTempDirectory("kit-aggregate-album-cache").toFile()
+            val cache = SecureMediaCache(cacheDirectory)
+            try {
+                // Each original respects the per-item wire cap, but together they overflow the
+                // album's aggregate ciphertext budget — an invariant only recovery re-proves.
+                listOf(firstItemId, secondItemId).forEach { attachmentId ->
+                    cache.store(
+                        cacheKey = "kit-media:${owner.cacheScopeId}:$CONVERSATION_ONE:$attachmentId",
+                        mediaType = "video/mp4",
+                        retainUntilReleased = true,
+                        collection = LocalMediaCollection.SENT,
+                    ) { destination ->
+                        RandomAccessFile(destination, "rw").use {
+                            it.setLength(140L * 1024L * 1024L)
+                        }
+                    }
+                }
+
+                val restartedQueue = ImmediateSendIntentStore(disk, authentication)
+                val runtime = FakeRuntime().apply {
+                    conversations += conversation(CONVERSATION_ONE, "Grace")
+                }
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = restartedQueue,
+                    immediateMediaSpool = ImmediateMediaSpool(spoolDirectory),
+                    secureMediaCache = cache,
+                    localMediaLibrary = LocalMediaLibrary(disk, authentication),
+                )
+                runCurrent()
+
+                // The refused reconciliation becomes the row's own visible terminal failure
+                // instead of an exception that would crash and endlessly retry the worker.
+                assertEquals(
+                    ImmediateMediaPreparationOutcome.IDLE,
+                    ImmediateSendDispatcher(
+                        restartedQueue,
+                        ImmediateMediaSpool(spoolDirectory),
+                        repository,
+                    ).prepareLocalMedia(),
+                )
+                assertEquals(ImmediateSendState.FAILED, restartedQueue.items.value.single().state)
+                runCurrent()
+                val visible = repository.conversation(CONVERSATION_ONE).value.single()
+                assertEquals(DeliveryState.FAILED, visible.state)
+            } finally {
+                spoolDirectory.deleteRecursively()
+                cacheDirectory.deleteRecursively()
+            }
+        }
 
     @Test
     fun `preparing media is a same conversation fifo barrier`() = runTest {
@@ -3083,6 +3481,8 @@ class EncryptedChatRepositoryTest {
                 )
             }.exceptionOrNull()
             assertEquals("This secure attachment is still being prepared", openFailure?.message)
+            // Same contract as the single-attachment path: a not-yet, never a recorded failure.
+            assertTrue(openFailure is SecureMediaStillPreparingException)
 
             releaseEncryption.complete(Unit)
             send.join()

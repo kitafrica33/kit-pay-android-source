@@ -10,8 +10,10 @@ import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.ImmediateSendDispatcher
@@ -41,9 +43,10 @@ internal class SecureMessagingSyncWorker @AssistedInject constructor(
     private val immediateSends: ImmediateSendDispatcher,
 ) : CoroutineWorker(appContext, workerParameters) {
     override suspend fun doWork(): Result {
+        val urgent = inputData.getBoolean(URGENT_MESSAGING_WAKE_INPUT_KEY, false)
         // This run now covers every wake observed before it started. A wake arriving from this
         // point onward appends exactly one sequential follow-up instead of being dropped by KEEP.
-        wakeCoalescer.workerStarted()
+        wakeCoalescer.workerStarted(urgent)
         if (sessions.current() == null || !syncEngine.isReady) return Result.success()
 
         return try {
@@ -123,12 +126,28 @@ class SecureMessagingSyncScheduler @Inject constructor(
 ) {
     fun schedule() {
         enqueueLocalMediaPreparation()
-        enqueueSync(initialDelayMillis = 0L)
+        enqueueSync(initialDelayMillis = 0L, urgent = false)
+    }
+
+    /**
+     * Starts an authenticated message wake with Android's expedited-job allowance.
+     *
+     * A data-only high-priority FCM gives the process only a short execution window. Enqueuing an
+     * ordinary constrained job here can leave the ciphertext untouched until the person opens the
+     * app, which in turn delays the only notification whose sender/content the client can trust.
+     * The urgent lane is deliberately separate from maintenance work: an already queued ordinary
+     * sync must not prevent a new-message wake from asking the OS for immediate execution. The
+     * sync engine and outbox dispatcher retain their own serialization, so two lanes can never
+     * race ratchet or durable queue state.
+     */
+    fun scheduleUrgentMessageWake() {
+        enqueueLocalMediaPreparation()
+        enqueueSync(initialDelayMillis = 0L, urgent = true)
     }
 
     fun scheduleHistoryContinuation(delayMillis: Long) {
         require(delayMillis >= 0L)
-        enqueueSync(initialDelayMillis = delayMillis)
+        enqueueSync(initialDelayMillis = delayMillis, urgent = false)
     }
 
     private fun enqueueLocalMediaPreparation() {
@@ -144,8 +163,8 @@ class SecureMessagingSyncScheduler @Inject constructor(
         )
     }
 
-    private fun enqueueSync(initialDelayMillis: Long) {
-        wakeCoalescer.enqueueOnce {
+    private fun enqueueSync(initialDelayMillis: Long, urgent: Boolean) {
+        wakeCoalescer.enqueueOnce(urgent) {
             val builder = OneTimeWorkRequestBuilder<SecureMessagingSyncWorker>()
                 .setConstraints(
                     Constraints.Builder()
@@ -153,16 +172,26 @@ class SecureMessagingSyncScheduler @Inject constructor(
                         .build(),
                 )
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                .setInputData(workDataOf(URGENT_MESSAGING_WAKE_INPUT_KEY to urgent))
             if (initialDelayMillis > 0L) {
                 builder.setInitialDelay(initialDelayMillis, TimeUnit.MILLISECONDS)
             }
+            if (urgent) {
+                check(initialDelayMillis == 0L) { "An expedited message wake cannot be delayed" }
+                builder.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            }
             val request = builder.build()
-            workManager.enqueueUniqueWork(WORK_NAME, SECURE_MESSAGING_WORK_POLICY, request)
+            workManager.enqueueUniqueWork(
+                if (urgent) URGENT_WORK_NAME else WORK_NAME,
+                SECURE_MESSAGING_WORK_POLICY,
+                request,
+            )
         }
     }
 
     private companion object {
         const val WORK_NAME = "kit-secure-messaging-sync"
+        const val URGENT_WORK_NAME = "kit-secure-messaging-urgent-sync"
         const val LOCAL_MEDIA_PREPARATION_WORK_NAME = "kit-local-media-preparation"
     }
 }
@@ -174,22 +203,27 @@ class SecureMessagingSyncScheduler @Inject constructor(
  */
 @Singleton
 class SecureMessagingWakeCoalescer @Inject constructor() {
-    private val enqueuePending = AtomicBoolean(false)
+    private val ordinaryEnqueuePending = AtomicBoolean(false)
+    private val urgentEnqueuePending = AtomicBoolean(false)
 
-    fun enqueueOnce(enqueue: () -> Unit) {
-        if (!enqueuePending.compareAndSet(false, true)) return
+    fun enqueueOnce(urgent: Boolean = false, enqueue: () -> Unit) {
+        val lane = if (urgent) urgentEnqueuePending else ordinaryEnqueuePending
+        if (!lane.compareAndSet(false, true)) return
         try {
             enqueue()
         } catch (error: Throwable) {
-            enqueuePending.set(false)
+            lane.set(false)
             throw error
         }
     }
 
-    fun workerStarted() {
-        enqueuePending.set(false)
+    fun workerStarted(urgent: Boolean = false) {
+        (if (urgent) urgentEnqueuePending else ordinaryEnqueuePending).set(false)
     }
 }
+
+@VisibleForTesting
+internal const val URGENT_MESSAGING_WAKE_INPUT_KEY = "kit.messaging.urgent_wake"
 
 @VisibleForTesting
 internal val SECURE_MESSAGING_WORK_POLICY: ExistingWorkPolicy = ExistingWorkPolicy.APPEND_OR_REPLACE

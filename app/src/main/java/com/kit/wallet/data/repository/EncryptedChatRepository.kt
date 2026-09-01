@@ -301,6 +301,16 @@ internal class SecureMessagingPendingPredecessorException : IOException(
     "An earlier encrypted message is still waiting to send",
 )
 
+/**
+ * The queued attachment exists but its bytes are not yet servable: the import copy has not
+ * published and the encrypted spool is not yet written. Unlike every other open failure this one
+ * resolves by itself as the send queue advances, so callers must treat it as "not yet" rather
+ * than record it as an error — a remembered failure would outlive the moment it described.
+ */
+internal class SecureMediaStillPreparingException : IllegalStateException(
+    "This secure attachment is still being prepared",
+)
+
 internal fun projectionIsFromCurrentUser(
     direction: LibSignalCompanionDirection,
     senderUserId: String,
@@ -3005,6 +3015,43 @@ class EncryptedChatRepository @Inject internal constructor(
         idempotentClientMessageId = clientMessageId,
     )
 
+    override suspend fun captureNotificationReplyForOwner(
+        owner: SessionFence,
+        chatId: String,
+        text: String,
+        clientMessageId: String,
+    ) {
+        require(ImmediateSendIntent.CANONICAL_UUID.matches(chatId)) {
+            "Invalid notification-reply conversation"
+        }
+        require(ImmediateSendIntent.CANONICAL_UUID.matches(clientMessageId)) {
+            "Invalid notification-reply message ID"
+        }
+        val normalized = text.trim()
+        require(KitUserAuthoredTextPolicy.allows(normalized)) {
+            "Messages cannot start with one of Kit Pay's reserved prefixes"
+        }
+        val queue = checkNotNull(immediateSends) {
+            "Durable notification-reply capture is unavailable"
+        }
+        immediateSendAcceptanceMutex(chatId).withLock {
+            if (authenticationSessions?.current()?.fence() != owner) {
+                throw SessionInvalidatedException()
+            }
+            queue.enqueueIdempotentForOwner(
+                owner,
+                ImmediateSendIntent(
+                    id = clientMessageId,
+                    conversationId = chatId,
+                    kind = ImmediateSendKind.TEXT,
+                    createdAtEpochMillis = clock.instant().toEpochMilli(),
+                    text = normalized,
+                ),
+            )
+        }
+        runCatching { immediateSendScheduler?.schedule() }
+    }
+
     override suspend fun sendPaymentEvent(
         chatId: String,
         descriptor: String,
@@ -3382,9 +3429,12 @@ class EncryptedChatRepository @Inject internal constructor(
         ) { "The selected photo cannot use this media processing plan" }
         require(
             processingPlan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4 ||
-                normalizedMediaType == "video/mp4" && originalMediaType.startsWith("video/") &&
-                videoEditPlan != null,
+                normalizedMediaType == "video/mp4" && originalMediaType.startsWith("video/"),
         ) { "The selected video cannot use this media processing plan" }
+        require(
+            videoEditPlan == null ||
+                processingPlan == SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
+        ) { "A selected video edit requires canonical MP4 processing" }
         require(
             durationMillis == null ||
                 originalMediaType.startsWith("audio/") || originalMediaType.startsWith("video/"),
@@ -3593,6 +3643,7 @@ class EncryptedChatRepository @Inject internal constructor(
                     mediaType = originalMediaType,
                     source = source,
                     retainUntilReleased = true,
+                    maxPlaintextBytes = immediateOriginalByteCap(processingPlan),
                 )
                 localPublished = true
                 val localAvailableAt = maxOf(
@@ -3824,10 +3875,14 @@ class EncryptedChatRepository @Inject internal constructor(
                     mediaTypes[index] == "image/jpeg" &&
                     originalMediaTypes[index].startsWith("image/"),
             ) { "A selected photo cannot use this media processing plan" }
+            require(attachments[index].source.videoEditPlan == null) {
+                "Edited videos must be sent one at a time"
+            }
             require(
-                plan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4 &&
-                    attachments[index].source.videoEditPlan == null,
-            ) { "Edited videos must be sent one at a time" }
+                plan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4 ||
+                    mediaTypes[index] == "video/mp4" &&
+                    originalMediaTypes[index].startsWith("video/"),
+            ) { "A selected video cannot use this media processing plan" }
         }
         // Refuse a hopeless passthrough batch before any encryption work. Transformed photos are
         // checked against the exact aggregate after background JPEG preparation.
@@ -4103,6 +4158,7 @@ class EncryptedChatRepository @Inject internal constructor(
                         mediaType = item.localMediaType,
                         source = attachment.source,
                         retainUntilReleased = true,
+                        maxPlaintextBytes = immediateOriginalByteCap(item.processingPlan),
                     )
                     publishedMediaIds += item.attachmentId
                     val localAvailableAt = maxOf(
@@ -4267,7 +4323,7 @@ class EncryptedChatRepository @Inject internal constructor(
                 intent?.state == ImmediateSendState.IMPORTING ||
                 intent?.state == ImmediateSendState.PREPARING
             ) {
-                error("This secure attachment is still being prepared")
+                throw SecureMediaStillPreparingException()
             }
             // MEDIA only, deliberately: an album is opened one attachment at a time through
             // [openAlbumItemMessage], so an album id here fails closed rather than guessing
@@ -4439,7 +4495,7 @@ class EncryptedChatRepository @Inject internal constructor(
                 intent?.state == ImmediateSendState.IMPORTING ||
                 intent?.state == ImmediateSendState.PREPARING
             ) {
-                error("This secure attachment is still being prepared")
+                throw SecureMediaStillPreparingException()
             }
             checkNotNull(intent)
             val item = checkNotNull(queuedItem) {
@@ -4595,7 +4651,26 @@ class EncryptedChatRepository @Inject internal constructor(
         else -> emptyList()
     }
 
-    /** Atomically imports one picked attachment before its ciphertext is prepared. */
+    /**
+     * The byte ceiling enforced while an original is copied into Sent Media. A passthrough
+     * original IS the upload plaintext, so the wire cap applies during the copy itself — the only
+     * place a size-blind or lying provider meets the real byte count before the durable bubble
+     * depends on it. A recompressed original only has to fit local storage.
+     */
+    private fun immediateOriginalByteCap(plan: SecureMediaProcessingPlan): Long =
+        if (plan == SecureMediaProcessingPlan.PASSTHROUGH) {
+            MAX_IMAGE_PLAINTEXT_BYTES.toLong()
+        } else {
+            MAX_LOCAL_MEDIA_ORIGINAL_BYTES.toLong()
+        }
+
+    /** True when an already-adopted original can never leave this device as it stands. */
+    private fun immediateOriginalUnsendable(
+        byteCount: Long,
+        plan: SecureMediaProcessingPlan,
+    ): Boolean = byteCount > immediateOriginalByteCap(plan)
+
+    /** Atomically imports one picked attachment, capped, before its ciphertext is prepared. */
     private suspend fun cacheOutgoingMedia(
         owner: SessionFence,
         chatId: String,
@@ -4603,12 +4678,13 @@ class EncryptedChatRepository @Inject internal constructor(
         mediaType: String,
         source: SecureMediaSource,
         retainUntilReleased: Boolean,
+        maxPlaintextBytes: Long,
     ): SecureMediaFile {
         val cache = checkNotNull(secureMediaCache) { "Secure media storage is unavailable" }
         require(
             source.declaredByteCount <= 0L ||
-                source.declaredByteCount <= MAX_LOCAL_MEDIA_ORIGINAL_BYTES.toLong(),
-        ) { "This attachment is too large to keep locally" }
+                source.declaredByteCount <= maxPlaintextBytes,
+        ) { "This attachment is too large to send" }
         return cache.store(
             cacheKey = mediaCacheKey(owner, chatId, attachmentId),
             mediaType = mediaType,
@@ -4626,8 +4702,8 @@ class EncryptedChatRepository @Inject internal constructor(
                             val read = input.read(buffer)
                             if (read < 0) break
                             total += read
-                            require(total <= MAX_LOCAL_MEDIA_ORIGINAL_BYTES.toLong()) {
-                                "This attachment is too large to keep locally"
+                            require(total <= maxPlaintextBytes) {
+                                "This attachment is too large to send"
                             }
                             output.write(buffer, 0, read)
                         }
@@ -4914,6 +4990,13 @@ class EncryptedChatRepository @Inject internal constructor(
                         durationMillis = intent.mediaDurationMillis,
                     ),
                 )
+                if (immediateOriginalUnsendable(local.byteCount, intent.mediaProcessingPlan)) {
+                    // An older build could adopt an original whose true size the wire can never
+                    // accept. The person keeps the playable Sent Media copy recorded above; the
+                    // send itself must fail in front of them instead of throwing inside every
+                    // future preparation pass forever.
+                    return intent.copy(state = ImmediateSendState.FAILED)
+                }
                 intent.copy(
                     state = ImmediateSendState.PREPARING,
                     mediaPlaintextBytes = if (
@@ -4968,6 +5051,12 @@ class EncryptedChatRepository @Inject internal constructor(
                             durationMillis = item.durationMillis,
                         ),
                     )
+                    if (immediateOriginalUnsendable(local.byteCount, item.processingPlan)) {
+                        // Same rule as the single-media branch, applied whole: KITMEDIA2 §7
+                        // forbids a partial album, so one unsendable original fails the album
+                        // in front of the person while every item stays locally playable.
+                        return intent.copy(state = ImmediateSendState.FAILED)
+                    }
                     local
                 }
                 val readyItems = intent.mediaItems.mapIndexed { index, item ->

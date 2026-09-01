@@ -7,6 +7,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import com.kit.wallet.data.repository.WalletCurrency
 import com.kit.wallet.data.remote.KitFeature
 import com.kit.wallet.feature.calls.CallsContent
 import com.kit.wallet.feature.chat.ChatsContent
@@ -87,6 +88,7 @@ class StoreScreenshotActivity : ComponentActivity() {
             initialContactId = "c2",
             contacts = StoreScreenshotData.favorites,
             balanceMinor = StoreScreenshotData.balanceMinor,
+            currency = WalletCurrency(),
             sending = false,
             lastSent = null,
             error = null,
