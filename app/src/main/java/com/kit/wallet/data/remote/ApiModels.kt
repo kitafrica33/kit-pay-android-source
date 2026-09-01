@@ -19,6 +19,8 @@ data class MessagingProtocolDto(
     val suite: String? = null,
     @Json(name = "post_quantum") val postQuantum: Boolean? = null,
     @Json(name = "rich_media") val richMedia: RichMediaProtocolDto? = null,
+    @Json(name = "resumable_attachments")
+    val resumableAttachments: ResumableAttachmentProtocolDto? = null,
     @Json(name = "media_message") val mediaMessage: MediaMessageProtocolDto? = null,
 )
 
@@ -32,6 +34,43 @@ data class RichMediaProtocolDto(
     @Json(name = "maximum_ciphertext_bytes") val maximumCiphertextBytes: Long? = null,
     @Json(name = "media_types") val mediaTypes: List<String>? = null,
 )
+
+/** Optional, fail-closed capability for byte-offset ciphertext uploads. */
+@JsonClass(generateAdapter = false)
+data class ResumableAttachmentProtocolDto(
+    val ready: Boolean? = null,
+    val profile: String? = null,
+    @Json(name = "max_chunk_bytes") val maxChunkBytes: Long? = null,
+    @Json(name = "offset_unit") val offsetUnit: String? = null,
+    @Json(name = "chunk_digest") val chunkDigest: String? = null,
+    @Json(name = "full_digest") val fullDigest: String? = null,
+)
+
+/**
+ * Isolates malformed optional rollout data from the mandatory messaging handshake. A wrong-shaped
+ * resumable block disables resumable uploads only; it must not make text messaging unavailable.
+ */
+class ResumableAttachmentProtocolDtoAdapter {
+    @FromJson
+    fun fromJson(reader: JsonReader): ResumableAttachmentProtocolDto? {
+        val block = reader.readJsonValue() as? Map<*, *> ?: return null
+        return ResumableAttachmentProtocolDto(
+            ready = block["ready"] as? Boolean,
+            profile = block["profile"] as? String,
+            maxChunkBytes = integralMember(block, "max_chunk_bytes"),
+            offsetUnit = block["offset_unit"] as? String,
+            chunkDigest = block["chunk_digest"] as? String,
+            fullDigest = block["full_digest"] as? String,
+        )
+    }
+
+    private fun integralMember(block: Map<*, *>, key: String): Long? {
+        val number = (block[key] as? Number)?.toDouble() ?: return null
+        if (!number.isFinite() || number != Math.floor(number)) return null
+        if (number < Long.MIN_VALUE.toDouble() || number > Long.MAX_VALUE.toDouble()) return null
+        return number.toLong()
+    }
+}
 
 /**
  * The optional `protocols.messaging.media_message` block (KITMEDIA2 frozen contract, §5a).
@@ -792,12 +831,20 @@ data class CounterpartyDto(
     val verification: AccountVerificationDto? = null,
 )
 
+/** Complete customer-visible wallet impact after private accounting legs are combined. */
+@JsonClass(generateAdapter = false)
+data class CustomerTransactionTotalsDto(
+    val added: String,
+    val deducted: String,
+)
+
 @JsonClass(generateAdapter = false)
 data class TransactionDto(
     val id: String,
     @Json(name = "wallet_id") val walletId: String,
     val reference: String,
     val amount: String,
+    val totals: CustomerTransactionTotalsDto? = null,
     val currency: CurrencyDto,
     val type: String,
     val direction: String,
@@ -1388,17 +1435,13 @@ data class BankingOutboundQuoteDto(
     val bank: BankingQuoteBankDto,
     @Json(name = "recipient_amount") val recipientAmount: String,
     @Json(name = "processing_fee") val processingFee: String,
-    @Json(name = "provider_fee") val providerFee: String,
-    @Json(name = "kit_fee") val kitFee: String,
-    @Json(name = "provider_fee_cap") val providerFeeCap: String,
-    @Json(name = "maximum_provider_total") val maximumProviderTotal: String,
     @Json(name = "customer_debit") val customerDebit: String,
-    @Json(name = "kit_debit") val kitDebit: String,
-    @Json(name = "schedule_version") val scheduleVersion: String,
     @Json(name = "schedule_verified") val scheduleVerified: Boolean,
     val currency: CurrencyDto,
     @Json(name = "expires_at") val expiresAt: String,
     @Json(name = "step_up") val stepUp: BankingQuoteStepUpDto,
+    @Json(name = "total_fees") val totalFees: String? = null,
+    @Json(name = "pricing_scope") val pricingScope: String? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -1428,15 +1471,9 @@ data class BankingOutboundPricingDto(
     @Json(name = "fee_mode") val feeMode: String,
     @Json(name = "recipient_amount") val recipientAmount: String,
     @Json(name = "processing_fee") val processingFee: String,
-    @Json(name = "provider_fee") val providerFee: String,
-    @Json(name = "kit_fee") val kitFee: String,
-    @Json(name = "provider_fee_cap") val providerFeeCap: String,
-    @Json(name = "maximum_provider_total") val maximumProviderTotal: String,
     @Json(name = "customer_debit") val customerDebit: String,
-    @Json(name = "kit_debit") val kitDebit: String,
-    @Json(name = "schedule_version") val scheduleVersion: String,
-    @Json(name = "actual_provider_fee") val actualProviderFee: String? = null,
-    @Json(name = "actual_provider_total") val actualProviderTotal: String? = null,
+    @Json(name = "total_fees") val totalFees: String? = null,
+    @Json(name = "pricing_scope") val pricingScope: String? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -1456,12 +1493,9 @@ data class BankingOperationDto(
     @Json(name = "fee_quote_id") val feeQuoteId: String? = null,
     @Json(name = "fee_mode") val feeMode: String? = null,
     @Json(name = "requested_amount") val requestedAmount: String? = null,
-    @Json(name = "provider_fee") val providerFee: String? = null,
-    @Json(name = "provider_fee_estimated") val providerFeeEstimated: Boolean? = null,
-    @Json(name = "platform_fee") val platformFee: String? = null,
-    @Json(name = "rounding_adjustment") val roundingAdjustment: String? = null,
     @Json(name = "total_fees") val totalFees: String? = null,
     @Json(name = "net_amount") val netAmount: String? = null,
+    @Json(name = "pricing_scope") val pricingScope: String? = null,
     val currency: CurrencyDto,
     @Json(name = "provider_reference") val providerReference: String? = null,
     @Json(name = "wallet_transaction_id") val walletTransactionId: String? = null,
@@ -1585,16 +1619,9 @@ data class MobileMoneyQuoteDto(
     @Json(name = "customer_debit") val customerDebit: String? = null,
     @Json(name = "total_fees") val totalFees: String? = null,
     @Json(name = "processing_fee") val processingFee: String? = null,
-    @Json(name = "provider_fee") val providerFee: String,
-    @Json(name = "platform_fee") val platformFee: String? = null,
-    @Json(name = "kit_fee") val kitFee: String? = null,
-    @Json(name = "rounding_adjustment") val roundingAdjustment: String? = null,
     @Json(name = "wallet_credit") val walletCredit: String? = null,
-    @Json(name = "provider_fee_cap") val providerFeeCap: String? = null,
-    @Json(name = "maximum_provider_total") val maximumProviderTotal: String? = null,
-    @Json(name = "kit_debit") val kitDebit: String? = null,
-    @Json(name = "schedule_version") val scheduleVersion: String? = null,
     @Json(name = "schedule_verified") val scheduleVerified: Boolean? = null,
+    @Json(name = "pricing_scope") val pricingScope: String? = null,
     @Json(name = "expires_at") val expiresAt: String,
     @Json(name = "step_up") val stepUp: MobileMoneyQuoteStepUpDto,
 )
@@ -1616,12 +1643,9 @@ data class MobileMoneyOperationDto(
     @Json(name = "fee_quote_id") val feeQuoteId: String? = null,
     @Json(name = "fee_mode") val feeMode: String? = null,
     @Json(name = "requested_amount") val requestedAmount: String? = null,
-    @Json(name = "provider_fee") val providerFee: String? = null,
-    @Json(name = "provider_fee_estimated") val providerFeeEstimated: Boolean? = null,
-    @Json(name = "platform_fee") val platformFee: String? = null,
-    @Json(name = "rounding_adjustment") val roundingAdjustment: String? = null,
     @Json(name = "total_fees") val totalFees: String? = null,
     @Json(name = "net_amount") val netAmount: String? = null,
+    @Json(name = "pricing_scope") val pricingScope: String? = null,
     val currency: CurrencyDto,
     @Json(name = "provider_reference") val providerReference: String? = null,
     @Json(name = "wallet_transaction_id") val walletTransactionId: String? = null,

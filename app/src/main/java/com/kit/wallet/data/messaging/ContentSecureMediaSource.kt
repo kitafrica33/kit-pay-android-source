@@ -9,15 +9,25 @@ import java.io.FileNotFoundException
  * Treats something the user picked as a stream to encrypt, never as bytes to hold.
  *
  * A gallery video or a shared document already exists in the provider that owns it. Opening it at
- * the moment of encryption is what keeps a 200 MB attachment off the heap, and it is also what
- * keeps the outbox's promise intact: the plaintext is never copied onto this app's own storage,
- * it goes from its original home through the cipher into the ciphertext spool.
+ * the moment of local adoption is what keeps a 200 MB attachment off the heap. The stream is
+ * copied atomically into app-owned Sent Media first, while encryption and upload consume that
+ * durable copy later in background work.
  *
  * The read permission that came with the pick lasts as long as the activity, and staging happens
  * immediately, so the stream is opened while the grant is certainly still good.
  */
-internal fun ContentResolver.secureMediaSource(uri: Uri): SecureMediaSource =
-    SecureMediaSource(declaredByteCount(uri)) {
+internal fun ContentResolver.secureMediaSource(
+    uri: Uri,
+    originatedAtNanos: Long = System.nanoTime(),
+    originalMediaType: String? = null,
+    processingPlan: SecureMediaProcessingPlan = SecureMediaProcessingPlan.PASSTHROUGH,
+): SecureMediaSource =
+    SecureMediaSource(
+        declaredByteCount = declaredByteCount(uri),
+        originatedAtNanos = originatedAtNanos,
+        originalMediaType = originalMediaType,
+        processingPlan = processingPlan,
+    ) {
         openInputStream(uri) ?: throw FileNotFoundException(
             "The selected file could not be opened",
         )

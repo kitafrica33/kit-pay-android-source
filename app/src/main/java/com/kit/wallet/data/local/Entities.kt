@@ -82,6 +82,8 @@ data class WalletTransactionEntity(
     val counterpartyVerificationSince: String? = null,
     val note: String?,
     val occurredAtEpochMillis: Long,
+    /** True only after the server's aggregate customer totals passed client validation. */
+    val customerProjectionVerified: Boolean,
 )
 
 @Entity(tableName = "sync_state")

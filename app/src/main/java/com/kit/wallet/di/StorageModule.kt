@@ -17,6 +17,7 @@ import com.kit.wallet.data.local.WalletTransactionDao
 import com.kit.wallet.data.media.ProfileAvatarByteStore
 import com.kit.wallet.data.media.ProfileAvatarImages
 import com.kit.wallet.data.remote.MediaMessageProtocolDtoAdapter
+import com.kit.wallet.data.remote.ResumableAttachmentProtocolDtoAdapter
 import com.kit.wallet.data.remote.PaymentProtocolsDtoAdapter
 import com.kit.wallet.data.remote.StarterChecklistMilestoneDtoAdapter
 import com.kit.wallet.data.remote.SupportPaymentBeneficiaryDtoAdapter
@@ -28,6 +29,7 @@ import com.kit.wallet.data.repository.BeneficiaryPhoneIdentity
 import com.kit.wallet.data.session.KeystoreSessionStore
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.messaging.AndroidKeystoreMessagingRecordCipher
+import com.kit.wallet.data.messaging.AndroidSecureMediaUploadProcessor
 import com.kit.wallet.data.messaging.AccountMessageArchiveCipher
 import com.kit.wallet.data.messaging.AccountMessageArchiveStore
 import com.kit.wallet.data.messaging.AccountMessageHistoryAccess
@@ -45,6 +47,7 @@ import com.kit.wallet.data.messaging.SecureMessagingLegacyStateValidator
 import com.kit.wallet.data.messaging.SecureMessagingRecordCipher
 import com.kit.wallet.data.messaging.SecureMessagingStateEraser
 import com.kit.wallet.data.messaging.SecureMessagingStateStore
+import com.kit.wallet.data.messaging.SecureMediaUploadProcessor
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import dagger.Binds
@@ -134,6 +137,12 @@ internal abstract class SecureMessagingStorageModule {
     abstract fun bindSecureMessagingInitialSyncActivation(
         implementation: RealSecureMessagingInitialSyncActivation,
     ): SecureMessagingInitialSyncActivation
+
+    @Binds
+    @Singleton
+    abstract fun bindSecureMediaUploadProcessor(
+        implementation: AndroidSecureMediaUploadProcessor,
+    ): SecureMediaUploadProcessor
 }
 
 @Module
@@ -152,6 +161,7 @@ object StorageModule {
         // Ahead of the reflective factory: a malformed `media_message` capabilities block must
         // turn one feature off, not fail the whole capabilities document.
         .add(MediaMessageProtocolDtoAdapter())
+        .add(ResumableAttachmentProtocolDtoAdapter())
         .add(PaymentProtocolsDtoAdapter())
         // Ahead of the reflective factory: the support protocol block and the payment
         // beneficiary bind with additionalProperties:false semantics reflection cannot express
@@ -180,6 +190,7 @@ object StorageModule {
                 KitWalletDatabase.MIGRATION_12_13,
                 KitWalletDatabase.MIGRATION_13_14,
                 KitWalletDatabase.MIGRATION_14_15,
+                KitWalletDatabase.MIGRATION_15_16,
             )
             .fallbackToDestructiveMigrationOnDowngrade()
             .build()

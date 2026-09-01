@@ -47,6 +47,7 @@ import com.kit.wallet.data.remote.MESSAGING_MESSAGE_EDITS_DEVICE_CAPABILITY
 import com.kit.wallet.data.remote.MESSAGING_REACTIONS_DEVICE_CAPABILITY
 import com.kit.wallet.data.remote.MessagingDeviceClientDto
 import com.kit.wallet.data.remote.MediaMessageProtocolDtoAdapter
+import com.kit.wallet.data.remote.ResumableAttachmentProtocolDtoAdapter
 import com.kit.wallet.data.remote.MessagingDeviceRosterDto
 import com.kit.wallet.data.remote.MessagingDeviceRosterEntryDto
 import com.kit.wallet.data.remote.MessagingSignedPrekeyDto
@@ -74,6 +75,7 @@ import org.junit.Test
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
 import java.nio.charset.StandardCharsets
+import java.io.File
 import java.security.MessageDigest
 import java.util.Base64
 import java.util.concurrent.TimeUnit
@@ -91,6 +93,7 @@ class RemoteSecureMessagingTransportTest {
         // would fail the whole capabilities document instead of turning one feature off.
         moshi = Moshi.Builder()
             .add(MediaMessageProtocolDtoAdapter())
+            .add(ResumableAttachmentProtocolDtoAdapter())
             .add(KotlinJsonAdapterFactory())
             .build()
         val retrofit = Retrofit.Builder()
@@ -235,6 +238,213 @@ class RemoteSecureMessagingTransportTest {
             server.takeRequest().path,
         )
     }
+
+    @Test
+    fun `attachment upload binds permanent media id and exact ciphertext digest`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        enqueueActivation()
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        finishActivation(lifecycle, fence)
+        val clientMediaId = "7a4d529e-47e4-4cd8-a51c-f88f247f87a2"
+        val storageKey = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val ciphertext = "durable byte-identical ciphertext".toByteArray()
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(ciphertext)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        server.enqueue(
+            jsonResponse(
+                """{"ok":true,"data":{"storage_key":"$storageKey","client_media_id":"$clientMediaId","byte_size":${ciphertext.size},"ciphertext_sha256":"$digest"}}""",
+            ),
+        )
+
+        val uploaded = session.uploadAttachment(clientMediaId, "video/mp4", ciphertext)
+
+        assertEquals(storageKey, uploaded.storageKey)
+        val request = server.takeRequest()
+        assertEquals("/api/kit-wallet/v1/messaging/attachments", request.path)
+        val multipart = request.body.readUtf8()
+        assertTrue(multipart.contains("name=\"client_media_id\""))
+        assertTrue(multipart.contains(clientMediaId))
+        assertTrue(multipart.contains("name=\"ciphertext_sha256\""))
+        assertTrue(multipart.contains(digest))
+        assertTrue(multipart.contains("name=\"media_type\""))
+        assertTrue(multipart.contains("video/mp4"))
+    }
+
+    @Test
+    fun `resumable start response resumes directly without redundant status round trip`() =
+        runTest {
+            val (lifecycle, fence) = newActivation()
+            val resumableCapabilities = READY_CAPABILITIES.replace(
+                "\"post_quantum\":true",
+                """"post_quantum":true,"resumable_attachments":{"ready":true,
+                    "profile":"kit-attachment-upload-v1","max_chunk_bytes":5242880,
+                    "offset_unit":"ciphertext_byte","chunk_digest":"sha256",
+                    "full_digest":"sha256"}""".trimIndent(),
+            )
+            enqueueActivation(resumableCapabilities)
+            val session = transport.openSession(lifecycle, fence)
+            assertActivationRequests()
+            finishActivation(lifecycle, fence)
+
+            val clientMediaId = "7a4d529e-47e4-4cd8-a51c-f88f247f87a2"
+            val storageKey = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            val ciphertext = "abcdef".toByteArray()
+            val fullDigest = sha256(ciphertext)
+            fun uploadDataJson(nextOffset: Int, complete: Boolean, state: String) =
+                """{"client_media_id":"$clientMediaId","storage_key":"$storageKey",
+                    "media_type":"video/mp4","byte_size":${ciphertext.size},
+                    "ciphertext_sha256":"$fullDigest","state":"$state",
+                    "next_offset":$nextOffset,"max_chunk_bytes":5242880,
+                    "complete":$complete,"expires_at":null}"""
+            fun uploadJson(nextOffset: Int, complete: Boolean, state: String) =
+                """{"ok":true,"data":${uploadDataJson(nextOffset, complete, state)}}"""
+
+            // A previous process uploaded abc and died. Replaying the exact idempotent start
+            // returns the authoritative offset, so this invocation transmits only def without a
+            // redundant GET status round trip first.
+            server.enqueue(jsonResponse(uploadJson(3, false, "pending")))
+            val remaining = "def".toByteArray()
+            val chunkDigest = sha256(remaining)
+            server.enqueue(
+                jsonResponse(
+                    """{"ok":true,"data":{
+                        "upload":${uploadDataJson(6, false, "pending")},
+                        "chunk":{"byte_offset":3,"byte_size":3,
+                        "ciphertext_sha256":"$chunkDigest","replayed":false}}}""",
+                ),
+            )
+            server.enqueue(jsonResponse(uploadJson(6, true, "ready")))
+            val file = File.createTempFile("kit-resumable-test-", ".bin")
+            try {
+                file.writeBytes(ciphertext)
+                val uploaded = session.uploadAttachment(clientMediaId, "video/mp4", file)
+                assertEquals(storageKey, uploaded.storageKey)
+                assertEquals(ciphertext.size.toLong(), uploaded.byteSize)
+                assertEquals(fullDigest, uploaded.ciphertextSha256)
+            } finally {
+                file.delete()
+            }
+
+            val start = server.takeRequest()
+            assertEquals("/api/kit-wallet/v1/messaging/attachment-uploads", start.path)
+            assertTrue(start.body.readUtf8().contains("\"client_media_id\":\"$clientMediaId\""))
+            val patch = server.takeRequest()
+            assertEquals("PATCH", patch.method)
+            assertEquals("3", patch.getHeader("Upload-Offset"))
+            assertEquals(chunkDigest, patch.getHeader("Upload-Chunk-SHA256"))
+            assertEquals("def", patch.body.readUtf8())
+            val complete = server.takeRequest()
+            assertEquals("POST", complete.method)
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/attachment-uploads/$clientMediaId/complete",
+                complete.path,
+            )
+        }
+
+    @Test
+    fun `an expired start response cannot masquerade as a renewable upload`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        val resumableCapabilities = READY_CAPABILITIES.replace(
+            "\"post_quantum\":true",
+            """"post_quantum":true,"resumable_attachments":{"ready":true,
+                "profile":"kit-attachment-upload-v1","max_chunk_bytes":5242880,
+                "offset_unit":"ciphertext_byte","chunk_digest":"sha256",
+                "full_digest":"sha256"}""".trimIndent(),
+        )
+        enqueueActivation(resumableCapabilities)
+        val session = transport.openSession(lifecycle, fence)
+        assertActivationRequests()
+        finishActivation(lifecycle, fence)
+
+        val clientMediaId = "7a4d529e-47e4-4cd8-a51c-f88f247f87a2"
+        val storageKey = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val ciphertext = "abcdef".toByteArray()
+        val fullDigest = sha256(ciphertext)
+        server.enqueue(
+            jsonResponse(
+                """{"ok":true,"data":{"client_media_id":"$clientMediaId",
+                    "storage_key":"$storageKey","media_type":"video/mp4",
+                    "byte_size":${ciphertext.size},"ciphertext_sha256":"$fullDigest",
+                    "state":"expired","next_offset":3,"max_chunk_bytes":5242880,
+                    "complete":false,"expires_at":null}}""",
+            ),
+        )
+        val file = File.createTempFile("kit-resumable-expired-test-", ".bin")
+        try {
+            file.writeBytes(ciphertext)
+            val failure = runCatching {
+                session.uploadAttachment(clientMediaId, "video/mp4", file)
+            }.exceptionOrNull()
+            assertTrue(failure is IllegalStateException)
+        } finally {
+            file.delete()
+        }
+
+        val start = server.takeRequest()
+        assertEquals("POST", start.method)
+        assertEquals("/api/kit-wallet/v1/messaging/attachment-uploads", start.path)
+    }
+
+    @Test
+    fun `completed resumable object is renewed before message sealing without retransmitting bytes`() =
+        runTest {
+            val (lifecycle, fence) = newActivation()
+            val resumableCapabilities = READY_CAPABILITIES.replace(
+                "\"post_quantum\":true",
+                """"post_quantum":true,"resumable_attachments":{"ready":true,
+                    "profile":"kit-attachment-upload-v1","max_chunk_bytes":5242880,
+                    "offset_unit":"ciphertext_byte","chunk_digest":"sha256",
+                    "full_digest":"sha256"}""".trimIndent(),
+            )
+            enqueueActivation(resumableCapabilities)
+            val session = transport.openSession(lifecycle, fence)
+            assertActivationRequests()
+            finishActivation(lifecycle, fence)
+
+            val clientMediaId = "7a4d529e-47e4-4cd8-a51c-f88f247f87a2"
+            // A sweep may have removed the former unclaimed object while the app was dead. Exact
+            // replay keeps the permanent media ID but is allowed to return this replacement key.
+            val replacementStorageKey = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            val ciphertext = "already complete".toByteArray()
+            val fullDigest = sha256(ciphertext)
+            val completeUpload = """{"client_media_id":"$clientMediaId",
+                "storage_key":"$replacementStorageKey","media_type":"video/mp4",
+                "byte_size":${ciphertext.size},"ciphertext_sha256":"$fullDigest",
+                "state":"ready","next_offset":${ciphertext.size},"max_chunk_bytes":5242880,
+                "complete":true,"expires_at":"2026-09-01T00:00:00Z"}"""
+            server.enqueue(jsonResponse("""{"ok":true,"data":$completeUpload}"""))
+            server.enqueue(jsonResponse("""{"ok":true,"data":$completeUpload}"""))
+            val file = File.createTempFile("kit-resumable-renewal-test-", ".bin")
+            try {
+                file.writeBytes(ciphertext)
+                val renewed = checkNotNull(
+                    session.renewAttachmentIfResumable(
+                        clientMediaId = clientMediaId,
+                        mediaType = "video/mp4",
+                        ciphertext = file,
+                        expectedByteSize = ciphertext.size.toLong(),
+                        expectedSha256 = fullDigest,
+                    ),
+                )
+                assertEquals(replacementStorageKey, renewed.storageKey)
+            } finally {
+                file.delete()
+            }
+
+            val start = server.takeRequest()
+            assertEquals("POST", start.method)
+            assertEquals("/api/kit-wallet/v1/messaging/attachment-uploads", start.path)
+            val complete = server.takeRequest()
+            assertEquals("POST", complete.method)
+            assertEquals(
+                "/api/kit-wallet/v1/messaging/attachment-uploads/$clientMediaId/complete",
+                complete.path,
+            )
+            // A completed checkpoint needs no PATCH and no ciphertext body replay.
+            assertEquals(0L, complete.body.size)
+        }
 
     @Test
     fun `attachment bytes are discarded when the session changes during streaming`() = runTest {

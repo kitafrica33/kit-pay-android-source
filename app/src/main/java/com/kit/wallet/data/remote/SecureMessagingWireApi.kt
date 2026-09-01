@@ -15,6 +15,7 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 import retrofit2.http.Streaming
 import retrofit2.http.Tag
+import retrofit2.http.Header
 
 /**
  * Raw secure-messaging routes. Production callers must go through
@@ -161,8 +162,33 @@ internal interface SecureMessagingWireApi {
     @POST("api/kit-wallet/v1/messaging/attachments")
     suspend fun uploadMessagingAttachment(
         @Part("media_type") mediaType: okhttp3.RequestBody,
+        @Part("client_media_id") clientMediaId: okhttp3.RequestBody,
+        @Part("ciphertext_sha256") ciphertextSha256: okhttp3.RequestBody,
         @Part ciphertext: MultipartBody.Part,
     ): ApiEnvelope<MessagingAttachmentUploadDto>
+
+    @POST("api/kit-wallet/v1/messaging/attachment-uploads")
+    suspend fun startResumableMessagingAttachmentUpload(
+        @Body request: StartResumableMessagingAttachmentUploadRequest,
+    ): ApiEnvelope<ResumableMessagingAttachmentUploadDto>
+
+    @GET("api/kit-wallet/v1/messaging/attachment-uploads/{clientMediaId}")
+    suspend fun resumableMessagingAttachmentUploadStatus(
+        @Path("clientMediaId") clientMediaId: String,
+    ): ApiEnvelope<ResumableMessagingAttachmentUploadDto>
+
+    @PATCH("api/kit-wallet/v1/messaging/attachment-uploads/{clientMediaId}")
+    suspend fun appendResumableMessagingAttachmentUpload(
+        @Path("clientMediaId") clientMediaId: String,
+        @Header("Upload-Offset") uploadOffset: Long,
+        @Header("Upload-Chunk-SHA256") chunkSha256: String,
+        @Body ciphertextChunk: okhttp3.RequestBody,
+    ): ApiEnvelope<ResumableMessagingAttachmentChunkResultDto>
+
+    @POST("api/kit-wallet/v1/messaging/attachment-uploads/{clientMediaId}/complete")
+    suspend fun completeResumableMessagingAttachmentUpload(
+        @Path("clientMediaId") clientMediaId: String,
+    ): ApiEnvelope<ResumableMessagingAttachmentUploadDto>
 
     /** Streams one opaque end-to-end encrypted attachment ciphertext blob. */
     @Streaming

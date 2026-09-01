@@ -1,9 +1,11 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.messaging.SecureMediaCache
+import com.kit.wallet.data.messaging.LocalMediaCollection
 import com.kit.wallet.data.session.SessionInvalidatedException
 import java.io.File
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -37,6 +39,9 @@ class SecureMediaCacheTest {
     private fun cache(
         maximumBytes: Long = 4_096L,
         deleteFile: (File) -> Boolean = File::delete,
+        fileDigest: (File) -> ByteArray = { file ->
+            MessageDigest.getInstance("SHA-256").digest(file.readBytes())
+        },
     ) = SecureMediaCache(
         preferredDirectory = null,
         fallbackDirectory = cacheRoot(),
@@ -44,6 +49,7 @@ class SecureMediaCacheTest {
         mediaChanged = { _, _ -> },
         privateMetadataDirectory = metadataRoot(),
         deleteFile = deleteFile,
+        fileDigest = fileDigest,
     )
 
     private suspend fun SecureMediaCache.put(
@@ -75,6 +81,33 @@ class SecureMediaCacheTest {
         val cached = checkNotNull(cache.cached("descriptor-1", "image/jpeg"))
         assertEquals(stored.file, cached.file)
         assertTrue(cached.file.readBytes().contentEquals(bytes))
+    }
+
+    @Test
+    fun `sent media survives automatic pressure eviction after its handoff pin is released`() = runTest {
+        val cache = cache(maximumBytes = 64)
+        cache.store(
+            cacheKey = "sent-original",
+            mediaType = "video/mp4",
+            retainUntilReleased = true,
+            collection = LocalMediaCollection.SENT,
+        ) { destination -> destination.writeBytes(ByteArray(64) { 1 }) }
+        cache.releaseRetention("sent-original")
+
+        cache.store(
+            cacheKey = "received-one",
+            mediaType = "video/mp4",
+            collection = LocalMediaCollection.RECEIVED,
+        ) { destination -> destination.writeBytes(ByteArray(64) { 2 }) }
+        cache.store(
+            cacheKey = "received-two",
+            mediaType = "video/mp4",
+            collection = LocalMediaCollection.RECEIVED,
+        ) { destination -> destination.writeBytes(ByteArray(64) { 3 }) }
+
+        assertNotNull(
+            cache.cached("sent-original", "video/mp4", LocalMediaCollection.SENT),
+        )
     }
 
     @Test
@@ -115,6 +148,73 @@ class SecureMediaCacheTest {
 
         assertEquals(stored.file, cached.file)
         assertTrue(cached.file.readBytes().contentEquals(bytes))
+    }
+
+    @Test
+    fun `a local-only image original survives process restart without becoming wire jpeg`() = runTest {
+        val bytes = ByteArray(64) { 9 }
+        val stored = cache().store(
+            cacheKey = "heic-sender-original",
+            mediaType = "image/heic",
+            collection = LocalMediaCollection.SENT,
+        ) { destination -> destination.writeBytes(bytes) }
+
+        val restored = checkNotNull(
+            cache().cached(
+                "heic-sender-original",
+                "image/heic",
+                LocalMediaCollection.SENT,
+            ),
+        )
+
+        assertEquals("image/heic", restored.mediaType)
+        assertEquals(stored.file, restored.file)
+        assertTrue(restored.file.readBytes().contentEquals(bytes))
+    }
+
+    @Test
+    fun `an unchanged private attachment is not hashed again on every playback`() = runTest {
+        var digestPasses = 0
+        val cache = cache(
+            fileDigest = { file ->
+                digestPasses += 1
+                MessageDigest.getInstance("SHA-256").digest(file.readBytes())
+            },
+        )
+        cache.put("large-private-video", ByteArray(64) { 8 }, "video/mp4")
+        assertEquals(1, digestPasses)
+
+        assertNotNull(cache.cached("large-private-video", "video/mp4"))
+        assertEquals(2, digestPasses)
+        assertNotNull(cache.cached("large-private-video", "video/mp4"))
+        assertEquals(2, digestPasses)
+    }
+
+    @Test
+    fun `different attachments copy concurrently while publication remains serialized`() = runTest {
+        val cache = cache()
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val secondStarted = CompletableDeferred<Unit>()
+        val first = backgroundScope.async {
+            cache.store("large-video", "video/mp4") { destination ->
+                destination.writeBytes(ByteArray(64) { 1 })
+                firstStarted.complete(Unit)
+                releaseFirst.await()
+            }
+        }
+        firstStarted.await()
+        val second = backgroundScope.async {
+            cache.store("voice-note", "audio/mp4") { destination ->
+                secondStarted.complete(Unit)
+                destination.writeBytes(ByteArray(32) { 2 })
+            }
+        }
+
+        secondStarted.await()
+        assertTrue(second.await().exists)
+        releaseFirst.complete(Unit)
+        assertTrue(first.await().exists)
     }
 
     @Test

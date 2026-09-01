@@ -17,6 +17,7 @@ import com.kit.wallet.data.remote.CreateBankingOperationRequest
 import com.kit.wallet.data.remote.CreateBankingOutboundQuoteRequest
 import com.kit.wallet.data.remote.CreateQuotedBankingOperationRequest
 import com.kit.wallet.data.remote.BankingOutboundQuoteDto
+import com.kit.wallet.data.remote.BankingOperationDto
 import com.kit.wallet.data.remote.ContactDto
 import com.kit.wallet.data.remote.ContactSyncRequest
 import com.kit.wallet.data.remote.BeginContactSyncRequest
@@ -28,6 +29,7 @@ import com.kit.wallet.data.remote.CallSessionDto
 import com.kit.wallet.data.remote.StartCallRequest
 import com.kit.wallet.data.remote.EndCallRequest
 import com.kit.wallet.data.remote.ProviderProductDto
+import com.kit.wallet.data.realtime.KitNetworkSource
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionInvalidatedException
@@ -50,6 +52,7 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -61,6 +64,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 
@@ -923,9 +927,18 @@ class RemoteBankingRepository @Inject constructor(
     private val apiCalls: ApiCallExecutor,
     private val walletCache: WalletCache,
     private val paymentAuthorizer: PaymentAuthorizer,
+    private val walletRefreshTrigger: WalletRefreshTrigger,
     private val sessions: SessionStore,
-    @ApplicationScope scope: CoroutineScope,
+    private val networkSource: KitNetworkSource,
+    @ApplicationScope private val scope: CoroutineScope,
 ) : BankingRepository {
+    private val activeSettlementScreens = AtomicInteger(0)
+    private val operationPoller = SettlementReconciliationPoller(
+        scope = scope,
+        currentSession = { sessions.current()?.fence() },
+        canPoll = { activeSettlementScreens.get() > 0 && networkSource.online.value },
+    )
+
     private val mutableBanks = MutableStateFlow<List<BankInstitution>>(emptyList())
     override val banks: StateFlow<List<BankInstitution>> = mutableBanks.asStateFlow()
 
@@ -936,12 +949,23 @@ class RemoteBankingRepository @Inject constructor(
     override val operations: StateFlow<List<Transaction>> = mutableOperations.asStateFlow()
 
     init {
+        networkSource.start()
         scope.launch {
             sessions.session.map { it?.cacheScopeId }.distinctUntilChanged().collectLatest { owner ->
+                operationPoller.cancelAll()
                 mutableBanks.value = emptyList()
                 mutableBeneficiaries.value = emptyList()
                 mutableOperations.value = emptyList()
                 if (owner != null) runCatching { refresh() }
+            }
+        }
+        scope.launch {
+            networkSource.online.collectLatest { online ->
+                if (!online) {
+                    operationPoller.cancelAll()
+                } else if (activeSettlementScreens.get() > 0) {
+                    runCatching { refresh() }
+                }
             }
         }
     }
@@ -970,47 +994,33 @@ class RemoteBankingRepository @Inject constructor(
             )
         }
         val beneficiaryNames = beneficiaries.associate { it.id to it.label }
-        val mappedOperations = apiCalls.execute { api.bankingOperations() }.items
+        val operationItems = apiCalls.execute { api.bankingOperations() }.items
             .filter { it.bankId in bankIds }
-            .map { operation ->
-                val scale = operation.currency.scale.toInt()
-                val amountMinor = DecimalMoney.toMinor(operation.amount, scale)
-                val pricing = operation.outboundPricing
-                val feeMinor = pricing?.processingFee?.let { DecimalMoney.toMinor(it, scale) }
-                    ?: operation.totalFees?.let { DecimalMoney.toMinor(it, scale) }
-                val recipientMinor = pricing?.recipientAmount?.let { DecimalMoney.toMinor(it, scale) }
-                    ?: operation.netAmount?.let { DecimalMoney.toMinor(it, scale) }
-                val debitMinor = pricing?.customerDebit?.let { DecimalMoney.toMinor(it, scale) }
-                val incoming = operation.direction.lowercase() in
-                    setOf("credit", "incoming", "in") || operation.type == "deposit"
-                Transaction(
-                    id = operation.id,
-                    counterparty = operation.beneficiaryId
-                        ?.let(beneficiaryNames::get)
-                        ?: "Bank transfer",
-                    note = null,
-                    amountMinor = if (incoming) amountMinor else -amountMinor,
-                    time = operation.createdAt?.let(::formatBankingTime) ?: "Pending",
-                    dateGroup = "Banking",
-                    type = if (incoming) TxType.BANK_IN else TxType.BANK_OUT,
-                    status = when (operation.status) {
-                        "completed", "succeeded" -> TxStatus.COMPLETED
-                        "failed", "reversed" -> TxStatus.FAILED
-                        else -> TxStatus.PENDING
-                    },
-                    reference = operation.reference,
-                    currencyCode = operation.currency.code.uppercase(),
-                    currencyScale = scale,
-                    feeMinor = feeMinor,
-                    recipientAmountMinor = recipientMinor,
-                    customerDebitMinor = debitMinor,
-                    feeMode = pricing?.feeMode ?: operation.feeMode,
-                )
-            }
+        val mappedOperations = operationItems
+            .filter { it.hasVerifiedCustomerActivityProjection() }
+            .map { it.toTransaction(beneficiaryNames) }
         sessions.withCurrentSession(fence) {
             mutableBanks.value = mappedBanks
             mutableBeneficiaries.value = mappedBeneficiaries
             mutableOperations.value = mappedOperations
+        }
+        if (activeSettlementScreens.get() > 0) {
+            operationItems
+                .filterNot { it.status.isTerminalSettlementStatus() }
+                .forEach { ensureOperationPolling(fence, it.id) }
+        }
+    }
+
+    override fun setSettlementScreenActive(active: Boolean) {
+        val count = if (active) {
+            activeSettlementScreens.incrementAndGet()
+        } else {
+            activeSettlementScreens.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+        }
+        if (active && count == 1) {
+            if (networkSource.online.value) scope.launch { runCatching { refresh() } }
+        } else if (!active && count == 0) {
+            operationPoller.cancelAll()
         }
     }
 
@@ -1161,7 +1171,16 @@ class RemoteBankingRepository @Inject constructor(
                     destinationId = beneficiaryId,
                     amountMinor = amountMinor,
                     recipientAmountMinor = DecimalMoney.toMinor(quote.recipientAmount, wallet.currencyScale),
-                    feesMinor = DecimalMoney.toMinor(quote.processingFee, wallet.currencyScale),
+                    feesMinor = DecimalMoney.toMinor(
+                        requireNotNull(
+                            customerFeeAmountForPublicContract(
+                                totalFees = quote.totalFees,
+                                processingFee = quote.processingFee,
+                                pricingScope = quote.pricingScope,
+                            ),
+                        ),
+                        wallet.currencyScale,
+                    ),
                     customerDebitMinor = DecimalMoney.toMinor(quote.customerDebit, wallet.currencyScale),
                     currencyCode = wallet.currencyCode,
                     currencyScale = wallet.currencyScale,
@@ -1220,8 +1239,109 @@ class RemoteBankingRepository @Inject constructor(
                 }
             }
         }
-        refresh()
+        if (created.hasVerifiedCustomerActivityProjection()) {
+            val mapped = created.toTransaction(
+                mutableBeneficiaries.value.associate { it.id to it.name },
+            )
+            sessions.withCurrentSession(quote.sessionFence) {
+                mergeOperation(mapped)
+            }
+        }
+        walletRefreshTrigger.refreshNow()
+        if (
+            activeSettlementScreens.get() > 0 &&
+            !created.status.isTerminalSettlementStatus()
+        ) {
+            ensureOperationPolling(quote.sessionFence, created.id)
+        }
         return created.id
+    }
+
+    private fun ensureOperationPolling(owner: SessionFence, operationId: String) {
+        operationPoller.ensure(owner, operationId) {
+            val operation = apiCalls.execute { api.bankingOperation(operationId) }
+            requireExactSettlementOperationId(operationId, operation.id)
+            if (operation.hasVerifiedCustomerActivityProjection()) {
+                val model = operation.toTransaction(
+                    mutableBeneficiaries.value.associate { it.id to it.name },
+                )
+                sessions.withCurrentSession(owner) {
+                    mergeOperation(model)
+                }
+            } else {
+                sessions.withCurrentSession(owner) {
+                    removeOperation(operation.id)
+                }
+            }
+            if (operation.status.isTerminalSettlementStatus()) {
+                walletRefreshTrigger.refreshNow()
+                SettlementPollResult.TERMINAL
+            } else {
+                SettlementPollResult.PENDING
+            }
+        }
+    }
+
+    private fun mergeOperation(operation: Transaction) {
+        mutableOperations.update { current ->
+            val existingIndex = current.indexOfFirst { it.id == operation.id }
+            if (existingIndex == -1) {
+                listOf(operation) + current
+            } else {
+                current.toMutableList().apply { this[existingIndex] = operation }
+            }
+        }
+    }
+
+    private fun removeOperation(operationId: String) {
+        mutableOperations.update { current -> current.filterNot { it.id == operationId } }
+    }
+
+    private fun BankingOperationDto.toTransaction(
+        beneficiaryNames: Map<String, String>,
+    ): Transaction {
+        val scale = currency.scale.toInt()
+        val amountMinor = DecimalMoney.toMinor(amount, scale)
+        val pricing = outboundPricing
+        val topLevelFee = customerFeeAmountForPublicContract(
+            totalFees = totalFees,
+            processingFee = null,
+            pricingScope = pricingScope,
+        )
+        val feeMinor = if (pricing != null) {
+            customerFeeAmountForPublicContract(
+                totalFees = pricing.totalFees,
+                processingFee = pricing.processingFee,
+                pricingScope = pricing.pricingScope,
+            )?.let { DecimalMoney.toMinor(it, scale) }
+        } else {
+            topLevelFee?.let { DecimalMoney.toMinor(it, scale) }
+        }
+        val recipientMinor = pricing?.recipientAmount?.let { DecimalMoney.toMinor(it, scale) }
+            ?: netAmount?.let { DecimalMoney.toMinor(it, scale) }
+        val debitMinor = pricing?.customerDebit?.let { DecimalMoney.toMinor(it, scale) }
+        val incoming = direction.lowercase() in setOf("credit", "incoming", "in") || type == "deposit"
+        return Transaction(
+            id = id,
+            counterparty = beneficiaryId?.let(beneficiaryNames::get) ?: "Bank transfer",
+            note = null,
+            amountMinor = if (incoming) amountMinor else -amountMinor,
+            time = createdAt?.let(::formatBankingTime) ?: "Pending",
+            dateGroup = "Banking",
+            type = if (incoming) TxType.BANK_IN else TxType.BANK_OUT,
+            status = when (status.lowercase()) {
+                "completed", "succeeded" -> TxStatus.COMPLETED
+                "failed", "reversed", "cancelled", "canceled" -> TxStatus.FAILED
+                else -> TxStatus.PENDING
+            },
+            reference = reference,
+            currencyCode = currency.code.uppercase(),
+            currencyScale = scale,
+            feeMinor = feeMinor,
+            recipientAmountMinor = recipientMinor,
+            customerDebitMinor = debitMinor,
+            feeMode = pricing?.feeMode ?: feeMode,
+        )
     }
 
     private fun formatBankingTime(value: String): String = runCatching {
@@ -1249,15 +1369,19 @@ internal fun validateBankingOutboundQuote(
 ) {
     val expectedAction = if (operation == BankOperationKind.TRANSFER) "transfer" else "withdrawal"
     val enteredAmount = if (feeMode == "recipient_absorbs") quote.customerDebit else quote.recipientAmount
-    fun decimal(value: String) = runCatching { java.math.BigDecimal(value) }.getOrNull()
+    fun decimal(value: String?) = value?.let {
+        runCatching { java.math.BigDecimal(it) }.getOrNull()
+    }
     val recipient = decimal(quote.recipientAmount)
-    val processing = decimal(quote.processingFee)
-    val provider = decimal(quote.providerFee)
-    val kitFee = decimal(quote.kitFee)
-    val providerCap = decimal(quote.providerFeeCap)
-    val maximumProviderTotal = decimal(quote.maximumProviderTotal)
+    val customerFee = runCatching {
+        customerFeeAmountForPublicContract(
+            totalFees = quote.totalFees,
+            processingFee = quote.processingFee,
+            pricingScope = quote.pricingScope,
+        )
+    }.getOrNull()
+    val processing = decimal(customerFee)
     val customer = decimal(quote.customerDebit)
-    val kitDebit = decimal(quote.kitDebit)
     val expectedIntent = mapOf(
         "action" to expectedAction,
         "operation_type" to operation.apiType,
@@ -1269,15 +1393,14 @@ internal fun validateBankingOutboundQuote(
         "fee_mode" to feeMode,
         "recipient_amount" to quote.recipientAmount,
         "processing_fee" to quote.processingFee,
-        "provider_fee" to quote.providerFee,
-        "kit_fee" to quote.kitFee,
-        "provider_fee_cap" to quote.providerFeeCap,
-        "maximum_provider_total" to quote.maximumProviderTotal,
         "customer_debit" to quote.customerDebit,
-        "kit_debit" to quote.kitDebit,
-        "schedule_version" to quote.scheduleVersion,
         "currency" to quote.currency.code,
     )
+    val legacyIntentKeys = setOf(
+        "provider_fee", "kit_fee", "provider_fee_cap", "maximum_provider_total",
+        "kit_debit", "schedule_version",
+    )
+    val allowedIntentKeys = expectedIntent.keys + legacyIntentKeys
     check(
         quote.action == expectedAction && quote.operationType == operation.apiType &&
             quote.walletId == walletId && quote.beneficiaryId == beneficiaryId &&
@@ -1285,13 +1408,83 @@ internal fun validateBankingOutboundQuote(
             quote.currency.code.equals(currency, ignoreCase = true) &&
             quote.currency.scale.toIntOrNull() == currencyScale &&
             recipient != null && decimal(enteredAmount)?.compareTo(java.math.BigDecimal(amount)) == 0 &&
-            processing != null && provider != null && kitFee != null && providerCap != null &&
-            maximumProviderTotal != null && customer != null && kitDebit != null &&
-            recipient.signum() > 0 && provider.signum() >= 0 && kitFee.signum() >= 0 &&
-            processing.compareTo(provider + kitFee) == 0 && providerCap.compareTo(provider) == 0 &&
-            maximumProviderTotal.compareTo(recipient + providerCap) == 0 &&
-            customer.compareTo(recipient + processing) == 0 && kitDebit.signum() == 0 &&
+            processing != null && customer != null && recipient.signum() > 0 &&
+            processing.signum() >= 0 &&
+            customer.compareTo(
+                if (feeMode == "kit_covers") recipient else recipient + processing
+            ) == 0 &&
             runCatching { Instant.parse(quote.expiresAt).isAfter(now) }.getOrDefault(false) &&
-            quote.stepUp.purpose == "bank_transfer" && quote.stepUp.intent == expectedIntent
+            quote.stepUp.purpose == "bank_transfer" &&
+            quote.stepUp.intent.keys.all(allowedIntentKeys::contains) &&
+            expectedIntent.all { (key, value) -> quote.stepUp.intent[key] == value }
     ) { "The bank transfer quote does not match this request" }
+}
+
+/**
+ * Selects the customer-visible aggregate fee and rejects payloads that could mix a new public
+ * pricing contract with a contradictory legacy alias. A missing scope remains compatible with
+ * already-issued records; any advertised scope must be the exact customer-only contract.
+ */
+internal fun customerFeeAmountForPublicContract(
+    totalFees: String?,
+    processingFee: String?,
+    pricingScope: String?,
+): String? {
+    check(pricingScope == null || pricingScope == "customer_totals") {
+        "The pricing response is not customer-scoped"
+    }
+    check(pricingScope != "customer_totals" || totalFees != null) {
+        "The customer-scoped pricing response omitted its authoritative total"
+    }
+    if (totalFees != null && processingFee != null) {
+        val total = runCatching { java.math.BigDecimal(totalFees) }.getOrNull()
+        val legacy = runCatching { java.math.BigDecimal(processingFee) }.getOrNull()
+        check(total != null && legacy != null && total.compareTo(legacy) == 0) {
+            "The customer fee totals do not match"
+        }
+    }
+    return totalFees ?: processingFee
+}
+
+/**
+ * Accepts only the authoritative customer-total projection used by the recent bank-transfer UI.
+ * Deposits have their own reference/proof timeline, while wallet history is sourced from the
+ * separately verified `transactions[].totals` contract. Unknown or legacy operation shapes are
+ * intentionally absent instead of being rendered from their nominal/provider amount.
+ */
+internal fun BankingOperationDto.hasVerifiedCustomerActivityProjection(): Boolean {
+    val operation = BankOperationKind.fromApiType(type) ?: return false
+    if (operation == BankOperationKind.DEPOSIT || direction != "outbound") return false
+
+    val scale = currency.scale.toIntOrNull()?.takeIf { it in 0..9 } ?: return false
+    fun minor(value: String?): Long? = value?.trim()?.let { candidate ->
+        runCatching { DecimalMoney.toMinor(candidate, scale) }.getOrNull()
+    }
+
+    val pricing = outboundPricing ?: return false
+    if (pricing.pricingScope != "customer_totals") return false
+    if (feeMode != null && feeMode != pricing.feeMode) return false
+
+    val nominal = minor(amount)?.takeIf { it > 0 } ?: return false
+    val recipient = minor(pricing.recipientAmount)?.takeIf { it > 0 } ?: return false
+    val customerFee = minor(pricing.totalFees)?.takeIf { it >= 0 } ?: return false
+    val compatibilityFee = minor(pricing.processingFee)?.takeIf { it >= 0 } ?: return false
+    val customerDebit = minor(pricing.customerDebit)?.takeIf { it > 0 } ?: return false
+    if (nominal != recipient || customerFee != compatibilityFee) return false
+
+    val expectedDebit = when (pricing.feeMode) {
+        "kit_covers" -> recipient
+        "sender_absorbs", "recipient_absorbs" ->
+            runCatching { Math.addExact(recipient, customerFee) }.getOrNull() ?: return false
+        else -> return false
+    }
+    if (customerDebit != expectedDebit) return false
+
+    // A top-level compatibility projection may be absent. If either member is advertised, both
+    // must be present, customer-scoped, and identical to the nested aggregate.
+    if (pricingScope != null || totalFees != null) {
+        if (pricingScope != "customer_totals") return false
+        if (minor(totalFees) != customerFee) return false
+    }
+    return true
 }

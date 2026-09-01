@@ -94,7 +94,16 @@ fun TransactionRow(
         Spacer(Modifier.width(12.dp))
         Column(horizontalAlignment = Alignment.End) {
             Text(
-                Money.format(tx.amountMinor, tx.currencyCode, tx.currencyScale, signed = true),
+                if (tx.amountMinor > 0) "Money Added" else "Money Deducted",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                Money.format(
+                    kotlin.math.abs(tx.customerVisibleAmountMinor),
+                    tx.currencyCode,
+                    tx.currencyScale,
+                ),
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.SemiBold,
                 color = amountColor,

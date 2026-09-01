@@ -34,6 +34,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -46,7 +47,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.kit.wallet.feature.funding.TopUpSheetContent
 import com.kit.wallet.feature.funding.TopUpViewModel
 import com.kit.wallet.ui.components.GroupedAmountTransformation
@@ -85,6 +89,25 @@ fun MobileMoneyScreen(
     val biometricsAvailable = rememberBiometricApprovalAvailable()
     var addingAccount by remember { mutableStateOf(false) }
     var operationAction by remember { mutableStateOf<String?>(null) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> viewModel.setSettlementScreenActive(true)
+                Lifecycle.Event.ON_STOP -> viewModel.setSettlementScreenActive(false)
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            viewModel.setSettlementScreenActive(true)
+        }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.setSettlementScreenActive(false)
+        }
+    }
 
     LaunchedEffect(shortOfFunds) {
         val shortfall = shortOfFunds ?: return@LaunchedEffect
@@ -334,6 +357,9 @@ private fun MobileMoneyAccountRow(account: MobileMoneyAccount) {
 
 @Composable
 private fun MobileMoneyOperationRow(operation: MobileMoneyOperation) {
+    // The repository drops malformed operations, but keep the rendering boundary fail-closed too:
+    // a nominal provider amount must never be substituted for a missing customer aggregate.
+    val customerAmount = operation.customerVisibleAmountMinor ?: return
     val successful = operation.status in setOf("completed", "succeeded")
     val failed = operation.status in setOf("failed", "reversed", "cancelled", "canceled")
     Row(
@@ -365,8 +391,7 @@ private fun MobileMoneyOperationRow(operation: MobileMoneyOperation) {
             )
             operation.feeMinor?.let { fee ->
                 Text(
-                    "Fee ${Money.format(fee, operation.currencyCode, operation.currencyScale)}" +
-                        if (operation.providerFeeEstimated == true) " estimated" else "",
+                    "Fee ${Money.format(fee, operation.currencyCode, operation.currencyScale)}",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -374,16 +399,25 @@ private fun MobileMoneyOperationRow(operation: MobileMoneyOperation) {
         }
         Column(horizontalAlignment = Alignment.End) {
             Text(
-                Money.format(operation.amountMinor, operation.currencyCode, operation.currencyScale),
+                if (operation.action.equals("collection", ignoreCase = true)) {
+                    "Money Added"
+                } else {
+                    "Money Deducted"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                Money.format(
+                    customerAmount,
+                    operation.currencyCode,
+                    operation.currencyScale,
+                ),
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.SemiBold,
             )
             StatusChip(
-                when {
-                    successful -> "Completed"
-                    failed -> "Failed"
-                    else -> "Processing"
-                },
+                mobileMoneyOperationStatusLabel(operation),
                 when {
                     successful -> KitTheme.colors.successContainer
                     failed -> MaterialTheme.colorScheme.errorContainer
@@ -396,6 +430,18 @@ private fun MobileMoneyOperationRow(operation: MobileMoneyOperation) {
                 },
             )
         }
+    }
+}
+
+internal fun mobileMoneyOperationStatusLabel(operation: MobileMoneyOperation): String {
+    val status = operation.status.lowercase()
+    return when (status) {
+        "completed", "succeeded" ->
+            if (operation.action.equals("payout", ignoreCase = true)) "Paid" else "Completed"
+        "failed" -> "Failed"
+        "reversed" -> "Reversed"
+        "cancelled", "canceled" -> "Cancelled"
+        else -> "Processing"
     }
 }
 

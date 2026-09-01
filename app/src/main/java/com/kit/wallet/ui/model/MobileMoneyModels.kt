@@ -51,8 +51,20 @@ data class MobileMoneyOperation(
     val netAmountMinor: Long? = null,
     val customerDebitMinor: Long? = null,
     val feeMode: String? = null,
-    val providerFeeEstimated: Boolean? = null,
-)
+) {
+    /**
+     * Complete wallet impact, never a provider or institutional accounting component.
+     *
+     * A missing aggregate deliberately stays missing. Falling back to [amountMinor] would turn a
+     * provider/requested amount into a customer total and can understate a debit or credit.
+     */
+    val customerVisibleAmountMinor: Long?
+        get() = if (action.equals("collection", ignoreCase = true)) {
+            netAmountMinor
+        } else {
+            customerDebitMinor
+        }
+}
 
 data class MobileMoneyVerificationState(
     val id: String,

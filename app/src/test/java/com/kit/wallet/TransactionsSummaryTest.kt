@@ -42,6 +42,19 @@ class TransactionsSummaryTest {
         assertTrue(summary.moneyOutWeight?.isFinite() == true)
     }
 
+    @Test
+    fun `activity totals use authoritative combined customer movements`() {
+        val summary = summarizeTransactionActivity(
+            listOf(
+                transaction(10_000).copy(recipientAmountMinor = 9_400),
+                transaction(-20_000).copy(customerDebitMinor = 21_000),
+            ),
+        )
+
+        assertEquals(9_400L, summary.moneyInMinor)
+        assertEquals(21_000L, summary.moneyOutMinor)
+    }
+
     private fun transaction(amountMinor: Long) = Transaction(
         id = amountMinor.toString(),
         counterparty = "Test",

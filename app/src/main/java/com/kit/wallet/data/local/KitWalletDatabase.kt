@@ -19,7 +19,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         BeneficiaryContactEntity::class,
         SupportOutboxEntity::class,
     ],
-    version = 15,
+    version = 16,
     exportSchema = true,
 )
 abstract class KitWalletDatabase : RoomDatabase() {
@@ -273,6 +273,18 @@ abstract class KitWalletDatabase : RoomDatabase() {
                 )
                 db.execSQL(
                     "ALTER TABLE wallet_transactions ADD COLUMN counterpartyVerificationSince TEXT",
+                )
+            }
+        }
+
+        val MIGRATION_15_16: Migration = object : Migration(15, 16) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Version 15 cached only a display amount, so it cannot prove whether a bank fee
+                // companion was already included. Keep those rows untrusted until the next
+                // authoritative history refresh supplies and validates explicit customer totals.
+                db.execSQL(
+                    "ALTER TABLE wallet_transactions ADD COLUMN " +
+                        "customerProjectionVerified INTEGER NOT NULL DEFAULT 0",
                 )
             }
         }

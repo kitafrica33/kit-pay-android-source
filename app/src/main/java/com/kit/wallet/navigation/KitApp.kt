@@ -72,6 +72,7 @@ import com.kit.wallet.data.auth.AuthChallengeKind
 import com.kit.wallet.data.notifications.ActiveCallReturnLink
 import com.kit.wallet.data.notifications.AuthorizedIncomingCallLaunch
 import com.kit.wallet.data.notifications.CallReopenAction
+import com.kit.wallet.data.notifications.MobileMoneySettlementLink
 import com.kit.wallet.data.notifications.PaymentClaimLink
 import com.kit.wallet.data.notifications.callReopenDecision
 import com.kit.wallet.data.remote.KitFeature
@@ -294,6 +295,9 @@ internal fun KitApp(
         ) return@LaunchedEffect
         val callReturn = rawDeepLink?.let { ActiveCallReturnLink.fromDeepLink(it) }
         val claimLink = rawDeepLink?.let { PaymentClaimLink.fromDeepLink(it) }
+        val mobileMoneySettlementLink = rawDeepLink?.let {
+            MobileMoneySettlementLink.fromDeepLink(it)
+        }
         val uri = rawDeepLink?.let { Uri.parse(it) }
         val isKycReturn = uri?.let {
             it.scheme == "kitwallet" && it.host == "kyc" && it.path == "/status"
@@ -347,6 +351,17 @@ internal fun KitApp(
                 // own wallet-history fallback, so the link must not replay on recomposition.
                 onDeepLinkConsumed()
                 paymentClaimNavigationViewModel.open(claimLink)
+            }
+            mobileMoneySettlementLink != null -> {
+                if (!signedIn || !capabilities.loaded || capabilities.loadFailed) {
+                    return@LaunchedEffect
+                }
+                onDeepLinkConsumed()
+                if (!moneyMovementAllowed) {
+                    requestFinancialAccess()
+                } else if (capabilities.mobileMoneyUsable) {
+                    navController.navigate(Dest.MOBILE_MONEY) { launchSingleTop = true }
+                }
             }
             secureMessageConversationId != null -> {
                 if (!signedIn || !capabilities.loaded || capabilities.loadFailed) {

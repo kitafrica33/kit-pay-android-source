@@ -21,14 +21,19 @@ internal fun receiveDetailsShareText(profile: UserProfile): String {
 
 internal fun receiptShareText(
     recipientName: String?,
-    amountMinor: Long,
     transaction: Transaction,
 ): String = buildString {
     val recipient = recipientName?.trim()?.takeIf(String::isNotBlank)
         ?: transaction.counterparty
     appendLine("Kit Pay receipt")
-    append("Sent ${Money.format(amountMinor)} to ")
-    appendLine(recipient)
+    appendLine(
+        "Money deducted: " + Money.format(
+            kotlin.math.abs(transaction.customerVisibleAmountMinor),
+            transaction.currencyCode,
+            transaction.currencyScale,
+        ),
+    )
+    appendLine("To: $recipient")
     appendLine("Status: ${transaction.status.name.lowercase().replaceFirstChar { it.titlecase() }}")
     appendLine("Reference: ${transaction.reference}")
     append("Date: ${transaction.dateGroup}, ${transaction.time}")

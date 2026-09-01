@@ -1,5 +1,7 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.messaging.SecureMediaProcessingPlan
+import com.kit.wallet.data.messaging.SecureMediaVideoEditPlan
 import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.messaging.ImmediateMediaSpool
 import com.kit.wallet.data.messaging.ImmediateSendIntent
@@ -88,6 +90,7 @@ class ImmediateSendIntentStoreTest {
                     ciphertextBytes = 2_112,
                     keyBase64 = key,
                     ciphertextSha256Hex = "2".repeat(64),
+                    durationMillis = 121_000,
                 ),
             ),
         )
@@ -118,7 +121,10 @@ class ImmediateSendIntentStoreTest {
             createdAtEpochMillis = NOW,
             state = ImmediateSendState.PREPARING,
             mediaType = "image/jpeg",
-            mediaPlaintextBytes = 1_024,
+            mediaPlaintextBytes = 0,
+            mediaOriginalType = "image/heic",
+            mediaOriginalPlaintextBytes = 1_024,
+            mediaProcessingPlan = SecureMediaProcessingPlan.CHAT_IMAGE_JPEG,
         )
         val album = ImmediateSendIntent(
             id = ID_TWO,
@@ -130,10 +136,13 @@ class ImmediateSendIntentStoreTest {
                 ImmediateSendMediaItem(
                     attachmentId = ATTACHMENT_ONE,
                     mediaType = "image/jpeg",
-                    plaintextBytes = 1_024,
+                    plaintextBytes = 0,
                     ciphertextBytes = 0,
                     keyBase64 = "",
                     ciphertextSha256Hex = "",
+                    originalMediaType = "image/heic",
+                    originalPlaintextBytes = 1_024,
+                    processingPlan = SecureMediaProcessingPlan.CHAT_IMAGE_JPEG,
                 ),
                 ImmediateSendMediaItem(
                     attachmentId = ATTACHMENT_TWO,
@@ -160,12 +169,196 @@ class ImmediateSendIntentStoreTest {
         assertEquals(1, ImmediateSendState.RETRY_REQUIRED.ordinal)
         assertEquals(2, ImmediateSendState.FAILED.ordinal)
         assertEquals(3, ImmediateSendState.PREPARING.ordinal)
+        assertEquals(4, ImmediateSendState.IMPORTING.ordinal)
+        assertEquals(0, SecureMediaProcessingPlan.PASSTHROUGH.persistenceCode)
+        assertEquals(1, SecureMediaProcessingPlan.CHAT_IMAGE_JPEG.persistenceCode)
+        assertEquals(2, SecureMediaProcessingPlan.CHAT_VIDEO_MP4.persistenceCode)
+    }
+
+    @Test fun `edited video plan survives restart before background remux`() {
+        val edit = SecureMediaVideoEditPlan(
+            startMicros = 2_000_000,
+            endMicros = 12_000_000,
+            keepAudio = false,
+        )
+        val intent = ImmediateSendIntent(
+            id = ID_ONE,
+            conversationId = CONVERSATION_ID,
+            kind = ImmediateSendKind.MEDIA,
+            createdAtEpochMillis = NOW,
+            state = ImmediateSendState.PREPARING,
+            mediaType = "video/mp4",
+            mediaOriginalType = "video/quicktime",
+            mediaOriginalPlaintextBytes = 240_000_000,
+            mediaProcessingPlan = SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
+            mediaVideoEditPlan = edit,
+            mediaDurationMillis = 10_000,
+        )
+
+        val encoded = ImmediateSendIntentCodec.encode(intent)
+        assertEquals(intent, ImmediateSendIntentCodec.decode(encoded))
+        encoded.fill(0)
+    }
+
+    @Test fun `version five media defaults duration without shifting the prior codec`() {
+        val prior = ImmediateSendIntent(
+            id = ID_ONE,
+            conversationId = CONVERSATION_ID,
+            kind = ImmediateSendKind.MEDIA,
+            createdAtEpochMillis = NOW,
+            state = ImmediateSendState.PREPARING,
+            mediaType = "audio/mp4",
+            mediaPlaintextBytes = 512_000,
+            mediaOriginalPlaintextBytes = 512_000,
+        )
+        val versionSix = ImmediateSendIntentCodec.encode(prior)
+        val versionFive = versionSix.copyOf(versionSix.size - 1).also { it[0] = 5 }
+        versionSix.fill(0)
+
+        assertEquals(prior, ImmediateSendIntentCodec.decode(versionFive))
+        versionFive.fill(0)
+    }
+
+    @Test fun `media duration is bounded and belongs only to audio or video`() {
+        val voice = ImmediateSendIntent(
+            id = ID_ONE,
+            conversationId = CONVERSATION_ID,
+            kind = ImmediateSendKind.MEDIA,
+            createdAtEpochMillis = NOW,
+            state = ImmediateSendState.PREPARING,
+            mediaType = "audio/mp4",
+            mediaPlaintextBytes = 512_000,
+            mediaOriginalPlaintextBytes = 512_000,
+            mediaDurationMillis = 121_000,
+        )
+
+        assertEquals(121_000L, voice.mediaDurationMillis)
+        assertThrows(IllegalArgumentException::class.java) {
+            voice.copy(mediaDurationMillis = 0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            voice.copy(mediaDurationMillis = 24L * 60L * 60L * 1_000L + 1L)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            voice.copy(mediaType = "image/jpeg")
+        }
+    }
+
+    @Test fun `video processing fails closed without a matching edit recipe`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            SecureMediaSource.ofBytes(
+                bytes = byteArrayOf(1),
+                originalMediaType = "video/mp4",
+                processingPlan = SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            ImmediateSendIntent(
+                id = ID_ONE,
+                conversationId = CONVERSATION_ID,
+                kind = ImmediateSendKind.MEDIA,
+                createdAtEpochMillis = NOW,
+                state = ImmediateSendState.PREPARING,
+                mediaType = "video/mp4",
+                mediaOriginalPlaintextBytes = 1,
+                mediaProcessingPlan = SecureMediaProcessingPlan.CHAT_VIDEO_MP4,
+            )
+        }
+    }
+
+    @Test fun `importing media preserves permanent ids with an unknown size across restart`() = runTest {
+        val importing = ImmediateSendIntent(
+            id = ID_ONE,
+            conversationId = CONVERSATION_ID,
+            kind = ImmediateSendKind.MEDIA,
+            createdAtEpochMillis = NOW,
+            state = ImmediateSendState.IMPORTING,
+            mediaType = "video/mp4",
+            mediaPlaintextBytes = 0,
+        )
+        val importingAlbum = ImmediateSendIntent(
+            id = ID_TWO,
+            conversationId = CONVERSATION_ID,
+            kind = ImmediateSendKind.MEDIA_V2,
+            createdAtEpochMillis = NOW + 1,
+            state = ImmediateSendState.IMPORTING,
+            mediaItems = listOf(
+                ImmediateSendMediaItem(
+                    attachmentId = ATTACHMENT_ONE,
+                    mediaType = "image/jpeg",
+                    plaintextBytes = 0,
+                    ciphertextBytes = 0,
+                    keyBase64 = "",
+                    ciphertextSha256Hex = "",
+                ),
+                ImmediateSendMediaItem(
+                    attachmentId = ATTACHMENT_TWO,
+                    mediaType = "application/pdf",
+                    plaintextBytes = 0,
+                    ciphertextBytes = 0,
+                    keyBase64 = "",
+                    ciphertextSha256Hex = "",
+                ),
+            ),
+        )
+
+        val store = ImmediateSendIntentStore(disk, sessions)
+        store.enqueueForOwner(checkNotNull(sessions.current()).fence(), importing)
+        store.enqueueForOwner(checkNotNull(sessions.current()).fence(), importingAlbum)
+
+        val restarted = ImmediateSendIntentStore(disk, sessions)
+        restarted.reload()
+        assertEquals(listOf(importing, importingAlbum), restarted.items.value)
+        assertEquals(
+            setOf(ID_ONE, ATTACHMENT_ONE, ATTACHMENT_TWO),
+            restarted.items.value.flatMap { intent ->
+                if (intent.kind == ImmediateSendKind.MEDIA) {
+                    listOf(intent.id)
+                } else {
+                    intent.mediaItems.map { it.attachmentId }
+                }
+            }.toSet(),
+        )
     }
 
     @Test fun `pre-album queue records are still read exactly as written`() {
         val withReply = textIntent().copy(replyToMessageId = TARGET_ID)
         assertEquals(withReply, ImmediateSendIntentCodec.decode(legacyRecord(2, TARGET_ID)))
         assertEquals(textIntent(), ImmediateSendIntentCodec.decode(legacyRecord(1, null)))
+    }
+
+    @Test fun `version three album records default to passthrough originals`() {
+        val key = Base64.getEncoder().encodeToString(
+            ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES),
+        )
+        val expected = ImmediateSendIntent(
+            id = ID_ONE,
+            conversationId = CONVERSATION_ID,
+            kind = ImmediateSendKind.MEDIA_V2,
+            createdAtEpochMillis = NOW,
+            mediaItems = listOf(
+                ImmediateSendMediaItem(
+                    attachmentId = ATTACHMENT_ONE,
+                    mediaType = "image/jpeg",
+                    plaintextBytes = 1_024,
+                    ciphertextBytes = 1_088,
+                    keyBase64 = key,
+                    ciphertextSha256Hex = "1".repeat(64),
+                    originalPlaintextBytes = 1_024,
+                ),
+                ImmediateSendMediaItem(
+                    attachmentId = ATTACHMENT_TWO,
+                    mediaType = "application/pdf",
+                    plaintextBytes = 2_048,
+                    ciphertextBytes = 2_112,
+                    keyBase64 = key,
+                    ciphertextSha256Hex = "2".repeat(64),
+                    originalPlaintextBytes = 2_048,
+                ),
+            ),
+        )
+
+        assertEquals(expected, ImmediateSendIntentCodec.decode(legacyAlbumRecordV3(expected)))
     }
 
     @Test fun `queued text enforces the exact encrypted wire scalar policy`() {
@@ -390,6 +583,38 @@ class ImmediateSendIntentStoreTest {
             if (version >= 2) {
                 data.writeBoolean(replyToMessageId != null)
                 replyToMessageId?.let { data.writeLegacyString(it) }
+            }
+        }
+        return output.toByteArray()
+    }
+
+    private fun legacyAlbumRecordV3(intent: ImmediateSendIntent): ByteArray {
+        val output = ByteArrayOutputStream()
+        DataOutputStream(output).use { data ->
+            data.writeByte(3)
+            data.writeByte(intent.kind.ordinal)
+            data.writeByte(intent.state.ordinal)
+            data.writeLegacyString(intent.id)
+            data.writeLegacyString(intent.conversationId)
+            data.writeLong(intent.createdAtEpochMillis)
+            data.writeLegacyString(intent.text)
+            data.writeBoolean(false) // mediaType
+            data.writeBoolean(false) // caption
+            data.writeInt(0)
+            data.writeInt(0)
+            data.writeBoolean(false) // mediaKeyBase64
+            data.writeBoolean(false) // mediaSha256Base64
+            data.writeBoolean(false) // preparedMediaDescriptor
+            data.writeBoolean(false) // replyToMessageId
+            data.writeInt(intent.mediaItems.size)
+            intent.mediaItems.forEach { item ->
+                data.writeLegacyString(item.attachmentId)
+                data.writeLegacyString(item.mediaType)
+                data.writeInt(item.plaintextBytes)
+                data.writeLong(item.ciphertextBytes)
+                data.writeLegacyString(item.keyBase64)
+                data.writeLegacyString(item.ciphertextSha256Hex)
+                data.writeBoolean(false) // storageKey
             }
         }
         return output.toByteArray()

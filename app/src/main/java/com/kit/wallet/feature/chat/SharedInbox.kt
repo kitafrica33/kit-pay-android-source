@@ -3,7 +3,10 @@ package com.kit.wallet.feature.chat
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.data.messaging.KitUserAuthoredTextPolicy
 import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
+import com.kit.wallet.data.messaging.MAX_LOCAL_MEDIA_DURATION_MILLIS
+import com.kit.wallet.data.messaging.SecureMediaProcessingPlan
 import com.kit.wallet.data.messaging.SecureMediaSource
+import com.kit.wallet.data.messaging.normalizeLocalMediaType
 import com.kit.wallet.data.session.SessionFence
 import java.nio.charset.StandardCharsets
 import java.util.Locale
@@ -19,7 +22,23 @@ internal data class SharedInboxItem(
     /** What the review screen should call it — the original filename for documents. */
     val displayName: String,
     val byteCount: Int,
-)
+    /** MIME of the retained source when the wire representation is produced later. */
+    val originalMediaType: String? = null,
+    /** Restart-safe transform applied only after the original is durably admitted. */
+    val processingPlan: SecureMediaProcessingPlan = SecureMediaProcessingPlan.PASSTHROUGH,
+    /** Playback duration captured from the app-owned copy when this is audio or video. */
+    val durationMillis: Long? = null,
+) {
+    val localMediaType: String get() = originalMediaType ?: mediaType
+
+    init {
+        require(
+            durationMillis == null ||
+                durationMillis in 1..MAX_LOCAL_MEDIA_DURATION_MILLIS &&
+                (localMediaType.startsWith("audio/") || localMediaType.startsWith("video/")),
+        ) { "Invalid shared-media duration" }
+    }
+}
 
 /** Everything one trip through the share sheet produced. */
 internal data class SharedInboxBatch(
@@ -147,8 +166,9 @@ internal object SharedInboxPolicy {
     /**
      * What a shared file will travel as.
      *
-     * Images are the exception to the allowlist: a camera-native HEIC is converted to the JPEG the
-     * wire accepts rather than demoted to an opaque document the recipient cannot preview.
+     * Images are the exception to the allowlist: a camera-native HEIC is assigned the JPEG wire
+     * type, while its untouched original is retained locally and converted only by the durable
+     * background preparation worker.
      * Anything else the wire does not accept is sent as a document, which is lossless and works
      * through the profile's generic document type.
      */
@@ -165,7 +185,7 @@ internal object SharedInboxPolicy {
         return FALLBACK_MEDIA_TYPE
     }
 
-    /** True when staging must convert an image before assigning [normalizedMediaType]. */
+    /** True when the durable sender pipeline must derive a JPEG wire copy from the local original. */
     fun requiresImageTranscode(raw: String?): Boolean {
         val normalized = raw.orEmpty()
             .substringBefore(';')

@@ -1,14 +1,13 @@
 package com.kit.wallet.feature.chat.camera
 
 import android.graphics.Bitmap
-import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
-import android.media.MediaMuxer
+import com.kit.wallet.data.media.MediaVideoRemuxPlan
+import com.kit.wallet.data.media.MediaVideoRemuxer
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.nio.ByteBuffer
 import kotlin.math.max
 
 internal const val MIN_CLIP_MILLIS = 500L
@@ -19,8 +18,6 @@ internal const val MIN_CLIP_MILLIS = 500L
  * window cut from a long, heavy video is exactly what this editor is for.
  */
 internal const val MAX_LIBRARY_VIDEO_SOURCE_BYTES = 1_073_741_824L
-
-private const val DEFAULT_SAMPLE_BUFFER_BYTES = 1 shl 20
 
 internal data class VideoTrimPlan(
     val startMicros: Long,
@@ -69,60 +66,12 @@ internal fun videoSendMediaType(edited: Boolean, sourceMediaType: String): Strin
  */
 internal object ChatVideoTranscoder {
 
-    fun trim(source: File, destination: File, plan: VideoTrimPlan): Boolean {
-        if (plan.durationMicros <= 0L) return false
-        val extractor = MediaExtractor()
-        var muxer: MediaMuxer? = null
-        return try {
-            extractor.setDataSource(source.absolutePath)
-            val videoTrack = trackIndex(extractor, "video/") ?: return false
-            val audioTrack = if (plan.keepAudio) trackIndex(extractor, "audio/") else null
-
-            val created = MediaMuxer(destination.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            muxer = created
-            val videoFormat = extractor.getTrackFormat(videoTrack)
-            val audioFormat = audioTrack?.let(extractor::getTrackFormat)
-            val muxerVideoTrack = created.addTrack(videoFormat)
-            val muxerAudioTrack = audioFormat?.let(created::addTrack)
-            sourceRotationDegrees(source)
-                ?.takeIf { it == 90 || it == 180 || it == 270 }
-                ?.let(created::setOrientationHint)
-            created.start()
-
-            val buffer = ByteBuffer.allocate(sampleBufferBytes(videoFormat, audioFormat))
-            var video = copyTrack(
-                extractor, created, videoTrack, muxerVideoTrack, buffer, plan,
-                rebaseMicros = null,
-                seekMode = MediaExtractor.SEEK_TO_NEXT_SYNC,
-            )
-            if (video.samplesWritten == 0) {
-                video = copyTrack(
-                    extractor, created, videoTrack, muxerVideoTrack, buffer, plan,
-                    rebaseMicros = null,
-                    seekMode = MediaExtractor.SEEK_TO_PREVIOUS_SYNC,
-                )
-            }
-            check(video.samplesWritten > 0) { "The trim window holds no video samples" }
-            if (audioTrack != null && muxerAudioTrack != null) {
-                // Audio frames are all sync frames; drop the ones before the video base so no
-                // sound from ahead of the chosen start leaks into the clip.
-                copyTrack(
-                    extractor, created, audioTrack, muxerAudioTrack, buffer, plan,
-                    rebaseMicros = video.baseMicros,
-                    seekMode = MediaExtractor.SEEK_TO_PREVIOUS_SYNC,
-                    dropBeforeMicros = video.baseMicros,
-                )
-            }
-            created.stop()
-            true
-        } catch (_: Exception) {
-            destination.delete()
-            false
-        } finally {
-            runCatching { extractor.release() }
-            runCatching { muxer?.release() }
-        }
-    }
+    fun trim(source: File, destination: File, plan: VideoTrimPlan): Boolean =
+        MediaVideoRemuxer.remux(
+            source,
+            destination,
+            MediaVideoRemuxPlan(plan.startMicros, plan.endMicros, plan.keepAudio),
+        )
 
     /** Whether the clip carries an audio track at all (microphone permission may be denied). */
     fun hasAudioTrack(source: File): Boolean {
@@ -183,51 +132,6 @@ internal object ChatVideoTranscoder {
         }
     }
 
-    private class TrackCopy(val samplesWritten: Int, val baseMicros: Long)
-
-    private fun copyTrack(
-        extractor: MediaExtractor,
-        muxer: MediaMuxer,
-        sourceTrack: Int,
-        muxerTrack: Int,
-        buffer: ByteBuffer,
-        plan: VideoTrimPlan,
-        rebaseMicros: Long?,
-        seekMode: Int,
-        dropBeforeMicros: Long? = null,
-    ): TrackCopy {
-        extractor.selectTrack(sourceTrack)
-        val info = MediaCodec.BufferInfo()
-        var base = rebaseMicros
-        var written = 0
-        try {
-            extractor.seekTo(plan.startMicros, seekMode)
-            while (true) {
-                val sampleTime = extractor.sampleTime
-                if (sampleTime < 0 || sampleTime > plan.endMicros) break
-                if (dropBeforeMicros != null && sampleTime < dropBeforeMicros) {
-                    if (!extractor.advance()) break
-                    continue
-                }
-                val size = extractor.readSampleData(buffer, 0)
-                if (size < 0) break
-                if (base == null) base = sampleTime
-                val flags = if ((extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
-                    MediaCodec.BUFFER_FLAG_KEY_FRAME
-                } else {
-                    0
-                }
-                info.set(0, size, (sampleTime - base).coerceAtLeast(0L), flags)
-                muxer.writeSampleData(muxerTrack, buffer, info)
-                written++
-                if (!extractor.advance()) break
-            }
-        } finally {
-            runCatching { extractor.unselectTrack(sourceTrack) }
-        }
-        return TrackCopy(written, base ?: plan.startMicros)
-    }
-
     private fun trackIndex(extractor: MediaExtractor, mimePrefix: String): Int? {
         for (index in 0 until extractor.trackCount) {
             val mime = extractor.getTrackFormat(index).getString(MediaFormat.KEY_MIME) ?: continue
@@ -236,25 +140,4 @@ internal object ChatVideoTranscoder {
         return null
     }
 
-    private fun sampleBufferBytes(vararg formats: MediaFormat?): Int {
-        var largest = 0
-        for (format in formats) {
-            if (format != null && format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
-                largest = max(largest, format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
-            }
-        }
-        return if (largest > 0) largest else DEFAULT_SAMPLE_BUFFER_BYTES
-    }
-
-    private fun sourceRotationDegrees(source: File): Int? {
-        val retriever = MediaMetadataRetriever()
-        return try {
-            retriever.setDataSource(source.absolutePath)
-            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull()
-        } catch (_: Exception) {
-            null
-        } finally {
-            runCatching { retriever.release() }
-        }
-    }
 }

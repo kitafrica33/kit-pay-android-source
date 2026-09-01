@@ -56,6 +56,7 @@ import com.kit.wallet.data.notifications.EXTRA_INCOMING_CALL_AUTHORIZATION
 import com.kit.wallet.data.notifications.IncomingCallLaunchAuthorizer
 import com.kit.wallet.data.notifications.IncomingCallLaunchPurpose
 import com.kit.wallet.data.notifications.IncomingCallReplayLedger
+import com.kit.wallet.data.notifications.MobileMoneySettlementLink
 import com.kit.wallet.data.notifications.PaymentClaimAlert
 import com.kit.wallet.data.notifications.PaymentClaimLink
 import com.kit.wallet.data.notifications.PushTokenCoordinator
@@ -850,6 +851,7 @@ internal fun Intent.takeKitDeepLink(): String? {
         } == true
         val returnLink = ActiveCallReturnLink.fromDeepLink(raw)
         val claimLink = PaymentClaimLink.fromDeepLink(raw)
+        val mobileMoneySettlementLink = MobileMoneySettlementLink.fromDeepLink(raw)
         val canonicalRoute = when {
             isKycReturn -> KYC_STATUS_DEEP_LINK
             // The ongoing-call notification: return to the call the app is already in.
@@ -860,6 +862,7 @@ internal fun Intent.takeKitDeepLink(): String? {
                 conversationId = getStringExtra(PaymentClaimAlert.EXTRA_CONVERSATION_HINT),
                 groupPaymentId = getStringExtra(PaymentClaimAlert.EXTRA_GROUP_PAYMENT_HINT),
             )?.deepLinkUri()
+            mobileMoneySettlementLink != null -> mobileMoneySettlementLink.deepLinkUri()
             else -> null
         }
         if (canonicalRoute != null) {

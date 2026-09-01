@@ -1,6 +1,5 @@
 package com.kit.wallet.data.notifications
 
-import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -9,16 +8,13 @@ import android.content.Intent
 import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.net.Uri
-import android.os.Build
-import android.provider.Settings
-import android.content.pm.PackageManager
 import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
 import com.kit.wallet.IncomingCallRelayActivity
 import com.kit.wallet.MainActivity
 import com.kit.wallet.R
 import com.kit.wallet.feature.calls.KitTelecomBridge
 import com.kit.wallet.feature.calls.KitTelecomDisconnect
+import com.kit.wallet.data.repository.MobileMoneyRepository
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.time.Clock
@@ -37,6 +33,7 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
     private val telecom: KitTelecomBridge,
     private val ringDeadlines: CallRingDeadlineCoordinator,
     private val messagingSync: SecureMessagingSyncScheduler,
+    private val mobileMoney: MobileMoneyRepository,
     private val clock: Clock,
 ) : PushEnvelopeReceiver {
     override fun receive(envelope: PushEnvelope) {
@@ -78,6 +75,7 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
 
         val incomingCall = IncomingCallPayload.fromData(envelope.data)
         if (incomingCall != null) {
+            IncomingCallDiagnostics.pushReceived(context, envelope)
             // Push display fields are hints, not identity evidence. Until GET /calls/{id}
             // succeeds, both the lock-screen alert and Telecom receive generic presentation.
             showIncomingCall(
@@ -85,6 +83,14 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
                 incomingCall.copy(callerName = "Kit Pay contact"),
                 phone = null,
             )
+            return
+        }
+
+        if (MobileMoneySettlementAlert.isCandidate(envelope.data)) {
+            val settlement = MobileMoneySettlementAlert.fromData(envelope.data) ?: return
+            // The payload never writes status. It only wakes an authenticated exact-operation GET.
+            mobileMoney.reconcileSettlementHint(settlement.operationId)
+            showMobileMoneySettlement(manager, envelope, settlement)
             return
         }
 
@@ -163,6 +169,57 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
                         .setContentText("New payment activity")
                         .build(),
                 )
+                .setAutoCancel(true)
+                .setContentIntent(open)
+                .build(),
+        )
+    }
+
+    private fun showMobileMoneySettlement(
+        manager: NotificationManager,
+        envelope: PushEnvelope,
+        alert: MobileMoneySettlementAlert,
+    ) {
+        manager.createNotificationChannel(
+            NotificationChannel(
+                PAYMENTS_CHANNEL_ID,
+                "Kit Pay payments",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply { lockscreenVisibility = NotificationCompat.VISIBILITY_PRIVATE },
+        )
+        val open = PendingIntent.getActivity(
+            context,
+            alert.notificationTag.hashCode(),
+            Intent(context, MainActivity::class.java)
+                .setAction(Intent.ACTION_VIEW)
+                .setData(Uri.parse(alert.link().deepLinkUri()))
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        manager.notify(
+            alert.notificationTag,
+            PAYMENT_NOTIFICATION_ID,
+            NotificationCompat.Builder(context, PAYMENTS_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_kit_mark)
+                .setContentTitle(
+                    alert.title
+                        ?: envelope.notification?.title
+                        ?: context.getString(R.string.app_name),
+                )
+                .setContentText(
+                    alert.body
+                        ?: envelope.notification?.body
+                        ?: "Open Kit Pay to view this payment.",
+                )
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setPublicVersion(
+                    NotificationCompat.Builder(context, PAYMENTS_CHANNEL_ID)
+                        .setSmallIcon(R.drawable.ic_kit_mark)
+                        .setContentTitle(context.getString(R.string.app_name))
+                        .setContentText("New payment activity")
+                        .build(),
+                )
+                .setOnlyAlertOnce(true)
                 .setAutoCancel(true)
                 .setContentIntent(open)
                 .build(),
@@ -289,7 +346,7 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         ) ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
         manager.createNotificationChannel(
             NotificationChannel(
-                CALLS_CHANNEL_ID,
+                INCOMING_CALLS_CHANNEL_ID,
                 "Incoming Kit Pay calls",
                 NotificationManager.IMPORTANCE_HIGH,
             ).apply {
@@ -342,20 +399,10 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
             .setName(call.callerName)
             .setImportant(true)
             .build()
-        val configuredChannel = manager.getNotificationChannel(CALLS_CHANNEL_ID)
-        val postNotificationsGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
-            PackageManager.PERMISSION_GRANTED
-        val access = IncomingCallNotificationAccess(
-            postNotificationsGranted = postNotificationsGranted,
-            appNotificationsEnabled = manager.areNotificationsEnabled(),
-            channelImportance = configuredChannel?.importance ?: NotificationManager.IMPORTANCE_NONE,
-            channelHasSound = configuredChannel?.sound != null,
-            fullScreenIntentAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE ||
-                runCatching { manager.canUseFullScreenIntent() }.getOrDefault(false),
-        )
+        val access = incomingCallNotificationAccess(context)
         val alertPlan = incomingCallAlertPlan(access)
-        val notification = NotificationCompat.Builder(context, CALLS_CHANNEL_ID)
+        IncomingCallDiagnostics.alertEvaluated(access, alertPlan)
+        val notification = NotificationCompat.Builder(context, INCOMING_CALLS_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_kit_mark)
                 .setContentTitle(
                     if (call.video) "Incoming Kit Pay video call" else "Incoming Kit Pay call",
@@ -371,7 +418,7 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
                 .setTimeoutAfter(timeoutMillis)
                 .setContentIntent(openCall)
                 .setPublicVersion(
-                    NotificationCompat.Builder(context, CALLS_CHANNEL_ID)
+                    NotificationCompat.Builder(context, INCOMING_CALLS_CHANNEL_ID)
                         .setSmallIcon(R.drawable.ic_kit_mark)
                         .setContentTitle("Incoming Kit Pay call")
                         .setContentText("Open Kit Pay to answer.")
@@ -383,29 +430,18 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         if (alertPlan.showSettingsAction) {
             notification.addAction(0, "Enable call alerts", callAlertSettingsIntent(access))
         }
-        manager.notify(callTag(call.callId), CALL_NOTIFICATION_ID, notification.build())
+        val published = runCatching {
+            manager.notify(callTag(call.callId), CALL_NOTIFICATION_ID, notification.build())
+        }.isSuccess
+        IncomingCallDiagnostics.notificationPublished(alertPlan.mode, published)
         ringDeadlines.schedule(call.callId, expiresAt)
     }
 
     private fun callAlertSettingsIntent(access: IncomingCallNotificationAccess): PendingIntent {
-        val fullScreenAccessIsOnlyMissingGate =
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
-                access.postNotificationsGranted &&
-                access.appNotificationsEnabled &&
-                access.channelImportance >= NotificationManager.IMPORTANCE_HIGH &&
-                !access.fullScreenIntentAllowed
-        val settings = if (fullScreenAccessIsOnlyMissingGate) {
-            Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT)
-                .setData(Uri.parse("package:${context.packageName}"))
-        } else {
-            Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
-                .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
-                .putExtra(Settings.EXTRA_CHANNEL_ID, CALLS_CHANNEL_ID)
-        }
         return PendingIntent.getActivity(
             context,
             CALL_ALERT_SETTINGS_REQUEST_CODE,
-            settings,
+            incomingCallAlertSettingsIntent(context, access),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
     }
@@ -470,7 +506,6 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         const val PAYMENT_NOTIFICATION_ID = 4_201
         // Bumped from "kit_incoming_calls": notification-channel sound and vibration are immutable
         // once created, so a new id is required for the ringtone settings to apply on upgrades.
-        const val CALLS_CHANNEL_ID = "kit_incoming_calls_v2"
         const val CALL_NOTIFICATION_ID = 4_101
         const val CALL_ALERT_SETTINGS_REQUEST_CODE = 4_102
         const val MAX_RING_TIMEOUT_MILLIS = 60_000L

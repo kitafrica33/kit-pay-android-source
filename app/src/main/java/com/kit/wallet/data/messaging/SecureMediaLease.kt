@@ -218,10 +218,15 @@ internal class SecureMediaLease private constructor(
         private fun inferredLeaseDirectory(source: File): File {
             val parent = source.absoluteFile.parentFile
                 ?: return File(source.absoluteFile, LEASE_DIRECTORY_NAME)
-            val storeRoot = if (parent.name in SecureMediaCache.CATEGORY_DIRECTORIES) {
+            val categoryRoot = if (parent.name in SecureMediaCache.CATEGORY_DIRECTORIES) {
                 parent.parentFile ?: parent
             } else {
                 parent
+            }
+            val storeRoot = if (categoryRoot.name in SecureMediaCache.COLLECTION_DIRECTORIES) {
+                categoryRoot.parentFile ?: categoryRoot
+            } else {
+                categoryRoot
             }
             return File(storeRoot, LEASE_DIRECTORY_NAME)
         }

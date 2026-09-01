@@ -34,6 +34,8 @@ class IncomingCallSecurityContractTest {
     fun `keyguard visibility waits for an opaque frame and supports api 26`() {
         val root = repositoryRoot()
         val main = source(root, "app/src/main/java/com/kit/wallet/MainActivity.kt")
+        val relay = source(root, "app/src/main/java/com/kit/wallet/IncomingCallRelayActivity.kt")
+        val themes = source(root, "app/src/main/res/values/themes.xml")
         val navigation = source(root, "app/src/main/java/com/kit/wallet/navigation/KitApp.kt")
         val install = main
             .substringAfter("private fun installAuthorizedIncomingCall(")
@@ -47,6 +49,28 @@ class IncomingCallSecurityContractTest {
         assertTrue(main.contains("Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1"))
         assertTrue(main.contains("FLAG_SHOW_WHEN_LOCKED"))
         assertTrue(main.contains("FLAG_TURN_SCREEN_ON"))
+        val relayTheme = themes
+            .substringAfter("name=\"Theme.KitWallet.CallRelay\"")
+            .substringBefore("</style>")
+        assertFalse(relayTheme.contains("Theme.NoDisplay"))
+        assertTrue(relayTheme.contains("@color/kit_navy"))
+        assertTrue(relayTheme.contains("android:windowIsTranslucent\">false"))
+        val relayCreate = relay
+            .substringAfter("override fun onCreate")
+            .substringBefore("companion object")
+        assertTrue(relayCreate.indexOf("if (token == null)") >= 0)
+        assertTrue(
+            relayCreate.indexOf("if (token == null)") <
+                relayCreate.indexOf("showAuthorizedCallOverKeyguard()"),
+        )
+        assertTrue(
+            relayCreate.indexOf("showAuthorizedCallOverKeyguard()") <
+                relayCreate.indexOf("startActivity("),
+        )
+        assertTrue(relay.contains("setShowWhenLocked(true)"))
+        assertTrue(relay.contains("setTurnScreenOn(true)"))
+        assertTrue(relay.contains("FLAG_SHOW_WHEN_LOCKED"))
+        assertTrue(relay.contains("FLAG_TURN_SCREEN_ON"))
         val incomingRoute = navigation
             .substringAfter("route = Dest.INCOMING_CALL")
             .substringBefore("// --- Settings ---")
@@ -91,6 +115,34 @@ class IncomingCallSecurityContractTest {
             .substringAfter("private fun closeRingWindow(callId: String?)")
             .substringBefore("\n}\n\nprivate const val OUTGOING_CALL_LAUNCH_CLAIMED")
         assertTrue(ringWindow.contains("ringDeadlines.retire(canonicalIncomingId)"))
+    }
+
+    @Test
+    fun `telecom answer stays pre active until authenticated media connects`() {
+        val root = repositoryRoot()
+        val telecom = source(
+            root,
+            "app/src/main/java/com/kit/wallet/feature/calls/KitTelecomBridge.kt",
+        )
+        val onAnswer = telecom
+            .substringAfter("override fun onAnswer(videoState: Int)")
+            .substringBefore("override fun onReject()")
+        val systemAnswered = telecom
+            .substringAfter("internal fun systemAnswered")
+            .substringBefore("internal fun systemDeclined")
+        val activeCall = source(
+            root,
+            "app/src/main/java/com/kit/wallet/feature/calls/ActiveCallViewModel.kt",
+        )
+        val connected = activeCall
+            .substringAfter("private fun markConnected()")
+            .substringBefore("private fun publishPresence()")
+
+        assertFalse(onAnswer.contains("setActive()"))
+        assertTrue(onAnswer.contains("bridge.systemAnswered"))
+        assertTrue(systemAnswered.contains("TelecomCallState.ANSWERING"))
+        assertTrue(telecom.contains("TelecomCallState.ANSWERING -> setInitializing()"))
+        assertTrue(connected.contains("telecom::markActive"))
     }
 
     @Test

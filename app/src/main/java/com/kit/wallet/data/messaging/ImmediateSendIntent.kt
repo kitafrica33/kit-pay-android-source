@@ -47,17 +47,29 @@ internal enum class ImmediateSendKind {
  */
 internal data class ImmediateSendMediaItem(
     val attachmentId: String,
+    /** Cross-platform MIME of the optimized plaintext that is encrypted for delivery. */
     val mediaType: String,
     val plaintextBytes: Int,
     val ciphertextBytes: Long,
     val keyBase64: String,
     val ciphertextSha256Hex: String,
     val storageKey: String? = null,
+    /** MIME and size of the independent device-local original retained for sender playback. */
+    val originalMediaType: String? = null,
+    val originalPlaintextBytes: Int = 0,
+    /** Persisted so a process restart can reproduce the same upload representation. */
+    val processingPlan: SecureMediaProcessingPlan = SecureMediaProcessingPlan.PASSTHROUGH,
+    /** Known sender-local audio/video duration; presentation metadata, not wire authority. */
+    val durationMillis: Long? = null,
 ) {
     /** True while this item names only the retained device-local plaintext copy. */
     val isPreparing: Boolean
         get() = ciphertextBytes == 0L && keyBase64.isEmpty() &&
             ciphertextSha256Hex.isEmpty() && storageKey == null
+
+    val localMediaType: String get() = originalMediaType ?: mediaType
+    val localPlaintextBytes: Int
+        get() = originalPlaintextBytes.takeIf { it > 0 } ?: plaintextBytes
 
     init {
         require(ImmediateSendIntent.CANONICAL_UUID.matches(attachmentId)) {
@@ -66,8 +78,29 @@ internal data class ImmediateSendMediaItem(
         require(KitMediaMessage.normalizeMediaType(mediaType) == mediaType) {
             "Invalid queued album media type"
         }
-        require(plaintextBytes in 1..MAX_IMAGE_PLAINTEXT_BYTES) {
+        require(normalizeLocalMediaType(localMediaType) == localMediaType) {
+            "Invalid queued album original media type"
+        }
+        require(originalPlaintextBytes in 0..MAX_LOCAL_MEDIA_ORIGINAL_BYTES) {
+            "Invalid queued album original size"
+        }
+        require(processingPlan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4) {
+            "Queued albums do not yet carry per-video edit plans"
+        }
+        require(
+            processingPlan != SecureMediaProcessingPlan.CHAT_IMAGE_JPEG ||
+                mediaType == "image/jpeg" && localMediaType.startsWith("image/"),
+        ) { "Invalid queued album image processing plan" }
+        require(
+            durationMillis == null ||
+                durationMillis in 1..MAX_LOCAL_MEDIA_DURATION_MILLIS &&
+                (localMediaType.startsWith("audio/") || localMediaType.startsWith("video/")),
+        ) { "Invalid queued album media duration" }
+        require(plaintextBytes in 0..MAX_IMAGE_PLAINTEXT_BYTES) {
             "Invalid queued album item size"
+        }
+        require(plaintextBytes > 0 || isPreparing) {
+            "Only an unfinished local import can have an unknown album item size"
         }
         if (!isPreparing) {
             // Cipher layout is IV(16) + CBC/PKCS7 + HMAC(32); a pair that disagrees describes a
@@ -115,6 +148,13 @@ internal enum class ImmediateSendState {
      * committed to the media spool. Appended to preserve every previously persisted ordinal.
      */
     PREPARING,
+
+    /**
+     * The durable bubble exists and the selected original is being atomically adopted into Sent
+     * Media. Appended for persisted-ordinal compatibility. A restart either finds the complete
+     * cache entry and advances it, or leaves a visible terminal failure; it never loses the row.
+     */
+    IMPORTING,
 }
 
 /** A retained plaintext preparation vanished before the background cipher could adopt it. */
@@ -142,6 +182,14 @@ internal data class ImmediateSendIntent(
     val mediaCiphertextBytes: Int = 0,
     val mediaKeyBase64: String? = null,
     val mediaSha256Base64: String? = null,
+    /** Device-local original facts, separate from the optimized wire plaintext facts above. */
+    val mediaOriginalType: String? = null,
+    val mediaOriginalPlaintextBytes: Int = 0,
+    val mediaProcessingPlan: SecureMediaProcessingPlan = SecureMediaProcessingPlan.PASSTHROUGH,
+    /** Restart-safe trim/mute recipe for an asynchronously prepared video upload. */
+    val mediaVideoEditPlan: SecureMediaVideoEditPlan? = null,
+    /** Known sender-local audio/video duration, independent of the remote descriptor. */
+    val mediaDurationMillis: Long? = null,
     /**
      * Canonical media descriptor after upload — KITMEDIA1 for [ImmediateSendKind.MEDIA],
      * KITMEDIA2 for [ImmediateSendKind.MEDIA_V2] — persisted before Signal encryption.
@@ -213,7 +261,42 @@ internal data class ImmediateSendIntent(
                 requireNotNull(KitMediaMessage.normalizeMediaType(mediaType.orEmpty())) {
                     "Invalid queued media type"
                 }
-                require(mediaPlaintextBytes in 1..MAX_IMAGE_PLAINTEXT_BYTES)
+                require(normalizeLocalMediaType(localMediaType) == localMediaType) {
+                    "Invalid queued original media type"
+                }
+                require(mediaOriginalPlaintextBytes in 0..MAX_LOCAL_MEDIA_ORIGINAL_BYTES) {
+                    "Invalid queued original media size"
+                }
+                require(
+                    mediaProcessingPlan != SecureMediaProcessingPlan.CHAT_IMAGE_JPEG ||
+                        mediaType == "image/jpeg" && localMediaType.startsWith("image/"),
+                ) { "Invalid queued image processing plan" }
+                require(
+                    (mediaProcessingPlan == SecureMediaProcessingPlan.CHAT_VIDEO_MP4) ==
+                        (mediaVideoEditPlan != null),
+                ) { "A queued video processing plan needs exact edit parameters" }
+                require(
+                    mediaProcessingPlan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4 ||
+                        mediaType == "video/mp4" && localMediaType.startsWith("video/"),
+                ) { "Invalid queued video processing plan" }
+                require(
+                    mediaDurationMillis == null ||
+                        mediaDurationMillis in 1..MAX_LOCAL_MEDIA_DURATION_MILLIS &&
+                        (
+                            localMediaType.startsWith("audio/") ||
+                                localMediaType.startsWith("video/")
+                            ),
+                ) { "Invalid queued media duration" }
+                require(mediaPlaintextBytes in 0..MAX_IMAGE_PLAINTEXT_BYTES)
+                require(
+                    mediaPlaintextBytes > 0 ||
+                        state == ImmediateSendState.IMPORTING ||
+                        state == ImmediateSendState.PREPARING &&
+                        mediaProcessingPlan != SecureMediaProcessingPlan.PASSTHROUGH ||
+                        state == ImmediateSendState.FAILED,
+                ) {
+                    "Only an unfinished or failed local import can have an unknown media size"
+                }
                 require(
                     caption == null ||
                         caption.toByteArray(StandardCharsets.UTF_8).size <= MAX_CAPTION_UTF8_BYTES,
@@ -221,11 +304,18 @@ internal data class ImmediateSendIntent(
                 val unencrypted = mediaCiphertextBytes == 0 && mediaKeyBase64 == null &&
                     mediaSha256Base64 == null && preparedMediaDescriptor == null
                 if (unencrypted) {
-                    require(state == ImmediateSendState.PREPARING || state == ImmediateSendState.FAILED) {
-                        "Unencrypted queued media must still be preparing or have failed"
+                    require(
+                        state == ImmediateSendState.IMPORTING ||
+                            state == ImmediateSendState.PREPARING ||
+                            state == ImmediateSendState.FAILED,
+                    ) {
+                        "Unencrypted queued media must still be importing, preparing or have failed"
                     }
                 } else {
-                    require(state != ImmediateSendState.PREPARING) {
+                    require(
+                        state != ImmediateSendState.IMPORTING &&
+                            state != ImmediateSendState.PREPARING,
+                    ) {
                         "Preparing queued media cannot carry ciphertext metadata"
                     }
                     require(mediaCiphertextBytes > 0)
@@ -249,6 +339,12 @@ internal data class ImmediateSendIntent(
                     mediaType == null && mediaPlaintextBytes == 0 && mediaCiphertextBytes == 0 &&
                         mediaKeyBase64 == null && mediaSha256Base64 == null,
                 ) { "A queued media album carries per-item fields only" }
+                require(mediaVideoEditPlan == null) {
+                    "A queued media album cannot carry a single-item video edit plan"
+                }
+                require(mediaDurationMillis == null) {
+                    "A queued media album carries per-item duration only"
+                }
                 require(
                     mediaItems.size in
                         KitMediaMessageV2.MIN_ATTACHMENTS..KitMediaMessageV2.MAX_ATTACHMENTS,
@@ -262,18 +358,37 @@ internal data class ImmediateSendIntent(
                     "Queued album preparation cannot be partial"
                 }
                 if (unencrypted) {
-                    require(state == ImmediateSendState.PREPARING || state == ImmediateSendState.FAILED) {
-                        "Unencrypted queued album must still be preparing or have failed"
+                    require(
+                        state == ImmediateSendState.IMPORTING ||
+                            state == ImmediateSendState.PREPARING ||
+                            state == ImmediateSendState.FAILED,
+                    ) {
+                        "Unencrypted queued album must still be importing, preparing or have failed"
                     }
                     require(preparedMediaDescriptor == null)
                     require(
+                        state != ImmediateSendState.PREPARING ||
+                            mediaItems.all {
+                                it.plaintextBytes > 0 ||
+                                    it.processingPlan != SecureMediaProcessingPlan.PASSTHROUGH &&
+                                    it.localPlaintextBytes > 0
+                            },
+                    ) { "A prepared local album needs exact non-empty item sizes" }
+                    require(
                         mediaItems.sumOf {
-                            it.plaintextBytes.toLong() + 64L -
-                                (it.plaintextBytes.toLong() % 16L)
+                            if (it.plaintextBytes == 0) {
+                                0L
+                            } else {
+                                it.plaintextBytes.toLong() + 64L -
+                                    (it.plaintextBytes.toLong() % 16L)
+                            }
                         } <= KitMediaMessageV2.MAX_AGGREGATE_CIPHERTEXT_BYTES,
                     ) { "Queued media album is too large" }
                 } else {
-                    require(state != ImmediateSendState.PREPARING) {
+                    require(
+                        state != ImmediateSendState.IMPORTING &&
+                            state != ImmediateSendState.PREPARING,
+                    ) {
                         "Preparing queued album cannot carry ciphertext metadata"
                     }
                     val storageKeys = mediaItems.mapNotNull(ImmediateSendMediaItem::storageKey)
@@ -309,8 +424,11 @@ internal data class ImmediateSendIntent(
                 }
             }
         }
-        require(state != ImmediateSendState.PREPARING || kind in MEDIA_KINDS) {
-            "Only queued media can be preparing"
+        require(
+            state !in setOf(ImmediateSendState.IMPORTING, ImmediateSendState.PREPARING) ||
+                kind in MEDIA_KINDS,
+        ) {
+            "Only queued media can be importing or preparing"
         }
     }
 
@@ -327,6 +445,10 @@ internal data class ImmediateSendIntent(
             ImmediateSendKind.MEDIA_V2,
             -> preparedMediaDescriptor
         }
+
+    val localMediaType: String get() = mediaOriginalType ?: checkNotNull(mediaType)
+    val localPlaintextBytes: Int
+        get() = mediaOriginalPlaintextBytes.takeIf { it > 0 } ?: mediaPlaintextBytes
 
     fun mediaKeyMaterial(): ByteArray = checkNotNull(decodeBase64(mediaKeyBase64))
 
@@ -378,7 +500,9 @@ internal data class ImmediateSendIntent(
             mediaType == null && caption == null && mediaPlaintextBytes == 0 &&
                 mediaCiphertextBytes == 0 && mediaKeyBase64 == null &&
                 mediaSha256Base64 == null && preparedMediaDescriptor == null &&
-                mediaItems.isEmpty(),
+                mediaOriginalType == null && mediaOriginalPlaintextBytes == 0 &&
+                mediaProcessingPlan == SecureMediaProcessingPlan.PASSTHROUGH &&
+                mediaVideoEditPlan == null && mediaDurationMillis == null && mediaItems.isEmpty(),
         ) { "A queued text event cannot carry media fields" }
     }
 
@@ -422,7 +546,7 @@ private fun hasCanonicalBase64Size(value: String, expectedBytes: Int): Boolean {
 
 /** Strict, bounded binary codec; future versions fail closed rather than being half-understood. */
 internal object ImmediateSendIntentCodec {
-    private const val VERSION = 3
+    private const val VERSION = 6
 
     /**
      * Version 1 is still read, and only read.
@@ -463,7 +587,16 @@ internal object ImmediateSendIntentCodec {
                 data.writeString(item.keyBase64)
                 data.writeString(item.ciphertextSha256Hex)
                 data.writeNullableString(item.storageKey)
+                data.writeNullableString(item.originalMediaType)
+                data.writeInt(item.originalPlaintextBytes)
+                data.writeByte(item.processingPlan.persistenceCode)
+                data.writeNullableLong(item.durationMillis)
             }
+            data.writeNullableString(intent.mediaOriginalType)
+            data.writeInt(intent.mediaOriginalPlaintextBytes)
+            data.writeByte(intent.mediaProcessingPlan.persistenceCode)
+            data.writeNullableVideoEditPlan(intent.mediaVideoEditPlan)
+            data.writeNullableLong(intent.mediaDurationMillis)
         }
         return output.toByteArray().also {
             require(it.size <= MAX_RECORD_BYTES) { "Immediate-send record is too large" }
@@ -478,22 +611,53 @@ internal object ImmediateSendIntentCodec {
                 if (version !in OLDEST_READABLE_VERSION..VERSION) return null
                 val kind = ImmediateSendKind.entries.getOrNull(data.readUnsignedByte()) ?: return null
                 val state = ImmediateSendState.entries.getOrNull(data.readUnsignedByte()) ?: return null
+                val id = data.readString()
+                val conversationId = data.readString()
+                val createdAtEpochMillis = data.readLong()
+                val text = data.readString()
+                val mediaType = data.readNullableString()
+                val caption = data.readNullableString()
+                val mediaPlaintextBytes = data.readInt()
+                val mediaCiphertextBytes = data.readInt()
+                val mediaKeyBase64 = data.readNullableString()
+                val mediaSha256Base64 = data.readNullableString()
+                val preparedMediaDescriptor = data.readNullableString()
+                val replyToMessageId = if (version >= 2) data.readNullableString() else null
+                val mediaItems = if (version >= 3) data.readMediaItems(version) else emptyList()
                 val decoded = ImmediateSendIntent(
-                    id = data.readString(),
-                    conversationId = data.readString(),
+                    id = id,
+                    conversationId = conversationId,
                     kind = kind,
-                    createdAtEpochMillis = data.readLong(),
+                    createdAtEpochMillis = createdAtEpochMillis,
                     state = state,
-                    text = data.readString(),
-                    mediaType = data.readNullableString(),
-                    caption = data.readNullableString(),
-                    mediaPlaintextBytes = data.readInt(),
-                    mediaCiphertextBytes = data.readInt(),
-                    mediaKeyBase64 = data.readNullableString(),
-                    mediaSha256Base64 = data.readNullableString(),
-                    preparedMediaDescriptor = data.readNullableString(),
-                    replyToMessageId = if (version >= 2) data.readNullableString() else null,
-                    mediaItems = if (version >= 3) data.readMediaItems() else emptyList(),
+                    text = text,
+                    mediaType = mediaType,
+                    caption = caption,
+                    mediaPlaintextBytes = mediaPlaintextBytes,
+                    mediaCiphertextBytes = mediaCiphertextBytes,
+                    mediaKeyBase64 = mediaKeyBase64,
+                    mediaSha256Base64 = mediaSha256Base64,
+                    preparedMediaDescriptor = preparedMediaDescriptor,
+                    replyToMessageId = replyToMessageId,
+                    mediaItems = mediaItems,
+                    mediaOriginalType = if (version >= 4) data.readNullableString() else null,
+                    mediaOriginalPlaintextBytes = if (version >= 4) {
+                        data.readInt()
+                    } else {
+                        mediaPlaintextBytes
+                    },
+                    mediaProcessingPlan = if (version >= 4) {
+                        SecureMediaProcessingPlan.fromPersistenceCode(data.readUnsignedByte())
+                            ?: return null
+                    } else {
+                        SecureMediaProcessingPlan.PASSTHROUGH
+                    },
+                    mediaVideoEditPlan = if (version >= 5) {
+                        data.readNullableVideoEditPlan()
+                    } else {
+                        null
+                    },
+                    mediaDurationMillis = if (version >= 6) data.readNullableLong() else null,
                 )
                 if (data.available() != 0) return null
                 decoded
@@ -501,20 +665,36 @@ internal object ImmediateSendIntentCodec {
         }.getOrNull()
     }
 
-    private fun DataInputStream.readMediaItems(): List<ImmediateSendMediaItem> {
+    private fun DataInputStream.readMediaItems(version: Int): List<ImmediateSendMediaItem> {
         val count = readInt()
         require(count in 0..KitMediaMessageV2.MAX_ATTACHMENTS) {
             "Immediate-send album item count is out of range"
         }
         return List(count) {
+            val attachmentId = readString()
+            val mediaType = readString()
+            val plaintextBytes = readInt()
+            val ciphertextBytes = readLong()
+            val keyBase64 = readString()
+            val ciphertextSha256Hex = readString()
+            val storageKey = readNullableString()
             ImmediateSendMediaItem(
-                attachmentId = readString(),
-                mediaType = readString(),
-                plaintextBytes = readInt(),
-                ciphertextBytes = readLong(),
-                keyBase64 = readString(),
-                ciphertextSha256Hex = readString(),
-                storageKey = readNullableString(),
+                attachmentId = attachmentId,
+                mediaType = mediaType,
+                plaintextBytes = plaintextBytes,
+                ciphertextBytes = ciphertextBytes,
+                keyBase64 = keyBase64,
+                ciphertextSha256Hex = ciphertextSha256Hex,
+                storageKey = storageKey,
+                originalMediaType = if (version >= 4) readNullableString() else null,
+                originalPlaintextBytes = if (version >= 4) readInt() else plaintextBytes,
+                processingPlan = if (version >= 4) {
+                    SecureMediaProcessingPlan.fromPersistenceCode(readUnsignedByte())
+                        ?: error("Invalid queued media processing plan")
+                } else {
+                    SecureMediaProcessingPlan.PASSTHROUGH
+                },
+                durationMillis = if (version >= 6) readNullableLong() else null,
             )
         }
     }
@@ -530,6 +710,20 @@ internal object ImmediateSendIntentCodec {
     private fun DataOutputStream.writeNullableString(value: String?) {
         writeBoolean(value != null)
         if (value != null) writeString(value)
+    }
+
+    private fun DataOutputStream.writeNullableVideoEditPlan(value: SecureMediaVideoEditPlan?) {
+        writeBoolean(value != null)
+        if (value != null) {
+            writeLong(value.startMicros)
+            writeLong(value.endMicros)
+            writeBoolean(value.keepAudio)
+        }
+    }
+
+    private fun DataOutputStream.writeNullableLong(value: Long?) {
+        writeBoolean(value != null)
+        if (value != null) writeLong(value)
     }
 
     private fun DataInputStream.readString(): String {
@@ -550,4 +744,18 @@ internal object ImmediateSendIntentCodec {
 
     private fun DataInputStream.readNullableString(): String? =
         if (readBoolean()) readString() else null
+
+    private fun DataInputStream.readNullableVideoEditPlan(): SecureMediaVideoEditPlan? =
+        if (readBoolean()) {
+            SecureMediaVideoEditPlan(
+                startMicros = readLong(),
+                endMicros = readLong(),
+                keepAudio = readBoolean(),
+            )
+        } else {
+            null
+        }
+
+    private fun DataInputStream.readNullableLong(): Long? =
+        if (readBoolean()) readLong() else null
 }

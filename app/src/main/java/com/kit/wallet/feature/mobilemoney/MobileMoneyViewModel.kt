@@ -34,6 +34,7 @@ class MobileMoneyViewModel @Inject constructor(
     beneficiaryContacts: BeneficiaryContactDirectory,
     profilePhotos: ProfilePhotoDirectory,
 ) : ViewModel() {
+    private var settlementScreenActive = false
     val networks = mobileMoney.networks
 
     /**
@@ -95,6 +96,18 @@ class MobileMoneyViewModel @Inject constructor(
 
     fun refresh() {
         runCommand { mobileMoney.refresh() }
+    }
+
+    fun setSettlementScreenActive(active: Boolean) {
+        if (settlementScreenActive == active) return
+        settlementScreenActive = active
+        mobileMoney.setSettlementScreenActive(active)
+    }
+
+    override fun onCleared() {
+        if (settlementScreenActive) mobileMoney.setSettlementScreenActive(false)
+        settlementScreenActive = false
+        super.onCleared()
     }
 
     fun addAccount(

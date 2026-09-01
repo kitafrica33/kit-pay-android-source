@@ -10,7 +10,8 @@ import java.security.MessageDigest
 // through a fixed buffer, uploads stream off the spool file, downloads stream into a cache file,
 // and the UI holds decrypted attachments as files rather than arrays. Nothing on either path is
 // obliged to fit an attachment in heap, so the cap is a product decision rather than a heap-size
-// one. MessagingRichMediaCapability still clamps to min(compiled, advertised) at send time.
+// one. Local admission uses this compiled cap without networking; background dispatch still clamps
+// to the service's coherent advertisement before transmission.
 internal const val MAX_IMAGE_PLAINTEXT_BYTES = 200 * 1024 * 1024
 internal const val MAX_IMAGE_CIPHERTEXT_BYTES = 200L * 1024L * 1024L + 64L
 

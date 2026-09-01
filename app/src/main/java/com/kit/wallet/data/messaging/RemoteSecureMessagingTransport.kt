@@ -35,6 +35,7 @@ import com.kit.wallet.data.remote.MessagingKeyStatusDto
 import com.kit.wallet.data.remote.MessagingMessageInfoDto
 import com.kit.wallet.data.remote.MessagingReadReceiptDto
 import com.kit.wallet.data.remote.StoreMessagingHistoryEnvelopeRequest
+import com.kit.wallet.data.remote.StartResumableMessagingAttachmentUploadRequest
 import com.kit.wallet.data.remote.SECURE_MESSAGING_ROSTER_REVISION
 import com.kit.wallet.data.remote.SECURE_MESSAGING_PROTOCOL_VERSION
 import com.kit.wallet.data.remote.SecureMessagingWireApi
@@ -54,6 +55,7 @@ import com.kit.wallet.data.remote.ValidatedMessagingSyncPage
 import com.kit.wallet.data.remote.ValidatedOutboundEncryptedMessage
 import com.kit.wallet.data.remote.normalizeMessagingGroupTitle
 import java.security.MessageDigest
+import java.io.RandomAccessFile
 import java.time.Instant
 import java.util.Collections
 import java.util.WeakHashMap
@@ -124,6 +126,11 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
          * v2 descriptor to an incompatible conversation.
          */
         val mediaMessageV2Enabled: Boolean = false,
+        /**
+         * Additive transport only. False keeps the proven one-shot endpoint; true means this
+         * exact activation saw the complete `kit-attachment-upload-v1` capability contract.
+         */
+        private val resumableAttachmentUploadsEnabled: Boolean = false,
     ) {
         /**
          * Opaque authority for one exact, server-validated conversation.
@@ -1580,8 +1587,13 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
          * Uploads opaque attachment ciphertext and returns its server identity. The response is
          * checked against the exact bytes sent so a corrupted store can never be referenced.
          */
-        suspend fun uploadAttachment(mediaType: String, ciphertext: ByteArray): UploadedAttachment =
+        suspend fun uploadAttachment(
+            clientMediaId: String,
+            mediaType: String,
+            ciphertext: ByteArray,
+        ): UploadedAttachment =
             uploadAttachment(
+                clientMediaId = clientMediaId,
                 mediaType = mediaType,
                 byteSize = ciphertext.size.toLong(),
                 expectedSha256 = sha256Hex(ciphertext),
@@ -1592,28 +1604,284 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
          * File-backed variant: OkHttp streams the blob off disk a buffer at a time, so a 200 MB
          * attachment costs the upload nothing in heap.
          */
-        suspend fun uploadAttachment(mediaType: String, ciphertext: File): UploadedAttachment {
+        suspend fun uploadAttachment(
+            clientMediaId: String,
+            mediaType: String,
+            ciphertext: File,
+        ): UploadedAttachment {
             val byteSize = ciphertext.length()
             check(ciphertext.isFile && byteSize > 0) { "Attachment ciphertext is unavailable" }
             val digest = ciphertext.streamingSha256()
             return try {
                 uploadAttachment(
+                    clientMediaId = clientMediaId,
                     mediaType = mediaType,
-                    byteSize = byteSize,
+                    ciphertext = ciphertext,
+                    expectedByteSize = byteSize,
                     expectedSha256 = digest.toHexString(),
-                    body = ciphertext.asRequestBody("application/octet-stream".toMediaType()),
                 )
             } finally {
                 digest.fill(0)
             }
         }
 
+        /**
+         * Uploads a spool file whose exact size and digest were already authenticated by the
+         * hardware-encrypted outbox record. The spool verifies those facts before returning the
+         * file; accepting them here avoids hashing a 200 MB blob a second time on every retry.
+         */
+        suspend fun uploadAttachment(
+            clientMediaId: String,
+            mediaType: String,
+            ciphertext: File,
+            expectedByteSize: Long,
+            expectedSha256: String,
+        ): UploadedAttachment {
+            check(ciphertext.isFile && ciphertext.length() == expectedByteSize) {
+                "Attachment ciphertext is unavailable"
+            }
+            require(SHA256_HEX.matches(expectedSha256)) { "Invalid attachment ciphertext digest" }
+            return if (resumableAttachmentUploadsEnabled) {
+                uploadAttachmentResumably(
+                    clientMediaId = clientMediaId,
+                    mediaType = mediaType,
+                    ciphertext = ciphertext,
+                    byteSize = expectedByteSize,
+                    expectedSha256 = expectedSha256,
+                )
+            } else {
+                uploadAttachment(
+                    clientMediaId = clientMediaId,
+                    mediaType = mediaType,
+                    byteSize = expectedByteSize,
+                    expectedSha256 = expectedSha256,
+                    body = ciphertext.asRequestBody("application/octet-stream".toMediaType()),
+                )
+            }
+        }
+
+        /**
+         * Replays the immutable resumable declaration immediately before E2EE message sealing.
+         *
+         * A completed, still-unclaimed object has a finite server lease. An app can therefore be
+         * killed after persisting its storage key and return after that lease elapsed. Sending the
+         * old key first would commit immutable Signal ciphertext around a reference the server can
+         * no longer claim. When the exact resumable contract is active, replaying start/complete
+         * renews the object or reconstructs it from the byte-identical local spool after cleanup.
+         * The returned key is allowed to differ only because a fully swept object may be recreated;
+         * callers rebuild the descriptor before encryption in that case.
+         *
+         * `null` means this activation did not negotiate the additive resumable contract. The
+         * compatible whole-file endpoint remains unchanged and no surprise 200 MiB re-upload is
+         * introduced merely to preflight an older server.
+         */
+        suspend fun renewAttachmentIfResumable(
+            clientMediaId: String,
+            mediaType: String,
+            ciphertext: File,
+            expectedByteSize: Long,
+            expectedSha256: String,
+        ): UploadedAttachment? {
+            if (!resumableAttachmentUploadsEnabled) return null
+            check(ciphertext.isFile && ciphertext.length() == expectedByteSize) {
+                "Attachment ciphertext is unavailable"
+            }
+            require(SHA256_HEX.matches(expectedSha256)) {
+                "Invalid attachment ciphertext digest"
+            }
+            return uploadAttachmentResumably(
+                clientMediaId = clientMediaId,
+                mediaType = mediaType,
+                ciphertext = ciphertext,
+                byteSize = expectedByteSize,
+                expectedSha256 = expectedSha256,
+            )
+        }
+
+        /**
+         * Recovers exclusively from the immutable media UUID and the server-authoritative offset.
+         * No local mutable offset is needed: after process death the ciphertext spool is verified,
+         * start is replayed idempotently, and upload continues from `next_offset`.
+         */
+        private suspend fun uploadAttachmentResumably(
+            clientMediaId: String,
+            mediaType: String,
+            ciphertext: File,
+            byteSize: Long,
+            expectedSha256: String,
+        ): UploadedAttachment {
+            require(ImmediateSendIntent.CANONICAL_UUID.matches(clientMediaId)) {
+                "Invalid client media ID"
+            }
+            require(mediaType.isNotBlank() && mediaType.length <= 160) { "Invalid media type" }
+            require(byteSize > 0L) { "Attachment ciphertext is empty" }
+            suspend fun startOrRenew() = owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                startResumableMessagingAttachmentUpload(
+                    StartResumableMessagingAttachmentUploadRequest(
+                        clientMediaId = clientMediaId,
+                        mediaType = mediaType,
+                        byteSize = byteSize,
+                        ciphertextSha256 = expectedSha256,
+                    ),
+                )
+            }
+            var upload = startOrRenew()
+            var offset = requireValidResumableUpload(
+                upload = upload,
+                clientMediaId = clientMediaId,
+                mediaType = mediaType,
+                byteSize = byteSize,
+                expectedSha256 = expectedSha256,
+            )
+            val storageKey = checkNotNull(upload.storageKey)
+            // POST is idempotent under client_media_id and returns the authoritative current
+            // offset for both a fresh upload and a replay after process/network loss. A second
+            // status request here added one serialized RTT to every attachment without proving
+            // anything new. If the session expires after this snapshot, PATCH fails and the next
+            // worker replay renews it through the same exact POST declaration.
+
+            RandomAccessFile(ciphertext, "r").use { source ->
+                while (offset < byteSize) {
+                    val chunkSize = minOf(
+                        MessagingResumableAttachmentCapability.MAX_CHUNK_BYTES,
+                        byteSize - offset,
+                    ).toInt()
+                    val chunk = ByteArray(chunkSize)
+                    try {
+                        source.seek(offset)
+                        source.readFully(chunk)
+                        val chunkDigest = sha256Hex(chunk)
+                        val result = owner.fencedSessionCall(
+                            this,
+                            issuanceIdentity,
+                            lifecycle,
+                            fence,
+                            readyRequired = true,
+                        ) {
+                            appendResumableMessagingAttachmentUpload(
+                                clientMediaId = clientMediaId,
+                                uploadOffset = offset,
+                                chunkSha256 = chunkDigest,
+                                ciphertextChunk = chunk.toRequestBody(
+                                    RESUMABLE_CHUNK_MEDIA_TYPE,
+                                ),
+                            )
+                        }
+                        val returnedChunk = checkNotNull(result.chunk) {
+                            "The attachment store omitted the stored ciphertext range"
+                        }
+                        check(
+                            returnedChunk.byteOffset == offset &&
+                                returnedChunk.byteSize == chunkSize.toLong() &&
+                                returnedChunk.ciphertextSha256 == chunkDigest &&
+                                returnedChunk.replayed != null
+                        ) { "The attachment store returned different ciphertext range facts" }
+                        upload = checkNotNull(result.upload) {
+                            "The attachment store omitted resumable upload state"
+                        }
+                        val next = requireValidResumableUpload(
+                            upload = upload,
+                            clientMediaId = clientMediaId,
+                            mediaType = mediaType,
+                            byteSize = byteSize,
+                            expectedSha256 = expectedSha256,
+                            expectedStorageKey = storageKey,
+                        )
+                        check(next == offset + chunkSize) {
+                            "The attachment store did not advance to the next ciphertext byte"
+                        }
+                        offset = next
+                    } finally {
+                        chunk.fill(0)
+                    }
+                }
+            }
+
+            upload = owner.fencedSessionCall(
+                this,
+                issuanceIdentity,
+                lifecycle,
+                fence,
+                readyRequired = true,
+            ) {
+                completeResumableMessagingAttachmentUpload(clientMediaId)
+            }
+            val completedOffset = requireValidResumableUpload(
+                upload = upload,
+                clientMediaId = clientMediaId,
+                mediaType = mediaType,
+                byteSize = byteSize,
+                expectedSha256 = expectedSha256,
+                expectedStorageKey = storageKey,
+            )
+            check(completedOffset == byteSize && upload.complete == true) {
+                "The attachment store did not finalize the complete ciphertext"
+            }
+            return UploadedAttachment(
+                storageKey = checkNotNull(upload.storageKey),
+                byteSize = byteSize,
+                ciphertextSha256 = expectedSha256,
+            )
+        }
+
+        private fun requireValidResumableUpload(
+            upload: com.kit.wallet.data.remote.ResumableMessagingAttachmentUploadDto,
+            clientMediaId: String,
+            mediaType: String,
+            byteSize: Long,
+            expectedSha256: String,
+            expectedStorageKey: String? = null,
+        ): Long {
+            check(upload.clientMediaId == clientMediaId) {
+                "The attachment store returned another client media ID"
+            }
+            check(upload.storageKey?.let(ImmediateSendIntent.CANONICAL_UUID::matches) == true) {
+                "The attachment store returned an invalid storage key"
+            }
+            check(expectedStorageKey == null || upload.storageKey == expectedStorageKey) {
+                "The attachment store changed the resumable storage key"
+            }
+            check(
+                upload.mediaType == mediaType &&
+                    upload.byteSize == byteSize &&
+                    upload.ciphertextSha256 == expectedSha256
+            ) { "The attachment store returned different ciphertext facts" }
+            check(upload.maxChunkBytes == MessagingResumableAttachmentCapability.MAX_CHUNK_BYTES) {
+                "The attachment store changed the negotiated chunk bound"
+            }
+            check(upload.state in RESUMABLE_ACTIVE_UPLOAD_STATES) {
+                "The attachment store returned an invalid upload state"
+            }
+            val next = upload.nextOffset
+            check(next != null && next in 0L..byteSize) {
+                "The attachment store returned an invalid upload offset"
+            }
+            check(upload.complete != null) { "The attachment store omitted completion state" }
+            check(!upload.complete || next == byteSize) {
+                "The attachment store marked incomplete ciphertext complete"
+            }
+            check(
+                if (upload.state in RESUMABLE_COMPLETE_UPLOAD_STATES) upload.complete else true,
+            ) { "The attachment store returned unfinished final upload state" }
+            return next
+        }
+
         private suspend fun uploadAttachment(
+            clientMediaId: String,
             mediaType: String,
             byteSize: Long,
             expectedSha256: String,
             body: RequestBody,
         ): UploadedAttachment {
+            require(ImmediateSendIntent.CANONICAL_UUID.matches(clientMediaId)) {
+                "Invalid client media ID"
+            }
             require(mediaType.isNotBlank() && mediaType.length <= 160) { "Invalid media type" }
             require(byteSize > 0) { "Attachment ciphertext is empty" }
             val response = owner.fencedSessionCall(
@@ -1625,6 +1893,10 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             ) {
                 uploadMessagingAttachment(
                     mediaType = mediaType
+                        .toRequestBody("text/plain".toMediaType()),
+                    clientMediaId = clientMediaId
+                        .toRequestBody("text/plain".toMediaType()),
+                    ciphertextSha256 = expectedSha256
                         .toRequestBody("text/plain".toMediaType()),
                     ciphertext = MultipartBody.Part.createFormData(
                         "ciphertext",
@@ -1642,6 +1914,11 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             }
             check(response.ciphertextSha256?.lowercase() == expectedSha256) {
                 "The attachment store recorded a different ciphertext digest"
+            }
+            response.clientMediaId?.let { echoed ->
+                check(echoed == clientMediaId) {
+                    "The attachment store returned a different client media ID"
+                }
             }
             return UploadedAttachment(
                 storageKey = storageKey,
@@ -2657,9 +2934,18 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
         }
 
         private companion object {
+            val SHA256_HEX = Regex("^[0-9a-f]{64}$")
             const val MAX_RECIPIENT_DEVICES = 99
             const val MAX_DELIVERY_ACK_BATCH = 100
             const val HISTORY_PAGE_SIZE = 50
+            val RESUMABLE_CHUNK_MEDIA_TYPE =
+                "application/offset+octet-stream".toMediaType()
+            const val RESUMABLE_UPLOAD_EXPIRED_STATE = "expired"
+            val RESUMABLE_COMPLETE_UPLOAD_STATES = setOf("ready", "claimed")
+            val RESUMABLE_ACTIVE_UPLOAD_STATES = setOf(
+                "pending",
+                "assembling",
+            ) + RESUMABLE_COMPLETE_UPLOAD_STATES
         }
     }
 
@@ -2728,6 +3014,10 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             mediaMessageV2Enabled =
                 capabilities.features?.get(MESSAGING_MEDIA_MESSAGE_V2_FEATURE) == true &&
                     MessagingMediaMessageV2Capability.isUsable(protocol?.mediaMessage),
+            resumableAttachmentUploadsEnabled =
+                MessagingResumableAttachmentCapability.isUsable(
+                    protocol?.resumableAttachments,
+                ),
         )
         issuedSessions[session] = issuanceIdentity
         return session

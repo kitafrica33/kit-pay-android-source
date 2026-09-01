@@ -109,6 +109,37 @@ class IdentityCacheDatabaseMigrationTest {
         database.close()
     }
 
+    @Test
+    fun migration15To16MarksExistingTransactionCacheAsUnverified() {
+        helper.createDatabase(DATABASE_15_16, 15).apply {
+            execSQL(
+                "INSERT INTO wallet_transactions " +
+                    "(id, walletUuid, reference, amountMinor, currencyCode, currencyScale, " +
+                    "type, direction, status, counterpartyName, note, occurredAtEpochMillis) " +
+                    "VALUES ('legacy-bank-row', 'wallet', 'BANK-OLD', 50000, 'UGX', 0, " +
+                    "'bank_transfer', 'debit', 'completed', 'Bank', NULL, 1)",
+            )
+            close()
+        }
+
+        val database = helper.runMigrationsAndValidate(
+            DATABASE_15_16,
+            16,
+            true,
+            KitWalletDatabase.MIGRATION_15_16,
+        )
+
+        assertTrue("customerProjectionVerified" in database.columns("wallet_transactions"))
+        assertEquals(
+            0L,
+            database.longQuery(
+                "SELECT customerProjectionVerified FROM wallet_transactions " +
+                    "WHERE id = 'legacy-bank-row'",
+            ),
+        )
+        database.close()
+    }
+
     private fun SupportSQLiteDatabase.columns(table: String): List<String> =
         query("PRAGMA table_info($table)").use { cursor ->
             val name = cursor.getColumnIndexOrThrow("name")
@@ -130,6 +161,7 @@ class IdentityCacheDatabaseMigrationTest {
         const val DATABASE = "identity-cache-migration-11-12"
         const val DATABASE_13_14 = "identity-cache-migration-13-14"
         const val DATABASE_14_15 = "identity-cache-migration-14-15"
+        const val DATABASE_15_16 = "identity-cache-migration-15-16"
         const val OWNER_A = "scope-account-a"
     }
 }

@@ -25,15 +25,35 @@ internal data class ImmediateMediaMaterial(
 internal class ImmediateMediaSpoolUnavailableException(message: String) :
     IllegalStateException(message)
 
+/** Process-local proof that an app-private ciphertext file is the revision already authenticated. */
+private data class VerifiedCiphertextFile(
+    val canonicalPath: String,
+    val byteCount: Long,
+    val modifiedAtMillis: Long,
+    val sha256Hex: String,
+) {
+    companion object {
+        fun capture(file: File, sha256Hex: String) = VerifiedCiphertextFile(
+            canonicalPath = file.canonicalPath,
+            byteCount = file.length(),
+            modifiedAtMillis = file.lastModified(),
+            sha256Hex = sha256Hex,
+        )
+    }
+}
+
 /** App-private ciphertext spool; it never writes plaintext into the queued network outbox. */
 @Singleton
 internal class ImmediateMediaSpool internal constructor(
     private val directory: File,
     /** Test seam for proving that the UI publishes before expensive encryption starts. */
     private val beforeEncryption: suspend () -> Unit = {},
+    private val fileDigest: (File) -> ByteArray = File::streamingSha256,
 ) {
     private val fileMutex = Mutex()
     private val stagedBeforeQueueSnapshot = mutableSetOf<String>()
+    /** A spool file is immutable after publication, so one authenticated hash per process suffices. */
+    private val verifiedFiles = mutableMapOf<String, VerifiedCiphertextFile>()
 
     @Inject
     constructor(@ApplicationContext context: Context) : this(
@@ -59,6 +79,7 @@ internal class ImmediateMediaSpool internal constructor(
                     val temporary = File(directory, ".$id.tmp")
                     val destination = file(id)
                     try {
+                        verifiedFiles.remove(id)
                         val produced = FileOutputStream(temporary).use { output ->
                             val result = source.open().use { input ->
                                 MediaAttachmentStreamCipher.encrypt(
@@ -77,6 +98,10 @@ internal class ImmediateMediaSpool internal constructor(
                         // Until a prune observes that record, an older snapshot must not delete
                         // this newly committed file out from under its caller.
                         stagedBeforeQueueSnapshot += id
+                        verifiedFiles[id] = VerifiedCiphertextFile.capture(
+                            destination,
+                            produced.sha256.toLowercaseHex(),
+                        )
                         produced
                     } finally {
                         if (temporary.exists()) temporary.delete()
@@ -126,24 +151,32 @@ internal class ImmediateMediaSpool internal constructor(
         expectedSha256: ByteArray,
     ): File = withContext(Dispatchers.IO) {
         fileMutex.withLock {
-            val source = file(id)
-            if (!source.isFile || source.length() != expectedCiphertextBytes) {
-                expectedSha256.fill(0)
-                throw ImmediateMediaSpoolUnavailableException(
-                    "The queued secure attachment is no longer available",
-                )
-            }
-            val actual = source.streamingSha256()
             try {
-                if (!MessageDigest.isEqual(expectedSha256, actual)) {
+                val source = file(id)
+                if (!source.isFile || source.length() != expectedCiphertextBytes) {
+                    verifiedFiles.remove(id)
                     throw ImmediateMediaSpoolUnavailableException(
-                        "The queued secure attachment failed its integrity check",
+                        "The queued secure attachment is no longer available",
                     )
                 }
-                source
+                val expectedHex = expectedSha256.toLowercaseHex()
+                val cached = verifiedFiles[id]
+                if (cached == VerifiedCiphertextFile.capture(source, expectedHex)) return@withLock source
+                val actual = fileDigest(source)
+                try {
+                    if (!MessageDigest.isEqual(expectedSha256, actual)) {
+                        verifiedFiles.remove(id)
+                        throw ImmediateMediaSpoolUnavailableException(
+                            "The queued secure attachment failed its integrity check",
+                        )
+                    }
+                    verifiedFiles[id] = VerifiedCiphertextFile.capture(source, expectedHex)
+                    source
+                } finally {
+                    actual.fill(0)
+                }
             } finally {
                 expectedSha256.fill(0)
-                actual.fill(0)
             }
         }
     }
@@ -151,6 +184,7 @@ internal class ImmediateMediaSpool internal constructor(
     suspend fun discard(id: String) = withContext(Dispatchers.IO + NonCancellable) {
         fileMutex.withLock {
             stagedBeforeQueueSnapshot.remove(id)
+            verifiedFiles.remove(id)
             if (ImmediateSendIntent.CANONICAL_UUID.matches(id)) file(id).delete()
         }
     }
@@ -170,7 +204,7 @@ internal class ImmediateMediaSpool internal constructor(
                     !ImmediateSendIntent.CANONICAL_UUID.matches(id) ||
                     (id !in retainedIds && id !in protectedByStage)
                 ) {
-                    candidate.delete()
+                    if (candidate.delete()) verifiedFiles.remove(id)
                 }
             }
         }
@@ -179,12 +213,16 @@ internal class ImmediateMediaSpool internal constructor(
     suspend fun clear() = withContext(Dispatchers.IO + NonCancellable) {
         fileMutex.withLock {
             stagedBeforeQueueSnapshot.clear()
+            verifiedFiles.clear()
             directory.listFiles().orEmpty().forEach(File::delete)
             directory.delete()
         }
     }
 
     private fun file(id: String): File = File(directory, "$id$FILE_SUFFIX")
+
+    private fun ByteArray.toLowercaseHex(): String =
+        joinToString(separator = "") { "%02x".format(it.toInt() and 0xff) }
 
     private companion object {
         const val DIRECTORY_NAME = "secure-message-outbox"

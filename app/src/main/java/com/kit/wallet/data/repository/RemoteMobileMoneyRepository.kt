@@ -14,6 +14,8 @@ import com.kit.wallet.data.remote.MobileMoneyAccountDto
 import com.kit.wallet.data.remote.MobileMoneyNetworkDto
 import com.kit.wallet.data.remote.MobileMoneyOperationDto
 import com.kit.wallet.data.remote.MobileMoneyVerificationDto
+import com.kit.wallet.data.realtime.KitNetworkSource
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.ui.model.MobileMoneyAccount
@@ -23,6 +25,7 @@ import com.kit.wallet.ui.model.MobileMoneyVerificationState
 import java.math.BigDecimal
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
@@ -35,6 +38,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 @Singleton
@@ -46,8 +50,16 @@ class RemoteMobileMoneyRepository @Inject constructor(
     private val walletRefreshTrigger: WalletRefreshTrigger,
     private val beneficiaryContacts: BeneficiaryContactDirectory,
     private val sessions: SessionStore,
+    private val networkSource: KitNetworkSource,
     @ApplicationScope private val scope: CoroutineScope,
 ) : MobileMoneyRepository {
+    private val activeSettlementScreens = AtomicInteger(0)
+    private val operationPoller = SettlementReconciliationPoller(
+        scope = scope,
+        currentSession = { sessions.current()?.fence() },
+        canPoll = { activeSettlementScreens.get() > 0 && networkSource.online.value },
+    )
+
     private val mutableNetworks = MutableStateFlow<List<MobileMoneyNetwork>>(emptyList())
     override val networks: StateFlow<List<MobileMoneyNetwork>> = mutableNetworks.asStateFlow()
 
@@ -61,10 +73,21 @@ class RemoteMobileMoneyRepository @Inject constructor(
     override val verification: StateFlow<MobileMoneyVerificationState?> = mutableVerification.asStateFlow()
 
     init {
+        networkSource.start()
         scope.launch {
             sessions.session.map { it?.cacheScopeId }.distinctUntilChanged().collectLatest { owner ->
+                operationPoller.cancelAll()
                 clearSessionProjections()
                 if (owner != null) runCatching { refresh() }
+            }
+        }
+        scope.launch {
+            networkSource.online.collectLatest { online ->
+                if (!online) {
+                    operationPoller.cancelAll()
+                } else if (activeSettlementScreens.get() > 0) {
+                    runCatching { refresh() }
+                }
             }
         }
     }
@@ -78,7 +101,10 @@ class RemoteMobileMoneyRepository @Inject constructor(
 
         val networks = networkRequest.await().map { it.toUiModel() }
         val accounts = accountRequest.await().map { it.toUiModel() }
-        val operations = operationRequest.await().map { it.toUiModel() }
+        val operationItems = operationRequest.await()
+        val operations = operationItems
+            .filter { it.hasVerifiedCustomerActivityProjection() }
+            .map { it.toUiModel() }
         sessions.withCurrentSession(fence) {
             // Only ids this repository already knew to be mobile money accounts are named as gone,
             // so a refresh here can never drop a bank beneficiary's link out of the shared table.
@@ -89,6 +115,38 @@ class RemoteMobileMoneyRepository @Inject constructor(
             mutableNetworks.value = networks
             mutableAccounts.value = accounts
             mutableOperations.value = operations
+        }
+        if (activeSettlementScreens.get() > 0) {
+            operationItems
+                .filterNot { it.status.isTerminalSettlementStatus() }
+                .forEach { ensureOperationPolling(fence, it.id) }
+        }
+    }
+
+    override fun setSettlementScreenActive(active: Boolean) {
+        val count = if (active) {
+            activeSettlementScreens.incrementAndGet()
+        } else {
+            activeSettlementScreens.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+        }
+        if (active && count == 1) {
+            if (networkSource.online.value) scope.launch { runCatching { refresh() } }
+        } else if (!active && count == 0) {
+            operationPoller.cancelAll()
+        }
+    }
+
+    override fun reconcileSettlementHint(operationId: String) {
+        val owner = sessions.current()?.fence() ?: return
+        // Durable wallet refresh survives service/process teardown and waits for connectivity.
+        walletRefreshTrigger.refreshNow()
+        if (!networkSource.online.value) return
+        if (activeSettlementScreens.get() > 0) {
+            ensureOperationPolling(owner, operationId, restart = true)
+        } else {
+            // A push is one piece of new information, so one exact read is warranted even when
+            // the financial screen is closed. It never turns into a background polling loop.
+            scope.launch { runCatching { reconcileOperation(owner, operationId) } }
         }
     }
 
@@ -137,10 +195,7 @@ class RemoteMobileMoneyRepository @Inject constructor(
             pollCount++
         }
 
-        check(verification.status.equals("verified", ignoreCase = true)) {
-            verification.failure?.message
-                ?: "The account is still being verified. Try again shortly."
-        }
+        requireCustomerVerifiedMobileMoneyAccount(verification)
         val saved = apiCalls.execute {
             api.createMobileMoneyAccount(
                 idempotencyKey("account"),
@@ -231,7 +286,11 @@ class RemoteMobileMoneyRepository @Inject constructor(
                 currencyScale = account.currencyScale,
             )
             val recipient = if (action == "collection") quote.walletCredit else quote.recipientAmount
-            val fees = if (action == "collection") quote.totalFees else quote.processingFee
+            val fees = customerFeeAmountForPublicContract(
+                totalFees = quote.totalFees,
+                processingFee = quote.processingFee,
+                pricingScope = quote.pricingScope,
+            )
             val debit = if (action == "collection") quote.providerAmount else quote.customerDebit
             FinancialOperationQuote(
                 quoteId = quote.id,
@@ -312,9 +371,18 @@ class RemoteMobileMoneyRepository @Inject constructor(
                 }
             }
         }
-        mergeOperation(operation.toUiModel())
+        if (operation.hasVerifiedCustomerActivityProjection()) {
+            sessions.withCurrentSession(quote.sessionFence) {
+                mergeOperation(operation.toUiModel())
+            }
+        }
         walletRefreshTrigger.refreshNow()
-        scope.launch { pollOperation(operation.id) }
+        if (
+            activeSettlementScreens.get() > 0 &&
+            !operation.status.isTerminalSettlementStatus()
+        ) {
+            ensureOperationPolling(quote.sessionFence, operation.id)
+        }
         return operation.id
     }
 
@@ -340,18 +408,40 @@ class RemoteMobileMoneyRepository @Inject constructor(
         }
     }
 
-    private suspend fun pollOperation(operationId: String) {
-        repeat(OPERATION_POLL_LIMIT) {
-            delay(OPERATION_POLL_INTERVAL_MILLIS)
-            val operation = runCatching {
-                apiCalls.execute { api.mobileMoneyOperation(operationId) }
-            }.getOrNull() ?: return@repeat
-            val model = operation.toUiModel()
-            mergeOperation(model)
-            if (model.status.lowercase() in OPERATION_TERMINAL_STATUSES) {
-                walletRefreshTrigger.refreshNow()
-                return
+    private fun ensureOperationPolling(
+        owner: SessionFence,
+        operationId: String,
+        restart: Boolean = false,
+    ) {
+        val reconcile = suspend { reconcileOperation(owner, operationId) }
+        if (restart) {
+            operationPoller.restart(owner, operationId, reconcile)
+        } else {
+            operationPoller.ensure(owner, operationId, reconcile)
+        }
+    }
+
+    private suspend fun reconcileOperation(
+        owner: SessionFence,
+        operationId: String,
+    ): SettlementPollResult {
+        val response = apiCalls.execute { api.mobileMoneyOperation(operationId) }
+        requireExactSettlementOperationId(operationId, response.id)
+        val model = response.takeIf { it.hasVerifiedCustomerActivityProjection() }?.toUiModel()
+        if (model != null) {
+            sessions.withCurrentSession(owner) {
+                mergeOperation(model)
             }
+        } else {
+            sessions.withCurrentSession(owner) {
+                removeOperation(response.id)
+            }
+        }
+        return if (response.status.isTerminalSettlementStatus()) {
+            walletRefreshTrigger.refreshNow()
+            SettlementPollResult.TERMINAL
+        } else {
+            SettlementPollResult.PENDING
         }
     }
 
@@ -361,14 +451,23 @@ class RemoteMobileMoneyRepository @Inject constructor(
             status = value.status,
             phoneNumberMasked = value.accountNumberMasked,
             accountName = value.verifiedAccountName,
-            failureMessage = value.failure?.message,
+            failureMessage = customerSafeMobileMoneyVerificationFailure(value.failure?.code),
         )
     }
 
     private fun mergeOperation(operation: MobileMoneyOperation) {
-        mutableOperations.value = (listOf(operation) +
-            mutableOperations.value.filterNot { it.id == operation.id })
-            .sortedByDescending { it.createdAt.orEmpty() }
+        mutableOperations.update { current ->
+            val existingIndex = current.indexOfFirst { it.id == operation.id }
+            if (existingIndex == -1) {
+                listOf(operation) + current
+            } else {
+                current.toMutableList().apply { this[existingIndex] = operation }
+            }
+        }
+    }
+
+    private fun removeOperation(operationId: String) {
+        mutableOperations.update { current -> current.filterNot { it.id == operationId } }
     }
 
     private fun idempotencyKey(command: String): String =
@@ -409,6 +508,11 @@ class RemoteMobileMoneyRepository @Inject constructor(
 
     private fun MobileMoneyOperationDto.toUiModel(): MobileMoneyOperation {
         val scale = currency.scale.toInt()
+        val topLevelFee = customerFeeAmountForPublicContract(
+            totalFees = totalFees,
+            processingFee = null,
+            pricingScope = pricingScope,
+        )
         return MobileMoneyOperation(
             id = id,
             reference = reference,
@@ -422,14 +526,24 @@ class RemoteMobileMoneyRepository @Inject constructor(
             status = status.lowercase(),
             submissionStage = submissionStage,
             createdAt = createdAt,
-            failureMessage = failure?.message,
-            feeMinor = outboundPricing?.processingFee?.let { DecimalMoney.toMinor(it, scale) }
-                ?: totalFees?.let { DecimalMoney.toMinor(it, scale) },
+            failureMessage = customerSafeMobileMoneyOperationFailure(
+                failureCode = failure?.code,
+                action = mobileMoneyType,
+                status = status,
+            ),
+            feeMinor = if (outboundPricing != null) {
+                customerFeeAmountForPublicContract(
+                    totalFees = outboundPricing.totalFees,
+                    processingFee = outboundPricing.processingFee,
+                    pricingScope = outboundPricing.pricingScope,
+                )?.let { DecimalMoney.toMinor(it, scale) }
+            } else {
+                topLevelFee?.let { DecimalMoney.toMinor(it, scale) }
+            },
             netAmountMinor = outboundPricing?.recipientAmount?.let { DecimalMoney.toMinor(it, scale) }
                 ?: netAmount?.let { DecimalMoney.toMinor(it, scale) },
             customerDebitMinor = outboundPricing?.customerDebit?.let { DecimalMoney.toMinor(it, scale) },
             feeMode = outboundPricing?.feeMode ?: feeMode,
-            providerFeeEstimated = providerFeeEstimated,
         )
     }
 
@@ -439,18 +553,8 @@ class RemoteMobileMoneyRepository @Inject constructor(
         val COLLECTION_FEE_MODES = setOf("inclusive", "gross_up")
         val PAYOUT_FEE_MODES = setOf("sender_absorbs", "recipient_absorbs")
         val VERIFICATION_PENDING_STATUSES = setOf("pending", "queued", "processing", "submitted")
-        val OPERATION_TERMINAL_STATUSES = setOf(
-            "completed",
-            "succeeded",
-            "failed",
-            "reversed",
-            "cancelled",
-            "canceled",
-        )
         const val VERIFICATION_POLL_LIMIT = 30
         const val VERIFICATION_POLL_INTERVAL_MILLIS = 1_000L
-        const val OPERATION_POLL_LIMIT = 40
-        const val OPERATION_POLL_INTERVAL_MILLIS = 1_500L
     }
 }
 
@@ -471,13 +575,19 @@ internal fun validateMobileMoneyQuote(
         else -> quote.recipientAmount
     }
     fun decimal(value: String?) = value?.let { runCatching { BigDecimal(it) }.getOrNull() }
+    val customerFee = runCatching {
+        customerFeeAmountForPublicContract(
+            totalFees = quote.totalFees,
+            processingFee = quote.processingFee,
+            pricingScope = quote.pricingScope,
+        )
+    }.getOrNull()
     val expectedIntent = if (action == "collection") {
         mapOf(
             "action" to action, "quote_id" to quote.id, "wallet_id" to walletId,
             "mobile_money_account_id" to accountId, "network" to quote.network,
             "fee_mode" to feeMode, "requested_amount" to quote.requestedAmount,
-            "provider_amount" to quote.providerAmount, "provider_fee" to quote.providerFee,
-            "platform_fee" to quote.platformFee, "rounding_adjustment" to quote.roundingAdjustment,
+            "provider_amount" to quote.providerAmount,
             "total_fees" to quote.totalFees, "wallet_credit" to quote.walletCredit,
             "currency" to quote.currency.code,
         ).mapValues { requireNotNull(it.value) }
@@ -486,33 +596,42 @@ internal fun validateMobileMoneyQuote(
             "action" to action, "quote_id" to quote.id, "wallet_id" to walletId,
             "mobile_money_account_id" to accountId, "network" to quote.network,
             "fee_mode" to feeMode, "recipient_amount" to quote.recipientAmount,
-            "processing_fee" to quote.processingFee, "provider_fee" to quote.providerFee,
-            "kit_fee" to quote.kitFee, "provider_fee_cap" to quote.providerFeeCap,
-            "maximum_provider_total" to quote.maximumProviderTotal,
-            "customer_debit" to quote.customerDebit, "kit_debit" to quote.kitDebit,
-            "schedule_version" to quote.scheduleVersion, "currency" to quote.currency.code,
+            "processing_fee" to quote.processingFee,
+            "customer_debit" to quote.customerDebit, "currency" to quote.currency.code,
         ).mapValues { requireNotNull(it.value) }
     }
+    val legacyIntentKeys = if (action == "collection") {
+        setOf("provider_fee", "platform_fee", "rounding_adjustment")
+    } else {
+        setOf(
+            "provider_fee", "kit_fee", "provider_fee_cap", "maximum_provider_total",
+            "kit_debit", "schedule_version",
+        )
+    }
+    val allowedIntentKeys = expectedIntent.keys + legacyIntentKeys
     val amountsReconcile = if (action == "collection") {
+        val requested = decimal(quote.requestedAmount)
         val providerAmount = decimal(quote.providerAmount)
-        val totalFees = decimal(quote.totalFees)
+        val totalFees = decimal(customerFee)
         val walletCredit = decimal(quote.walletCredit)
-        providerAmount != null && totalFees != null && walletCredit != null &&
-            providerAmount.compareTo(walletCredit + totalFees) == 0
+        requested != null && requested.signum() > 0 && providerAmount != null &&
+            providerAmount.signum() > 0 && totalFees != null && totalFees.signum() >= 0 &&
+            walletCredit != null && walletCredit.signum() > 0 &&
+            providerAmount.compareTo(walletCredit + totalFees) == 0 &&
+            when (feeMode) {
+                "inclusive" -> providerAmount.compareTo(requested) == 0
+                "gross_up" -> walletCredit.compareTo(requested) == 0
+                else -> false
+            }
     } else {
         val recipient = decimal(quote.recipientAmount)
-        val processing = decimal(quote.processingFee)
-        val provider = decimal(quote.providerFee)
-        val kitFee = decimal(quote.kitFee)
-        val providerCap = decimal(quote.providerFeeCap)
-        val maximumTotal = decimal(quote.maximumProviderTotal)
+        val processing = decimal(customerFee)
         val customer = decimal(quote.customerDebit)
-        val kitDebit = decimal(quote.kitDebit)
-        recipient != null && processing != null && provider != null && kitFee != null &&
-            providerCap != null && maximumTotal != null && customer != null && kitDebit != null &&
-            processing.compareTo(provider + kitFee) == 0 && providerCap.compareTo(provider) == 0 &&
-            maximumTotal.compareTo(recipient + providerCap) == 0 &&
-            customer.compareTo(recipient + processing) == 0 && kitDebit.signum() == 0 &&
+        recipient != null && processing != null && customer != null &&
+            recipient.signum() > 0 && processing.signum() >= 0 &&
+            customer.compareTo(
+                if (feeMode == "kit_covers") recipient else recipient + processing
+            ) == 0 &&
             quote.scheduleVerified == true
     }
     check(quote.action == action && quote.walletId == walletId && quote.accountId == accountId &&
@@ -522,6 +641,96 @@ internal fun validateMobileMoneyQuote(
         amountsReconcile &&
         runCatching { Instant.parse(quote.expiresAt).isAfter(now) }.getOrDefault(false) &&
         quote.stepUp.purpose == "mobile_money_$action" &&
-        quote.stepUp.intent == expectedIntent
+        quote.stepUp.intent.keys.all(allowedIntentKeys::contains) &&
+        expectedIntent.all { (key, value) -> quote.stepUp.intent[key] == value }
     ) { "The mobile money quote does not match this request" }
+}
+
+/**
+ * Verifies the customer aggregate used by mobile-money activity before the operation reaches UI.
+ * This intentionally rejects legacy principal-only rows and any institutional pricing shape.
+ */
+internal fun MobileMoneyOperationDto.hasVerifiedCustomerActivityProjection(): Boolean {
+    val scale = currency.scale.toIntOrNull()?.takeIf { it in 0..9 } ?: return false
+    fun minor(value: String?): Long? = value?.trim()?.let { candidate ->
+        runCatching { DecimalMoney.toMinor(candidate, scale) }.getOrNull()
+    }
+    val nominal = minor(amount)?.takeIf { it > 0 } ?: return false
+
+    return when (mobileMoneyType) {
+        "collection" -> {
+            if (type != "deposit" || direction != "inbound" || outboundPricing != null) return false
+            if (pricingScope != "customer_totals") return false
+            val customerFee = minor(totalFees)?.takeIf { it >= 0 } ?: return false
+            val walletCredit = minor(netAmount)?.takeIf { it > 0 } ?: return false
+            val providerAmount = runCatching {
+                Math.addExact(walletCredit, customerFee)
+            }.getOrNull() ?: return false
+            nominal == providerAmount
+        }
+        "payout" -> {
+            if (type !in setOf("withdrawal", "bank_transfer") || direction != "outbound") {
+                return false
+            }
+            val pricing = outboundPricing ?: return false
+            if (pricing.pricingScope != "customer_totals") return false
+            if (feeMode != null && feeMode != pricing.feeMode) return false
+
+            val recipient = minor(pricing.recipientAmount)?.takeIf { it > 0 } ?: return false
+            val customerFee = minor(pricing.totalFees)?.takeIf { it >= 0 } ?: return false
+            val compatibilityFee = minor(pricing.processingFee)?.takeIf { it >= 0 } ?: return false
+            val customerDebit = minor(pricing.customerDebit)?.takeIf { it > 0 } ?: return false
+            if (nominal != recipient || customerFee != compatibilityFee) return false
+
+            val expectedDebit = when (pricing.feeMode) {
+                "kit_covers" -> recipient
+                "sender_absorbs", "recipient_absorbs" ->
+                    runCatching { Math.addExact(recipient, customerFee) }.getOrNull() ?: return false
+                else -> return false
+            }
+            if (customerDebit != expectedDebit) return false
+
+            if (pricingScope != null || totalFees != null) {
+                if (pricingScope != "customer_totals") return false
+                if (minor(totalFees) != customerFee) return false
+            }
+            true
+        }
+        else -> false
+    }
+}
+
+/** Persisted provider diagnostics stay server-side; mobile renders only stable customer copy. */
+internal fun customerSafeMobileMoneyVerificationFailure(failureCode: String?): String? =
+    failureCode?.let { "We could not verify these account details. Review them and try again." }
+
+/**
+ * Terminates account verification without ever promoting provider diagnostics to UI exceptions.
+ * [MobileMoneyViewModel] displays repository exception messages, so the raw failure message must
+ * be discarded at this boundary just as it is when publishing [MobileMoneyVerificationState].
+ */
+internal fun requireCustomerVerifiedMobileMoneyAccount(
+    verification: MobileMoneyVerificationDto,
+) {
+    check(verification.status.equals("verified", ignoreCase = true)) {
+        customerSafeMobileMoneyVerificationFailure(verification.failure?.code)
+            ?: "The account is still being verified. Try again shortly."
+    }
+}
+
+/** Persisted provider/ledger/settlement diagnostics must never be copied into customer activity. */
+internal fun customerSafeMobileMoneyOperationFailure(
+    failureCode: String?,
+    action: String,
+    status: String,
+): String? = failureCode?.let {
+    when (status) {
+        "failed" -> if (action == "collection") {
+            "This deposit could not be completed. No money was added to your wallet."
+        } else {
+            "This payment could not be completed. Check your balance before trying again."
+        }
+        "unknown" -> "We could not confirm this transaction yet. Check again before retrying."
+        else -> "This transaction needs attention. Contact support with the reference."
+    }
 }

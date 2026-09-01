@@ -1,6 +1,7 @@
 package com.kit.wallet.data.notifications.fcm
 
 import com.kit.wallet.data.notifications.PushNotificationContent
+import com.kit.wallet.data.notifications.PushDeliveryPriority
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -72,6 +73,25 @@ class FcmPushEnvelopeMapperTest {
                 notification = null,
                 messageId = null,
             ).opaqueWakeVerified,
+        )
+    }
+
+    @Test
+    fun `mapper retains a privacy safe provider priority downgrade`() {
+        val envelope = FcmPushEnvelopeMapper.map(
+            data = wakeData,
+            rawEnvelopeKeys = wakeData.keys,
+            notification = null,
+            messageId = null,
+            deliveredPriority = PushDeliveryPriority.NORMAL,
+            originalPriority = PushDeliveryPriority.HIGH,
+        )
+
+        assertEquals(PushDeliveryPriority.NORMAL, envelope.deliveredPriority)
+        assertEquals(PushDeliveryPriority.HIGH, envelope.originalPriority)
+        assertTrue(envelope.priorityWasDowngraded)
+        assertFalse(
+            envelope.copy(deliveredPriority = PushDeliveryPriority.HIGH).priorityWasDowngraded,
         )
     }
 }

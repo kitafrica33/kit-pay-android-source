@@ -12,6 +12,8 @@ import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import kotlin.math.max
 
 /**
@@ -60,6 +62,16 @@ internal fun decodeUploadImage(
     return decoded.fitWithin(maxDimension)
 }
 
+/** File-backed equivalent used after a picked original is durable in Sent Media. */
+internal fun decodeUploadImage(file: File, maxDimension: Int): Bitmap? {
+    require(maxDimension > 0) { "maxDimension must be positive" }
+    if (!file.isFile || file.length() <= 0L) return null
+    val decoded = decodeFileWithImageDecoder(file, maxDimension)
+        ?: decodeFileWithBitmapFactory(file, maxDimension)
+        ?: return null
+    return decoded.fitWithin(maxDimension)
+}
+
 /**
  * Compresses [source] to JPEG, stepping quality down until the bytes fit [maxBytes]. Alpha is
  * flattened onto white first, because JPEG has no alpha channel and would otherwise render
@@ -80,6 +92,37 @@ internal fun compressUploadJpeg(source: Bitmap, maxBytes: Int, qualities: IntArr
     return null
 }
 
+/** Encodes into an unpublished file so background preparation never needs a JPEG-sized array. */
+internal fun compressUploadJpegToFile(
+    source: Bitmap,
+    destination: File,
+    maxBytes: Int,
+    qualities: IntArray,
+): Long? {
+    require(maxBytes > 0) { "maxBytes must be positive" }
+    val opaque = source.flattenedForJpeg()
+    try {
+        for (quality in qualities) {
+            val encoded = runCatching {
+                FileOutputStream(destination, false).use { output ->
+                    if (!opaque.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
+                        return@use false
+                    }
+                    output.flush()
+                    output.fd.sync()
+                    true
+                }
+            }.getOrDefault(false)
+            val byteCount = destination.length()
+            if (encoded && byteCount in 1..maxBytes.toLong()) return byteCount
+        }
+    } finally {
+        if (opaque !== source) opaque.recycle()
+    }
+    destination.delete()
+    return null
+}
+
 /** Power-of-two sample factor bringing [longestSide] to at least [maxDimension]. */
 internal fun uploadSampleSize(longestSide: Int, maxDimension: Int): Int {
     var sample = 1
@@ -97,6 +140,20 @@ private fun decodeWithImageDecoder(
         val source = ImageDecoder.createSource(resolver, uri)
         ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
             // A HARDWARE bitmap has no pixel access, so cropping and JPEG encoding would fail.
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            decoder.isMutableRequired = false
+            decoder.setTargetSampleSize(
+                uploadSampleSize(max(info.size.width, info.size.height), maxDimension),
+            )
+        }
+    }.getOrNull()
+}
+
+private fun decodeFileWithImageDecoder(file: File, maxDimension: Int): Bitmap? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+    return runCatching {
+        val source = ImageDecoder.createSource(file)
+        ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
             decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             decoder.isMutableRequired = false
             decoder.setTargetSampleSize(
@@ -127,6 +184,30 @@ private fun decodeWithBitmapFactory(
     } ?: return@runCatching null
 
     val rotation = exifRotationDegrees(resolver, uri)
+    if (rotation == 0) bitmap else bitmap.rotated(rotation)
+}.getOrNull()
+
+private fun decodeFileWithBitmapFactory(file: File, maxDimension: Int): Bitmap? = runCatching {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
+    val options = BitmapFactory.Options().apply {
+        inSampleSize = uploadSampleSize(max(bounds.outWidth, bounds.outHeight), maxDimension)
+        inPreferredConfig = Bitmap.Config.ARGB_8888
+    }
+    val bitmap = BitmapFactory.decodeFile(file.absolutePath, options) ?: return@runCatching null
+    val orientation = runCatching {
+        ExifInterface(file.absolutePath).getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL,
+        )
+    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+    val rotation = when (orientation) {
+        ExifInterface.ORIENTATION_ROTATE_90 -> 90
+        ExifInterface.ORIENTATION_ROTATE_180 -> 180
+        ExifInterface.ORIENTATION_ROTATE_270 -> 270
+        else -> 0
+    }
     if (rotation == 0) bitmap else bitmap.rotated(rotation)
 }.getOrNull()
 

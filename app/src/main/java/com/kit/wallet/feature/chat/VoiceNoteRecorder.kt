@@ -5,8 +5,10 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.SystemClock
 import com.kit.wallet.data.messaging.KitChatMediaLimits
+import com.kit.wallet.data.messaging.SecureMediaSource
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
 /**
@@ -23,7 +25,46 @@ import kotlin.math.min
  * uploaded before then.
  */
 internal class VoiceNoteRecorder(private val context: Context) {
-    class Recording(val bytes: ByteArray, val durationMillis: Long) {
+    /**
+     * Ownership of finalized recording segments transferred out of the recorder.
+     *
+     * [source] defers the only potentially expensive step (joining paused segments) until the
+     * repository has already committed the permanent local message identity. The stream is
+     * file-backed in every case, including a 30-minute note, and [release] is idempotent so UI
+     * cancellation cannot race cleanup against the repository's final read.
+     */
+    class Recording internal constructor(
+        private val files: List<File>,
+        val durationMillis: Long,
+    ) {
+        private val released = AtomicBoolean(false)
+        private val assemblyLock = Any()
+        private var assembled: File? = files.singleOrNull()
+
+        val source: SecureMediaSource = SecureMediaSource(
+            declaredByteCount = files.sumOf(File::length),
+            durationMillis = durationMillis,
+            localPlaybackFile = files.singleOrNull()?.takeIf { it.isFile && it.length() > 0L },
+        ) {
+            assembledFile().inputStream()
+        }
+
+        fun release() {
+            if (!released.compareAndSet(false, true)) return
+            synchronized(assemblyLock) {
+                assembled?.takeUnless { it in files }?.delete()
+                assembled = null
+                files.forEach(File::delete)
+            }
+        }
+
+        private fun assembledFile(): File = synchronized(assemblyLock) {
+            check(!released.get()) { "The voice-note source is no longer available" }
+            assembled?.takeIf { it.isFile && it.length() > 0L }?.let { return@synchronized it }
+            VoiceNoteSegmentAssembler.assembleFile(files)?.also { assembled = it }
+                ?: error("The voice note could not be prepared")
+        }
+
         companion object {
             const val MEDIA_TYPE = "audio/mp4"
         }
@@ -94,23 +135,25 @@ internal class VoiceNoteRecorder(private val context: Context) {
      */
     fun previewFiles(): List<File> = segments.toList()
 
-    /** Stops and returns the finished note, or null when shorter than the one-second minimum. */
+    /**
+     * Stops and transfers the finalized files without reading them into heap. The caller owns the
+     * returned [Recording] until its local-first send completes and must invoke `release()` then.
+     */
     fun finish(): Recording? {
         pause()
         val files = segments.toList()
         val duration = finalizedMillis
         segments.clear()
         finalizedMillis = 0
-        try {
-            if (files.isEmpty() || duration < KitChatMediaLimits.VOICE_NOTE_MIN_DURATION_MILLIS) {
-                return null
-            }
-            val bytes = VoiceNoteSegmentAssembler.assemble(files) ?: return null
-            if (!KitChatMediaLimits.fits(bytes.size.toLong())) return null
-            return Recording(bytes, min(duration, KitChatMediaLimits.VOICE_NOTE_MAX_DURATION_MILLIS))
-        } finally {
+        if (
+            files.isEmpty() ||
+            duration < KitChatMediaLimits.VOICE_NOTE_MIN_DURATION_MILLIS ||
+            !KitChatMediaLimits.fits(files.sumOf(File::length))
+        ) {
             files.forEach { it.delete() }
+            return null
         }
+        return Recording(files, min(duration, KitChatMediaLimits.VOICE_NOTE_MAX_DURATION_MILLIS))
     }
 
     /** The explicit discard: everything captured so far is deleted, live or finalized. */

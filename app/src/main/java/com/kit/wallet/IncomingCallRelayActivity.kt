@@ -2,7 +2,9 @@ package com.kit.wallet
 
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import com.kit.wallet.data.notifications.ACTION_OPEN_AUTHORIZED_INCOMING_CALL
 import com.kit.wallet.data.notifications.EXTRA_INCOMING_CALL_AUTHORIZATION
@@ -42,16 +44,36 @@ class IncomingCallRelayActivity : ComponentActivity() {
                 )
             }
         }
+        // An expired, retired or session-mismatched PendingIntent must neither wake the device
+        // nor turn an ordinary launcher open into a call surface. The real relay window is opaque,
+        // so enabling these flags only after authorization safely wakes a locked phone while
+        // MainActivity draws its own privacy cover behind the keyguard.
+        if (token == null) {
+            finish()
+            return
+        }
+        showAuthorizedCallOverKeyguard()
         startActivity(
             Intent(this, MainActivity::class.java).apply {
-                if (token != null) {
-                    action = ACTION_OPEN_AUTHORIZED_INCOMING_CALL
-                    putExtra(EXTRA_INCOMING_CALL_AUTHORIZATION, token)
-                }
+                action = ACTION_OPEN_AUTHORIZED_INCOMING_CALL
+                putExtra(EXTRA_INCOMING_CALL_AUTHORIZATION, token)
                 addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             },
         )
         finish()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun showAuthorizedCallOverKeyguard() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON,
+            )
+        }
     }
 
     companion object {

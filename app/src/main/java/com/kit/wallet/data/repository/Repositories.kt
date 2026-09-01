@@ -567,7 +567,12 @@ interface ChatRepository {
      * Downloads and decrypts the media a message's authenticated descriptor references, returning
      * it as an app-private file the platform's players and viewers can read directly.
      */
-    suspend fun openImageMessage(chatId: String, mediaDescriptor: String): SecureMediaFile {
+    suspend fun openImageMessage(
+        chatId: String,
+        mediaDescriptor: String,
+        messageId: String? = null,
+        fromCurrentUser: Boolean? = null,
+    ): SecureMediaFile {
         error("This chat repository does not support secure media messages")
     }
 
@@ -579,6 +584,8 @@ interface ChatRepository {
         chatId: String,
         mediaDescriptor: String,
         attachmentId: String,
+        messageId: String? = null,
+        fromCurrentUser: Boolean? = null,
     ): SecureMediaFile {
         error("This chat repository does not support media albums")
     }
@@ -780,6 +787,8 @@ interface BankingRepository {
     val operations: StateFlow<List<Transaction>>
 
     suspend fun refresh()
+    /** Enables exact-operation reconciliation only while its financial UI is visible. */
+    fun setSettlementScreenActive(active: Boolean) = Unit
     suspend fun addBeneficiary(
         bankId: String,
         accountNumber: String,

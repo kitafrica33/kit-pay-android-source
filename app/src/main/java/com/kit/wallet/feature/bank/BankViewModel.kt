@@ -39,6 +39,7 @@ class BankViewModel @Inject constructor(
     profilePhotos: ProfilePhotoDirectory,
     private val bankDeposits: BankDepositRepository = UnavailableBankDepositRepository,
 ) : ViewModel() {
+    private var settlementScreenActive = false
 
     /**
      * The saved bank accounts, each carrying a face when the server says the account belongs to a
@@ -92,6 +93,18 @@ class BankViewModel @Inject constructor(
 
     init {
         viewModelScope.launch { runCatching { banking.refresh() } }
+    }
+
+    fun setSettlementScreenActive(active: Boolean) {
+        if (settlementScreenActive == active) return
+        settlementScreenActive = active
+        banking.setSettlementScreenActive(active)
+    }
+
+    override fun onCleared() {
+        if (settlementScreenActive) banking.setSettlementScreenActive(false)
+        settlementScreenActive = false
+        super.onCleared()
     }
 
     fun addAccount(

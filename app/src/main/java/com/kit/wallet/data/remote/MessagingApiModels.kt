@@ -721,8 +721,45 @@ data class MessagingMessageInfoDto(
 @JsonClass(generateAdapter = false)
 data class MessagingAttachmentUploadDto(
     @Json(name = "storage_key") val storageKey: String? = null,
+    @Json(name = "client_media_id") val clientMediaId: String? = null,
     @Json(name = "byte_size") val byteSize: Long? = null,
     @Json(name = "ciphertext_sha256") val ciphertextSha256: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class StartResumableMessagingAttachmentUploadRequest(
+    @Json(name = "client_media_id") val clientMediaId: String,
+    @Json(name = "media_type") val mediaType: String,
+    @Json(name = "byte_size") val byteSize: Long,
+    @Json(name = "ciphertext_sha256") val ciphertextSha256: String,
+)
+
+@JsonClass(generateAdapter = false)
+data class ResumableMessagingAttachmentUploadDto(
+    @Json(name = "client_media_id") val clientMediaId: String? = null,
+    @Json(name = "storage_key") val storageKey: String? = null,
+    @Json(name = "media_type") val mediaType: String? = null,
+    @Json(name = "byte_size") val byteSize: Long? = null,
+    @Json(name = "ciphertext_sha256") val ciphertextSha256: String? = null,
+    val state: String? = null,
+    @Json(name = "next_offset") val nextOffset: Long? = null,
+    @Json(name = "max_chunk_bytes") val maxChunkBytes: Long? = null,
+    val complete: Boolean? = null,
+    @Json(name = "expires_at") val expiresAt: String? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class ResumableMessagingAttachmentChunkDto(
+    @Json(name = "byte_offset") val byteOffset: Long? = null,
+    @Json(name = "byte_size") val byteSize: Long? = null,
+    @Json(name = "ciphertext_sha256") val ciphertextSha256: String? = null,
+    val replayed: Boolean? = null,
+)
+
+@JsonClass(generateAdapter = false)
+data class ResumableMessagingAttachmentChunkResultDto(
+    val upload: ResumableMessagingAttachmentUploadDto? = null,
+    val chunk: ResumableMessagingAttachmentChunkDto? = null,
 )
 
 const val SECURE_MESSAGING_PROTOCOL_VERSION = "v2"

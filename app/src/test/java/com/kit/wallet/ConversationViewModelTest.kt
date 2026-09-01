@@ -1663,6 +1663,8 @@ class ConversationViewModelTest {
         override suspend fun openImageMessage(
             chatId: String,
             mediaDescriptor: String,
+            messageId: String?,
+            fromCurrentUser: Boolean?,
         ): SecureMediaFile {
             openedSingleMedia += mediaDescriptor
             return openMediaFixture(
@@ -1675,6 +1677,8 @@ class ConversationViewModelTest {
             chatId: String,
             mediaDescriptor: String,
             attachmentId: String,
+            messageId: String?,
+            fromCurrentUser: Boolean?,
         ): SecureMediaFile {
             openedAlbumMedia += mediaDescriptor to attachmentId
             return openMediaFixture(

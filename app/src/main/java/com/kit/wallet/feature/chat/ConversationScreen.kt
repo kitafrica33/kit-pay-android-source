@@ -150,8 +150,10 @@ import com.kit.wallet.data.messaging.KitScheduledPaymentAction
 import com.kit.wallet.data.messaging.KitScheduledPaymentMessage
 import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.SecureMediaProcessingPlan
 import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.messaging.displayName
+import com.kit.wallet.data.messaging.normalizeLocalMediaType
 import com.kit.wallet.data.messaging.secureMediaSource
 import com.kit.wallet.data.notifications.ActiveCallPresence
 import com.kit.wallet.data.remote.GroupPaymentRequestContributionDto
@@ -354,15 +356,22 @@ fun ConversationScreen(
 
     // A picked video opens the same trim/mute/caption editor the in-app camera uses, so a
     // library clip can be cut down before it is encrypted — the raw pick never goes straight
-    // to the wire anymore. Photos keep their existing transcode-and-send path.
+    // to the wire anymore. A photo is admitted as its original bytes first; downscaling, metadata
+    // stripping and JPEG encoding happen later in the durable background preparation worker.
     var libraryVideoDraft by remember { mutableStateOf<LibraryVideoDraft?>(null) }
     fun handleSingleLibraryPick(uri: Uri) {
+        val selectedAtNanos = System.nanoTime()
         val resolvedType = context.contentResolver.getType(uri).orEmpty().lowercase()
         if (resolvedType.startsWith("video/")) {
             coroutineScope.launch {
                 try {
                     val staged = withContext(Dispatchers.IO) {
-                        stageLibraryVideoForEditing(context, uri, resolvedType)
+                        stageLibraryVideoForEditing(
+                            context,
+                            uri,
+                            resolvedType,
+                            selectedAtNanos,
+                        )
                     }
                     libraryVideoDraft = staged
                 } catch (cancelled: CancellationException) {
@@ -375,11 +384,18 @@ fun ConversationScreen(
             }
         } else {
             sendPickedMedia {
-                // Photos are re-encoded first (orientation, size, stripped metadata), so this
-                // one really is bytes in heap — a transcoded still, not a source file.
-                val bytes = transcodeChatImage(context.contentResolver, uri)
-                    ?: error("The selected photo could not be prepared")
-                PickedMedia(SecureMediaSource.ofBytes(bytes), "image/jpeg")
+                val originalType = normalizeLocalMediaType(resolvedType)
+                    ?.takeIf { it.startsWith("image/") }
+                    ?: "image/jpeg"
+                PickedMedia(
+                    context.contentResolver.secureMediaSource(
+                        uri = uri,
+                        originatedAtNanos = selectedAtNanos,
+                        originalMediaType = originalType,
+                        processingPlan = SecureMediaProcessingPlan.CHAT_IMAGE_JPEG,
+                    ),
+                    "image/jpeg",
+                )
             }
         }
     }
@@ -394,6 +410,7 @@ fun ConversationScreen(
     val pickLibraryMediaAlbum = rememberLauncherForActivityResult(
         ActivityResultContracts.PickMultipleVisualMedia(KitMediaMessageV2.MAX_ATTACHMENTS),
     ) { uris ->
+        val selectedAtNanos = System.nanoTime()
         when {
             uris.isEmpty() -> Unit
             uris.size == 1 -> handleSingleLibraryPick(uris.single())
@@ -410,9 +427,18 @@ fun ConversationScreen(
                 try {
                     val attachments = withContext(Dispatchers.IO + NonCancellable) {
                         uris.map { uri ->
-                            val bytes = transcodeChatImage(context.contentResolver, uri)
-                                ?: error("A selected photo could not be prepared")
-                            SecureMediaAlbumSource(SecureMediaSource.ofBytes(bytes), "image/jpeg")
+                            val originalType = normalizeLocalMediaType(
+                                context.contentResolver.getType(uri).orEmpty(),
+                            )?.takeIf { it.startsWith("image/") } ?: "image/jpeg"
+                            SecureMediaAlbumSource(
+                                context.contentResolver.secureMediaSource(
+                                    uri = uri,
+                                    originatedAtNanos = selectedAtNanos,
+                                    originalMediaType = originalType,
+                                    processingPlan = SecureMediaProcessingPlan.CHAT_IMAGE_JPEG,
+                                ),
+                                "image/jpeg",
+                            )
                         }
                     }
                     coroutineContext.ensureActive()
@@ -467,9 +493,10 @@ fun ConversationScreen(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri != null) {
+            val selectedAtNanos = System.nanoTime()
             sendPickedMedia {
                 PickedMedia(
-                    source = context.contentResolver.secureMediaSource(uri),
+                    source = context.contentResolver.secureMediaSource(uri, selectedAtNanos),
                     mediaType = KitMediaMessage.normalizeMediaType(
                         context.contentResolver.getType(uri).orEmpty(),
                     ) ?: "application/octet-stream",
@@ -876,11 +903,15 @@ fun ConversationScreen(
                 pickDocument.launch(CHAT_DOCUMENT_MIME_TYPES)
             }
         },
-        onSendVoiceNote = { bytes ->
+        onSendVoiceNote = { recording ->
             if (BuildConfig.MEDIA_MESSAGING_ENABLED) {
-                viewModel.sendMedia(bytes, VoiceNoteRecorder.Recording.MEDIA_TYPE)
+                viewModel.sendMedia(
+                    source = recording.source,
+                    mediaType = VoiceNoteRecorder.Recording.MEDIA_TYPE,
+                    onFinished = recording::release,
+                )
             } else {
-                bytes.fill(0)
+                recording.release()
             }
         },
         mediaEnabled = BuildConfig.MEDIA_MESSAGING_ENABLED,
@@ -1119,7 +1150,7 @@ internal fun ConversationContent(
     onAttachVideoNote: () -> Unit = {},
     onAttachDocument: () -> Unit = {},
     onOpenCamera: () -> Unit = {},
-    onSendVoiceNote: (ByteArray) -> Unit = {},
+    onSendVoiceNote: (VoiceNoteRecorder.Recording) -> Unit = { it.release() },
     mediaEnabled: Boolean = false,
     mediaFiles: Map<String, SecureMediaFile> = emptyMap(),
     mediaLoading: Set<String> = emptySet(),
@@ -4348,7 +4379,7 @@ private fun Composer(
     onAttachCamera: () -> Unit = {},
     onAttachVideoNote: () -> Unit = {},
     onAttachDocument: () -> Unit = {},
-    onSendVoiceNote: (ByteArray) -> Unit = {},
+    onSendVoiceNote: (VoiceNoteRecorder.Recording) -> Unit = { it.release() },
     onVoiceNoteTooShort: () -> Unit = {},
     mediaEnabled: Boolean = false,
     onRequestPayment: () -> Unit = {},
@@ -4734,7 +4765,7 @@ private fun Composer(
                             val finished = recorder.finish()
                             VoiceNoteDrafts.release(voiceDraftKey)
                             draftPhase = VoiceNoteDraftPhase.IDLE
-                            if (finished != null) onSendVoiceNote(finished.bytes) else onVoiceNoteTooShort()
+                            if (finished != null) onSendVoiceNote(finished) else onVoiceNoteTooShort()
                         },
                     contentAlignment = Alignment.Center,
                 ) {

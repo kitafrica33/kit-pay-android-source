@@ -9,6 +9,46 @@ import org.junit.Test
 
 class TerminalAwareTelecomCallRegistryTest {
     @Test
+    fun `compare and set advances only the expected live state`() {
+        val registry = registry()
+        val callId = "answering-call"
+        registry.track(callId, "incoming", TestState.RINGING)
+        val applied = mutableListOf<TestState>()
+
+        assertNotNull(
+            registry.compareAndSetState(
+                callId,
+                TestState.RINGING,
+                TestState.ANSWERING,
+            ) { _, state ->
+                applied += state
+            },
+        )
+        assertNull(
+            registry.compareAndSetState(
+                callId,
+                TestState.RINGING,
+                TestState.ANSWERING,
+            ) { _, state ->
+                applied += state
+            },
+        )
+
+        // No connection is attached in this path; the state is still retained for the later
+        // Telecom callback, and a duplicate answer cannot regress it.
+        assertTrue(applied.isEmpty())
+        val attached = registry.attachConnection(
+            callId = callId,
+            metadata = "incoming",
+            initialState = TestState.RINGING,
+            createConnection = { "connection" },
+            prepareLiveConnection = { _, state -> applied += state },
+        )
+        assertEquals(TestState.ANSWERING, attached.liveCall?.state)
+        assertEquals(listOf(TestState.ANSWERING), applied)
+    }
+
+    @Test
     fun `unknown terminal event is a no-op and does not block later tracking`() {
         val registry = registry()
 
@@ -230,5 +270,5 @@ class TerminalAwareTelecomCallRegistryTest {
         maxResolvedTombstones = maxResolvedTombstones,
     )
 
-    private enum class TestState { RINGING, ACTIVE }
+    private enum class TestState { RINGING, ANSWERING, ACTIVE }
 }

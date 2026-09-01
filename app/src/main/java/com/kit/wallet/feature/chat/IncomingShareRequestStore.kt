@@ -1,6 +1,8 @@
 package com.kit.wallet.feature.chat
 
 import android.content.Context
+import com.kit.wallet.data.messaging.SecureMediaProcessingPlan
+import com.kit.wallet.data.messaging.normalizeLocalMediaType
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -241,6 +243,14 @@ internal class IncomingShareRequestPersistence(private val root: File) {
             require(canonicalUuid(item.id) == item.id)
             require(SharedInboxPolicy.isSafeFileName(item.fileName))
             require(SharedInboxPolicy.normalizedMediaType(item.mediaType) == item.mediaType)
+            require(normalizeLocalMediaType(item.localMediaType) == item.localMediaType)
+            require(
+                item.processingPlan != SecureMediaProcessingPlan.CHAT_IMAGE_JPEG ||
+                    item.mediaType == "image/jpeg" && item.localMediaType.startsWith("image/"),
+            )
+            require(item.processingPlan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4) {
+                "Shared video items cannot carry an editor-only processing plan"
+            }
             require(item.displayName.isNotBlank() && item.displayName.length <= 120)
             require(SharedInboxPolicy.fits(item.byteCount.toLong()))
         }
@@ -279,6 +289,9 @@ internal class IncomingShareRequestPersistence(private val root: File) {
             output.writeString(item.mediaType)
             output.writeString(item.displayName)
             output.writeInt(item.byteCount)
+            output.writeNullableString(item.originalMediaType)
+            output.writeByte(item.processingPlan.persistenceCode)
+            output.writeNullableLong(item.durationMillis)
         }
         output.writeNullableString(batch.text)
     }
@@ -286,7 +299,7 @@ internal class IncomingShareRequestPersistence(private val root: File) {
     private fun decode(input: java.io.InputStream): SharedInboxBatch {
         DataInputStream(BufferedInputStream(input)).use { data ->
             val version = data.readUnsignedByte()
-            check(version == VERSION || version == LEGACY_VERSION_WITHOUT_SHAPE) {
+            check(version in LEGACY_VERSION_WITHOUT_SHAPE..VERSION) {
                 "Unsupported share manifest"
             }
             val id = data.readString(MAX_IDENTIFIER_BYTES)
@@ -309,12 +322,33 @@ internal class IncomingShareRequestPersistence(private val root: File) {
             val itemCount = data.readInt()
             check(itemCount in 0..SharedInboxPolicy.MAXIMUM_ITEMS)
             val items = List(itemCount) {
+                val itemId = data.readString(MAX_IDENTIFIER_BYTES)
+                val fileName = data.readString(MAX_FILE_NAME_BYTES)
+                val mediaType = data.readString(MAX_MEDIA_TYPE_BYTES)
+                val displayName = data.readString(MAX_DISPLAY_NAME_BYTES)
+                val byteCount = data.readInt()
                 SharedInboxItem(
-                    id = data.readString(MAX_IDENTIFIER_BYTES),
-                    fileName = data.readString(MAX_FILE_NAME_BYTES),
-                    mediaType = data.readString(MAX_MEDIA_TYPE_BYTES),
-                    displayName = data.readString(MAX_DISPLAY_NAME_BYTES),
-                    byteCount = data.readInt(),
+                    id = itemId,
+                    fileName = fileName,
+                    mediaType = mediaType,
+                    displayName = displayName,
+                    byteCount = byteCount,
+                    originalMediaType = if (version >= VERSION_WITH_LOCAL_ORIGINAL) {
+                        data.readNullableString(MAX_MEDIA_TYPE_BYTES)
+                    } else {
+                        null
+                    },
+                    processingPlan = if (version >= VERSION_WITH_LOCAL_ORIGINAL) {
+                        SecureMediaProcessingPlan.fromPersistenceCode(data.readUnsignedByte())
+                            ?: error("Invalid shared-media processing plan")
+                    } else {
+                        SecureMediaProcessingPlan.PASSTHROUGH
+                    },
+                    durationMillis = if (version >= VERSION_WITH_DURATION) {
+                        data.readNullableLong()
+                    } else {
+                        null
+                    },
                 )
             }
             val text = data.readNullableString(MAX_TEXT_BYTES)
@@ -342,6 +376,11 @@ internal class IncomingShareRequestPersistence(private val root: File) {
         if (value != null) writeString(value)
     }
 
+    private fun DataOutputStream.writeNullableLong(value: Long?) {
+        writeBoolean(value != null)
+        if (value != null) writeLong(value)
+    }
+
     private fun DataInputStream.readString(maxBytes: Int): String {
         val size = readInt()
         check(size in 0..maxBytes) { "Invalid share manifest string" }
@@ -357,6 +396,9 @@ internal class IncomingShareRequestPersistence(private val root: File) {
     private fun DataInputStream.readNullableString(maxBytes: Int): String? =
         if (readBoolean()) readString(maxBytes) else null
 
+    private fun DataInputStream.readNullableLong(): Long? =
+        if (readBoolean()) readLong() else null
+
     private fun requireValidOwnerValue(value: String) {
         require(value.isNotBlank() && value.toByteArray(StandardCharsets.UTF_8).size <= MAX_OWNER_VALUE_BYTES)
         require(value.none(Char::isISOControl))
@@ -370,7 +412,9 @@ internal class IncomingShareRequestPersistence(private val root: File) {
         runCatching { UUID.fromString(raw).toString() }.getOrNull()
 
     private companion object {
-        const val VERSION = 4
+        const val VERSION = 6
+        const val VERSION_WITH_LOCAL_ORIGINAL = 5
+        const val VERSION_WITH_DURATION = 6
 
         /**
          * Manifests written before [SharedInboxBatch.albumDelivery] existed. Still readable —

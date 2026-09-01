@@ -556,7 +556,7 @@ private fun SendSuccess(
                     launchTextShare(
                         context = context,
                         chooserTitle = "Share Kit Pay receipt",
-                        text = receiptShareText(recipient?.name, amountMinor, transaction),
+                        text = receiptShareText(recipient?.name, transaction),
                     )
                 },
             )

@@ -16,6 +16,7 @@ import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.ImmediateSendDispatcher
 import com.kit.wallet.data.messaging.ImmediateSendDispatchOutcome
+import com.kit.wallet.data.messaging.ImmediateMediaPreparationOutcome
 import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
 import com.kit.wallet.data.messaging.SecureMessagingCryptographicFailureException
 import com.kit.wallet.data.messaging.SecureMessagingProtocolUnavailableException
@@ -65,6 +66,38 @@ internal class SecureMessagingSyncWorker @AssistedInject constructor(
     }
 }
 
+/**
+ * Device-only media preparation. Deliberately has no network constraint: an offline capture can
+ * be encrypted and checkpointed while upload remains queued for [SecureMessagingSyncWorker].
+ */
+@HiltWorker
+internal class LocalMediaPreparationWorker @AssistedInject constructor(
+    @Assisted appContext: Context,
+    @Assisted workerParameters: WorkerParameters,
+    private val sessions: SessionStore,
+    private val immediateSends: ImmediateSendDispatcher,
+) : CoroutineWorker(appContext, workerParameters) {
+    override suspend fun doWork(): Result {
+        if (sessions.current() == null) return Result.success()
+        return try {
+            when (immediateSends.prepareLocalMedia()) {
+                ImmediateMediaPreparationOutcome.RETRY -> Result.retry()
+                ImmediateMediaPreparationOutcome.IDLE,
+                ImmediateMediaPreparationOutcome.PREPARED,
+                -> Result.success()
+            }
+        } catch (error: Throwable) {
+            debugSecureMessagingWorkerFailure(error)
+            when (secureMessagingSyncFailureDisposition(error)) {
+                SecureMessagingSyncFailureDisposition.SUCCESS -> Result.success()
+                SecureMessagingSyncFailureDisposition.RETRY -> Result.retry()
+                SecureMessagingSyncFailureDisposition.FAILURE -> Result.failure()
+                SecureMessagingSyncFailureDisposition.RETHROW -> throw error
+            }
+        }
+    }
+}
+
 /** Debug builds report only exception class names; no account, message, or key data is logged. */
 private fun debugSecureMessagingWorkerFailure(error: Throwable) {
     if (!BuildConfig.DEBUG) return
@@ -89,15 +122,29 @@ class SecureMessagingSyncScheduler @Inject constructor(
     private val wakeCoalescer: SecureMessagingWakeCoalescer,
 ) {
     fun schedule() {
-        enqueue(initialDelayMillis = 0L)
+        enqueueLocalMediaPreparation()
+        enqueueSync(initialDelayMillis = 0L)
     }
 
     fun scheduleHistoryContinuation(delayMillis: Long) {
         require(delayMillis >= 0L)
-        enqueue(initialDelayMillis = delayMillis)
+        enqueueSync(initialDelayMillis = delayMillis)
     }
 
-    private fun enqueue(initialDelayMillis: Long) {
+    private fun enqueueLocalMediaPreparation() {
+        val request = OneTimeWorkRequestBuilder<LocalMediaPreparationWorker>()
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .build()
+        // Every enqueue joins the durable chain. The first worker drains the whole current
+        // snapshot; a successor covers an attachment accepted after that snapshot was taken.
+        workManager.enqueueUniqueWork(
+            LOCAL_MEDIA_PREPARATION_WORK_NAME,
+            LOCAL_MEDIA_PREPARATION_WORK_POLICY,
+            request,
+        )
+    }
+
+    private fun enqueueSync(initialDelayMillis: Long) {
         wakeCoalescer.enqueueOnce {
             val builder = OneTimeWorkRequestBuilder<SecureMessagingSyncWorker>()
                 .setConstraints(
@@ -116,6 +163,7 @@ class SecureMessagingSyncScheduler @Inject constructor(
 
     private companion object {
         const val WORK_NAME = "kit-secure-messaging-sync"
+        const val LOCAL_MEDIA_PREPARATION_WORK_NAME = "kit-local-media-preparation"
     }
 }
 
@@ -145,6 +193,10 @@ class SecureMessagingWakeCoalescer @Inject constructor() {
 
 @VisibleForTesting
 internal val SECURE_MESSAGING_WORK_POLICY: ExistingWorkPolicy = ExistingWorkPolicy.APPEND_OR_REPLACE
+
+@VisibleForTesting
+internal val LOCAL_MEDIA_PREPARATION_WORK_POLICY: ExistingWorkPolicy =
+    ExistingWorkPolicy.APPEND_OR_REPLACE
 
 @VisibleForTesting
 internal enum class SecureMessagingSyncFailureDisposition {

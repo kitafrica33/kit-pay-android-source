@@ -541,6 +541,11 @@ interface KitWalletApi {
     @GET("api/kit-wallet/v1/banking/operations")
     suspend fun bankingOperations(): ApiEnvelope<BankingOperationListDto>
 
+    @GET("api/kit-wallet/v1/banking/operations/{operationId}")
+    suspend fun bankingOperation(
+        @Path("operationId") operationId: String,
+    ): ApiEnvelope<BankingOperationDto>
+
     @GET("api/kit-wallet/v1/banking/funding-accounts")
     suspend fun bankFundingAccounts(): ApiEnvelope<BankFundingAccountListDto>
 

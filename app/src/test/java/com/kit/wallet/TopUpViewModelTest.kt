@@ -4,8 +4,12 @@ import com.kit.wallet.data.local.BeneficiaryContactDao
 import com.kit.wallet.data.local.BeneficiaryContactEntity
 import com.kit.wallet.data.local.ProfilePhotoDao
 import com.kit.wallet.data.local.ProfilePhotoEntity
+import com.kit.wallet.data.remote.CurrencyDto
 import com.kit.wallet.data.remote.KIT_INSUFFICIENT_FUNDS_CODE
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.remote.MobileMoneyFailureDto
+import com.kit.wallet.data.remote.MobileMoneyNetworkDto
+import com.kit.wallet.data.remote.MobileMoneyVerificationDto
 import com.kit.wallet.data.repository.BankingRepository
 import com.kit.wallet.data.repository.BeneficiaryContactDirectory
 import com.kit.wallet.data.repository.BeneficiaryPhoneIdentity
@@ -19,6 +23,7 @@ import com.kit.wallet.data.repository.WalletCurrency
 import com.kit.wallet.data.repository.WalletRepository
 import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.data.repository.WalletSyncResult
+import com.kit.wallet.data.repository.requireCustomerVerifiedMobileMoneyAccount
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.feature.funding.TopUpStage
 import com.kit.wallet.feature.funding.TopUpViewModel
@@ -198,6 +203,59 @@ class TopUpViewModelTest {
     }
 
     @Test
+    fun `mobile money verification provider diagnostics cannot reach the screen`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val sensitive = "Commission margin failed in the settlement wallet ledger."
+        val mobile = FakeMobileMoneyRepository(
+            accountVerification = MobileMoneyVerificationDto(
+                id = "verification-1",
+                bankId = "mobile-bank",
+                status = "failed",
+                accountNumberMasked = "+256•••001",
+                failure = MobileMoneyFailureDto(
+                    code = "PROVIDER_VERIFICATION_FAILED",
+                    message = sensitive,
+                ),
+                network = MobileMoneyNetworkDto(
+                    id = "mobile-network",
+                    code = "MTN_UG",
+                    name = "MTN",
+                    currency = CurrencyDto("UGX", "2"),
+                ),
+            ),
+        )
+        val session = MutableTestSessionStore(testSession("mobile-privacy"))
+        val viewModel = MobileMoneyViewModel(
+            mobileMoney = mobile,
+            wallet = FakeWalletRepository(0),
+            walletSync = RecordingTestWalletSync(),
+            contacts = EmptyContactRepository,
+            beneficiaryContacts = BeneficiaryContactDirectory(
+                EmptyBeneficiaryContactDao,
+                session,
+                EmptyBeneficiaryPhoneIdentity,
+                backgroundScope,
+            ),
+            profilePhotos = ProfilePhotoDirectory(
+                EmptyProfilePhotoDao,
+                session,
+                backgroundScope,
+            ),
+        )
+        runCurrent()
+
+        viewModel.addAccount("MTN_UG", "+256700000001", "My phone", "own") {}
+        runCurrent()
+
+        assertEquals(
+            "We could not verify these account details. Review them and try again.",
+            viewModel.error.value,
+        )
+        assertFalse(viewModel.error.value.orEmpty().contains(sensitive))
+        assertFalse(viewModel.busy.value)
+    }
+
+    @Test
     fun `bank server rejection uses refreshed authoritative balance`() = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         val wallet = FakeWalletRepository(100_000)
@@ -319,6 +377,7 @@ class TopUpViewModelTest {
     private class FakeMobileMoneyRepository(
         initialAccounts: List<MobileMoneyAccount> = listOf(mobileAccount(DEFAULT_ID)),
         private val submissionFailure: Exception? = null,
+        private val accountVerification: MobileMoneyVerificationDto? = null,
     ) : MobileMoneyRepository {
         override val networks: StateFlow<List<MobileMoneyNetwork>> = MutableStateFlow(emptyList())
         val accountsState = MutableStateFlow(initialAccounts)
@@ -333,6 +392,7 @@ class TopUpViewModelTest {
             label: String,
             kind: String,
         ) {
+            accountVerification?.let(::requireCustomerVerifiedMobileMoneyAccount)
             accountsState.value += mobileAccount(ADDED_ID, label)
         }
         override suspend fun createOperation(

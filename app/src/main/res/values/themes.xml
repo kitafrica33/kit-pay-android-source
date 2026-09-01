@@ -21,7 +21,13 @@
         <item name="android:windowBackground">@color/kit_navy</item>
     </style>
 
-    <!-- This relay performs no asynchronous work and always finishes from onCreate. Keeping it
-         non-rendering avoids a flash between the system call surface and MainActivity. -->
-    <style name="Theme.KitWallet.CallRelay" parent="android:style/Theme.NoDisplay" />
+    <!-- A validated incoming call uses this real, fully opaque window to wake a locked device.
+         MainActivity keeps the same navy starting window until its Compose privacy cover has
+         drawn, so no previously visible wallet or conversation frame can flash over keyguard. -->
+    <style name="Theme.KitWallet.CallRelay" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/kit_navy</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowIsTranslucent">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
 </resources>

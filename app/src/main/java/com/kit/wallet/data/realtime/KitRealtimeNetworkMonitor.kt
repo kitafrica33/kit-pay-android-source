@@ -3,13 +3,19 @@ package com.kit.wallet.data.realtime
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+private val ALWAYS_ONLINE = MutableStateFlow(true).asStateFlow()
 
 /** What the default network just did. */
 enum class KitNetworkEvent {
@@ -28,6 +34,10 @@ enum class KitNetworkEvent {
  */
 interface KitNetworkSource {
     val events: SharedFlow<KitNetworkEvent>
+
+    /** Current validated default-network availability for work that must pause while offline. */
+    val online: StateFlow<Boolean>
+        get() = ALWAYS_ONLINE
 
     fun start()
 }
@@ -52,6 +62,7 @@ interface KitNetworkSource {
 internal class KitRealtimeNetworkMonitor @Inject constructor(
     @ApplicationContext private val context: Context,
 ) : KitNetworkSource {
+    private val manager = context.getSystemService(ConnectivityManager::class.java)
     private val changes = MutableSharedFlow<KitNetworkEvent>(
         replay = 0,
         extraBufferCapacity = 8,
@@ -61,26 +72,51 @@ internal class KitRealtimeNetworkMonitor @Inject constructor(
     )
 
     override val events: SharedFlow<KitNetworkEvent> = changes.asSharedFlow()
+    private val mutableOnline = MutableStateFlow(hasUsableDefaultNetwork())
+    override val online: StateFlow<Boolean> = mutableOnline.asStateFlow()
 
     private var registered: Boolean = false
 
     private val callback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
+            updateOnlineFromSystem()
             changes.tryEmit(KitNetworkEvent.Available)
         }
 
         override fun onLost(network: Network) {
+            updateOnlineFromSystem()
             changes.tryEmit(KitNetworkEvent.Lost)
+        }
+
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            updateOnlineFromSystem()
         }
     }
 
+    @Synchronized
     override fun start() {
         if (registered) return
-        val manager = context.getSystemService(ConnectivityManager::class.java) ?: return
+        val manager = manager ?: return
+        updateOnlineFromSystem()
         // Never fatal: a device that refuses the registration keeps the socket on
         // its own ladder and the fallback poller behind it. Connectivity awareness
         // is an optimisation, not a correctness requirement.
         runCatching { manager.registerDefaultNetworkCallback(callback) }
             .onSuccess { registered = true }
+            // If observation itself is unavailable, retain retry correctness rather than
+            // freezing behind an offline snapshot that can never change.
+            .onFailure { mutableOnline.value = true }
     }
+
+    private fun updateOnlineFromSystem() {
+        mutableOnline.value = hasUsableDefaultNetwork()
+    }
+
+    private fun hasUsableDefaultNetwork(): Boolean = runCatching {
+        val manager = manager ?: return@runCatching true
+        val active = manager.activeNetwork ?: return@runCatching false
+        val capabilities = manager.getNetworkCapabilities(active) ?: return@runCatching false
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }.getOrDefault(true)
 }

@@ -20,6 +20,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 internal enum class ImmediateSendDispatchOutcome { IDLE, COMMITTED, RETRY }
+internal enum class ImmediateMediaPreparationOutcome { IDLE, PREPARED, RETRY }
 
 /** Promotes local plaintext intents to the existing encrypted companion outbox. */
 @Singleton
@@ -30,12 +31,105 @@ internal class ImmediateSendDispatcher @Inject constructor(
 ) {
     private val mutex = Mutex()
 
+    /**
+     * Performs device-only encryption without requiring connectivity or a ready network runtime.
+     *
+     * The unconstrained preparation worker calls this path. [dispatch] retains the same step as a
+     * crash/race fallback, but upload no longer has to be the operation that first makes local
+     * ciphertext durable.
+     */
+    suspend fun prepareLocalMedia(): ImmediateMediaPreparationOutcome = mutex.withLock {
+        val owner = store.loadForCurrentOwner()
+            ?: return@withLock ImmediateMediaPreparationOutcome.IDLE
+        val preparing = store.itemsForOwner(owner)
+            .filter {
+                it.state == ImmediateSendState.IMPORTING ||
+                    it.state == ImmediateSendState.PREPARING
+            }
+        if (preparing.isEmpty()) return@withLock ImmediateMediaPreparationOutcome.IDLE
+        val permit = Semaphore(MAX_CONCURRENT_MEDIA_PREPARATIONS)
+        val results = coroutineScope {
+            preparing.map { intent ->
+                async { permit.withPermit { prepareOne(owner, intent) } }
+            }.awaitAll()
+        }
+        when {
+            results.any { it == PrepareOneResult.RETRY } -> ImmediateMediaPreparationOutcome.RETRY
+            results.any { it == PrepareOneResult.PREPARED } -> ImmediateMediaPreparationOutcome.PREPARED
+            else -> ImmediateMediaPreparationOutcome.IDLE
+        }
+    }
+
+    private enum class PrepareOneResult { PREPARED, RETRY, FAILED, GONE }
+
+    private suspend fun prepareOne(
+        owner: SessionFence,
+        original: ImmediateSendIntent,
+    ): PrepareOneResult {
+        var current = store.itemsForOwner(owner).firstOrNull { it.id == original.id }
+            ?: return PrepareOneResult.GONE
+        if (current.state == ImmediateSendState.IMPORTING) {
+            val recovered = chats.recoverImmediateMediaImport(owner, current)
+                ?: return PrepareOneResult.RETRY
+            if (!store.replaceForOwner(owner, current, recovered)) {
+                return PrepareOneResult.GONE
+            }
+            current = recovered
+            if (current.state == ImmediateSendState.FAILED) {
+                runCatching { chats.releaseImmediateMediaRetention(owner, current) }
+                runCatching { chats.markImmediateMediaFailure(owner, current, permanent = true) }
+                return PrepareOneResult.FAILED
+            }
+        }
+        if (current.state != ImmediateSendState.PREPARING) return PrepareOneResult.GONE
+        val failure = try {
+            val prepared = chats.prepareImmediateMediaCiphertext(owner, current)
+            if (!store.replaceForOwner(owner, current, prepared)) {
+                prepared.spoolIds().forEach { mediaSpool.discard(it) }
+                return PrepareOneResult.GONE
+            }
+            // The queue now owns durable ciphertext; plaintext remains in Sent Media but is no
+            // longer pinned above the ordinary LRU budget.
+            runCatching { chats.releaseImmediateMediaRetention(owner, prepared) }
+            return PrepareOneResult.PREPARED
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (invalidated: SessionInvalidatedException) {
+            return PrepareOneResult.GONE
+        } catch (authenticationChanged: SecureMessagingAuthenticationEpochChangedException) {
+            throw authenticationChanged
+        } catch (cryptographic: SecureMessagingCryptographicFailureException) {
+            throw cryptographic
+        } catch (error: Exception) {
+            error
+        }
+        return if (failure.isTransientImmediateSendFailure()) {
+            runCatching { chats.markImmediateMediaFailure(owner, current, permanent = false) }
+            PrepareOneResult.RETRY
+        } else {
+            withContext(NonCancellable) {
+                store.replaceForOwner(
+                    owner,
+                    current,
+                    current.copy(state = ImmediateSendState.FAILED),
+                )
+                current.spoolIds().forEach { mediaSpool.discard(it) }
+                runCatching { chats.releaseImmediateMediaRetention(owner, current) }
+                runCatching { chats.markImmediateMediaFailure(owner, current, permanent = true) }
+            }
+            PrepareOneResult.FAILED
+        }
+    }
+
     suspend fun dispatch(): ImmediateSendDispatchOutcome = mutex.withLock {
         val owner = store.loadForCurrentOwner()
             ?: return@withLock ImmediateSendDispatchOutcome.IDLE
         val snapshot = store.itemsForOwner(owner)
         mediaSpool.prune(
-            snapshot.filter { it.state != ImmediateSendState.PREPARING }
+            snapshot.filter {
+                it.state != ImmediateSendState.IMPORTING &&
+                    it.state != ImmediateSendState.PREPARING
+            }
                 .flatMapTo(mutableSetOf(), ImmediateSendIntent::spoolIds),
         )
         if (snapshot.isEmpty()) return@withLock ImmediateSendDispatchOutcome.IDLE
@@ -137,6 +231,11 @@ internal class ImmediateSendDispatcher @Inject constructor(
     ): DispatchOneResult {
         var current = store.itemsForOwner(owner).firstOrNull { it.id == original.id }
             ?: return DispatchOneResult.GONE
+        if (current.state == ImmediateSendState.IMPORTING) {
+            // The unconstrained local worker owns import reconciliation and encryption. Keeping
+            // this row at the per-conversation head preserves ordering while network work retries.
+            return DispatchOneResult.RETRY
+        }
         var encryptedOutboxOwnsSend = false
         val failure = try {
             if (current.state == ImmediateSendState.PREPARING) {
@@ -155,6 +254,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
             ) {
                 runCatching { chats.releaseImmediateMediaRetention(owner, current) }
             }
+            val restoredPreparedDescriptor = current.preparedMediaDescriptor != null
             if (current.kind == ImmediateSendKind.MEDIA && current.preparedMediaDescriptor == null) {
                 // The spool verifies the blob is still the one the queue recorded and hands back
                 // the file itself, so the upload streams off disk rather than through heap.
@@ -182,13 +282,25 @@ internal class ImmediateSendDispatcher @Inject constructor(
                 // every confirmed storage key is persisted before the next upload begins, so a
                 // process death resumes exactly where the record says and repeats nothing.
                 for (item in current.mediaItems.sortedBy(ImmediateSendMediaItem::attachmentId)) {
-                    if (item.storageKey != null) continue
-                    val storageKey = chats.uploadImmediateAlbumItem(
-                        owner = owner,
-                        intent = current,
-                        attachmentId = item.attachmentId,
-                        ciphertext = mediaSpool.albumItemCiphertextFile(current, item.attachmentId),
-                    )
+                    val ciphertext = mediaSpool.albumItemCiphertextFile(current, item.attachmentId)
+                    val storageKey = if (item.storageKey == null) {
+                        chats.uploadImmediateAlbumItem(
+                            owner = owner,
+                            intent = current,
+                            attachmentId = item.attachmentId,
+                            ciphertext = ciphertext,
+                        )
+                    } else {
+                        // A process may have slept longer than the server's unclaimed-object TTL
+                        // after this exact checkpoint. Renew/reconstruct it before sealing.
+                        chats.renewImmediateAlbumItem(
+                            owner = owner,
+                            intent = current,
+                            attachmentId = item.attachmentId,
+                            ciphertext = ciphertext,
+                        )
+                    }
+                    if (storageKey == item.storageKey) continue
                     val recorded = current.withAlbumItemStorageKey(item.attachmentId, storageKey)
                     if (!store.replaceForOwner(owner, current, recorded)) {
                         return DispatchOneResult.GONE
@@ -202,6 +314,15 @@ internal class ImmediateSendDispatcher @Inject constructor(
                     return DispatchOneResult.GONE
                 }
                 current = sealed
+            }
+            if (restoredPreparedDescriptor) {
+                val renewed = chats.renewPreparedImmediateMediaReferences(owner, current)
+                if (renewed != current) {
+                    if (!store.replaceForOwner(owner, current, renewed)) {
+                        return DispatchOneResult.GONE
+                    }
+                    current = renewed
+                }
             }
             chats.promoteImmediateSend(owner, current) { encryptedOutboxOwnsSend = true }
             null
@@ -244,6 +365,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
 
         if (current.state == ImmediateSendState.PREPARING) {
             return if (failure.isTransientImmediateSendFailure()) {
+                runCatching { chats.markImmediateMediaFailure(owner, current, permanent = false) }
                 DispatchOneResult.RETRY
             } else {
                 withContext(NonCancellable) {
@@ -254,6 +376,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
                     )
                     current.spoolIds().forEach { mediaSpool.discard(it) }
                     runCatching { chats.releaseImmediateMediaRetention(owner, current) }
+                    runCatching { chats.markImmediateMediaFailure(owner, current, permanent = true) }
                 }
                 DispatchOneResult.FAILED
             }
@@ -278,6 +401,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
             withContext(NonCancellable) {
                 store.removeForOwner(owner, current.id)
                 mediaSpool.discard(current.id)
+                runCatching { chats.markImmediateMediaFailure(owner, current, permanent = true) }
             }
             return DispatchOneResult.RETIRED
         }
@@ -296,12 +420,15 @@ internal class ImmediateSendDispatcher @Inject constructor(
                     current.copy(state = ImmediateSendState.FAILED),
                 )
                 current.spoolIds().forEach { mediaSpool.discard(it) }
+                runCatching { chats.markImmediateMediaFailure(owner, current, permanent = true) }
             }
             return DispatchOneResult.FAILED
         }
         return if (failure.isTransientImmediateSendFailure()) {
+            runCatching { chats.markImmediateMediaFailure(owner, current, permanent = false) }
             DispatchOneResult.RETRY
         } else {
+            runCatching { chats.markImmediateMediaFailure(owner, current, permanent = false) }
             store.markRetryRequiredForOwner(owner, current)
             DispatchOneResult.RETRY_REQUIRED
         }
@@ -320,5 +447,6 @@ internal class ImmediateSendDispatcher @Inject constructor(
 
     private companion object {
         const val MAX_CONCURRENT_CONVERSATIONS = 4
+        const val MAX_CONCURRENT_MEDIA_PREPARATIONS = 2
     }
 }

@@ -34,6 +34,7 @@ import androidx.compose.material.icons.rounded.Contacts
 import androidx.compose.material.icons.rounded.DeleteForever
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.PrivacyTip
 import androidx.compose.material.icons.rounded.Refresh
@@ -68,12 +69,18 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.net.toUri
 import com.kit.wallet.data.repository.KycVerificationState
 import com.kit.wallet.data.repository.kycVerificationStateOf
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.demo.DemoData
+import com.kit.wallet.data.notifications.IncomingCallAlertMode
+import com.kit.wallet.data.notifications.foregroundReadinessCopy
+import com.kit.wallet.data.notifications.incomingCallAlertPlan
+import com.kit.wallet.data.notifications.incomingCallAlertSettingsIntent
+import com.kit.wallet.data.notifications.incomingCallNotificationAccess
 import com.kit.wallet.data.remote.KitFeature
 import com.kit.wallet.data.repository.BlockedCommunicationUser
 import com.kit.wallet.feature.legal.OpenSourceLicenceDialog
@@ -130,6 +137,19 @@ fun SettingsScreen(
     var showLogoutError by rememberSaveable { mutableStateOf(false) }
     var showDeletionDialog by rememberSaveable { mutableStateOf(false) }
     var showBlockedAccounts by rememberSaveable { mutableStateOf(false) }
+    var callAlertReadinessRevision by remember { mutableLongStateOf(0L) }
+
+    // Notification permission, channel importance and full-screen-call access can change in
+    // Android Settings while this screen is paused. Re-read them on every foreground return;
+    // opening Settings itself remains an explicit user action.
+    LifecycleResumeEffect(Unit) {
+        callAlertReadinessRevision += 1L
+        onPauseOrDispose { }
+    }
+    val callAlertAccess = remember(context, callAlertReadinessRevision) {
+        incomingCallNotificationAccess(context)
+    }
+    val callAlertPlan = incomingCallAlertPlan(callAlertAccess)
 
     LaunchedEffect(logoutError) {
         if (!logoutError.isNullOrBlank()) showLogoutError = true
@@ -324,6 +344,19 @@ fun SettingsScreen(
         shareDeviceContactsEnabled = contactDiscoveryToggle.enabled,
         onShareDeviceContactsChanged = contactDiscoveryToggle.onCheckedChange,
         onIncomingCallsChanged = communicationViewModel::setIncomingCallsEnabled,
+        callAlertReadiness = callAlertPlan.foregroundReadinessCopy(),
+        onCallAlertSettings = if (callAlertPlan.mode == IncomingCallAlertMode.FULL_SCREEN) {
+            null
+        } else {
+            {
+                runCatching {
+                    context.startActivity(
+                        incomingCallAlertSettingsIntent(context, callAlertAccess),
+                    )
+                }
+                Unit
+            }
+        },
         onDirectMessageRequestsChanged = { enabled ->
             communicationViewModel.setDirectMessageRequestsEnabled(
                 enabled = enabled,
@@ -396,6 +429,8 @@ private fun SettingsContent(
     shareDeviceContactsEnabled: Boolean,
     onShareDeviceContactsChanged: (Boolean) -> Unit,
     onIncomingCallsChanged: (Boolean) -> Unit,
+    callAlertReadiness: String,
+    onCallAlertSettings: (() -> Unit)?,
     onDirectMessageRequestsChanged: (Boolean) -> Unit,
     onMessagingPresenceChanged: (Boolean) -> Unit,
     onRefreshCommunicationPrivacy: () -> Unit,
@@ -483,6 +518,8 @@ private fun SettingsContent(
                 shareDeviceContactsEnabled = shareDeviceContactsEnabled,
                 onShareDeviceContactsChanged = onShareDeviceContactsChanged,
                 onIncomingCallsChanged = onIncomingCallsChanged,
+                callAlertReadiness = callAlertReadiness,
+                onCallAlertSettings = onCallAlertSettings,
                 onDirectMessageRequestsChanged = onDirectMessageRequestsChanged,
                 onMessagingPresenceChanged = onMessagingPresenceChanged,
                 onRefresh = onRefreshCommunicationPrivacy,
@@ -596,6 +633,8 @@ private fun CommunicationPrivacySettings(
     shareDeviceContactsEnabled: Boolean,
     onShareDeviceContactsChanged: (Boolean) -> Unit,
     onIncomingCallsChanged: (Boolean) -> Unit,
+    callAlertReadiness: String,
+    onCallAlertSettings: (() -> Unit)?,
     onDirectMessageRequestsChanged: (Boolean) -> Unit,
     onMessagingPresenceChanged: (Boolean) -> Unit,
     onRefresh: () -> Unit,
@@ -655,6 +694,12 @@ private fun CommunicationPrivacySettings(
                 )
             },
             onClick = null,
+        )
+        SettingsRow(
+            icon = Icons.Rounded.NotificationsActive,
+            title = "Call alerts",
+            subtitle = callAlertReadiness,
+            onClick = onCallAlertSettings,
         )
         SettingsRow(
             icon = Icons.Rounded.ChatBubbleOutline,
@@ -1318,6 +1363,8 @@ private fun SettingsPreview() {
             shareDeviceContactsEnabled = false,
             onShareDeviceContactsChanged = {},
             onIncomingCallsChanged = {},
+            callAlertReadiness = "Ready to ring and appear over the lock screen",
+            onCallAlertSettings = null,
             onDirectMessageRequestsChanged = {},
             onMessagingPresenceChanged = {},
             onRefreshCommunicationPrivacy = {},

@@ -3,21 +3,28 @@ package com.kit.wallet.data.messaging
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.RichMediaProtocolDto
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * Send-side gate for chat media, mirroring the iOS `MessagingRichMediaCapabilityPolicy`.
+ * The selected media is valid locally, but the authenticated service has not yet advertised a
+ * compatible transport contract. This is retryable: the durable pending bubble and local original
+ * stay in place while WorkManager waits for a later coherent capability document.
+ */
+internal class MessagingRichMediaCapabilityTemporarilyUnavailableException(message: String) :
+    IOException(message)
+
+/**
+ * Local-admission and network-dispatch policy for chat media.
  *
- * Images at or under the 10 MB legacy baseline always send — every service that ever spoke
- * `KITMEDIA1` accepts them — so today's offline photo sends keep working with no network call.
- * Everything larger, plus voice notes, videos and documents, is gated on the server's
- * `kit-media-v1` advertisement: the app accepts any *coherent* advertisement and clamps the
- * effective send cap to min(compiled cap, advertised cap), falling back to the 10 MB legacy
- * baseline when nothing usable is advertised. The check is refreshed at send time (like iOS
- * `queueMediaMessage`) so a service rollout raises the limit without an app update.
+ * Selecting or capturing media is a device-local action: [requireLocallyQueueable] validates only
+ * facts compiled into this client and must never fetch service capabilities. That lets the durable
+ * outbox publish a playable pending bubble on a fresh install with no network. [requireSendable]
+ * remains the authoritative dispatch-time check against the service advertisement; a missing or
+ * incompatible advertisement keeps the already-local message pending rather than weakening E2EE.
  */
 @Singleton
 class MessagingRichMediaCapability @Inject constructor(
@@ -26,39 +33,93 @@ class MessagingRichMediaCapability @Inject constructor(
 ) {
     private val refreshMutex = Mutex()
 
-    @Volatile
-    private var lastAdvertisement: RichMediaProtocolDto? = null
+    private data class CachedAdvertisement(
+        val ownerScopeId: String,
+        val loadedAtMillis: Long,
+        val advertisement: RichMediaProtocolDto?,
+    )
 
     @Volatile
-    private var lastLoadedAtMillis: Long = 0
+    private var cachedAdvertisement: CachedAdvertisement? = null
+
+    private var currentTimeMillis: () -> Long = System::currentTimeMillis
+
+    /** Test-only clock injection without adding a function dependency to the Hilt constructor. */
+    internal constructor(
+        api: KitWalletApi,
+        apiCalls: ApiCallExecutor,
+        currentTimeMillis: () -> Long,
+    ) : this(api, apiCalls) {
+        this.currentTimeMillis = currentTimeMillis
+    }
+
+    /**
+     * Validates whether this build can safely retain and eventually transmit the selected bytes.
+     *
+     * This method is deliberately synchronous and cache-independent. In particular, it must not
+     * turn a fresh-install offline capture into a network request before the durable local media
+     * record and pending message exist.
+     */
+    fun requireLocallyQueueable(mediaType: String, byteCount: Long) {
+        check(KitMediaMessage.normalizeMediaType(mediaType) != null) {
+            "Choose a supported photo, voice note, video or document"
+        }
+        check(byteCount in 1..maximumLocallyQueueableBytes()) {
+            "Files up to ${maximumLocallyQueueableBytes() / (1024 * 1024)} MB are supported"
+        }
+    }
+
+    /** The file-backed plaintext ceiling this build can accept without consulting the network. */
+    fun maximumLocallyQueueableBytes(): Long = MAX_IMAGE_PLAINTEXT_BYTES.toLong()
 
     /**
      * Throws with customer-facing copy when [mediaType] at [byteCount] plaintext bytes cannot be
      * sent through this service.
      */
-    suspend fun requireSendable(mediaType: String, byteCount: Long) {
-        val isImage = mediaType.startsWith("image/")
+    suspend fun requireSendable(
+        mediaType: String,
+        byteCount: Long,
+        ownerScopeId: String,
+    ) {
+        requireLocallyQueueable(mediaType, byteCount)
+        require(ownerScopeId.isNotBlank()) { "The media queue owner is unavailable" }
+        val normalizedMediaType = mediaType.trim().lowercase()
+        val isImage = normalizedMediaType.startsWith("image/")
         // Legacy-baseline images send unconditionally: every KITMEDIA1 service accepts them, so
         // no capability round trip may delay (or, offline, block) a plain photo send.
         if (isImage && byteCount <= LEGACY_MAX_PLAINTEXT_BYTES) return
-        if (!permitsWithCachedAdvertisement(mediaType, isImage, byteCount)) {
-            refreshMutex.withLock {
-                if (System.currentTimeMillis() - lastLoadedAtMillis >= REFRESH_INTERVAL_MILLIS) {
-                    lastAdvertisement = runCatching {
-                        apiCalls.execute { api.capabilities() }.protocols?.messaging?.richMedia
-                    }.getOrNull() ?: lastAdvertisement
-                    lastLoadedAtMillis = System.currentTimeMillis()
-                }
+        val advertisement = refreshMutex.withLock {
+            val now = currentTimeMillis()
+            val cached = cachedAdvertisement
+            val age = cached?.let { now - it.loadedAtMillis }
+            val isFreshForOwner = cached?.ownerScopeId == ownerScopeId &&
+                age != null && age in 0 until REFRESH_INTERVAL_MILLIS
+            if (!isFreshForOwner) {
+                // A transport failure intentionally leaves the previous cache untouched and is
+                // propagated: the outbox classifies it as a background retry. The next run will
+                // try again rather than treating an unreachable service as a feature denial.
+                val fetched = apiCalls.execute {
+                    api.capabilities()
+                }.protocols?.messaging?.richMedia
+                cachedAdvertisement = CachedAdvertisement(
+                    ownerScopeId = ownerScopeId,
+                    loadedAtMillis = currentTimeMillis(),
+                    advertisement = fetched,
+                )
             }
+            cachedAdvertisement?.advertisement
         }
-        if (!isImage) {
-            check(supports(lastAdvertisement, mediaType)) {
-                "Voice notes, videos, and documents are not available on this Kit Pay service yet."
-            }
+        val limit = maximumSendableBytes(advertisement)
+        if (byteCount > limit) {
+            throw MessagingRichMediaCapabilityTemporarilyUnavailableException(
+                "This Kit Pay service accepts files up to ${limit / (1024 * 1024)} MB right now",
+            )
         }
-        val limit = maximumSendableBytes()
-        check(byteCount <= limit) {
-            "This Kit Pay service accepts files up to ${limit / (1024 * 1024)} MB right now"
+        val requiresAdvertisedType = !isImage || byteCount > LEGACY_MAX_PLAINTEXT_BYTES
+        if (requiresAdvertisedType && !supports(advertisement, normalizedMediaType)) {
+            throw MessagingRichMediaCapabilityTemporarilyUnavailableException(
+                "This attachment type is not available on this Kit Pay service yet.",
+            )
         }
     }
 
@@ -67,20 +128,14 @@ class MessagingRichMediaCapability @Inject constructor(
      * usable advertisement offers, or the 10 MB legacy baseline when none is cached.
      */
     fun maximumSendableBytes(): Long {
-        val advertisement = lastAdvertisement
+        return maximumSendableBytes(cachedAdvertisement?.advertisement)
+    }
+
+    private fun maximumSendableBytes(advertisement: RichMediaProtocolDto?): Long {
         val advertised = advertisement?.maximumPlaintextBytes
             ?.takeIf { isUsable(advertisement) }
             ?: LEGACY_MAX_PLAINTEXT_BYTES
         return minOf(MAX_IMAGE_PLAINTEXT_BYTES.toLong(), advertised)
-    }
-
-    private fun permitsWithCachedAdvertisement(
-        mediaType: String,
-        isImage: Boolean,
-        byteCount: Long,
-    ): Boolean {
-        if (!isImage && !supports(lastAdvertisement, mediaType)) return false
-        return byteCount <= maximumSendableBytes()
     }
 
     private fun isUsable(advertisement: RichMediaProtocolDto?): Boolean {

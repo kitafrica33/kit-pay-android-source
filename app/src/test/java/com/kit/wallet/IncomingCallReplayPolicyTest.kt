@@ -14,9 +14,21 @@ class IncomingCallReplayPolicyTest {
     private val recordedUntil = ringExpiry.plus(Duration.ofMinutes(10)).toEpochMilli()
 
     @Test
-    fun `first ring is admitted and duplicate active ring is suppressed`() {
+    fun `first and exact duplicate live rings are admitted idempotently`() {
         assertTrue(shouldAdmitIncomingRing(now, ringExpiry, null, null))
-        assertFalse(shouldAdmitIncomingRing(now, ringExpiry, recordedUntil, null))
+        assertTrue(shouldAdmitIncomingRing(now, ringExpiry, recordedUntil, null))
+    }
+
+    @Test
+    fun `same call id with a different live expiry cannot replace the admitted ring`() {
+        assertFalse(
+            shouldAdmitIncomingRing(
+                now,
+                ringExpiry.plusSeconds(1),
+                recordedUntil,
+                null,
+            ),
+        )
     }
 
     @Test

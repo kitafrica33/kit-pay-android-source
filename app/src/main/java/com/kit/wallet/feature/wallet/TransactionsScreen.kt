@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.kit.wallet.data.demo.DemoData
+import com.kit.wallet.data.repository.WalletCurrency
 import com.kit.wallet.ui.components.SectionHeader
 import com.kit.wallet.ui.components.TransactionRow
 import com.kit.wallet.ui.model.Money
@@ -68,14 +69,15 @@ internal fun summarizeTransactionActivity(
     var moneyIn = 0L
     var moneyOut = 0L
     transactions.forEach { transaction ->
+        val customerAmount = transaction.customerVisibleAmountMinor
+        val magnitude = when {
+            customerAmount == Long.MIN_VALUE -> Long.MAX_VALUE
+            customerAmount < 0 -> -customerAmount
+            else -> customerAmount
+        }
         if (transaction.amountMinor > 0) {
-            moneyIn = saturatedAdd(moneyIn, transaction.amountMinor)
+            moneyIn = saturatedAdd(moneyIn, magnitude)
         } else if (transaction.amountMinor < 0) {
-            val magnitude = if (transaction.amountMinor == Long.MIN_VALUE) {
-                Long.MAX_VALUE
-            } else {
-                -transaction.amountMinor
-            }
             moneyOut = saturatedAdd(moneyOut, magnitude)
         }
     }
@@ -93,7 +95,8 @@ fun TransactionsScreen(
     viewModel: TransactionsViewModel = hiltViewModel(),
 ) {
     val transactions by viewModel.transactions.collectAsStateWithLifecycle()
-    TransactionsContent(transactions, onBack, onTransaction)
+    val currency by viewModel.currency.collectAsStateWithLifecycle()
+    TransactionsContent(transactions, onBack, onTransaction, currency)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -102,6 +105,7 @@ internal fun TransactionsContent(
     transactions: List<Transaction>,
     onBack: () -> Unit,
     onTransaction: (String) -> Unit,
+    currency: WalletCurrency = WalletCurrency(),
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf("All") }
@@ -168,7 +172,7 @@ internal fun TransactionsContent(
                     }
                 }
             }
-            item { MonthSummary(transactions) }
+            item { ActivitySummary(transactions, currency) }
 
             if (visible.isEmpty()) {
                 item {
@@ -204,9 +208,13 @@ internal fun TransactionsContent(
     }
 }
 
-/** Simple in/out monthly summary with proportion bars. */
+/** Summary of the currently loaded transaction page with proportion bars. */
 @Composable
-private fun MonthSummary(transactions: List<Transaction>, modifier: Modifier = Modifier) {
+private fun ActivitySummary(
+    transactions: List<Transaction>,
+    currency: WalletCurrency,
+    modifier: Modifier = Modifier,
+) {
     val summary = summarizeTransactionActivity(transactions)
 
     Surface(
@@ -217,29 +225,29 @@ private fun MonthSummary(transactions: List<Transaction>, modifier: Modifier = M
         color = MaterialTheme.colorScheme.surfaceContainer,
     ) {
         Column(Modifier.padding(16.dp)) {
-            Text("This month", style = MaterialTheme.typography.titleSmall)
+            Text("Recent activity", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(12.dp))
             Row {
                 Column(Modifier.weight(1f)) {
                     Text(
-                        "Money in",
+                        "Money Added",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
-                        Money.format(summary.moneyInMinor),
+                        Money.format(summary.moneyInMinor, currency.code, currency.scale),
                         style = MaterialTheme.typography.titleMedium,
                         color = KitTheme.colors.moneyIn,
                     )
                 }
                 Column(Modifier.weight(1f)) {
                     Text(
-                        "Money out",
+                        "Money Deducted",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
-                        Money.format(summary.moneyOutMinor),
+                        Money.format(summary.moneyOutMinor, currency.code, currency.scale),
                         style = MaterialTheme.typography.titleMedium,
                     )
                 }

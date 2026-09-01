@@ -229,6 +229,7 @@ class RequestMoneyViewModel @Inject constructor(
 @HiltViewModel
 class TransactionsViewModel @Inject constructor(wallet: WalletRepository) : ViewModel() {
     val transactions = wallet.transactions
+    val currency = wallet.walletCurrency
 }
 
 sealed interface TransactionDetailUiState {

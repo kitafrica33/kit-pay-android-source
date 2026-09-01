@@ -20,6 +20,7 @@ import androidx.core.content.ContextCompat
 import com.kit.wallet.IncomingCallRelayActivity
 import com.kit.wallet.data.notifications.CallActionReceiver
 import com.kit.wallet.data.notifications.IncomingCallLaunchPurpose
+import com.kit.wallet.data.notifications.IncomingCallDiagnostics
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -46,8 +47,11 @@ class KitTelecomBridge @Inject constructor(
     >()
 
     fun registerPhoneAccount(): Boolean {
-        if (!supportsTelecomRegistration(context.packageManager::hasSystemFeature)) return false
-        return runCatching {
+        if (!supportsTelecomRegistration(context.packageManager::hasSystemFeature)) {
+            IncomingCallDiagnostics.telecomRegistration("unsupported", false)
+            return false
+        }
+        val registered = runCatching {
             val extras = Bundle().apply {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     putBoolean(PhoneAccount.EXTRA_LOG_SELF_MANAGED_CALLS, true)
@@ -69,6 +73,8 @@ class KitTelecomBridge @Inject constructor(
             )
             true
         }.getOrDefault(false)
+        IncomingCallDiagnostics.telecomRegistration("phone_account", registered)
+        return registered
     }
 
     fun trackOutgoing(callId: String, name: String, phone: String?, video: Boolean) {
@@ -130,6 +136,7 @@ class KitTelecomBridge @Inject constructor(
     ) {
         val permitted = registerPhoneAccount() &&
             runCatching { telecom.isIncomingCallPermitted(accountHandle) }.getOrDefault(false)
+        IncomingCallDiagnostics.telecomRegistration("incoming_permitted", permitted)
         if (!permitted) return
         val metadata = TelecomCallMetadata(callId, name, phone, video, incoming = true, ringExpiresAt)
         val tracked = calls.track(callId, metadata, TelecomCallState.RINGING) ?: return
@@ -141,8 +148,9 @@ class KitTelecomBridge @Inject constructor(
             putParcelable(TelecomManager.EXTRA_INCOMING_CALL_ADDRESS, metadata.address)
             putInt(TelecomManager.EXTRA_INCOMING_VIDEO_STATE, metadata.videoState)
         }
-        runCatching { telecom.addNewIncomingCall(accountHandle, extras) }
-            .onFailure { registrationFailed(callId) }
+        val added = runCatching { telecom.addNewIncomingCall(accountHandle, extras) }.isSuccess
+        IncomingCallDiagnostics.telecomRegistration("incoming_added", added)
+        if (!added) registrationFailed(callId)
     }
 
     fun updatePresentation(callId: String, name: String, phone: String?, video: Boolean) {
@@ -195,6 +203,15 @@ class KitTelecomBridge @Inject constructor(
 
     internal fun systemAnswered(callId: String, ringExpiresAt: String?) {
         val expiry = ringExpiresAt ?: return
+        // Telecom's answer gesture is only a local intent. Keep the Connection in an explicit
+        // pre-acceptance state until the authenticated backend accept and LiveKit connection
+        // advance it; reporting ACTIVE here would claim live audio that does not yet exist.
+        calls.compareAndSetState(
+            callId = callId,
+            expected = TelecomCallState.RINGING,
+            state = TelecomCallState.ANSWERING,
+            applyToConnection = { connection, state -> connection.applyState(state) },
+        ) ?: return
         val intent = IncomingCallRelayActivity.intent(
             context = context,
             callId = callId,
@@ -215,7 +232,10 @@ class KitTelecomBridge @Inject constructor(
 
     internal fun systemDisconnected(callId: String) {
         val tracked = calls.finish(callId, KitTelecomDisconnect.LOCAL) ?: return
-        val intent = if (tracked.metadata.incoming && tracked.state == TelecomCallState.RINGING) {
+        val intent = if (
+            tracked.metadata.incoming &&
+            tracked.state in setOf(TelecomCallState.RINGING, TelecomCallState.ANSWERING)
+        ) {
             CallActionReceiver.declineIntent(context, callId)
         } else {
             CallActionReceiver.endIntent(context, callId, "cancelled")
@@ -258,7 +278,7 @@ enum class KitTelecomDisconnect(internal val cause: DisconnectCause) {
     ANSWERED_ELSEWHERE(DisconnectCause(DisconnectCause.ANSWERED_ELSEWHERE)),
 }
 
-private enum class TelecomCallState { RINGING, DIALING, ACTIVE }
+private enum class TelecomCallState { RINGING, ANSWERING, DIALING, ACTIVE }
 
 internal data class TelecomCallMetadata(
     val callId: String,
@@ -335,6 +355,7 @@ private class KitTelecomConnection(
 
     fun applyState(state: TelecomCallState) = when (state) {
         TelecomCallState.RINGING -> setRinging()
+        TelecomCallState.ANSWERING -> setInitializing()
         TelecomCallState.DIALING -> setDialing()
         TelecomCallState.ACTIVE -> setActive()
     }
@@ -348,7 +369,6 @@ private class KitTelecomConnection(
 
     override fun onAnswer(videoState: Int) {
         setVideoState(videoState)
-        setActive()
         bridge.systemAnswered(callId, ringExpiresAt)
     }
 

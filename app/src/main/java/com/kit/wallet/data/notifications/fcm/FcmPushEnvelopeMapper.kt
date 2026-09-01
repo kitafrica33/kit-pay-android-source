@@ -2,6 +2,7 @@ package com.kit.wallet.data.notifications.fcm
 
 import com.google.firebase.messaging.RemoteMessage
 import com.kit.wallet.data.notifications.PushEnvelope
+import com.kit.wallet.data.notifications.PushDeliveryPriority
 import com.kit.wallet.data.notifications.PushNotificationContent
 
 internal object FcmPushEnvelopeMapper {
@@ -15,6 +16,8 @@ internal object FcmPushEnvelopeMapper {
             )
         },
         messageId = message.messageId,
+        deliveredPriority = priority(message.priority),
+        originalPriority = priority(message.originalPriority),
     )
 
     internal fun map(
@@ -22,6 +25,8 @@ internal object FcmPushEnvelopeMapper {
         rawEnvelopeKeys: Set<String>?,
         notification: PushNotificationContent?,
         messageId: String?,
+        deliveredPriority: PushDeliveryPriority = PushDeliveryPriority.UNKNOWN,
+        originalPriority: PushDeliveryPriority = PushDeliveryPriority.UNKNOWN,
     ): PushEnvelope {
         val completeEnvelope = rawEnvelopeKeys != null &&
             data.keys.all(rawEnvelopeKeys::contains)
@@ -31,8 +36,16 @@ internal object FcmPushEnvelopeMapper {
             data = data,
             notification = notification,
             messageId = messageId,
+            deliveredPriority = deliveredPriority,
+            originalPriority = originalPriority,
             opaqueWakeVerified = notification == null && completeEnvelope && analyticsFree,
         )
+    }
+
+    private fun priority(value: Int): PushDeliveryPriority = when (value) {
+        RemoteMessage.PRIORITY_HIGH -> PushDeliveryPriority.HIGH
+        RemoteMessage.PRIORITY_NORMAL -> PushDeliveryPriority.NORMAL
+        else -> PushDeliveryPriority.UNKNOWN
     }
 
     private const val FCM_ANALYTICS_KEY_PREFIX = "google.c.a."

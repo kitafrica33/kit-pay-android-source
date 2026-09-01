@@ -21,6 +21,7 @@ import com.kit.wallet.data.messaging.ScheduledSendState
 import com.kit.wallet.data.messaging.ScheduledSendStore
 import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaFile
+import com.kit.wallet.data.messaging.SecureMediaProcessingPlan
 import com.kit.wallet.data.messaging.SecureMediaSource
 import com.kit.wallet.data.notifications.ActiveCallPresence
 import com.kit.wallet.data.notifications.ActiveCallStateHolder
@@ -942,16 +943,20 @@ class ConversationViewModel @Inject internal constructor(
     private sealed interface MediaPreloadTarget {
         val key: String
         val mediaDescriptor: String
+        val fromCurrentUser: Boolean
 
         data class Single(
             override val key: String,
             override val mediaDescriptor: String,
+            override val fromCurrentUser: Boolean,
         ) : MediaPreloadTarget
 
         data class AlbumItem(
             override val key: String,
             override val mediaDescriptor: String,
             val attachmentId: String,
+            val messageId: String,
+            override val fromCurrentUser: Boolean,
         ) : MediaPreloadTarget
     }
 
@@ -1090,6 +1095,8 @@ class ConversationViewModel @Inject internal constructor(
                                 chatRepo.openImageMessage(
                                     selectedChat.id,
                                     target.mediaDescriptor,
+                                    messageId = target.key,
+                                    fromCurrentUser = target.fromCurrentUser,
                                 )
                             }
 
@@ -1104,6 +1111,8 @@ class ConversationViewModel @Inject internal constructor(
                                     selectedChat.id,
                                     target.mediaDescriptor,
                                     target.attachmentId,
+                                    messageId = target.messageId,
+                                    fromCurrentUser = target.fromCurrentUser,
                                 )
                             }
                         }
@@ -2883,24 +2892,22 @@ class ConversationViewModel @Inject internal constructor(
         onFinished: () -> Unit = {},
     ) {
         val selectedChat = chat.value
-        if (selectedChat == null || !historyAvailable.value || mutableSending.value) {
-            mutableError.value = if (mutableSending.value) {
-                "Wait for the current attachment to finish sending, then try again"
-            } else {
-                "Secure messaging is temporarily unavailable"
-            }
+        if (selectedChat == null || !historyAvailable.value) {
+            mutableError.value = "Secure messaging is temporarily unavailable"
             onFinished()
             return
         }
         val replyToMessageId = consumeReplyTarget()
         val sendJob = viewModelScope.launch {
-            mutableSending.value = true
             mutableError.value = null
             try {
                 // A declared size of zero means the provider would not say; the cipher still stops
                 // at the compiled cap, so an unknown size can never become an oversized upload.
-                if (source.declaredByteCount > 0) {
-                    richMediaCapability?.requireSendable(
+                if (
+                    source.processingPlan == SecureMediaProcessingPlan.PASSTHROUGH &&
+                    source.declaredByteCount > 0
+                ) {
+                    richMediaCapability?.requireLocallyQueueable(
                         mediaType.trim().lowercase(),
                         source.declaredByteCount,
                     )
@@ -2918,8 +2925,6 @@ class ConversationViewModel @Inject internal constructor(
             } catch (error: Exception) {
                 mutableError.value = error.message
                     ?: "The secure attachment could not be sent"
-            } finally {
-                mutableSending.value = false
             }
         }
         // A launch into an already-cleared ViewModel can be cancelled before its body — and so
@@ -2938,26 +2943,24 @@ class ConversationViewModel @Inject internal constructor(
         onFinished: () -> Unit = {},
     ) {
         val selectedChat = chat.value
-        if (selectedChat == null || !historyAvailable.value || mutableSending.value) {
-            mutableError.value = if (mutableSending.value) {
-                "Wait for the current attachment to finish sending, then try again"
-            } else {
-                "Secure messaging is temporarily unavailable"
-            }
+        if (selectedChat == null || !historyAvailable.value) {
+            mutableError.value = "Secure messaging is temporarily unavailable"
             onFinished()
             return
         }
         val replyToMessageId = consumeReplyTarget()
         val sendJob = viewModelScope.launch {
-            mutableSending.value = true
             mutableError.value = null
             try {
                 // Per-item policy check first, so an oversized pick fails before any encryption.
                 // A declared size of zero means the provider would not say; the cipher still
                 // stops at the compiled cap.
                 for (attachment in attachments) {
-                    if (attachment.source.declaredByteCount > 0) {
-                        richMediaCapability?.requireSendable(
+                    if (
+                        attachment.source.processingPlan == SecureMediaProcessingPlan.PASSTHROUGH &&
+                        attachment.source.declaredByteCount > 0
+                    ) {
+                        richMediaCapability?.requireLocallyQueueable(
                             attachment.mediaType.trim().lowercase(),
                             attachment.source.declaredByteCount,
                         )
@@ -2975,19 +2978,18 @@ class ConversationViewModel @Inject internal constructor(
             } catch (error: Exception) {
                 mutableError.value = error.message
                     ?: "The secure attachments could not be sent"
-            } finally {
-                mutableSending.value = false
             }
         }
         sendJob.invokeOnCompletion { onFinished() }
     }
 
     /**
-     * Recording/encoding cap for the in-app camera: the compiled policy clamped to what this
-     * service currently accepts, so the camera improves for free when the service limit rises.
+     * Device-local recording/encoding cap for the in-app camera. Capture must not depend on a
+     * cached or live service advertisement; the background dispatcher applies the authoritative
+     * network gate after the original and pending message are durable.
      */
     fun captureByteLimit(): Long =
-        richMediaCapability?.maximumSendableBytes()
+        richMediaCapability?.maximumLocallyQueueableBytes()
             ?: KitChatMediaLimits.MAX_TRANSFER_BYTES.toLong()
 
     /** Sends any kit-media-v1 attachment (photo, voice note, video or document) end-to-end. */
@@ -3001,27 +3003,24 @@ class ConversationViewModel @Inject internal constructor(
         if (
             selectedChat == null ||
             !historyAvailable.value ||
-            bytes.isEmpty() ||
-            mutableSending.value
+            bytes.isEmpty()
         ) {
             // Dropping a capture without a word would present a fake success (the camera has
             // already closed); say why the attachment was not queued.
             if (bytes.isNotEmpty() && selectedChat != null) {
-                mutableError.value = if (mutableSending.value) {
-                    "Wait for the current attachment to finish sending, then try again"
-                } else {
-                    "Secure messaging is temporarily unavailable"
-                }
+                mutableError.value = "Secure messaging is temporarily unavailable"
             }
             bytes.fill(0)
             return
         }
         val replyToMessageId = consumeReplyTarget()
         val sendJob = viewModelScope.launch {
-            mutableSending.value = true
             mutableError.value = null
             try {
-                richMediaCapability?.requireSendable(mediaType.trim().lowercase(), bytes.size.toLong())
+                richMediaCapability?.requireLocallyQueueable(
+                    mediaType.trim().lowercase(),
+                    bytes.size.toLong(),
+                )
                 chatRepo.sendImageMessage(
                     chatId = selectedChat.id,
                     bytes = bytes,
@@ -3037,7 +3036,6 @@ class ConversationViewModel @Inject internal constructor(
                     ?: "The secure attachment could not be sent"
             } finally {
                 bytes.fill(0)
-                mutableSending.value = false
             }
         }
         // A launch into an already-cleared ViewModel can be cancelled before its body (and
@@ -3053,7 +3051,12 @@ class ConversationViewModel @Inject internal constructor(
         if (!claimMedia(message.id)) return
         viewModelScope.launch {
             hydrateMedia(message.id, "The secure photo could not be opened") {
-                chatRepo.openImageMessage(selectedChat.id, descriptor)
+                chatRepo.openImageMessage(
+                    selectedChat.id,
+                    descriptor,
+                    messageId = message.id,
+                    fromCurrentUser = message.fromMe,
+                )
             }
         }
     }
@@ -3083,6 +3086,8 @@ class ConversationViewModel @Inject internal constructor(
                     selectedChat.id,
                     descriptor,
                     item.attachmentId,
+                    messageId = message.id,
+                    fromCurrentUser = message.fromMe,
                 )
             }
         }
@@ -3158,7 +3163,11 @@ class ConversationViewModel @Inject internal constructor(
                 MessageKind.VOICE_NOTE,
                 MessageKind.DOCUMENT,
                 -> if (message.mediaPlaintextBytes > 0) {
-                    targets += MediaPreloadTarget.Single(message.id, descriptor)
+                    targets += MediaPreloadTarget.Single(
+                        key = message.id,
+                        mediaDescriptor = descriptor,
+                        fromCurrentUser = message.fromMe,
+                    )
                 }
 
                 MessageKind.MEDIA_ALBUM -> for (item in message.mediaItems) {
@@ -3169,6 +3178,8 @@ class ConversationViewModel @Inject internal constructor(
                         key = albumItemMediaKey(message.id, item.attachmentId),
                         mediaDescriptor = descriptor,
                         attachmentId = item.attachmentId,
+                        messageId = message.id,
+                        fromCurrentUser = message.fromMe,
                     )
                     if (targets.size == MAX_MEDIA_PRELOAD_ENTRIES) return targets
                 }

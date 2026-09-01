@@ -14,6 +14,12 @@ interface MobileMoneyRepository {
 
     suspend fun refresh()
 
+    /** Enables exact-operation reconciliation only while its financial UI is visible. */
+    fun setSettlementScreenActive(active: Boolean) = Unit
+
+    /** Treats a push payload only as a hint and re-fetches its exact operation from the server. */
+    fun reconcileSettlementHint(operationId: String) = Unit
+
     suspend fun verifyAndSaveAccount(
         networkCode: String,
         phoneNumber: String,

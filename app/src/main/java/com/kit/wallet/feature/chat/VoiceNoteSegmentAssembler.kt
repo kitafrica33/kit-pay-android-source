@@ -17,19 +17,26 @@ import java.nio.ByteBuffer
  * voice note that cannot be assembled is not sent, and the caller tells the user.
  */
 internal object VoiceNoteSegmentAssembler {
-    fun assemble(segments: List<File>): ByteArray? {
+    /**
+     * Produces one seekable MPEG-4 file without ever materialising the recording in heap.
+     *
+     * A one-segment note is already the exact file the sender captured, so it is returned in
+     * place. Paused/resumed notes are muxed lazily only when the local-first repository adopts
+     * the source; by then the durable pending bubble already exists in the conversation.
+     */
+    fun assembleFile(segments: List<File>): File? {
         val single = segments.singleOrNull()
-        if (single != null) return single.takeIf(File::isFile)?.readBytes()
-        if (segments.isEmpty()) return null
+        if (single != null) return single.takeIf { it.isFile && it.length() > 0L }
+        if (segments.isEmpty() || segments.any { !it.isFile || it.length() <= 0L }) return null
 
         val joined = File.createTempFile("kit-voice-joined-", ".m4a", segments.first().parentFile)
-        return try {
-            runCatching {
-                join(segments, into = joined)
-                joined.readBytes()
-            }.getOrNull()
-        } finally {
+        return runCatching {
+            join(segments, into = joined)
+            joined.takeIf { it.isFile && it.length() > 0L }
+                ?: error("The joined voice note is empty")
+        }.getOrElse {
             joined.delete()
+            null
         }
     }
 

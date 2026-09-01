@@ -85,6 +85,25 @@ internal class TerminalAwareTelecomCallRegistry<Metadata : Any, State : Any, Con
     }
 
     /**
+     * Applies a one-way lifecycle edge only while the call still has the expected source state.
+     * Platform callbacks can be duplicated or arrive after backend/media state advanced; a stale
+     * answer must never move an active or terminal call back into its pre-acceptance state.
+     */
+    @Synchronized
+    fun compareAndSetState(
+        callId: String,
+        expected: State,
+        state: State,
+        applyToConnection: (Connection, State) -> Unit,
+    ): RegisteredTelecomCall<Metadata, State, Connection>? {
+        val current = liveCalls[callId]?.takeIf { it.state == expected } ?: return null
+        val updated = current.copy(state = state)
+        liveCalls[callId] = updated
+        updated.connection?.let { applyToConnection(it, state) }
+        return updated
+    }
+
+    /**
      * Atomically attaches and prepares a Telecom connection, or resolves it against a tombstone.
      * [prepareLiveConnection] runs while lifecycle mutation is excluded, so `finish` cannot
      * disconnect the connection and then have an older ringing/dialing state applied afterward.

@@ -1,5 +1,6 @@
 package com.kit.wallet.data.repository
 
+import android.media.MediaMetadataRetriever
 import android.util.Log
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.local.ConversationPrefEntity
@@ -33,12 +34,25 @@ import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.messaging.KitUserAuthoredTextPolicy
 import com.kit.wallet.data.messaging.LibSignalCompanionDirection
 import com.kit.wallet.data.messaging.LibSignalCompanionRecord
+import com.kit.wallet.data.messaging.LocalMediaAvailabilityState
+import com.kit.wallet.data.messaging.LocalMediaCollection
+import com.kit.wallet.data.messaging.LocalMediaDownloadState
+import com.kit.wallet.data.messaging.LocalMediaEncryptionState
+import com.kit.wallet.data.messaging.LocalMediaLibrary
+import com.kit.wallet.data.messaging.LocalMediaProcessingState
+import com.kit.wallet.data.messaging.LocalMediaRecord
+import com.kit.wallet.data.messaging.LocalMediaUploadState
 import com.kit.wallet.data.messaging.MAX_IMAGE_PLAINTEXT_BYTES
+import com.kit.wallet.data.messaging.MAX_LOCAL_MEDIA_DURATION_MILLIS
+import com.kit.wallet.data.messaging.MAX_LOCAL_MEDIA_ORIGINAL_BYTES
 import com.kit.wallet.data.messaging.MEMBERSHIP_ADDED_EVENT
 import com.kit.wallet.data.messaging.MEMBERSHIP_REMOVED_EVENT
 import com.kit.wallet.data.messaging.MEMBERSHIP_ROLE_CHANGED_EVENT
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
 import com.kit.wallet.data.messaging.MediaAttachmentStreamCipher
+import com.kit.wallet.data.messaging.MediaPipelineMilestone
+import com.kit.wallet.data.messaging.MediaPipelineProfiler
+import com.kit.wallet.data.messaging.MessagingRichMediaCapability
 import com.kit.wallet.data.messaging.MessageReplyQuotes
 import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.ScheduledSendStore
@@ -48,6 +62,10 @@ import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaCache
 import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.data.messaging.SecureMediaSource
+import com.kit.wallet.data.messaging.SecureMediaProcessingPlan
+import com.kit.wallet.data.messaging.SecureMediaVideoEditPlan
+import com.kit.wallet.data.messaging.PreparedSecureMedia
+import com.kit.wallet.data.messaging.SecureMediaUploadProcessor
 import com.kit.wallet.data.messaging.SecureMessagingActivationCapability
 import com.kit.wallet.data.messaging.SecureMessagingActiveSession
 import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
@@ -76,6 +94,7 @@ import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
 import com.kit.wallet.data.messaging.kitMediaOutboundAttachmentsFor
 import com.kit.wallet.data.messaging.kitMediaProjectedText
 import com.kit.wallet.data.messaging.mediaAlbumPreviewLabel
+import com.kit.wallet.data.messaging.normalizeLocalMediaType
 import com.kit.wallet.data.messaging.requireDurablyCommittedSessions
 import com.kit.wallet.data.messaging.spoolIds
 import com.kit.wallet.data.realtime.KitPresenceRegistry
@@ -159,7 +178,9 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 internal data class AuthenticatedConversationMember(
@@ -620,6 +641,8 @@ internal interface SecureMessagingChatRuntime {
         keyMaterialBase64: String,
         plaintextBytes: Int,
         caption: String?,
+        expectedCiphertextBytes: Long? = null,
+        expectedCiphertextSha256Hex: String? = null,
     ): String = error("This secure messaging runtime does not support queued media")
 
     /**
@@ -639,11 +662,28 @@ internal interface SecureMessagingChatRuntime {
     suspend fun uploadAlbumAttachment(
         session: SecureMessagingChatSession,
         conversationId: String,
+        attachmentId: String,
         ciphertext: File,
         mediaType: String,
         expectedCiphertextBytes: Long,
         expectedCiphertextSha256Hex: String,
     ): String = error("This secure messaging runtime does not support media albums")
+
+    /**
+     * Renews an already uploaded, unclaimed attachment immediately before its storage key is
+     * sealed into immutable E2EE message ciphertext. Implementations return [existingStorageKey]
+     * when the additive resumable transport was not negotiated.
+     */
+    suspend fun renewUploadedAttachment(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        attachmentId: String,
+        existingStorageKey: String,
+        ciphertext: File,
+        mediaType: String,
+        expectedCiphertextBytes: Long,
+        expectedCiphertextSha256Hex: String,
+    ): String = existingStorageKey
 
     /** Encrypts, uploads and sends one attachment as an end-to-end encrypted media message. */
     suspend fun sendImage(
@@ -1318,6 +1358,8 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         keyMaterialBase64: String,
         plaintextBytes: Int,
         caption: String?,
+        expectedCiphertextBytes: Long?,
+        expectedCiphertextSha256Hex: String?,
     ): String {
         require(CANONICAL_UUID.matches(attachmentId)) { "Invalid queued attachment ID" }
         require(ciphertext.isFile && ciphertext.length() > 0) { "Attachment ciphertext is empty" }
@@ -1326,7 +1368,24 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         }
         val active = requireCurrent(session)
         requireConversation(active, conversationId)
-        val uploaded = active.transport.uploadAttachment(normalizedMediaType, ciphertext)
+        check((expectedCiphertextBytes == null) == (expectedCiphertextSha256Hex == null)) {
+            "Queued ciphertext size and digest must be supplied together"
+        }
+        val uploaded = if (expectedCiphertextBytes != null) {
+            active.transport.uploadAttachment(
+                clientMediaId = attachmentId,
+                mediaType = normalizedMediaType,
+                ciphertext = ciphertext,
+                expectedByteSize = expectedCiphertextBytes,
+                expectedSha256 = checkNotNull(expectedCiphertextSha256Hex),
+            )
+        } else {
+            active.transport.uploadAttachment(
+                attachmentId,
+                normalizedMediaType,
+                ciphertext,
+            )
+        }
         check(sessions.currentOrNull() === active) {
             "Secure messaging session changed while uploading encrypted media"
         }
@@ -1361,6 +1420,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
     override suspend fun uploadAlbumAttachment(
         session: SecureMessagingChatSession,
         conversationId: String,
+        attachmentId: String,
         ciphertext: File,
         mediaType: String,
         expectedCiphertextBytes: Long,
@@ -1372,7 +1432,16 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         }
         val active = requireCurrent(session)
         requireConversation(active, conversationId)
-        val uploaded = active.transport.uploadAttachment(normalizedMediaType, ciphertext)
+        require(ImmediateSendIntent.CANONICAL_UUID.matches(attachmentId)) {
+            "Invalid queued attachment ID"
+        }
+        val uploaded = active.transport.uploadAttachment(
+            clientMediaId = attachmentId,
+            mediaType = normalizedMediaType,
+            ciphertext = ciphertext,
+            expectedByteSize = expectedCiphertextBytes,
+            expectedSha256 = expectedCiphertextSha256Hex,
+        )
         check(sessions.currentOrNull() === active) {
             "Secure messaging session changed while uploading encrypted media"
         }
@@ -1387,6 +1456,46 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             "The attachment store returned a non-canonical storage key"
         }
         return uploaded.storageKey
+    }
+
+    override suspend fun renewUploadedAttachment(
+        session: SecureMessagingChatSession,
+        conversationId: String,
+        attachmentId: String,
+        existingStorageKey: String,
+        ciphertext: File,
+        mediaType: String,
+        expectedCiphertextBytes: Long,
+        expectedCiphertextSha256Hex: String,
+    ): String {
+        require(CANONICAL_UUID.matches(attachmentId)) { "Invalid queued attachment ID" }
+        require(CANONICAL_UUID.matches(existingStorageKey)) {
+            "Invalid queued attachment storage key"
+        }
+        require(ciphertext.isFile && ciphertext.length() == expectedCiphertextBytes) {
+            "Attachment ciphertext is unavailable"
+        }
+        val normalizedMediaType = requireNotNull(KitMediaMessage.normalizeMediaType(mediaType)) {
+            "Choose a supported photo, voice note, video or document"
+        }
+        val active = requireCurrent(session)
+        requireConversation(active, conversationId)
+        val renewed = active.transport.renewAttachmentIfResumable(
+            clientMediaId = attachmentId,
+            mediaType = normalizedMediaType,
+            ciphertext = ciphertext,
+            expectedByteSize = expectedCiphertextBytes,
+            expectedSha256 = expectedCiphertextSha256Hex,
+        ) ?: return existingStorageKey
+        check(sessions.currentOrNull() === active) {
+            "Secure messaging session changed while renewing encrypted media"
+        }
+        check(
+            renewed.byteSize == expectedCiphertextBytes &&
+                renewed.ciphertextSha256 == expectedCiphertextSha256Hex &&
+                CANONICAL_UUID.matches(renewed.storageKey)
+        ) { "The attachment store renewed different ciphertext facts" }
+        return renewed.storageKey
     }
 
     private fun requireAuthenticationOwner(
@@ -1434,12 +1543,17 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
             }
             coroutineContext.ensureActive()
             val owned = checkNotNull(streamed)
-            val uploaded = active.transport.uploadAttachment(normalizedMediaType, spooled)
+            val attachmentId = UUID.randomUUID().toString()
+            val uploaded = active.transport.uploadAttachment(
+                attachmentId,
+                normalizedMediaType,
+                spooled,
+            )
             check(sessions.currentOrNull() === active) {
                 "Secure messaging session changed while uploading encrypted media"
             }
             val descriptor = KitMediaMessage(
-                attachmentId = UUID.randomUUID().toString(),
+                attachmentId = attachmentId,
                 storageKey = uploaded.storageKey,
                 mediaType = normalizedMediaType,
                 ciphertextByteSize = uploaded.byteSize,
@@ -1496,14 +1610,13 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 "The encrypted media blob does not match its authenticated size"
             }
             val plaintextBytes = withContext(Dispatchers.IO + NonCancellable) {
-                destination.outputStream().buffered().use { output ->
-                    MediaAttachmentStreamCipher.decrypt(
-                        ciphertext = ciphertext,
-                        keyMaterial = key,
-                        expectedSha256 = digest,
-                        destination = output,
-                    )
-                }
+                MediaAttachmentStreamCipher.decrypt(
+                    ciphertext = ciphertext,
+                    keyMaterial = key,
+                    expectedSha256 = digest,
+                    expectedPlaintextBytes = media.plaintextByteSize,
+                    destination = destination,
+                )
             }
             coroutineContext.ensureActive()
             check(plaintextBytes == media.plaintextByteSize) {
@@ -1560,14 +1673,13 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 "The encrypted media blob does not match its authenticated size"
             }
             val plaintextBytes = withContext(Dispatchers.IO + NonCancellable) {
-                destination.outputStream().buffered().use { output ->
-                    MediaAttachmentStreamCipher.decrypt(
-                        ciphertext = ciphertext,
-                        keyMaterial = key,
-                        expectedSha256 = digest,
-                        destination = output,
-                    )
-                }
+                MediaAttachmentStreamCipher.decrypt(
+                    ciphertext = ciphertext,
+                    keyMaterial = key,
+                    expectedSha256 = digest,
+                    expectedPlaintextBytes = item.plaintextByteSize,
+                    destination = destination,
+                )
             }
             coroutineContext.ensureActive()
             check(plaintextBytes == item.plaintextByteSize) {
@@ -1998,7 +2110,7 @@ private fun String?.safeChatContactName(): String? = this
 class EncryptedChatRepository @Inject internal constructor(
     private val runtime: SecureMessagingChatRuntime,
     private val contacts: ContactRepository,
-    @ApplicationScope scope: CoroutineScope,
+    @ApplicationScope private val scope: CoroutineScope,
     private val clock: Clock,
     private val composerDrafts: SecureMessagingComposerDraftStore? = null,
     private val conversationPrefs: ConversationPrefsDao? = null,
@@ -2012,7 +2124,11 @@ class EncryptedChatRepository @Inject internal constructor(
     private val immediateMediaSpool: ImmediateMediaSpool? = null,
     private val immediateSendScheduler: SecureMessagingSyncScheduler? = null,
     private val secureMediaCache: SecureMediaCache? = null,
+    private val localMediaLibrary: LocalMediaLibrary? = null,
+    private val mediaPipelineProfiler: MediaPipelineProfiler? = null,
+    private val secureMediaUploadProcessor: SecureMediaUploadProcessor? = null,
     private val avatarUploader: ProfileAvatarUploader? = null,
+    private val richMediaCapability: MessagingRichMediaCapability? = null,
 ) : ChatRepository {
     /**
      * Defines each conversation's local acceptance order across text, events and media. A text
@@ -2020,6 +2136,26 @@ class EncryptedChatRepository @Inject internal constructor(
      * attachment is still being adopted, while unrelated conversations remain independent.
      */
     private val immediateSendAcceptanceMutexes = ConcurrentHashMap<String, Mutex>()
+
+    /**
+     * Process-local import leases. A worker may observe the durable IMPORTING row immediately, but
+     * must not diagnose its final cache file as missing while the foreground copy has yet to take
+     * the cache's filesystem lock. The set intentionally starts empty after process death, making
+     * every restored IMPORTING row eligible for deterministic recovery.
+     */
+    private val activeImmediateMediaImports = ConcurrentHashMap.newKeySet<String>()
+
+    /** Seekable, caller-owned originals available during the short atomic-import window. */
+    private data class ActiveLocalMediaOriginal(
+        val owner: SessionFence,
+        val conversationId: String,
+        val mediaType: String,
+        val file: File,
+    )
+
+    private val activeLocalMediaOriginals = ConcurrentHashMap<String, ActiveLocalMediaOriginal>()
+    private val activeRecipientMediaHydrations = ConcurrentHashMap.newKeySet<String>()
+    private val recipientMediaHydrationPermits = Semaphore(MAX_CONCURRENT_MEDIA_HYDRATIONS)
 
     private fun immediateSendAcceptanceMutex(chatId: String): Mutex =
         immediateSendAcceptanceMutexes.computeIfAbsent(chatId) { Mutex() }
@@ -2317,7 +2453,10 @@ class EncryptedChatRepository @Inject internal constructor(
                                 val pending = queue.items.value
                                 immediateMediaSpool?.prune(
                                     pending
-                                        .filter { it.state != ImmediateSendState.PREPARING }
+                                        .filter {
+                                            it.state != ImmediateSendState.IMPORTING &&
+                                                it.state != ImmediateSendState.PREPARING
+                                        }
                                         .flatMapTo(
                                             mutableSetOf(),
                                             ImmediateSendIntent::spoolIds,
@@ -2328,7 +2467,10 @@ class EncryptedChatRepository @Inject internal constructor(
                                         emptySet()
                                     } else {
                                         pending
-                                            .filter { it.state == ImmediateSendState.PREPARING }
+                                            .filter {
+                                                it.state == ImmediateSendState.IMPORTING ||
+                                                    it.state == ImmediateSendState.PREPARING
+                                            }
                                             .flatMapTo(mutableSetOf()) {
                                                 immediateMediaCacheKeys(owner, it)
                                             }
@@ -2346,6 +2488,7 @@ class EncryptedChatRepository @Inject internal constructor(
                 combine(runtime.activeSession, queue.items) { session, pending ->
                     session != null && pending.any {
                         it.state == ImmediateSendState.WAITING ||
+                            it.state == ImmediateSendState.IMPORTING ||
                             it.state == ImmediateSendState.PREPARING
                     }
                 }.distinctUntilChanged().collect { shouldWake ->
@@ -3187,20 +3330,18 @@ class EncryptedChatRepository @Inject internal constructor(
         val owner = expectedOwner ?: authenticationSessions?.current()?.fence()
         val replyTarget = resolvedReplyTarget(chatId, replyToMessageId)
         if (queue != null && spool != null && owner != null) {
-            return immediateSendAcceptanceMutex(chatId).withLock {
-                withIdempotentMediaSendLock(idempotentClientMessageId) {
-                    acceptImmediateMedia(
-                        owner = owner,
-                        queue = queue,
-                        spool = spool,
-                        chatId = chatId,
-                        source = source,
-                        mediaType = mediaType,
-                        caption = caption,
-                        replyTarget = replyTarget,
-                        idempotentClientMessageId = idempotentClientMessageId,
-                    )
-                }
+            return withIdempotentMediaSendLock(idempotentClientMessageId) {
+                acceptImmediateMedia(
+                    owner = owner,
+                    queue = queue,
+                    spool = spool,
+                    chatId = chatId,
+                    source = source,
+                    mediaType = mediaType,
+                    caption = caption,
+                    replyTarget = replyTarget,
+                    idempotentClientMessageId = idempotentClientMessageId,
+                )
             }
         }
         check(idempotentClientMessageId == null && expectedOwner == null) {
@@ -3226,13 +3367,28 @@ class EncryptedChatRepository @Inject internal constructor(
         replyTarget: String?,
         idempotentClientMessageId: String?,
     ) {
-        if (authenticationSessions?.current()?.fence() != owner) {
-            throw SessionInvalidatedException()
-        }
-        check(chat(chatId) != null) { "The secure conversation is no longer available" }
         val normalizedMediaType = requireNotNull(KitMediaMessage.normalizeMediaType(mediaType)) {
             "Choose a supported photo, voice note, video or document"
         }
+        val originalMediaType = requireNotNull(
+            normalizeLocalMediaType(source.originalMediaType ?: normalizedMediaType),
+        ) { "Choose a supported local media type" }
+        val processingPlan = source.processingPlan
+        val videoEditPlan = source.videoEditPlan
+        val durationMillis = source.durationMillis
+        require(
+            processingPlan != SecureMediaProcessingPlan.CHAT_IMAGE_JPEG ||
+                normalizedMediaType == "image/jpeg" && originalMediaType.startsWith("image/"),
+        ) { "The selected photo cannot use this media processing plan" }
+        require(
+            processingPlan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4 ||
+                normalizedMediaType == "video/mp4" && originalMediaType.startsWith("video/") &&
+                videoEditPlan != null,
+        ) { "The selected video cannot use this media processing plan" }
+        require(
+            durationMillis == null ||
+                originalMediaType.startsWith("audio/") || originalMediaType.startsWith("video/"),
+        ) { "Only audio or video can carry a playback duration" }
         val normalizedCaption = caption?.trim()?.takeIf(String::isNotBlank)
         require(
             normalizedCaption == null ||
@@ -3245,103 +3401,305 @@ class EncryptedChatRepository @Inject internal constructor(
             }
         }
         val id = idempotentClientMessageId ?: UUID.randomUUID().toString()
-        if (idempotentClientMessageId != null) {
-            queue.findForOwner(owner, id)?.let { existing ->
-                check(
-                    existing.kind == ImmediateSendKind.MEDIA &&
-                        existing.conversationId == chatId &&
-                        existing.mediaType == normalizedMediaType &&
-                        existing.caption == normalizedCaption &&
-                        existing.replyToMessageId == replyTarget &&
-                        (source.declaredByteCount <= 0L ||
-                            existing.mediaPlaintextBytes.toLong() == source.declaredByteCount),
-                ) { "An immediate-send identity belongs to different media" }
-                if (existing.state != ImmediateSendState.FAILED) {
+        val createdAt = clock.instant().toEpochMilli()
+        mediaPipelineProfiler?.begin(
+            id,
+            normalizedMediaType,
+            source.originatedAtNanos,
+        )
+        val cache = secureMediaCache
+        if (cache == null) {
+            // Compatibility seam for focused unit tests and alternate runtimes. Production always
+            // has the durable local library and takes the IMPORTING path below.
+            check(processingPlan == SecureMediaProcessingPlan.PASSTHROUGH) {
+                "Local media processing requires durable Sent Media storage"
+            }
+            stagingMedia.update { current ->
+                current + StagingMedia(
+                    id = id,
+                    owner = owner,
+                    conversationId = chatId,
+                    createdAtEpochMillis = createdAt,
+                    mediaType = normalizedMediaType,
+                    caption = normalizedCaption,
+                    plaintextBytes = 0,
+                    replyToMessageId = replyTarget,
+                )
+            }
+            mediaPipelineProfiler?.mark(id, MediaPipelineMilestone.LOCAL_PROJECTION_READY)
+            try {
+                immediateSendAcceptanceMutex(chatId).withLock {
+                    requireCurrentMediaOwner(owner, chatId)
+                    existingImmediateSingleMedia(
+                        queue = queue,
+                        owner = owner,
+                        id = id,
+                        chatId = chatId,
+                        mediaType = normalizedMediaType,
+                        caption = normalizedCaption,
+                        replyTarget = replyTarget,
+                        declaredByteCount = source.declaredByteCount,
+                        originalMediaType = originalMediaType,
+                        processingPlan = processingPlan,
+                        videoEditPlan = videoEditPlan,
+                        durationMillis = durationMillis,
+                    )?.let { existing ->
+                        if (existing.state == ImmediateSendState.RETRY_REQUIRED) {
+                            queue.rearmForOwner(owner, existing.id)
+                        }
+                        immediateSendScheduler?.schedule()
+                        mediaPipelineProfiler?.forget(id)
+                        return
+                    }
+                    val material = spool.stage(id, source)
+                    enqueueImmediateMedia(
+                        queue,
+                        owner,
+                        ImmediateSendIntent(
+                            id = id,
+                            conversationId = chatId,
+                            kind = ImmediateSendKind.MEDIA,
+                            createdAtEpochMillis = createdAt,
+                            mediaType = normalizedMediaType,
+                            caption = normalizedCaption,
+                            mediaPlaintextBytes = material.plaintextBytes,
+                            mediaOriginalType = originalMediaType.takeUnless {
+                                it == normalizedMediaType
+                            },
+                            mediaOriginalPlaintextBytes = material.plaintextBytes,
+                            mediaProcessingPlan = processingPlan,
+                            mediaVideoEditPlan = videoEditPlan,
+                            mediaDurationMillis = durationMillis,
+                            mediaCiphertextBytes = material.ciphertextBytes,
+                            mediaKeyBase64 = material.keyBase64,
+                            mediaSha256Base64 = material.sha256Base64,
+                            replyToMessageId = replyTarget,
+                        ),
+                        idempotentClientMessageId,
+                    )
+                }
+                immediateSendScheduler?.schedule()
+            } catch (error: Throwable) {
+                spool.discard(id)
+                mediaPipelineProfiler?.forget(id)
+                throw error
+            } finally {
+                stagingMedia.update { current -> current.filterNot { it.id == id } }
+            }
+            return
+        }
+
+        val declaredBytes = source.declaredByteCount
+            .takeIf { it in 1..MAX_LOCAL_MEDIA_ORIGINAL_BYTES.toLong() }
+            ?.toInt()
+            ?: 0
+        val cacheKey = mediaCacheKey(owner, chatId, id)
+        var importing: ImmediateSendIntent? = null
+        var localPublished = false
+        try {
+            importing = immediateSendAcceptanceMutex(chatId).withLock {
+                requireCurrentMediaOwner(owner, chatId)
+                existingImmediateSingleMedia(
+                    queue = queue,
+                    owner = owner,
+                    id = id,
+                    chatId = chatId,
+                    mediaType = normalizedMediaType,
+                    caption = normalizedCaption,
+                    replyTarget = replyTarget,
+                    declaredByteCount = source.declaredByteCount,
+                    originalMediaType = originalMediaType,
+                    processingPlan = processingPlan,
+                    videoEditPlan = videoEditPlan,
+                    durationMillis = durationMillis,
+                )?.let { existing ->
                     if (existing.state == ImmediateSendState.RETRY_REQUIRED) {
                         queue.rearmForOwner(owner, existing.id)
                     }
                     immediateSendScheduler?.schedule()
+                    mediaPipelineProfiler?.forget(id)
                     return
                 }
+                val candidate = ImmediateSendIntent(
+                    id = id,
+                    conversationId = chatId,
+                    kind = ImmediateSendKind.MEDIA,
+                    createdAtEpochMillis = createdAt,
+                    state = ImmediateSendState.IMPORTING,
+                    mediaType = normalizedMediaType,
+                    caption = normalizedCaption,
+                    mediaPlaintextBytes = if (
+                        processingPlan == SecureMediaProcessingPlan.PASSTHROUGH
+                    ) declaredBytes else 0,
+                    mediaOriginalType = originalMediaType.takeUnless {
+                        it == normalizedMediaType
+                    },
+                    mediaOriginalPlaintextBytes = declaredBytes,
+                    mediaProcessingPlan = processingPlan,
+                    mediaVideoEditPlan = videoEditPlan,
+                    mediaDurationMillis = durationMillis,
+                    replyToMessageId = replyTarget,
+                )
+                check(activeImmediateMediaImports.add(id)) {
+                    "The local media import is already active"
+                }
+                source.localPlaybackFile
+                    ?.takeIf { it.isFile && it.length() > 0L }
+                    ?.let { file ->
+                        activeLocalMediaOriginals[id] = ActiveLocalMediaOriginal(
+                            owner = owner,
+                            conversationId = chatId,
+                            mediaType = originalMediaType,
+                            file = file,
+                        )
+                    }
+                try {
+                    enqueueImmediateMedia(queue, owner, candidate, idempotentClientMessageId)
+                    checkNotNull(queue.findForOwner(owner, id)) {
+                        "The durable local media import could not be read back"
+                    }
+                } catch (error: Throwable) {
+                    activeImmediateMediaImports.remove(id)
+                    activeLocalMediaOriginals.remove(id)
+                    throw error
+                }
             }
-        }
-        val createdAt = clock.instant().toEpochMilli()
-        stagingMedia.update { current ->
-            current + StagingMedia(
-                id = id,
-                owner = owner,
-                conversationId = chatId,
-                createdAtEpochMillis = createdAt,
-                mediaType = normalizedMediaType,
-                caption = normalizedCaption,
-                plaintextBytes = 0,
-                replyToMessageId = replyTarget,
-            )
-        }
-        var retainedCacheKey: String? = null
-        try {
+            mediaPipelineProfiler?.mark(id, MediaPipelineMilestone.LOCAL_PROJECTION_READY)
+            if (activeLocalMediaOriginals[id] != null) {
+                mediaPipelineProfiler?.mark(id, MediaPipelineMilestone.LOCAL_PLAYABLE)
+            }
+            immediateSendScheduler?.schedule()
+
             withContext(NonCancellable) {
-                val cache = secureMediaCache
-                if (cache == null) {
-                    // Test/alternate wiring retained for compatibility. Production always injects
-                    // the durable cache and therefore uses PREPARING below.
-                    val material = spool.stage(id, source)
-                    val ready = ImmediateSendIntent(
-                        id = id,
-                        conversationId = chatId,
-                        kind = ImmediateSendKind.MEDIA,
-                        createdAtEpochMillis = createdAt,
-                        mediaType = normalizedMediaType,
-                        caption = normalizedCaption,
-                        mediaPlaintextBytes = material.plaintextBytes,
-                        mediaCiphertextBytes = material.ciphertextBytes,
-                        mediaKeyBase64 = material.keyBase64,
-                        mediaSha256Base64 = material.sha256Base64,
-                        replyToMessageId = replyTarget,
-                    )
-                    enqueueImmediateMedia(queue, owner, ready, idempotentClientMessageId)
-                } else {
-                    val cacheKey = mediaCacheKey(owner, chatId, id)
-                    retainedCacheKey = cacheKey
-                    val local = cacheOutgoingMedia(
+                val durableImport = checkNotNull(importing)
+                localMediaLibrary?.recordImportPending(
+                    owner,
+                    pendingSentMediaRecord(
                         owner = owner,
                         chatId = chatId,
-                        attachmentId = id,
-                        mediaType = normalizedMediaType,
-                        source = source,
-                        retainUntilReleased = true,
-                    )
-                    stagingMedia.update { current ->
-                        current.map { staging ->
-                            if (staging.id == id && staging.owner == owner) {
-                                staging.copy(plaintextBytes = local.byteCount.toInt())
-                            } else {
-                                staging
-                            }
-                        }
-                    }
-                    val preparing = ImmediateSendIntent(
-                        id = id,
-                        conversationId = chatId,
-                        kind = ImmediateSendKind.MEDIA,
-                        createdAtEpochMillis = createdAt,
+                        messageId = id,
+                        mediaId = id,
+                        cacheKey = cacheKey,
+                        mediaType = originalMediaType,
+                        declaredBytes = declaredBytes.toLong(),
+                        acceptedAtEpochMillis = durableImport.createdAtEpochMillis,
+                        durationMillis = durationMillis,
+                    ),
+                )
+                val local = cacheOutgoingMedia(
+                    owner = owner,
+                    chatId = chatId,
+                    attachmentId = id,
+                    mediaType = originalMediaType,
+                    source = source,
+                    retainUntilReleased = true,
+                )
+                localPublished = true
+                val localAvailableAt = maxOf(
+                    durableImport.createdAtEpochMillis,
+                    clock.instant().toEpochMilli(),
+                )
+                localMediaLibrary?.recordLocalOriginal(
+                    owner,
+                    sentMediaRecord(
+                        owner = owner,
+                        chatId = chatId,
+                        messageId = id,
+                        mediaId = id,
+                        cacheKey = cacheKey,
+                        mediaType = originalMediaType,
+                        local = local,
+                        selectedAtEpochMillis = durableImport.createdAtEpochMillis,
+                        visibleAtEpochMillis = durableImport.createdAtEpochMillis,
+                        localAvailableAtEpochMillis = localAvailableAt,
+                        durationMillis = durationMillis,
+                    ),
+                )
+                mediaPipelineProfiler?.mark(id, MediaPipelineMilestone.LOCAL_PLAYABLE)
+                val current = queue.findForOwner(owner, id)
+                if (current?.state == ImmediateSendState.IMPORTING) {
+                    val preparing = current.copy(
                         state = ImmediateSendState.PREPARING,
-                        mediaType = normalizedMediaType,
-                        caption = normalizedCaption,
-                        mediaPlaintextBytes = local.byteCount.toInt(),
-                        replyToMessageId = replyTarget,
+                        mediaPlaintextBytes = if (
+                            processingPlan == SecureMediaProcessingPlan.PASSTHROUGH
+                        ) local.byteCount.toInt() else 0,
+                        mediaOriginalPlaintextBytes = local.byteCount.toInt(),
                     )
-                    enqueueImmediateMedia(queue, owner, preparing, idempotentClientMessageId)
-                    retainedCacheKey = null // The durable PREPARING record now owns the retention.
+                    check(queue.replaceForOwner(owner, current, preparing)) {
+                        "The durable local media import changed before completion"
+                    }
+                } else {
+                    check(
+                        current != null && current.state != ImmediateSendState.FAILED,
+                    ) { "The durable local media import was retired before completion" }
                 }
-                immediateSendScheduler?.schedule()
+                // Sent Media is intrinsically non-evictable. This marker only protects the narrow
+                // cache-write to durable-state handoff and can now be released.
+                cache.releaseRetention(cacheKey)
             }
         } catch (error: Throwable) {
-            spool.discard(id)
-            retainedCacheKey?.let { secureMediaCache?.releaseRetention(it) }
+            withContext(NonCancellable) {
+                val current = runCatching { queue.findForOwner(owner, id) }.getOrNull()
+                if (!localPublished && current?.state == ImmediateSendState.IMPORTING) {
+                    runCatching {
+                        queue.replaceForOwner(
+                            owner,
+                            current,
+                            current.copy(state = ImmediateSendState.FAILED),
+                        )
+                    }
+                    runCatching { markImmediateMediaFailure(owner, current, permanent = true) }
+                    runCatching { cache.releaseRetention(cacheKey) }
+                    mediaPipelineProfiler?.forget(id)
+                }
+            }
             throw error
         } finally {
-            stagingMedia.update { current -> current.filterNot { it.id == id } }
+            activeImmediateMediaImports.remove(id)
+            activeLocalMediaOriginals.remove(id)
+            if (importing != null) runCatching { immediateSendScheduler?.schedule() }
+        }
+    }
+
+    private suspend fun requireCurrentMediaOwner(owner: SessionFence, chatId: String) {
+        if (authenticationSessions?.current()?.fence() != owner) {
+            throw SessionInvalidatedException()
+        }
+        check(chat(chatId) != null) { "The secure conversation is no longer available" }
+    }
+
+    private suspend fun existingImmediateSingleMedia(
+        queue: ImmediateSendIntentStore,
+        owner: SessionFence,
+        id: String,
+        chatId: String,
+        mediaType: String,
+        caption: String?,
+        replyTarget: String?,
+        declaredByteCount: Long,
+        originalMediaType: String,
+        processingPlan: SecureMediaProcessingPlan,
+        videoEditPlan: SecureMediaVideoEditPlan?,
+        durationMillis: Long?,
+    ): ImmediateSendIntent? {
+        if (!ImmediateSendIntent.CANONICAL_UUID.matches(id)) return null
+        return queue.findForOwner(owner, id)?.also { existing ->
+            check(
+                existing.kind == ImmediateSendKind.MEDIA &&
+                    existing.conversationId == chatId &&
+                    existing.mediaType == mediaType &&
+                    existing.localMediaType == originalMediaType &&
+                    existing.mediaProcessingPlan == processingPlan &&
+                    existing.mediaVideoEditPlan == videoEditPlan &&
+                    existing.mediaDurationMillis == durationMillis &&
+                    existing.caption == caption &&
+                    existing.replyToMessageId == replyTarget &&
+                    (
+                        declaredByteCount <= 0L ||
+                            existing.localPlaintextBytes == 0 ||
+                            existing.localPlaintextBytes.toLong() == declaredByteCount
+                        ),
+            ) { "An immediate-send identity belongs to different media" }
         }
     }
 
@@ -3416,17 +3774,15 @@ class EncryptedChatRepository @Inject internal constructor(
             )
             return
         }
-        return immediateSendAcceptanceMutex(chatId).withLock {
-            withIdempotentMediaSendLock(idempotentClientMessageId) {
-                acceptImmediateMediaAlbum(
-                    chatId = chatId,
-                    attachments = attachments,
-                    caption = caption,
-                    replyToMessageId = replyToMessageId,
-                    expectedOwner = expectedOwner,
-                    idempotentClientMessageId = idempotentClientMessageId,
-                )
-            }
+        return withIdempotentMediaSendLock(idempotentClientMessageId) {
+            acceptImmediateMediaAlbum(
+                chatId = chatId,
+                attachments = attachments,
+                caption = caption,
+                replyToMessageId = replyToMessageId,
+                expectedOwner = expectedOwner,
+                idempotentClientMessageId = idempotentClientMessageId,
+            )
         }
     }
 
@@ -3447,10 +3803,6 @@ class EncryptedChatRepository @Inject internal constructor(
         }
         val owner = expectedOwner ?: authenticationSessions?.current()?.fence()
             ?: throw SessionInvalidatedException()
-        if (authenticationSessions?.current()?.fence() != owner) {
-            throw SessionInvalidatedException()
-        }
-        check(chat(chatId) != null) { "The secure conversation is no longer available" }
         require(attachments.size <= KitMediaMessageV2.MAX_ATTACHMENTS) {
             "Send at most ${KitMediaMessageV2.MAX_ATTACHMENTS} attachments in one message"
         }
@@ -3459,10 +3811,40 @@ class EncryptedChatRepository @Inject internal constructor(
                 "Choose supported photos, voice notes, videos or documents"
             }
         }
-        // Refuse a hopeless batch before any encryption work. The declared counts are only a
-        // floor for the real ciphertext, whose exact sizes the queued intent re-proves per item.
+        val originalMediaTypes = attachments.mapIndexed { index, attachment ->
+            requireNotNull(
+                normalizeLocalMediaType(attachment.source.originalMediaType ?: mediaTypes[index]),
+            ) { "Choose supported local media" }
+        }
+        val processingPlans = attachments.map(SecureMediaAlbumSource::source)
+            .map(SecureMediaSource::processingPlan)
+        processingPlans.forEachIndexed { index, plan ->
+            require(
+                plan != SecureMediaProcessingPlan.CHAT_IMAGE_JPEG ||
+                    mediaTypes[index] == "image/jpeg" &&
+                    originalMediaTypes[index].startsWith("image/"),
+            ) { "A selected photo cannot use this media processing plan" }
+            require(
+                plan != SecureMediaProcessingPlan.CHAT_VIDEO_MP4 &&
+                    attachments[index].source.videoEditPlan == null,
+            ) { "Edited videos must be sent one at a time" }
+        }
+        // Refuse a hopeless passthrough batch before any encryption work. Transformed photos are
+        // checked against the exact aggregate after background JPEG preparation.
         require(
-            attachments.sumOf { maxOf(it.source.declaredByteCount, 0L) } <=
+            attachments.indices.sumOf { index ->
+                if (processingPlans[index] == SecureMediaProcessingPlan.PASSTHROUGH) {
+                    val plaintext = attachments[index].source.declaredByteCount
+                    when {
+                        plaintext <= 0L -> 0L
+                        plaintext > MAX_IMAGE_PLAINTEXT_BYTES.toLong() ->
+                            KitMediaMessageV2.MAX_AGGREGATE_CIPHERTEXT_BYTES + 1L
+                        else -> plaintext + 64L - (plaintext % 16L)
+                    }
+                } else {
+                    0L
+                }
+            } <=
                 KitMediaMessageV2.MAX_AGGREGATE_CIPHERTEXT_BYTES,
         ) { "These attachments are too large to send in one message" }
         // An invalid caption fails the whole send here, in front of the person and with their
@@ -3478,101 +3860,82 @@ class EncryptedChatRepository @Inject internal constructor(
         }
         val replyTarget = resolvedReplyTarget(chatId, replyToMessageId)
         val id = idempotentClientMessageId ?: UUID.randomUUID().toString()
-        if (idempotentClientMessageId != null) {
-            queue.findForOwner(owner, id)?.let { existing ->
-                check(
-                    existing.kind == ImmediateSendKind.MEDIA_V2 &&
-                        existing.conversationId == chatId &&
-                        existing.caption == normalizedCaption &&
-                        existing.replyToMessageId == replyTarget &&
-                        existing.mediaItems.size == attachments.size &&
-                        existing.mediaItems.withIndex().all { (index, item) ->
-                            val declaredBytes = attachments[index].source.declaredByteCount
-                            item.mediaType == mediaTypes[index] &&
-                                (declaredBytes <= 0L || item.plaintextBytes.toLong() == declaredBytes)
-                        },
-                ) { "An immediate-send identity belongs to different media" }
-                if (existing.state != ImmediateSendState.FAILED) {
-                    if (existing.state == ImmediateSendState.RETRY_REQUIRED) {
-                        queue.rearmForOwner(owner, existing.id)
-                    }
-                    immediateSendScheduler?.schedule()
-                    return
-                }
-                // A failed record's ciphertext is gone for good: fall through and stage this
-                // batch afresh under the same stable identity — the store swaps it wholesale.
-            }
-        }
         val createdAt = clock.instant().toEpochMilli()
         // Mint attachment identities before any copy begins. They remain unchanged through local
         // preview, ciphertext spooling, upload and the final KITMEDIA2 descriptor.
-        val stagingItems = mediaTypes.map { mediaType ->
+        val importItems = mediaTypes.mapIndexed { index, mediaType ->
             StagingMediaItem(
                 attachmentId = UUID.randomUUID().toString(),
                 mediaType = mediaType,
-            )
+                plaintextBytes = if (
+                    processingPlans[index] == SecureMediaProcessingPlan.PASSTHROUGH
+                ) {
+                    attachments[index].source.declaredByteCount
+                        .takeIf { it in 1..MAX_IMAGE_PLAINTEXT_BYTES.toLong() }
+                        ?.toInt()
+                        ?: 0
+                } else {
+                    0
+                },
+            ).also {
+                mediaPipelineProfiler?.begin(
+                    it.attachmentId,
+                    mediaType,
+                    attachments[index].source.originatedAtNanos,
+                )
+            }
         }
-        stagingMedia.update { current ->
-            current + StagingMedia(
-                id = id,
-                owner = owner,
-                conversationId = chatId,
-                createdAtEpochMillis = createdAt,
-                mediaType = mediaTypes.first(),
-                caption = normalizedCaption,
-                plaintextBytes = 0,
-                replyToMessageId = replyTarget,
-                albumItems = stagingItems,
-            )
-        }
-        val stagedIds = mutableListOf<String>()
-        val retainedCacheKeys = mutableSetOf<String>()
-        try {
-            withContext(NonCancellable) {
-                // Finish every atomic device-local copy before encrypting the first item. The
-                // album can therefore render all selected media while the background worker later
-                // prepares its ciphertext.
-                val localFiles = attachments.mapIndexed { index, attachment ->
-                    val stagingItem = stagingItems[index]
-                    val cache = secureMediaCache
-                    val local = if (cache == null) {
-                        null
-                    } else {
-                        val cacheKey = mediaCacheKey(owner, chatId, stagingItem.attachmentId)
-                        retainedCacheKeys += cacheKey
-                        cacheOutgoingMedia(
-                            owner = owner,
-                            chatId = chatId,
-                            attachmentId = stagingItem.attachmentId,
-                            mediaType = stagingItem.mediaType,
-                            source = attachment.source,
-                            retainUntilReleased = true,
-                        )
-                    }
-                    if (local != null) {
-                        stagingMedia.update { current ->
-                            current.map { staging ->
-                                if (staging.id == id && staging.owner == owner) {
-                                    staging.copy(
-                                        albumItems = staging.albumItems.map { item ->
-                                            if (item.attachmentId == stagingItem.attachmentId) {
-                                                item.copy(plaintextBytes = local.byteCount.toInt())
-                                            } else {
-                                                item
-                                            }
-                                        },
-                                    )
-                                } else {
-                                    staging
-                                }
-                            }
+        val cache = secureMediaCache
+        if (cache == null) {
+            check(processingPlans.all { it == SecureMediaProcessingPlan.PASSTHROUGH }) {
+                "Local media processing requires durable Sent Media storage"
+            }
+            val stagedIds = mutableListOf<String>()
+            stagingMedia.update { current ->
+                current + StagingMedia(
+                    id = id,
+                    owner = owner,
+                    conversationId = chatId,
+                    createdAtEpochMillis = createdAt,
+                    mediaType = mediaTypes.first(),
+                    caption = normalizedCaption,
+                    plaintextBytes = 0,
+                    replyToMessageId = replyTarget,
+                    albumItems = importItems,
+                )
+            }
+            importItems.forEach {
+                mediaPipelineProfiler?.mark(
+                    it.attachmentId,
+                    MediaPipelineMilestone.LOCAL_PROJECTION_READY,
+                )
+            }
+            try {
+                immediateSendAcceptanceMutex(chatId).withLock {
+                    requireCurrentMediaOwner(owner, chatId)
+                    existingImmediateMediaAlbum(
+                        queue = queue,
+                        owner = owner,
+                        id = id,
+                        chatId = chatId,
+                        mediaTypes = mediaTypes,
+                        originalMediaTypes = originalMediaTypes,
+                        processingPlans = processingPlans,
+                        attachments = attachments,
+                        caption = normalizedCaption,
+                        replyTarget = replyTarget,
+                    )?.let { existing ->
+                        if (existing.state == ImmediateSendState.RETRY_REQUIRED) {
+                            queue.rearmForOwner(owner, existing.id)
                         }
+                        immediateSendScheduler?.schedule()
+                        importItems.forEach {
+                            mediaPipelineProfiler?.forget(it.attachmentId)
+                        }
+                        return
                     }
-                    local
-                }
-                val intent = if (secureMediaCache == null) {
                     val items = attachments.mapIndexed { index, attachment ->
-                        val attachmentId = stagingItems[index].attachmentId
+                        val attachmentId = importItems[index].attachmentId
                         stagedIds += attachmentId
                         val material = spool.stage(attachmentId, attachment.source)
                         ImmediateSendMediaItem(
@@ -3582,58 +3945,279 @@ class EncryptedChatRepository @Inject internal constructor(
                             ciphertextBytes = material.ciphertextBytes.toLong(),
                             keyBase64 = material.keyBase64,
                             ciphertextSha256Hex = base64ToLowercaseHex(material.sha256Base64),
+                            originalMediaType = originalMediaTypes[index].takeUnless {
+                                it == mediaTypes[index]
+                            },
+                            originalPlaintextBytes = material.plaintextBytes,
+                            processingPlan = processingPlans[index],
+                            durationMillis = attachment.source.durationMillis,
                         )
                     }
                     validateImmediateAlbumCaption(normalizedCaption, items)
-                    ImmediateSendIntent(
-                        id = id,
-                        conversationId = chatId,
-                        kind = ImmediateSendKind.MEDIA_V2,
-                        createdAtEpochMillis = createdAt,
-                        caption = normalizedCaption,
-                        mediaItems = items,
-                        replyToMessageId = replyTarget,
+                    enqueueImmediateMedia(
+                        queue,
+                        owner,
+                        ImmediateSendIntent(
+                            id = id,
+                            conversationId = chatId,
+                            kind = ImmediateSendKind.MEDIA_V2,
+                            createdAtEpochMillis = createdAt,
+                            caption = normalizedCaption,
+                            mediaItems = items,
+                            replyToMessageId = replyTarget,
+                        ),
+                        idempotentClientMessageId,
                     )
-                } else {
-                    val items = localFiles.mapIndexed { index, local ->
+                }
+                immediateSendScheduler?.schedule()
+            } catch (error: Throwable) {
+                stagedIds.forEach { spool.discard(it) }
+                importItems.forEach { mediaPipelineProfiler?.forget(it.attachmentId) }
+                throw error
+            } finally {
+                stagingMedia.update { current -> current.filterNot { it.id == id } }
+            }
+            return
+        }
+
+        var importing: ImmediateSendIntent? = null
+        val cacheKeys = importItems.associate { item ->
+            item.attachmentId to mediaCacheKey(owner, chatId, item.attachmentId)
+        }
+        val publishedMediaIds = mutableSetOf<String>()
+        try {
+            importing = immediateSendAcceptanceMutex(chatId).withLock {
+                requireCurrentMediaOwner(owner, chatId)
+                existingImmediateMediaAlbum(
+                    queue = queue,
+                    owner = owner,
+                    id = id,
+                    chatId = chatId,
+                    mediaTypes = mediaTypes,
+                    originalMediaTypes = originalMediaTypes,
+                    processingPlans = processingPlans,
+                    attachments = attachments,
+                    caption = normalizedCaption,
+                    replyTarget = replyTarget,
+                )?.let { existing ->
+                    if (existing.state == ImmediateSendState.RETRY_REQUIRED) {
+                        queue.rearmForOwner(owner, existing.id)
+                    }
+                    immediateSendScheduler?.schedule()
+                    importItems.forEach { mediaPipelineProfiler?.forget(it.attachmentId) }
+                    return
+                }
+                val candidate = ImmediateSendIntent(
+                    id = id,
+                    conversationId = chatId,
+                    kind = ImmediateSendKind.MEDIA_V2,
+                    createdAtEpochMillis = createdAt,
+                    state = ImmediateSendState.IMPORTING,
+                    caption = normalizedCaption,
+                    mediaItems = importItems.mapIndexed { index, item ->
                         ImmediateSendMediaItem(
-                            attachmentId = stagingItems[index].attachmentId,
-                            mediaType = mediaTypes[index],
-                            plaintextBytes = checkNotNull(local).byteCount.toInt(),
+                            attachmentId = item.attachmentId,
+                            mediaType = item.mediaType,
+                            plaintextBytes = item.plaintextBytes,
                             ciphertextBytes = 0L,
                             keyBase64 = "",
                             ciphertextSha256Hex = "",
+                            originalMediaType = originalMediaTypes[index].takeUnless {
+                                it == item.mediaType
+                            },
+                            originalPlaintextBytes = attachments[index].source.declaredByteCount
+                                .takeIf { it in 1..MAX_LOCAL_MEDIA_ORIGINAL_BYTES.toLong() }
+                                ?.toInt()
+                                ?: 0,
+                            processingPlan = processingPlans[index],
+                            durationMillis = attachments[index].source.durationMillis,
                         )
+                    },
+                    replyToMessageId = replyTarget,
+                )
+                check(activeImmediateMediaImports.add(id)) {
+                    "The local media import is already active"
+                }
+                importItems.forEachIndexed { index, item ->
+                    attachments[index].source.localPlaybackFile
+                        ?.takeIf { it.isFile && it.length() > 0L }
+                        ?.let { file ->
+                            activeLocalMediaOriginals[item.attachmentId] = ActiveLocalMediaOriginal(
+                                owner = owner,
+                                conversationId = chatId,
+                                mediaType = originalMediaTypes[index],
+                                file = file,
+                            )
+                        }
+                }
+                try {
+                    enqueueImmediateMedia(queue, owner, candidate, idempotentClientMessageId)
+                    checkNotNull(queue.findForOwner(owner, id)) {
+                        "The durable local media import could not be read back"
                     }
-                    validateImmediateAlbumCaption(normalizedCaption, items)
-                    ImmediateSendIntent(
-                        id = id,
-                        conversationId = chatId,
-                        kind = ImmediateSendKind.MEDIA_V2,
-                        createdAtEpochMillis = createdAt,
-                        state = ImmediateSendState.PREPARING,
-                        caption = normalizedCaption,
-                        mediaItems = items,
-                        replyToMessageId = replyTarget,
+                } catch (error: Throwable) {
+                    activeImmediateMediaImports.remove(id)
+                    importItems.forEach { activeLocalMediaOriginals.remove(it.attachmentId) }
+                    throw error
+                }
+            }
+            val durableImport = checkNotNull(importing)
+            importItems.forEach {
+                mediaPipelineProfiler?.mark(
+                    it.attachmentId,
+                    MediaPipelineMilestone.LOCAL_PROJECTION_READY,
+                )
+                if (activeLocalMediaOriginals[it.attachmentId] != null) {
+                    mediaPipelineProfiler?.mark(
+                        it.attachmentId,
+                        MediaPipelineMilestone.LOCAL_PLAYABLE,
                     )
                 }
-                enqueueImmediateMedia(queue, owner, intent, idempotentClientMessageId)
-                if (idempotentClientMessageId != null && intent.state != ImmediateSendState.PREPARING) {
-                    // The identical record may already be on disk from an earlier attempt at this
-                    // same identity; whatever this call staged beyond what the retained record
-                    // references is an orphan ciphertext.
-                    val retained = queue.findForOwner(owner, id)?.spoolIds().orEmpty().toSet()
-                    stagedIds.filterNot { it in retained }.forEach { spool.discard(it) }
+            }
+            immediateSendScheduler?.schedule()
+
+            withContext(NonCancellable) {
+                durableImport.mediaItems.forEach { item ->
+                    localMediaLibrary?.recordImportPending(
+                        owner,
+                        pendingSentMediaRecord(
+                            owner = owner,
+                            chatId = chatId,
+                            messageId = id,
+                            mediaId = item.attachmentId,
+                            cacheKey = checkNotNull(cacheKeys[item.attachmentId]),
+                            mediaType = item.localMediaType,
+                            declaredBytes = item.localPlaintextBytes.toLong(),
+                            acceptedAtEpochMillis = durableImport.createdAtEpochMillis,
+                            durationMillis = item.durationMillis,
+                        ),
+                    )
                 }
-                retainedCacheKeys.clear() // The durable PREPARING record owns these retentions.
-                immediateSendScheduler?.schedule()
+                val localFiles = attachments.mapIndexed { index, attachment ->
+                    val item = durableImport.mediaItems[index]
+                    val cacheKey = checkNotNull(cacheKeys[item.attachmentId])
+                    val local = cacheOutgoingMedia(
+                        owner = owner,
+                        chatId = chatId,
+                        attachmentId = item.attachmentId,
+                        mediaType = item.localMediaType,
+                        source = attachment.source,
+                        retainUntilReleased = true,
+                    )
+                    publishedMediaIds += item.attachmentId
+                    val localAvailableAt = maxOf(
+                        durableImport.createdAtEpochMillis,
+                        clock.instant().toEpochMilli(),
+                    )
+                    localMediaLibrary?.recordLocalOriginal(
+                        owner,
+                        sentMediaRecord(
+                            owner = owner,
+                            chatId = chatId,
+                            messageId = id,
+                            mediaId = item.attachmentId,
+                            cacheKey = cacheKey,
+                            mediaType = item.localMediaType,
+                            local = local,
+                            selectedAtEpochMillis = durableImport.createdAtEpochMillis,
+                            visibleAtEpochMillis = durableImport.createdAtEpochMillis,
+                            localAvailableAtEpochMillis = localAvailableAt,
+                            durationMillis = item.durationMillis,
+                        ),
+                    )
+                    mediaPipelineProfiler?.mark(
+                        item.attachmentId,
+                        MediaPipelineMilestone.LOCAL_PLAYABLE,
+                    )
+                    local
+                }
+                val readyItems = durableImport.mediaItems.mapIndexed { index, item ->
+                    item.copy(
+                        plaintextBytes = if (
+                            item.processingPlan == SecureMediaProcessingPlan.PASSTHROUGH
+                        ) localFiles[index].byteCount.toInt() else 0,
+                        originalPlaintextBytes = localFiles[index].byteCount.toInt(),
+                    )
+                }
+                validateImmediateAlbumCaption(normalizedCaption, readyItems)
+                val current = queue.findForOwner(owner, id)
+                if (current?.state == ImmediateSendState.IMPORTING) {
+                    check(
+                        queue.replaceForOwner(
+                            owner,
+                            current,
+                            current.copy(
+                                state = ImmediateSendState.PREPARING,
+                                mediaItems = readyItems,
+                            ),
+                        ),
+                    ) { "The durable local media import changed before completion" }
+                } else {
+                    check(
+                        current != null && current.state != ImmediateSendState.FAILED,
+                    ) { "The durable local media import was retired before completion" }
+                }
+                cacheKeys.values.forEach { cache.releaseRetention(it) }
             }
         } catch (error: Throwable) {
-            stagedIds.forEach { spool.discard(it) }
-            retainedCacheKeys.forEach { secureMediaCache?.releaseRetention(it) }
+            withContext(NonCancellable) {
+                val current = runCatching { queue.findForOwner(owner, id) }.getOrNull()
+                if (publishedMediaIds.isEmpty() && current?.state == ImmediateSendState.IMPORTING) {
+                    runCatching {
+                        queue.replaceForOwner(
+                            owner,
+                            current,
+                            current.copy(state = ImmediateSendState.FAILED),
+                        )
+                    }
+                    runCatching { markImmediateMediaFailure(owner, current, permanent = true) }
+                    cacheKeys.values.forEach { cacheKey ->
+                        runCatching { cache.releaseRetention(cacheKey) }
+                    }
+                    importItems.forEach { mediaPipelineProfiler?.forget(it.attachmentId) }
+                }
+            }
             throw error
         } finally {
-            stagingMedia.update { current -> current.filterNot { it.id == id } }
+            activeImmediateMediaImports.remove(id)
+            importItems.forEach { activeLocalMediaOriginals.remove(it.attachmentId) }
+            if (importing != null) runCatching { immediateSendScheduler?.schedule() }
+        }
+    }
+
+    private suspend fun existingImmediateMediaAlbum(
+        queue: ImmediateSendIntentStore,
+        owner: SessionFence,
+        id: String,
+        chatId: String,
+        mediaTypes: List<String>,
+        originalMediaTypes: List<String>,
+        processingPlans: List<SecureMediaProcessingPlan>,
+        attachments: List<SecureMediaAlbumSource>,
+        caption: String?,
+        replyTarget: String?,
+    ): ImmediateSendIntent? {
+        if (!ImmediateSendIntent.CANONICAL_UUID.matches(id)) return null
+        return queue.findForOwner(owner, id)?.also { existing ->
+            check(
+                existing.kind == ImmediateSendKind.MEDIA_V2 &&
+                    existing.conversationId == chatId &&
+                    existing.caption == caption &&
+                    existing.replyToMessageId == replyTarget &&
+                    existing.mediaItems.size == attachments.size &&
+                    existing.mediaItems.withIndex().all { (index, item) ->
+                        val declaredBytes = attachments[index].source.declaredByteCount
+                        item.mediaType == mediaTypes[index] &&
+                            item.localMediaType == originalMediaTypes[index] &&
+                            item.processingPlan == processingPlans[index] &&
+                            item.durationMillis == attachments[index].source.durationMillis &&
+                            (
+                                declaredBytes <= 0L ||
+                                    item.localPlaintextBytes == 0 ||
+                                    item.localPlaintextBytes.toLong() == declaredBytes
+                                )
+                    },
+            ) { "An immediate-send identity belongs to different media" }
         }
     }
 
@@ -3644,6 +4228,8 @@ class EncryptedChatRepository @Inject internal constructor(
     override suspend fun openImageMessage(
         chatId: String,
         mediaDescriptor: String,
+        messageId: String?,
+        fromCurrentUser: Boolean?,
     ): SecureMediaFile {
         val owner = authenticationSessions?.current()?.fence()
         if (mediaDescriptor.startsWith(LOCAL_MEDIA_DESCRIPTOR_PREFIX)) {
@@ -3652,11 +4238,35 @@ class EncryptedChatRepository @Inject internal constructor(
             val staging = currentStagingMedia().firstOrNull {
                 it.id == id && it.conversationId == chatId
             }
-            val mediaType = intent?.mediaType ?: staging?.mediaType
+            check(
+                intent == null ||
+                    intent.conversationId == chatId && intent.kind == ImmediateSendKind.MEDIA,
+            ) { "The queued secure attachment is no longer available" }
+            check(staging == null || staging.albumItems.size < 2) {
+                "The queued secure attachment is no longer available"
+            }
+            val mediaType = intent?.localMediaType ?: staging?.mediaType
                 ?: error("The queued secure attachment is no longer available")
+            activeLocalMediaOriginals[id]?.takeIf { original ->
+                original.owner == owner &&
+                    original.conversationId == chatId &&
+                    original.mediaType == mediaType &&
+                    original.file.isFile &&
+                    original.file.length() > 0L
+            }?.let { original ->
+                return SecureMediaFile(original.file, mediaType, original.file.length())
+            }
             val cacheKey = mediaCacheKey(owner, chatId, id)
-            secureMediaCache?.cached(cacheKey, mediaType)?.let { return it }
-            if ((intent == null && staging != null) || intent?.state == ImmediateSendState.PREPARING) {
+            secureMediaCache?.cached(
+                cacheKey,
+                mediaType,
+                LocalMediaCollection.SENT,
+            )?.let { return it }
+            if (
+                (intent == null && staging != null) ||
+                intent?.state == ImmediateSendState.IMPORTING ||
+                intent?.state == ImmediateSendState.PREPARING
+            ) {
                 error("This secure attachment is still being prepared")
             }
             // MEDIA only, deliberately: an album is opened one attachment at a time through
@@ -3667,13 +4277,22 @@ class EncryptedChatRepository @Inject internal constructor(
             }
             val cache = requireSecureMediaCache()
             val ciphertext = checkNotNull(immediateMediaSpool).ciphertextFile(intent)
-            return cache.storeForOwner(owner, cacheKey, mediaType) { destination ->
+            return cache.storeForOwner(
+                owner,
+                cacheKey,
+                checkNotNull(intent.mediaType),
+                LocalMediaCollection.SENT,
+            ) { destination ->
                 val key = intent.mediaKeyMaterial()
                 val digest = intent.mediaSha256()
                 try {
-                    destination.outputStream().buffered().use { output ->
-                        MediaAttachmentStreamCipher.decrypt(ciphertext, key, digest, output)
-                    }
+                    MediaAttachmentStreamCipher.decrypt(
+                        ciphertext = ciphertext,
+                        keyMaterial = key,
+                        expectedSha256 = digest,
+                        expectedPlaintextBytes = intent.mediaPlaintextBytes,
+                        destination = destination,
+                    )
                 } finally {
                     key.fill(0)
                     digest.fill(0)
@@ -3686,10 +4305,86 @@ class EncryptedChatRepository @Inject internal constructor(
         val mediaType = parsed.mediaType
         val cache = requireSecureMediaCache()
         val cacheKey = mediaCacheKey(owner, chatId, parsed.attachmentId)
-        cache.cached(cacheKey, mediaType)?.let { return it }
+        val collection = fromCurrentUser?.let {
+            if (it) LocalMediaCollection.SENT else LocalMediaCollection.RECEIVED
+        }
+        if (owner != null && collection == LocalMediaCollection.SENT) {
+            localMediaLibrary?.find(owner, parsed.attachmentId)
+                ?.takeIf { it.availabilityState == LocalMediaAvailabilityState.AVAILABLE }
+                ?.let { record ->
+                    cache.cached(cacheKey, record.mimeType, LocalMediaCollection.SENT)
+                }
+                ?.let { return it }
+        }
+        val receivedAt = clock.instant().toEpochMilli()
+        val canonicalMessageId = messageId
+            ?.takeIf(ImmediateSendIntent.CANONICAL_UUID::matches)
+            ?: parsed.attachmentId
+        cache.cached(cacheKey, mediaType, collection)?.let { cached ->
+            recordOpenedRemoteMedia(
+                owner = owner,
+                collection = collection,
+                chatId = chatId,
+                messageId = canonicalMessageId,
+                mediaId = parsed.attachmentId,
+                cacheKey = cacheKey,
+                mediaType = mediaType,
+                remoteReference = parsed.storageKey,
+                media = cached,
+                selectedAtEpochMillis = receivedAt,
+            )
+            return cached
+        }
         val session = requireReadySession()
-        return cache.storeForOwner(owner, cacheKey, mediaType) { destination ->
-            runtime.openMediaToFile(session, chatId, mediaDescriptor, destination)
+        if (owner != null && collection == LocalMediaCollection.RECEIVED) {
+            localMediaLibrary?.recordReceivePending(
+                owner,
+                receivedMediaRecord(
+                    owner = owner,
+                    chatId = chatId,
+                    messageId = canonicalMessageId,
+                    mediaId = parsed.attachmentId,
+                    cacheKey = cacheKey,
+                    mediaType = mediaType,
+                    fileSize = parsed.plaintextByteSize.toLong(),
+                    remoteReference = parsed.storageKey,
+                    atEpochMillis = receivedAt,
+                ),
+            )
+        }
+        return try {
+            val opened = cache.storeForOwner(
+                owner,
+                cacheKey,
+                mediaType,
+                collection,
+            ) { destination ->
+                runtime.openMediaToFile(session, chatId, mediaDescriptor, destination)
+            }
+            recordOpenedRemoteMedia(
+                owner = owner,
+                collection = collection,
+                chatId = chatId,
+                messageId = canonicalMessageId,
+                mediaId = parsed.attachmentId,
+                cacheKey = cacheKey,
+                mediaType = mediaType,
+                remoteReference = parsed.storageKey,
+                media = opened,
+                selectedAtEpochMillis = receivedAt,
+            )
+            opened
+        } catch (error: Throwable) {
+            if (owner != null && collection == LocalMediaCollection.RECEIVED) {
+                runCatching {
+                    localMediaLibrary?.markDownloadFailed(
+                        owner,
+                        parsed.attachmentId,
+                        maxOf(receivedAt, clock.instant().toEpochMilli()),
+                    )
+                }
+            }
+            throw error
         }
     }
 
@@ -3697,6 +4392,8 @@ class EncryptedChatRepository @Inject internal constructor(
         chatId: String,
         mediaDescriptor: String,
         attachmentId: String,
+        messageId: String?,
+        fromCurrentUser: Boolean?,
     ): SecureMediaFile {
         val owner = authenticationSessions?.current()?.fence()
         val cacheKey = mediaCacheKey(owner, chatId, attachmentId)
@@ -3721,10 +4418,27 @@ class EncryptedChatRepository @Inject internal constructor(
                 it.attachmentId == attachmentId
             }
             val queuedItem = intent?.mediaItems?.firstOrNull { it.attachmentId == attachmentId }
-            val mediaType = queuedItem?.mediaType ?: stagingItem?.mediaType
+            val mediaType = queuedItem?.localMediaType ?: stagingItem?.mediaType
                 ?: error("The requested attachment does not belong to this album")
-            secureMediaCache?.cached(cacheKey, mediaType)?.let { return it }
-            if ((intent == null && staging != null) || intent?.state == ImmediateSendState.PREPARING) {
+            activeLocalMediaOriginals[attachmentId]?.takeIf { original ->
+                original.owner == owner &&
+                    original.conversationId == chatId &&
+                    original.mediaType == mediaType &&
+                    original.file.isFile &&
+                    original.file.length() > 0L
+            }?.let { original ->
+                return SecureMediaFile(original.file, mediaType, original.file.length())
+            }
+            secureMediaCache?.cached(
+                cacheKey,
+                mediaType,
+                LocalMediaCollection.SENT,
+            )?.let { return it }
+            if (
+                (intent == null && staging != null) ||
+                intent?.state == ImmediateSendState.IMPORTING ||
+                intent?.state == ImmediateSendState.PREPARING
+            ) {
                 error("This secure attachment is still being prepared")
             }
             checkNotNull(intent)
@@ -3734,13 +4448,22 @@ class EncryptedChatRepository @Inject internal constructor(
             val cache = requireSecureMediaCache()
             val ciphertext = checkNotNull(immediateMediaSpool)
                 .albumItemCiphertextFile(intent, attachmentId)
-            return cache.storeForOwner(owner, cacheKey, item.mediaType) { destination ->
+            return cache.storeForOwner(
+                owner,
+                cacheKey,
+                item.mediaType,
+                LocalMediaCollection.SENT,
+            ) { destination ->
                 val key = item.keyMaterial()
                 val digest = item.ciphertextSha256()
                 try {
-                    destination.outputStream().buffered().use { output ->
-                        MediaAttachmentStreamCipher.decrypt(ciphertext, key, digest, output)
-                    }
+                    MediaAttachmentStreamCipher.decrypt(
+                        ciphertext = ciphertext,
+                        keyMaterial = key,
+                        expectedSha256 = digest,
+                        expectedPlaintextBytes = item.plaintextBytes,
+                        destination = destination,
+                    )
                 } finally {
                     key.fill(0)
                     digest.fill(0)
@@ -3754,10 +4477,92 @@ class EncryptedChatRepository @Inject internal constructor(
             "The requested attachment does not belong to this album"
         }
         val cache = requireSecureMediaCache()
-        cache.cached(cacheKey, item.mediaType)?.let { return it }
+        val collection = fromCurrentUser?.let {
+            if (it) LocalMediaCollection.SENT else LocalMediaCollection.RECEIVED
+        }
+        if (owner != null && collection == LocalMediaCollection.SENT) {
+            localMediaLibrary?.find(owner, attachmentId)
+                ?.takeIf { it.availabilityState == LocalMediaAvailabilityState.AVAILABLE }
+                ?.let { record ->
+                    cache.cached(cacheKey, record.mimeType, LocalMediaCollection.SENT)
+                }
+                ?.let { return it }
+        }
+        val receivedAt = clock.instant().toEpochMilli()
+        val canonicalMessageId = messageId
+            ?.takeIf(ImmediateSendIntent.CANONICAL_UUID::matches)
+            ?: attachmentId
+        cache.cached(cacheKey, item.mediaType, collection)?.let { cached ->
+            recordOpenedRemoteMedia(
+                owner = owner,
+                collection = collection,
+                chatId = chatId,
+                messageId = canonicalMessageId,
+                mediaId = attachmentId,
+                cacheKey = cacheKey,
+                mediaType = item.mediaType,
+                remoteReference = item.storageKey,
+                media = cached,
+                selectedAtEpochMillis = receivedAt,
+            )
+            return cached
+        }
         val session = requireReadySession()
-        return cache.storeForOwner(owner, cacheKey, item.mediaType) { destination ->
-            runtime.openAlbumItemToFile(session, chatId, mediaDescriptor, attachmentId, destination)
+        if (owner != null && collection == LocalMediaCollection.RECEIVED) {
+            localMediaLibrary?.recordReceivePending(
+                owner,
+                receivedMediaRecord(
+                    owner = owner,
+                    chatId = chatId,
+                    messageId = canonicalMessageId,
+                    mediaId = attachmentId,
+                    cacheKey = cacheKey,
+                    mediaType = item.mediaType,
+                    fileSize = item.plaintextByteSize.toLong(),
+                    remoteReference = item.storageKey,
+                    atEpochMillis = receivedAt,
+                ),
+            )
+        }
+        return try {
+            val opened = cache.storeForOwner(
+                owner,
+                cacheKey,
+                item.mediaType,
+                collection,
+            ) { destination ->
+                runtime.openAlbumItemToFile(
+                    session,
+                    chatId,
+                    mediaDescriptor,
+                    attachmentId,
+                    destination,
+                )
+            }
+            recordOpenedRemoteMedia(
+                owner = owner,
+                collection = collection,
+                chatId = chatId,
+                messageId = canonicalMessageId,
+                mediaId = attachmentId,
+                cacheKey = cacheKey,
+                mediaType = item.mediaType,
+                remoteReference = item.storageKey,
+                media = opened,
+                selectedAtEpochMillis = receivedAt,
+            )
+            opened
+        } catch (error: Throwable) {
+            if (owner != null && collection == LocalMediaCollection.RECEIVED) {
+                runCatching {
+                    localMediaLibrary?.markDownloadFailed(
+                        owner,
+                        attachmentId,
+                        maxOf(receivedAt, clock.instant().toEpochMilli()),
+                    )
+                }
+            }
+            throw error
         }
     }
 
@@ -3802,14 +4607,15 @@ class EncryptedChatRepository @Inject internal constructor(
         val cache = checkNotNull(secureMediaCache) { "Secure media storage is unavailable" }
         require(
             source.declaredByteCount <= 0L ||
-                source.declaredByteCount <= MAX_IMAGE_PLAINTEXT_BYTES.toLong(),
-        ) { "This attachment is too large to send" }
+                source.declaredByteCount <= MAX_LOCAL_MEDIA_ORIGINAL_BYTES.toLong(),
+        ) { "This attachment is too large to keep locally" }
         return cache.store(
             cacheKey = mediaCacheKey(owner, chatId, attachmentId),
             mediaType = mediaType,
             retainUntilReleased = retainUntilReleased,
             ownerScopeId = owner.cacheScopeId,
             ownerIsCurrent = { authenticationSessions?.current()?.fence() == owner },
+            collection = LocalMediaCollection.SENT,
         ) { destination ->
             source.open().buffered().use { input ->
                 destination.outputStream().buffered().use { output ->
@@ -3820,8 +4626,8 @@ class EncryptedChatRepository @Inject internal constructor(
                             val read = input.read(buffer)
                             if (read < 0) break
                             total += read
-                            require(total <= MAX_IMAGE_PLAINTEXT_BYTES.toLong()) {
-                                "This attachment is too large to send"
+                            require(total <= MAX_LOCAL_MEDIA_ORIGINAL_BYTES.toLong()) {
+                                "This attachment is too large to keep locally"
                             }
                             output.write(buffer, 0, read)
                         }
@@ -3830,6 +4636,189 @@ class EncryptedChatRepository @Inject internal constructor(
                         buffer.fill(0)
                     }
                 }
+            }
+        }
+    }
+
+    private fun pendingSentMediaRecord(
+        owner: SessionFence,
+        chatId: String,
+        messageId: String,
+        mediaId: String,
+        cacheKey: String,
+        mediaType: String,
+        declaredBytes: Long,
+        acceptedAtEpochMillis: Long,
+        durationMillis: Long? = null,
+    ): LocalMediaRecord = LocalMediaRecord(
+        ownerScopeId = owner.cacheScopeId,
+        conversationId = chatId,
+        messageId = messageId,
+        mediaId = mediaId,
+        collection = LocalMediaCollection.SENT,
+        localReference = cacheKey,
+        mimeType = mediaType,
+        fileSize = declaredBytes,
+        durationMillis = durationMillis,
+        processingState = LocalMediaProcessingState.PROCESSING,
+        uploadState = LocalMediaUploadState.PENDING,
+        downloadState = LocalMediaDownloadState.NOT_REQUIRED,
+        encryptionState = LocalMediaEncryptionState.PENDING,
+        availabilityState = LocalMediaAvailabilityState.MISSING,
+        selectedAtEpochMillis = acceptedAtEpochMillis,
+        visibleAtEpochMillis = acceptedAtEpochMillis,
+        localAvailableAtEpochMillis = null,
+        updatedAtEpochMillis = acceptedAtEpochMillis,
+    )
+
+    private fun sentMediaRecord(
+        owner: SessionFence,
+        chatId: String,
+        messageId: String,
+        mediaId: String,
+        cacheKey: String,
+        mediaType: String,
+        local: SecureMediaFile,
+        selectedAtEpochMillis: Long,
+        visibleAtEpochMillis: Long,
+        localAvailableAtEpochMillis: Long,
+        durationMillis: Long? = null,
+    ): LocalMediaRecord = LocalMediaRecord(
+        ownerScopeId = owner.cacheScopeId,
+        conversationId = chatId,
+        messageId = messageId,
+        mediaId = mediaId,
+        collection = LocalMediaCollection.SENT,
+        localReference = cacheKey,
+        mimeType = mediaType,
+        fileSize = local.byteCount,
+        durationMillis = durationMillis,
+        processingState = LocalMediaProcessingState.ORIGINAL_READY,
+        uploadState = LocalMediaUploadState.PENDING,
+        downloadState = LocalMediaDownloadState.NOT_REQUIRED,
+        encryptionState = LocalMediaEncryptionState.PENDING,
+        availabilityState = LocalMediaAvailabilityState.AVAILABLE,
+        selectedAtEpochMillis = selectedAtEpochMillis,
+        visibleAtEpochMillis = visibleAtEpochMillis,
+        localAvailableAtEpochMillis = localAvailableAtEpochMillis,
+        updatedAtEpochMillis = localAvailableAtEpochMillis,
+    )
+
+    private fun receivedMediaRecord(
+        owner: SessionFence,
+        chatId: String,
+        messageId: String,
+        mediaId: String,
+        cacheKey: String,
+        mediaType: String,
+        fileSize: Long,
+        remoteReference: String,
+        atEpochMillis: Long,
+    ): LocalMediaRecord = LocalMediaRecord(
+        ownerScopeId = owner.cacheScopeId,
+        conversationId = chatId,
+        messageId = messageId,
+        mediaId = mediaId,
+        collection = LocalMediaCollection.RECEIVED,
+        localReference = cacheKey,
+        remoteEncryptedObjectReference = remoteReference,
+        mimeType = mediaType,
+        fileSize = fileSize,
+        processingState = LocalMediaProcessingState.PROCESSING,
+        uploadState = LocalMediaUploadState.NOT_REQUIRED,
+        downloadState = LocalMediaDownloadState.DOWNLOADING,
+        encryptionState = LocalMediaEncryptionState.ENCRYPTED,
+        availabilityState = LocalMediaAvailabilityState.MISSING,
+        selectedAtEpochMillis = atEpochMillis,
+        visibleAtEpochMillis = atEpochMillis,
+        localAvailableAtEpochMillis = null,
+        updatedAtEpochMillis = atEpochMillis,
+    )
+
+    private suspend fun recordOpenedRemoteMedia(
+        owner: SessionFence?,
+        collection: LocalMediaCollection?,
+        chatId: String,
+        messageId: String,
+        mediaId: String,
+        cacheKey: String,
+        mediaType: String,
+        remoteReference: String,
+        media: SecureMediaFile,
+        selectedAtEpochMillis: Long,
+    ) {
+        val expectedOwner = owner ?: return
+        val availableAt = maxOf(selectedAtEpochMillis, clock.instant().toEpochMilli())
+        when (collection) {
+            LocalMediaCollection.RECEIVED -> {
+                localMediaLibrary?.recordReceivePending(
+                    expectedOwner,
+                    receivedMediaRecord(
+                        owner = expectedOwner,
+                        chatId = chatId,
+                        messageId = messageId,
+                        mediaId = mediaId,
+                        cacheKey = cacheKey,
+                        mediaType = mediaType,
+                        fileSize = media.byteCount,
+                        remoteReference = remoteReference,
+                        atEpochMillis = selectedAtEpochMillis,
+                    ),
+                )
+                localMediaLibrary?.markReceivedAvailable(
+                    expectedOwner,
+                    mediaId,
+                    media.byteCount,
+                    localMediaDurationMillis(media),
+                    availableAt,
+                )
+            }
+            LocalMediaCollection.SENT -> localMediaLibrary?.recordLocalOriginal(
+                expectedOwner,
+                LocalMediaRecord(
+                    ownerScopeId = expectedOwner.cacheScopeId,
+                    conversationId = chatId,
+                    messageId = messageId,
+                    mediaId = mediaId,
+                    collection = LocalMediaCollection.SENT,
+                    localReference = cacheKey,
+                    remoteEncryptedObjectReference = remoteReference,
+                    mimeType = mediaType,
+                    fileSize = media.byteCount,
+                    durationMillis = localMediaDurationMillis(media),
+                    processingState = LocalMediaProcessingState.READY,
+                    uploadState = LocalMediaUploadState.UPLOADED,
+                    downloadState = LocalMediaDownloadState.NOT_REQUIRED,
+                    encryptionState = LocalMediaEncryptionState.ENCRYPTED,
+                    availabilityState = LocalMediaAvailabilityState.AVAILABLE,
+                    selectedAtEpochMillis = selectedAtEpochMillis,
+                    visibleAtEpochMillis = selectedAtEpochMillis,
+                    localAvailableAtEpochMillis = availableAt,
+                    encryptionCompletedAtEpochMillis = availableAt,
+                    uploadedAtEpochMillis = availableAt,
+                    updatedAtEpochMillis = availableAt,
+                ),
+            )
+            null -> Unit
+        }
+    }
+
+    /** Duration is presentation metadata only; unsupported/corrupt containers remain nullable. */
+    private suspend fun localMediaDurationMillis(media: SecureMediaFile): Long? {
+        if (!media.mediaType.startsWith("audio/") && !media.mediaType.startsWith("video/")) {
+            return null
+        }
+        return withContext(Dispatchers.IO) {
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(media.file.absolutePath)
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull()
+                    ?.takeIf { it in 1..MAX_LOCAL_MEDIA_DURATION_MILLIS }
+            } catch (_: Exception) {
+                null
+            } finally {
+                runCatching { retriever.release() }
             }
         }
     }
@@ -3845,24 +4834,155 @@ class EncryptedChatRepository @Inject internal constructor(
             ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES),
         )
         val probe = items.map {
+            val projectedPlaintextBytes = if (it.isPreparing && it.plaintextBytes == 0) {
+                MAX_IMAGE_PLAINTEXT_BYTES
+            } else {
+                it.plaintextBytes
+            }
             KitMediaMessageV2Item(
                 attachmentId = it.attachmentId,
                 storageKey = it.attachmentId,
                 mediaType = it.mediaType,
                 ciphertextByteSize = if (it.isPreparing) {
-                    it.plaintextBytes.toLong() + 64L - (it.plaintextBytes.toLong() % 16L)
+                    projectedPlaintextBytes.toLong() + 64L -
+                        (projectedPlaintextBytes.toLong() % 16L)
                 } else {
                     it.ciphertextBytes
                 },
                 ciphertextSha256 = if (it.isPreparing) "0".repeat(64) else it.ciphertextSha256Hex,
                 keyMaterialBase64 = if (it.isPreparing) placeholderKey else it.keyBase64,
-                plaintextByteSize = it.plaintextBytes,
+                plaintextByteSize = projectedPlaintextBytes,
             )
         }
         require(
             KitMediaMessageV2.encodedCaptionBytes(caption) <=
                 KitMediaMessageV2.remainingEncodedCaptionBudgetBytes(probe),
         ) { "This caption is too long to send with these attachments" }
+    }
+
+    /**
+     * Reconciles a durable IMPORTING bubble after process death (or a worker/foreground race).
+     *
+     * A same-process import owns a lease and is left alone. After restart there is no lease: an
+     * atomically published final file advances to PREPARING under the same IDs, while a missing
+     * final file becomes a durable visible failure. Scratch files are never accepted as originals.
+     */
+    internal suspend fun recoverImmediateMediaImport(
+        owner: SessionFence,
+        intent: ImmediateSendIntent,
+    ): ImmediateSendIntent? {
+        require(intent.state == ImmediateSendState.IMPORTING)
+        if (intent.id in activeImmediateMediaImports) return null
+        if (authenticationSessions?.current()?.fence() != owner) {
+            throw SessionInvalidatedException()
+        }
+        val cache = secureMediaCache ?: return intent.copy(state = ImmediateSendState.FAILED)
+        return when (intent.kind) {
+            ImmediateSendKind.MEDIA -> {
+                val mediaType = intent.localMediaType
+                val cacheKey = mediaCacheKey(owner, intent.conversationId, intent.id)
+                localMediaLibrary?.recordImportPending(
+                    owner,
+                    pendingSentMediaRecord(
+                        owner = owner,
+                        chatId = intent.conversationId,
+                        messageId = intent.id,
+                        mediaId = intent.id,
+                        cacheKey = cacheKey,
+                        mediaType = mediaType,
+                        declaredBytes = intent.localPlaintextBytes.toLong(),
+                        acceptedAtEpochMillis = intent.createdAtEpochMillis,
+                        durationMillis = intent.mediaDurationMillis,
+                    ),
+                )
+                val local = cache.cached(cacheKey, mediaType, LocalMediaCollection.SENT)
+                    ?: return intent.copy(state = ImmediateSendState.FAILED)
+                val availableAt = maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli())
+                localMediaLibrary?.recordLocalOriginal(
+                    owner,
+                    sentMediaRecord(
+                        owner = owner,
+                        chatId = intent.conversationId,
+                        messageId = intent.id,
+                        mediaId = intent.id,
+                        cacheKey = cacheKey,
+                        mediaType = mediaType,
+                        local = local,
+                        selectedAtEpochMillis = intent.createdAtEpochMillis,
+                        visibleAtEpochMillis = intent.createdAtEpochMillis,
+                        localAvailableAtEpochMillis = availableAt,
+                        durationMillis = intent.mediaDurationMillis,
+                    ),
+                )
+                intent.copy(
+                    state = ImmediateSendState.PREPARING,
+                    mediaPlaintextBytes = if (
+                        intent.mediaProcessingPlan == SecureMediaProcessingPlan.PASSTHROUGH
+                    ) local.byteCount.toInt() else 0,
+                    mediaOriginalPlaintextBytes = local.byteCount.toInt(),
+                )
+            }
+            ImmediateSendKind.MEDIA_V2 -> {
+                val localFiles = intent.mediaItems.map { item ->
+                    val cacheKey = mediaCacheKey(
+                        owner,
+                        intent.conversationId,
+                        item.attachmentId,
+                    )
+                    localMediaLibrary?.recordImportPending(
+                        owner,
+                        pendingSentMediaRecord(
+                            owner = owner,
+                            chatId = intent.conversationId,
+                            messageId = intent.id,
+                            mediaId = item.attachmentId,
+                            cacheKey = cacheKey,
+                            mediaType = item.localMediaType,
+                            declaredBytes = item.localPlaintextBytes.toLong(),
+                            acceptedAtEpochMillis = intent.createdAtEpochMillis,
+                            durationMillis = item.durationMillis,
+                        ),
+                    )
+                    val local = cache.cached(
+                        cacheKey,
+                        item.localMediaType,
+                        LocalMediaCollection.SENT,
+                    ) ?: return intent.copy(state = ImmediateSendState.FAILED)
+                    val availableAt = maxOf(
+                        intent.createdAtEpochMillis,
+                        clock.instant().toEpochMilli(),
+                    )
+                    localMediaLibrary?.recordLocalOriginal(
+                        owner,
+                        sentMediaRecord(
+                            owner = owner,
+                            chatId = intent.conversationId,
+                            messageId = intent.id,
+                            mediaId = item.attachmentId,
+                            cacheKey = cacheKey,
+                            mediaType = item.localMediaType,
+                            local = local,
+                            selectedAtEpochMillis = intent.createdAtEpochMillis,
+                            visibleAtEpochMillis = intent.createdAtEpochMillis,
+                            localAvailableAtEpochMillis = availableAt,
+                            durationMillis = item.durationMillis,
+                        ),
+                    )
+                    local
+                }
+                val readyItems = intent.mediaItems.mapIndexed { index, item ->
+                    item.copy(
+                        plaintextBytes = if (
+                            item.processingPlan == SecureMediaProcessingPlan.PASSTHROUGH
+                        ) localFiles[index].byteCount.toInt() else 0,
+                        originalPlaintextBytes = localFiles[index].byteCount.toInt(),
+                    )
+                }
+                validateImmediateAlbumCaption(intent.caption, readyItems)
+                intent.copy(state = ImmediateSendState.PREPARING, mediaItems = readyItems)
+            }
+            else -> error("Only queued media can be imported")
+        }
     }
 
     /** Worker-only promotion from retained plaintext to a complete ciphertext queue record. */
@@ -3881,18 +5001,37 @@ class EncryptedChatRepository @Inject internal constructor(
                 val mediaType = checkNotNull(intent.mediaType)
                 val local = cache.cached(
                     mediaCacheKey(owner, intent.conversationId, intent.id),
-                    mediaType,
+                    intent.localMediaType,
+                    LocalMediaCollection.SENT,
                 ) ?: throw ImmediateMediaPreparationUnavailableException(
                     "The retained attachment is no longer available",
                 )
-                if (local.byteCount != intent.mediaPlaintextBytes.toLong()) {
+                if (local.byteCount != intent.localPlaintextBytes.toLong()) {
                     throw ImmediateMediaPreparationUnavailableException(
                         "The retained attachment changed before encryption",
                     )
                 }
-                val material = spool.stage(intent.id, SecureMediaSource.ofFile(local.file))
+                localMediaLibrary?.markEncrypting(
+                    owner,
+                    intent.id,
+                    maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
+                )
+                val prepared = prepareUploadPlaintext(
+                    local,
+                    intent.mediaProcessingPlan,
+                    intent.mediaVideoEditPlan,
+                )
+                val material = try {
+                    spool.stage(intent.id, SecureMediaSource.ofFile(prepared.file))
+                } finally {
+                    prepared.release()
+                }
+                val encryptedAt = maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli())
+                localMediaLibrary?.markEncrypted(owner, intent.id, encryptedAt)
+                mediaPipelineProfiler?.mark(intent.id, MediaPipelineMilestone.ENCRYPTED)
                 intent.copy(
                     state = ImmediateSendState.WAITING,
+                    mediaPlaintextBytes = material.plaintextBytes,
                     mediaCiphertextBytes = material.ciphertextBytes,
                     mediaKeyBase64 = material.keyBase64,
                     mediaSha256Base64 = material.sha256Base64,
@@ -3904,21 +5043,40 @@ class EncryptedChatRepository @Inject internal constructor(
                     val preparedItems = intent.mediaItems.map { item ->
                         val local = cache.cached(
                             mediaCacheKey(owner, intent.conversationId, item.attachmentId),
-                            item.mediaType,
+                            item.localMediaType,
+                            LocalMediaCollection.SENT,
                         ) ?: throw ImmediateMediaPreparationUnavailableException(
                             "A retained album attachment is no longer available",
                         )
-                        if (local.byteCount != item.plaintextBytes.toLong()) {
+                        if (local.byteCount != item.localPlaintextBytes.toLong()) {
                             throw ImmediateMediaPreparationUnavailableException(
                                 "A retained album attachment changed before encryption",
                             )
                         }
-                        val material = spool.stage(
+                        localMediaLibrary?.markEncrypting(
+                            owner,
                             item.attachmentId,
-                            SecureMediaSource.ofFile(local.file),
+                            maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
+                        )
+                        val prepared = prepareUploadPlaintext(local, item.processingPlan, null)
+                        val material = try {
+                            spool.stage(
+                                item.attachmentId,
+                                SecureMediaSource.ofFile(prepared.file),
+                            )
+                        } finally {
+                            prepared.release()
+                        }
+                        val encryptedAt =
+                            maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli())
+                        localMediaLibrary?.markEncrypted(owner, item.attachmentId, encryptedAt)
+                        mediaPipelineProfiler?.mark(
+                            item.attachmentId,
+                            MediaPipelineMilestone.ENCRYPTED,
                         )
                         stagedIds += item.attachmentId
                         item.copy(
+                            plaintextBytes = material.plaintextBytes,
                             ciphertextBytes = material.ciphertextBytes.toLong(),
                             keyBase64 = material.keyBase64,
                             ciphertextSha256Hex = base64ToLowercaseHex(material.sha256Base64),
@@ -3938,6 +5096,21 @@ class EncryptedChatRepository @Inject internal constructor(
         }
     }
 
+    /** The retained original is never replaced; only this disposable upload view is transformed. */
+    private suspend fun prepareUploadPlaintext(
+        original: SecureMediaFile,
+        plan: SecureMediaProcessingPlan,
+        videoEditPlan: SecureMediaVideoEditPlan?,
+    ): PreparedSecureMedia {
+        val processor = secureMediaUploadProcessor
+        if (processor != null) return processor.prepare(original, plan, videoEditPlan)
+        check(plan == SecureMediaProcessingPlan.PASSTHROUGH) {
+            "Secure media processing is unavailable"
+        }
+        check(videoEditPlan == null) { "Secure video processing is unavailable" }
+        return PreparedSecureMedia(original.file, deleteAfterUse = false)
+    }
+
     /** A WAITING/FAILED record no longer needs its plaintext protected from cache eviction. */
     internal suspend fun releaseImmediateMediaRetention(
         owner: SessionFence,
@@ -3947,16 +5120,47 @@ class EncryptedChatRepository @Inject internal constructor(
         immediateMediaCacheKeys(owner, intent).forEach { cache.releaseRetention(it) }
     }
 
+    internal suspend fun markImmediateMediaFailure(
+        owner: SessionFence,
+        intent: ImmediateSendIntent,
+        permanent: Boolean,
+    ) {
+        val at = maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli())
+        when (intent.kind) {
+            ImmediateSendKind.MEDIA -> localMediaLibrary?.markSendFailure(
+                owner,
+                intent.id,
+                permanent,
+                at,
+            )
+            ImmediateSendKind.MEDIA_V2 -> intent.mediaItems.forEach { item ->
+                localMediaLibrary?.markSendFailure(
+                    owner,
+                    item.attachmentId,
+                    permanent,
+                    at,
+                )
+            }
+            else -> Unit
+        }
+    }
+
     /** Publishes plaintext only while the exact session that requested it still owns the app. */
     private suspend fun SecureMediaCache.storeForOwner(
         owner: SessionFence?,
         cacheKey: String,
         mediaType: String,
+        collection: LocalMediaCollection? = null,
         write: suspend (File) -> Unit,
     ): SecureMediaFile {
         val sessions = authenticationSessions
         if (sessions == null) {
-            return store(cacheKey = cacheKey, mediaType = mediaType, write = write)
+            return store(
+                cacheKey = cacheKey,
+                mediaType = mediaType,
+                collection = collection,
+                write = write,
+            )
         }
         val expectedOwner = owner ?: throw SessionInvalidatedException()
         return store(
@@ -3964,6 +5168,7 @@ class EncryptedChatRepository @Inject internal constructor(
             mediaType = mediaType,
             ownerScopeId = expectedOwner.cacheScopeId,
             ownerIsCurrent = { sessions.current()?.fence() == expectedOwner },
+            collection = collection,
             write = write,
         )
     }
@@ -3987,7 +5192,20 @@ class EncryptedChatRepository @Inject internal constructor(
             authenticationSessions?.current()?.fence() != owner ||
             session.sessionEpoch != owner.sessionId
         ) throw SessionInvalidatedException()
-        return runtime.prepareMediaDescriptor(
+        // Local capture/selection has already been accepted and persisted. Only this
+        // network-constrained dispatch boundary consults the authoritative service contract;
+        // connectivity failures leave the stable outbox intent pending for an automatic retry.
+        richMediaCapability?.requireSendable(
+            checkNotNull(intent.mediaType),
+            intent.mediaPlaintextBytes.toLong(),
+            owner.cacheScopeId,
+        )
+        localMediaLibrary?.markUploadStarted(
+            owner,
+            intent.id,
+            maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
+        )
+        val descriptor = runtime.prepareMediaDescriptor(
             session = session,
             conversationId = intent.conversationId,
             attachmentId = intent.id,
@@ -3996,7 +5214,20 @@ class EncryptedChatRepository @Inject internal constructor(
             keyMaterialBase64 = checkNotNull(intent.mediaKeyBase64),
             plaintextBytes = intent.mediaPlaintextBytes,
             caption = intent.caption,
+            expectedCiphertextBytes = intent.mediaCiphertextBytes.toLong(),
+            expectedCiphertextSha256Hex = base64ToLowercaseHex(
+                checkNotNull(intent.mediaSha256Base64),
+            ),
         )
+        val storageKey = checkNotNull(KitMediaMessage.parse(descriptor)).storageKey
+        localMediaLibrary?.markUploaded(
+            owner,
+            intent.id,
+            storageKey,
+            maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
+        )
+        mediaPipelineProfiler?.mark(intent.id, MediaPipelineMilestone.UPLOADED)
+        return descriptor
     }
 
     /** Worker-only §6 admission for a queued album, taken once before any upload is spent. */
@@ -4010,6 +5241,16 @@ class EncryptedChatRepository @Inject internal constructor(
             authenticationSessions?.current()?.fence() != owner ||
             session.sessionEpoch != owner.sessionId
         ) throw SessionInvalidatedException()
+        // Validate every prepared item against the same live rich-media contract before the
+        // album roster gate or first upload. The local originals and one pending bubble already
+        // exist, so a temporary failure remains safely retryable and cannot lose the selection.
+        intent.mediaItems.forEach { item ->
+            richMediaCapability?.requireSendable(
+                item.mediaType,
+                item.plaintextBytes.toLong(),
+                owner.cacheScopeId,
+            )
+        }
         runtime.assertMediaAlbumSendable(session, intent.conversationId, owner)
     }
 
@@ -4029,14 +5270,172 @@ class EncryptedChatRepository @Inject internal constructor(
             authenticationSessions?.current()?.fence() != owner ||
             session.sessionEpoch != owner.sessionId
         ) throw SessionInvalidatedException()
-        return runtime.uploadAlbumAttachment(
+        localMediaLibrary?.markUploadStarted(
+            owner,
+            item.attachmentId,
+            maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
+        )
+        val storageKey = runtime.uploadAlbumAttachment(
             session = session,
             conversationId = intent.conversationId,
+            attachmentId = item.attachmentId,
             ciphertext = ciphertext,
             mediaType = item.mediaType,
             expectedCiphertextBytes = item.ciphertextBytes,
             expectedCiphertextSha256Hex = item.ciphertextSha256Hex,
         )
+        localMediaLibrary?.markUploaded(
+            owner,
+            item.attachmentId,
+            storageKey,
+            maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
+        )
+        mediaPipelineProfiler?.mark(item.attachmentId, MediaPipelineMilestone.UPLOADED)
+        return storageKey
+    }
+
+    /**
+     * Revalidates one checkpointed album upload without falling back to a whole-file replay on a
+     * server that did not negotiate resumable uploads. This runs before the item is sealed into
+     * the final descriptor, so a swept server object can safely return a replacement storage key.
+     */
+    internal suspend fun renewImmediateAlbumItem(
+        owner: SessionFence,
+        intent: ImmediateSendIntent,
+        attachmentId: String,
+        ciphertext: File,
+    ): String {
+        require(intent.kind == ImmediateSendKind.MEDIA_V2)
+        require(intent.preparedMediaDescriptor == null)
+        val item = requireNotNull(
+            intent.mediaItems.firstOrNull { it.attachmentId == attachmentId },
+        ) { "The renewed attachment does not belong to this album" }
+        val existingStorageKey = checkNotNull(item.storageKey) {
+            "Only an uploaded album attachment can be renewed"
+        }
+        val session = requireReadySession()
+        if (
+            authenticationSessions?.current()?.fence() != owner ||
+            session.sessionEpoch != owner.sessionId
+        ) throw SessionInvalidatedException()
+        val renewedStorageKey = runtime.renewUploadedAttachment(
+            session = session,
+            conversationId = intent.conversationId,
+            attachmentId = item.attachmentId,
+            existingStorageKey = existingStorageKey,
+            ciphertext = ciphertext,
+            mediaType = item.mediaType,
+            expectedCiphertextBytes = item.ciphertextBytes,
+            expectedCiphertextSha256Hex = item.ciphertextSha256Hex,
+        )
+        if (renewedStorageKey != existingStorageKey) {
+            localMediaLibrary?.markUploaded(
+                owner,
+                item.attachmentId,
+                renewedStorageKey,
+                maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
+            )
+        }
+        return renewedStorageKey
+    }
+
+    /**
+     * Refreshes every server reference in a descriptor restored from the durable queue, before
+     * Signal encryption makes that descriptor immutable. Exact resumable replay is cheap for a
+     * live completed object and reconstructs a swept object from the retained ciphertext spool.
+     */
+    internal suspend fun renewPreparedImmediateMediaReferences(
+        owner: SessionFence,
+        intent: ImmediateSendIntent,
+    ): ImmediateSendIntent {
+        require(intent.preparedMediaDescriptor != null)
+        val session = requireReadySession()
+        if (
+            authenticationSessions?.current()?.fence() != owner ||
+            session.sessionEpoch != owner.sessionId
+        ) throw SessionInvalidatedException()
+        val spool = checkNotNull(immediateMediaSpool) { "The secure media outbox is unavailable" }
+        return when (intent.kind) {
+            ImmediateSendKind.MEDIA -> {
+                val descriptor = requireNotNull(
+                    KitMediaMessage.parse(checkNotNull(intent.preparedMediaDescriptor)),
+                ) { "The prepared secure-media descriptor is unreadable" }
+                val expectedDigest = base64ToLowercaseHex(checkNotNull(intent.mediaSha256Base64))
+                check(
+                    descriptor.attachmentId == intent.id &&
+                        descriptor.mediaType == intent.mediaType &&
+                        descriptor.ciphertextByteSize == intent.mediaCiphertextBytes.toLong() &&
+                        descriptor.ciphertextSha256 == expectedDigest &&
+                        descriptor.keyMaterialBase64 == intent.mediaKeyBase64 &&
+                        descriptor.plaintextByteSize == intent.mediaPlaintextBytes &&
+                        descriptor.caption == intent.caption
+                ) { "The prepared secure-media descriptor does not match its durable upload" }
+                val renewedStorageKey = runtime.renewUploadedAttachment(
+                    session = session,
+                    conversationId = intent.conversationId,
+                    attachmentId = intent.id,
+                    existingStorageKey = descriptor.storageKey,
+                    ciphertext = spool.ciphertextFile(intent),
+                    mediaType = checkNotNull(intent.mediaType),
+                    expectedCiphertextBytes = intent.mediaCiphertextBytes.toLong(),
+                    expectedCiphertextSha256Hex = expectedDigest,
+                )
+                if (renewedStorageKey == descriptor.storageKey) {
+                    intent
+                } else {
+                    localMediaLibrary?.markUploaded(
+                        owner,
+                        intent.id,
+                        renewedStorageKey,
+                        maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
+                    )
+                    intent.copy(
+                        preparedMediaDescriptor = descriptor.copy(
+                            storageKey = renewedStorageKey,
+                        ).encode(),
+                    )
+                }
+            }
+            ImmediateSendKind.MEDIA_V2 -> {
+                // The intent invariant already proves the descriptor exactly matches these items.
+                var changed = false
+                val renewedItems = intent.mediaItems.map { item ->
+                    val existingStorageKey = checkNotNull(item.storageKey)
+                    val renewedStorageKey = runtime.renewUploadedAttachment(
+                        session = session,
+                        conversationId = intent.conversationId,
+                        attachmentId = item.attachmentId,
+                        existingStorageKey = existingStorageKey,
+                        ciphertext = spool.albumItemCiphertextFile(intent, item.attachmentId),
+                        mediaType = item.mediaType,
+                        expectedCiphertextBytes = item.ciphertextBytes,
+                        expectedCiphertextSha256Hex = item.ciphertextSha256Hex,
+                    )
+                    if (renewedStorageKey != existingStorageKey) {
+                        changed = true
+                        localMediaLibrary?.markUploaded(
+                            owner,
+                            item.attachmentId,
+                            renewedStorageKey,
+                            maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
+                        )
+                        item.copy(storageKey = renewedStorageKey)
+                    } else {
+                        item
+                    }
+                }
+                if (!changed) {
+                    intent
+                } else {
+                    val unsealed = intent.copy(
+                        mediaItems = renewedItems,
+                        preparedMediaDescriptor = null,
+                    )
+                    unsealed.copy(preparedMediaDescriptor = unsealed.buildAlbumDescriptor())
+                }
+            }
+            else -> error("Only queued media has uploaded references to renew")
+        }
     }
 
     /** Worker-only promotion into the Signal companion outbox under the intent's stable ID. */
@@ -4174,7 +5573,207 @@ class EncryptedChatRepository @Inject internal constructor(
         // replaces (or, on identity change, erases) the publication. Eagerly clearing here used
         // to blank the UI whenever the registry retained the session mid-refresh.
         (current && committed).also { published ->
-            if (published) rememberPublicationPhotos(session.sessionEpoch, publication)
+            if (published) {
+                rememberPublicationPhotos(session.sessionEpoch, publication)
+                scheduleRecipientMediaHydration(session, publication)
+            }
+        }
+    }
+
+    /** One authenticated incoming attachment eligible for quiet Received Media hydration. */
+    private data class RecipientMediaHydration(
+        val conversationId: String,
+        val messageId: String,
+        val descriptor: String,
+        val attachmentId: String,
+        val mediaType: String,
+        val plaintextBytes: Int,
+        val remoteReference: String,
+        val albumItem: Boolean,
+        val receivedAtEpochMillis: Long,
+    )
+
+    /**
+     * Keeps recently received media local without making transcript publication wait for it.
+     *
+     * The bounded byte/item window prevents an initial sync from consuming unbounded data or
+     * cycling the Received Media LRU. Cache and library writes remain account-fenced, and each
+     * attachment ID has at most one in-process hydration at a time. A later sync retries missing
+     * entries after connectivity returns or after an LRU eviction.
+     */
+    private fun scheduleRecipientMediaHydration(
+        session: SecureMessagingChatSession,
+        publication: ProjectionPublication,
+    ) {
+        if (secureMediaCache == null || localMediaLibrary == null) return
+        val owner = authenticationSessions?.current()?.fence() ?: return
+        if (owner.sessionId != session.sessionEpoch || !runtime.isCurrent(session)) return
+
+        val candidates = publication.messagesByConversation.asSequence()
+            .flatMap { (conversationId, messages) ->
+                messages.asSequence().filter { !it.fromMe }.flatMap message@{ message ->
+                    val descriptor = message.mediaDescriptor ?: return@message emptySequence()
+                    KitMediaMessage.parse(descriptor)?.let { media ->
+                        return@message sequenceOf(
+                            RecipientMediaHydration(
+                                conversationId = conversationId,
+                                messageId = message.id,
+                                descriptor = descriptor,
+                                attachmentId = media.attachmentId,
+                                mediaType = media.mediaType,
+                                plaintextBytes = media.plaintextByteSize,
+                                remoteReference = media.storageKey,
+                                albumItem = false,
+                                receivedAtEpochMillis = message.sortEpochMillis,
+                            ),
+                        )
+                    }
+                    KitMediaMessageV2.parse(descriptor)?.items.orEmpty().asSequence().map { item ->
+                        RecipientMediaHydration(
+                            conversationId = conversationId,
+                            messageId = message.id,
+                            descriptor = descriptor,
+                            attachmentId = item.attachmentId,
+                            mediaType = item.mediaType,
+                            plaintextBytes = item.plaintextByteSize,
+                            remoteReference = item.storageKey,
+                            albumItem = true,
+                            receivedAtEpochMillis = message.sortEpochMillis,
+                        )
+                    }
+                }
+            }
+            .sortedByDescending(RecipientMediaHydration::receivedAtEpochMillis)
+            .let(::boundedRecipientHydrations)
+
+        candidates.forEach { candidate ->
+            val hydrationKey = "${owner.cacheScopeId}:${candidate.conversationId}:${candidate.attachmentId}"
+            if (!activeRecipientMediaHydrations.add(hydrationKey)) return@forEach
+            scope.launch {
+                try {
+                    recipientMediaHydrationPermits.withPermit {
+                        hydrateRecipientMedia(session, owner, candidate)
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // A future sync retries. The transcript has already been published and never
+                    // waits for opportunistic media hydration.
+                } finally {
+                    activeRecipientMediaHydrations.remove(hydrationKey)
+                }
+            }
+        }
+    }
+
+    private fun boundedRecipientHydrations(
+        newestFirst: Sequence<RecipientMediaHydration>,
+    ): List<RecipientMediaHydration> {
+        var selectedBytes = 0L
+        val selected = mutableListOf<RecipientMediaHydration>()
+        for (candidate in newestFirst) {
+            if (selected.size >= MAX_BACKGROUND_MEDIA_ITEMS) break
+            val next = selectedBytes + candidate.plaintextBytes.toLong()
+            if (selected.isNotEmpty() && next > MAX_BACKGROUND_MEDIA_BYTES) continue
+            selected += candidate
+            selectedBytes = next
+        }
+        return selected
+    }
+
+    private suspend fun hydrateRecipientMedia(
+        session: SecureMessagingChatSession,
+        owner: SessionFence,
+        candidate: RecipientMediaHydration,
+    ) {
+        if (authenticationSessions?.current()?.fence() != owner || !runtime.isCurrent(session)) {
+            throw SessionInvalidatedException()
+        }
+        val cache = requireSecureMediaCache()
+        val cacheKey = mediaCacheKey(owner, candidate.conversationId, candidate.attachmentId)
+        val recordedAt = candidate.receivedAtEpochMillis.takeIf { it > 0L }
+            ?: clock.instant().toEpochMilli()
+        cache.cached(
+            cacheKey,
+            candidate.mediaType,
+            LocalMediaCollection.RECEIVED,
+        )?.let { cached ->
+            recordOpenedRemoteMedia(
+                owner = owner,
+                collection = LocalMediaCollection.RECEIVED,
+                chatId = candidate.conversationId,
+                messageId = candidate.messageId.takeIf(ImmediateSendIntent.CANONICAL_UUID::matches)
+                    ?: candidate.attachmentId,
+                mediaId = candidate.attachmentId,
+                cacheKey = cacheKey,
+                mediaType = candidate.mediaType,
+                remoteReference = candidate.remoteReference,
+                media = cached,
+                selectedAtEpochMillis = recordedAt,
+            )
+            return
+        }
+        localMediaLibrary?.recordReceivePending(
+            owner,
+            receivedMediaRecord(
+                owner = owner,
+                chatId = candidate.conversationId,
+                messageId = candidate.messageId.takeIf(ImmediateSendIntent.CANONICAL_UUID::matches)
+                    ?: candidate.attachmentId,
+                mediaId = candidate.attachmentId,
+                cacheKey = cacheKey,
+                mediaType = candidate.mediaType,
+                fileSize = candidate.plaintextBytes.toLong(),
+                remoteReference = candidate.remoteReference,
+                atEpochMillis = recordedAt,
+            ),
+        )
+        try {
+            val opened = cache.storeForOwner(
+                owner = owner,
+                cacheKey = cacheKey,
+                mediaType = candidate.mediaType,
+                collection = LocalMediaCollection.RECEIVED,
+            ) { destination ->
+                if (candidate.albumItem) {
+                    runtime.openAlbumItemToFile(
+                        session,
+                        candidate.conversationId,
+                        candidate.descriptor,
+                        candidate.attachmentId,
+                        destination,
+                    )
+                } else {
+                    runtime.openMediaToFile(
+                        session,
+                        candidate.conversationId,
+                        candidate.descriptor,
+                        destination,
+                    )
+                }
+            }
+            recordOpenedRemoteMedia(
+                owner = owner,
+                collection = LocalMediaCollection.RECEIVED,
+                chatId = candidate.conversationId,
+                messageId = candidate.messageId.takeIf(ImmediateSendIntent.CANONICAL_UUID::matches)
+                    ?: candidate.attachmentId,
+                mediaId = candidate.attachmentId,
+                cacheKey = cacheKey,
+                mediaType = candidate.mediaType,
+                remoteReference = candidate.remoteReference,
+                media = opened,
+                selectedAtEpochMillis = recordedAt,
+            )
+        } catch (error: Throwable) {
+            runCatching {
+                localMediaLibrary?.markDownloadFailed(
+                    owner,
+                    candidate.attachmentId,
+                    maxOf(recordedAt, clock.instant().toEpochMilli()),
+                )
+            }
+            throw error
         }
     }
 
@@ -4240,6 +5839,7 @@ class EncryptedChatRepository @Inject internal constructor(
                     sentAt = Instant.ofEpochMilli(intent.createdAtEpochMillis),
                     deliveryState = when (intent.state) {
                         ImmediateSendState.WAITING,
+                        ImmediateSendState.IMPORTING,
                         ImmediateSendState.PREPARING,
                         -> AuthenticatedTextDeliveryState.PENDING
                         ImmediateSendState.RETRY_REQUIRED ->
@@ -4856,6 +6456,7 @@ class EncryptedChatRepository @Inject internal constructor(
             fromMe = true,
             state = when (intent.state) {
                 ImmediateSendState.WAITING,
+                ImmediateSendState.IMPORTING,
                 ImmediateSendState.PREPARING,
                 -> DeliveryState.SENDING
                 ImmediateSendState.RETRY_REQUIRED -> DeliveryState.RETRY_REQUIRED
@@ -4889,6 +6490,7 @@ class EncryptedChatRepository @Inject internal constructor(
         fromMe = true,
         state = when (intent.state) {
             ImmediateSendState.WAITING,
+            ImmediateSendState.IMPORTING,
             ImmediateSendState.PREPARING,
             -> DeliveryState.SENDING
             ImmediateSendState.RETRY_REQUIRED -> DeliveryState.RETRY_REQUIRED
@@ -5127,6 +6729,9 @@ class EncryptedChatRepository @Inject internal constructor(
         const val MAX_BASELINE_REFRESH_COOLDOWN_MILLIS = 5 * 60_000L
         const val SIGNED_OUT_CLEAR_GRACE_MILLIS = 15_000L
         const val LOCAL_MEDIA_DESCRIPTOR_PREFIX = "KITLOCALMEDIA1:"
+        const val MAX_CONCURRENT_MEDIA_HYDRATIONS = 2
+        const val MAX_BACKGROUND_MEDIA_ITEMS = 12
+        const val MAX_BACKGROUND_MEDIA_BYTES = 256L * 1024L * 1024L
     }
 }
 

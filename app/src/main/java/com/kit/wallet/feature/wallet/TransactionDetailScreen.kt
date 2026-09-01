@@ -134,7 +134,16 @@ private fun TransactionDetailContent(tx: Transaction, onBack: () -> Unit) {
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                Money.format(tx.amountMinor, tx.currencyCode, tx.currencyScale, signed = true),
+                if (tx.amountMinor > 0) "Money Added" else "Money Deducted",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                Money.format(
+                    kotlin.math.abs(tx.customerVisibleAmountMinor),
+                    tx.currencyCode,
+                    tx.currencyScale,
+                ),
                 style = MaterialTheme.typography.displaySmall,
                 color = if (tx.amountMinor > 0) KitTheme.colors.moneyIn
                 else MaterialTheme.colorScheme.onSurface,
@@ -170,26 +179,13 @@ private fun TransactionDetailContent(tx: Transaction, onBack: () -> Unit) {
                     DetailRow("Type", tx.type.name.lowercase().replaceFirstChar { it.uppercase() })
                     if (tx.note != null) DetailRow("Note", tx.note)
                     DetailRow(
-                        "Fee",
-                        tx.feeMinor?.let {
-                            Money.format(it, tx.currencyCode, tx.currencyScale)
-                        } ?: "Not provided",
+                        if (tx.amountMinor > 0) "Money Added" else "Money Deducted",
+                        Money.format(
+                            kotlin.math.abs(tx.customerVisibleAmountMinor),
+                            tx.currencyCode,
+                            tx.currencyScale,
+                        ),
                     )
-                    tx.recipientAmountMinor?.let {
-                        DetailRow(
-                            "Recipient amount",
-                            Money.format(it, tx.currencyCode, tx.currencyScale),
-                        )
-                    }
-                    tx.customerDebitMinor?.let {
-                        DetailRow(
-                            "Total debit",
-                            Money.format(it, tx.currencyCode, tx.currencyScale),
-                        )
-                    }
-                    tx.feeMode?.let {
-                        DetailRow("Fee mode", it.replace('_', ' ').replaceFirstChar(Char::uppercase))
-                    }
                 }
             }
             Spacer(Modifier.height(24.dp))

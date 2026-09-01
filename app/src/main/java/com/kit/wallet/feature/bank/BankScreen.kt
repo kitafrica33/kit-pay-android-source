@@ -32,6 +32,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +46,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.kit.wallet.data.demo.DemoData
 import com.kit.wallet.data.repository.BankDeposit
 import com.kit.wallet.data.repository.BankFundingAccount
@@ -96,6 +100,25 @@ fun BankScreen(
     var addingAccount by remember { mutableStateOf(false) }
     var depositScreenOpen by remember { mutableStateOf(false) }
     var selectedDepositId by remember { mutableStateOf<String?>(null) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> viewModel.setSettlementScreenActive(true)
+                Lifecycle.Event.ON_STOP -> viewModel.setSettlementScreenActive(false)
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            viewModel.setSettlementScreenActive(true)
+        }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.setSettlementScreenActive(false)
+        }
+    }
     val linkableBanks = if (outboundEnabled) {
         banks.filter { it.supports(BankCapability.ACCOUNT_VERIFICATION) }
     } else {

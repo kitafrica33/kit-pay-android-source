@@ -75,14 +75,16 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.kit.wallet.data.media.compressUploadJpeg
 import com.kit.wallet.data.media.uploadSampleSize
 import android.net.Uri
 import com.kit.wallet.data.messaging.KitChatMediaLimits
+import com.kit.wallet.data.messaging.SecureMediaProcessingPlan
 import com.kit.wallet.data.messaging.SecureMediaSource
+import com.kit.wallet.data.messaging.SecureMediaVideoEditPlan
 import com.kit.wallet.data.messaging.KitMediaMessage
 import com.kit.wallet.feature.chat.CHAT_IMAGE_MAX_DIMENSION
 import java.io.File
+import java.io.FileOutputStream
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
@@ -101,9 +103,17 @@ internal const val SHUTTER_HOLD_TO_RECORD_MILLIS = 250L
 
 /** A capture the editor can still change; nothing is encoded or sent yet. */
 internal sealed interface CameraCaptureDraft {
-    data class Photo(val bitmap: Bitmap) : CameraCaptureDraft
+    val originatedAtNanos: Long
 
-    data class Video(val file: File) : CameraCaptureDraft
+    data class Photo(
+        val bitmap: Bitmap,
+        override val originatedAtNanos: Long = System.nanoTime(),
+    ) : CameraCaptureDraft
+
+    data class Video(
+        val file: File,
+        override val originatedAtNanos: Long = System.nanoTime(),
+    ) : CameraCaptureDraft
 
     fun release() {
         when (this) {
@@ -116,9 +126,9 @@ internal sealed interface CameraCaptureDraft {
 /**
  * The full in-app capture journey: full-screen camera (tap for a photo, hold for a video),
  * then the draft editor (filters, drawing, text, stickers, crop for photos; trim, mute and
- * caption for videos), then encoding on a worker dispatcher. The caller receives a way to open
- * the finished capture, exactly like the platform picker paths, and releases it when the send
- * path is done with it.
+ * caption for videos), then an ownership handoff on a worker dispatcher. The caller receives a
+ * way to open the original immediately; upload-only encoding/remuxing happens later in durable
+ * background work, and the caller releases this handoff file after local adoption.
  */
 @Composable
 internal fun KitChatCameraFlow(
@@ -218,7 +228,11 @@ internal fun KitChatCameraFlow(
 }
 
 /** A library video staged into the capture cache so the trim editor can seek and cut it. */
-internal class LibraryVideoDraft(val file: File, val mediaType: String)
+internal class LibraryVideoDraft(
+    val file: File,
+    val mediaType: String,
+    val originatedAtNanos: Long,
+)
 
 /**
  * Copies a picked library video into the capture cache. The copy is what makes trimming
@@ -230,6 +244,7 @@ internal fun stageLibraryVideoForEditing(
     context: Context,
     uri: Uri,
     resolvedMediaType: String,
+    originatedAtNanos: Long = System.nanoTime(),
 ): LibraryVideoDraft {
     val directory = File(context.cacheDir, "chat-capture").apply { mkdirs() }
     val staged = File(directory, "library-${UUID.randomUUID()}.video")
@@ -258,6 +273,7 @@ internal fun stageLibraryVideoForEditing(
         return LibraryVideoDraft(
             file = staged,
             mediaType = KitMediaMessage.normalizeMediaType(resolvedMediaType) ?: "video/mp4",
+            originatedAtNanos = originatedAtNanos,
         )
     } catch (error: Exception) {
         staged.delete()
@@ -281,7 +297,9 @@ internal fun KitChatVideoEditorFlow(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var preparing by remember { mutableStateOf(false) }
-    val captureDraft = remember(draft) { CameraCaptureDraft.Video(draft.file) }
+    val captureDraft = remember(draft) {
+        CameraCaptureDraft.Video(draft.file, draft.originatedAtNanos)
+    }
     fun closeFlow() {
         if (preparing) return
         captureDraft.release()
@@ -360,7 +378,7 @@ internal class EncodedCaptureMedia(
     val release: () -> Unit = {},
 )
 
-/** Bakes the edited draft into wire-ready plaintext. Runs on a worker dispatcher. */
+/** Publishes an editor result as a local playback original. Wire optimization happens later. */
 internal fun encodeCaptureDraft(
     context: Context,
     draft: CameraCaptureDraft,
@@ -370,18 +388,46 @@ internal fun encodeCaptureDraft(
 ): EncodedCaptureMedia? = when {
     draft is CameraCaptureDraft.Photo && spec is CaptureSendSpec.Photo -> {
         val baked = bakePhotoDraft(spec)
+        val directory = File(context.cacheDir, "chat-capture").apply { mkdirs() }
+        val payload = File(directory, "send-${UUID.randomUUID()}.jpg")
         try {
-            compressUploadJpeg(
-                baked,
-                maxTransferBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                CAPTURE_JPEG_QUALITIES,
-            )?.let { EncodedCaptureMedia(SecureMediaSource.ofBytes(it), "image/jpeg", spec.caption) }
+            val written = runCatching {
+                FileOutputStream(payload).use { output ->
+                    check(baked.compress(Bitmap.CompressFormat.JPEG, 100, output))
+                    output.flush()
+                    output.fd.sync()
+                }
+                payload.isFile && payload.length() in 1..maxTransferBytes
+            }.getOrDefault(false)
+            if (written) {
+                EncodedCaptureMedia(
+                    SecureMediaSource.ofFile(
+                        file = payload,
+                        originatedAtNanos = draft.originatedAtNanos,
+                        originalMediaType = "image/jpeg",
+                        processingPlan = SecureMediaProcessingPlan.CHAT_IMAGE_JPEG,
+                    ),
+                    "image/jpeg",
+                    spec.caption,
+                    release = { payload.delete() },
+                )
+            } else {
+                payload.delete()
+                null
+            }
         } finally {
             if (baked !== spec.bitmap) baked.recycle()
         }
     }
     draft is CameraCaptureDraft.Video && spec is CaptureSendSpec.Video -> {
-        encodeVideoDraft(context, draft.file, spec, maxTransferBytes, sourceMediaType)
+        encodeVideoDraft(
+            context,
+            draft.file,
+            spec,
+            maxTransferBytes,
+            sourceMediaType,
+            draft.originatedAtNanos,
+        )
     }
     else -> null
 }
@@ -392,43 +438,52 @@ private fun encodeVideoDraft(
     spec: CaptureSendSpec.Video,
     maxTransferBytes: Long,
     sourceMediaType: String,
+    sourceOriginNanos: Long,
 ): EncodedCaptureMedia? {
     val durationMillis = ChatVideoTranscoder.durationMillis(source)
     if (durationMillis <= 0L) return null
     val untouched = spec.startMillis <= 0L && spec.endMillis >= durationMillis && !spec.muted
-    val directory = File(context.cacheDir, "chat-capture").apply { mkdirs() }
-    // Whether it was trimmed or not, the clip that goes to the wire becomes this encoder's own
-    // file. An untouched recording is *moved* rather than copied, which costs nothing and takes it
-    // out of the draft's hands: the draft is released the moment the editor closes, while the send
-    // is still streaming the file through the cipher.
-    val payload = if (untouched) {
-        File(directory, "send-${UUID.randomUUID()}.mp4").takeIf { source.renameTo(it) }
-            ?: return null
+    val editPlan = if (untouched) {
+        null
     } else {
-        val plan = planVideoTrim(spec.startMillis, spec.endMillis, durationMillis, keepAudio = !spec.muted)
-            ?: return null
-        val trimmed = File(directory, "trim-${UUID.randomUUID()}.mp4")
-        if (!ChatVideoTranscoder.trim(source, trimmed, plan)) {
-            trimmed.delete()
-            return null
-        }
-        trimmed
+        val planned = planVideoTrim(
+            spec.startMillis,
+            spec.endMillis,
+            durationMillis,
+            keepAudio = !spec.muted,
+        ) ?: return null
+        SecureMediaVideoEditPlan(
+            startMicros = planned.startMicros,
+            endMicros = planned.endMicros,
+            keepAudio = planned.keepAudio,
+        )
     }
-    // The recording is sent as the file it already is. Reading it into heap first would put a
-    // whole 200 MB clip on the heap for no reason, and the cipher streams anyway.
-    if (!payload.isFile || payload.length() <= 0 || payload.length() > maxTransferBytes) {
-        payload.delete()
-        return null
-    }
+    if (source.length() <= 0L || source.length() > MAX_LIBRARY_VIDEO_SOURCE_BYTES) return null
+    if (untouched && source.length() > maxTransferBytes) return null
+    val directory = File(context.cacheDir, "chat-capture").apply { mkdirs() }
+    // Transfer ownership with a same-directory rename. The editor can close immediately and the
+    // sender can play this original at once; a durable worker performs any trim/mute remux later.
+    val payload = File(directory, "send-${UUID.randomUUID()}.video")
+        .takeIf { source.renameTo(it) }
+        ?: return null
     return EncodedCaptureMedia(
-        source = SecureMediaSource.ofFile(payload),
+        source = SecureMediaSource.ofFile(
+            file = payload,
+            originatedAtNanos = sourceOriginNanos,
+            originalMediaType = sourceMediaType,
+            durationMillis = durationMillis,
+            processingPlan = if (editPlan == null) {
+                SecureMediaProcessingPlan.PASSTHROUGH
+            } else {
+                SecureMediaProcessingPlan.CHAT_VIDEO_MP4
+            },
+            videoEditPlan = editPlan,
+        ),
         mediaType = videoSendMediaType(edited = !untouched, sourceMediaType = sourceMediaType),
         caption = spec.caption,
         release = { payload.delete() },
     )
 }
-
-private val CAPTURE_JPEG_QUALITIES = intArrayOf(90, 80, 70, 60, 50)
 
 /** One bound CameraX pipeline. LIMITED devices reject the combined trio; see [bindCameraSession]. */
 private class CameraSession(

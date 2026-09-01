@@ -1,5 +1,6 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.messaging.SecureMediaProcessingPlan
 import com.kit.wallet.feature.chat.IncomingShareRequestPersistence
 import com.kit.wallet.feature.chat.IncomingShareQueueFullException
 import com.kit.wallet.feature.chat.IncomingTextShare
@@ -36,6 +37,67 @@ class IncomingShareRequestPersistenceTest {
         recreated.acknowledge(batch.id)
         assertFalse(File(root, batch.id).exists())
         assertTrue(IncomingShareRequestPersistence(root).restore(nowMillis = NOW).isEmpty())
+    }
+
+    @Test
+    fun `image original and deferred processing plan survive process recreation`() {
+        val root = temporary.newFolder("inbox-local-original")
+        val directory = File(root, BATCH_ONE).apply { assertTrue(mkdirs()) }
+        val bytes = "raw-heic-original".toByteArray()
+        File(directory, ITEM_FILE).writeBytes(bytes)
+        val batch = SharedInboxBatch(
+            id = BATCH_ONE,
+            receivedAtMillis = NOW,
+            items = listOf(
+                com.kit.wallet.feature.chat.SharedInboxItem(
+                    id = ITEM_ONE,
+                    fileName = ITEM_FILE,
+                    mediaType = "image/jpeg",
+                    displayName = "Photo.heic",
+                    byteCount = bytes.size,
+                    originalMediaType = "image/heic",
+                    processingPlan = SecureMediaProcessingPlan.CHAT_IMAGE_JPEG,
+                ),
+            ),
+            owner = SharedInboxOwner("session-a", "scope-a", OWNER),
+        )
+
+        IncomingShareRequestPersistence(root).publish(batch)
+
+        assertEquals(
+            batch,
+            accepted(IncomingShareRequestPersistence(root).claim(BATCH_ONE, nowMillis = NOW)),
+        )
+    }
+
+    @Test
+    fun `shared audio duration survives process recreation`() {
+        val root = temporary.newFolder("inbox-audio-duration")
+        val directory = File(root, BATCH_ONE).apply { assertTrue(mkdirs()) }
+        val bytes = "audio-placeholder".toByteArray()
+        File(directory, ITEM_FILE).writeBytes(bytes)
+        val batch = SharedInboxBatch(
+            id = BATCH_ONE,
+            receivedAtMillis = NOW,
+            items = listOf(
+                com.kit.wallet.feature.chat.SharedInboxItem(
+                    id = ITEM_ONE,
+                    fileName = ITEM_FILE,
+                    mediaType = "audio/mp4",
+                    displayName = "Voice note.m4a",
+                    byteCount = bytes.size,
+                    durationMillis = 121_000,
+                ),
+            ),
+            owner = SharedInboxOwner("session-a", "scope-a", OWNER),
+        )
+
+        IncomingShareRequestPersistence(root).publish(batch)
+
+        assertEquals(
+            batch,
+            accepted(IncomingShareRequestPersistence(root).claim(BATCH_ONE, nowMillis = NOW)),
+        )
     }
 
     @Test
@@ -200,6 +262,19 @@ class IncomingShareRequestPersistenceTest {
         )
     }
 
+    @Test
+    fun `version four image manifests remain byte compatible and passthrough`() {
+        val root = temporary.newFolder("legacy-v4-image")
+        writeVersionFourImageManifest(root, BATCH_ONE)
+
+        val item = accepted(
+            IncomingShareRequestPersistence(root).claim(BATCH_ONE, nowMillis = NOW),
+        ).items.single()
+
+        assertEquals("image/jpeg", item.localMediaType)
+        assertEquals(SecureMediaProcessingPlan.PASSTHROUGH, item.processingPlan)
+    }
+
     /** Byte-for-byte what the store wrote before [SharedInboxBatch.albumDelivery] existed. */
     private fun writeVersionThreeManifest(root: File, id: String, pinnedConversationId: String?) {
         val directory = File(root, id)
@@ -226,6 +301,34 @@ class IncomingShareRequestPersistenceTest {
         val bytes = value.toByteArray(Charsets.UTF_8)
         writeInt(bytes.size)
         write(bytes)
+    }
+
+    /** Byte-for-byte v4 shape: album routing exists, local-original fields do not. */
+    private fun writeVersionFourImageManifest(root: File, id: String) {
+        val directory = File(root, id)
+        assertTrue(directory.mkdirs())
+        val bytes = "already-prepared-jpeg".toByteArray()
+        File(directory, ITEM_FILE).writeBytes(bytes)
+        File(directory, ".request-v1").outputStream().use { stream ->
+            DataOutputStream(stream).use { output ->
+                output.writeByte(4)
+                output.writeVersionThreeString(id)
+                output.writeLong(NOW)
+                output.writeVersionThreeString("session-a")
+                output.writeVersionThreeString("scope-a")
+                output.writeBoolean(true)
+                output.writeVersionThreeString(OWNER)
+                output.writeBoolean(false) // pinned conversation
+                output.writeBoolean(false) // albumDelivery is absent
+                output.writeInt(1)
+                output.writeVersionThreeString(ITEM_ONE)
+                output.writeVersionThreeString(ITEM_FILE)
+                output.writeVersionThreeString("image/jpeg")
+                output.writeVersionThreeString("Photo.jpg")
+                output.writeInt(bytes.size)
+                output.writeBoolean(false) // text
+            }
+        }
     }
 
     private fun batch(
@@ -255,6 +358,8 @@ class IncomingShareRequestPersistenceTest {
         const val BATCH_THREE = "20000000-0000-4000-8000-000000000003"
         const val BATCH_FOUR = "20000000-0000-4000-8000-000000000004"
         const val BATCH_FIVE = "20000000-0000-4000-8000-000000000005"
+        const val ITEM_ONE = "40000000-0000-4000-8000-000000000001"
+        const val ITEM_FILE = "$ITEM_ONE.heic"
         const val DIRECT_ONE = "30000000-0000-4000-8000-000000000001"
         const val DIRECT_TWO = "30000000-0000-4000-8000-000000000002"
     }

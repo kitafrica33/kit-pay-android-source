@@ -100,6 +100,37 @@ class OfflineWalletSyncRepositoryTest {
     }
 
     @Test
+    fun `refresh drops institutional and unreviewed ledger rows before caching`() = runTest {
+        server.enqueue(jsonResponse(BOOTSTRAP_JSON))
+        server.enqueue(jsonResponse(WALLETS_JSON))
+        server.enqueue(jsonResponse(TRANSACTIONS_WITH_INTERNAL_ROW_JSON))
+
+        val result = repository.refresh()
+
+        assertEquals(1, result.transactionCount)
+        assertEquals(listOf("tx-uuid"), cache.transactions.map { it.id })
+        assertEquals(listOf("internal_transfer"), cache.transactions.map { it.type })
+    }
+
+    @Test
+    fun `refresh never caches an institutional counterparty from a service movement`() = runTest {
+        server.enqueue(jsonResponse(BOOTSTRAP_JSON))
+        server.enqueue(jsonResponse(WALLETS_JSON))
+        server.enqueue(jsonResponse(TRANSACTIONS_WITH_SERVICE_COUNTERPARTY_JSON))
+
+        val result = repository.refresh()
+        val transaction = cache.transactions.single()
+
+        assertEquals(1, result.transactionCount)
+        assertEquals("Kit Pay", transaction.counterpartyName)
+        assertNull(transaction.counterpartyUserId)
+        assertNull(transaction.counterpartyAvatarUrl)
+        assertNull(transaction.counterpartyVerificationDesignation)
+        assertNull(transaction.counterpartyVerificationSince)
+        assertTrue(transaction.customerProjectionVerified)
+    }
+
+    @Test
     fun `foreground authority refresh replaces a stale 3000 balance with 150000`() = runTest {
         enqueueBalanceSnapshot("3000.00")
 
@@ -358,7 +389,15 @@ class OfflineWalletSyncRepositoryTest {
         """.trimIndent()
 
         val TRANSACTIONS_JSON = """
-            {"ok":true,"data":{"items":[{"id":"tx-uuid","wallet_id":"wallet-uuid","reference":"KIT-ABC123","amount":"85000.00","currency":{"code":"UGX","scale":"2"},"type":"transfer","direction":"debit","status":"completed","counterparty":{"id":"contact-uuid","name":"Brian Kato","phone":"+256700000001"},"note":"Lunch","occurred_at":"2026-07-16T10:30:00Z"}],"page":{"next_cursor":"cursor-2","has_more":true,"limit":50}},"meta":{"request_id":"request-003","api_version":"v1","server_time":"2026-07-16T12:00:00Z"}}
+            {"ok":true,"data":{"items":[{"id":"tx-uuid","wallet_id":"wallet-uuid","reference":"KIT-ABC123","amount":"85000.00","totals":{"added":"0.00","deducted":"85000.00"},"currency":{"code":"UGX","scale":"2"},"type":"internal_transfer","direction":"debit","status":"completed","counterparty":{"id":"contact-uuid","name":"Brian Kato","phone":"+256700000001"},"note":"Lunch","occurred_at":"2026-07-16T10:30:00Z"}],"page":{"next_cursor":"cursor-2","has_more":true,"limit":50}},"meta":{"request_id":"request-003","api_version":"v1","server_time":"2026-07-16T12:00:00Z"}}
+        """.trimIndent()
+
+        val TRANSACTIONS_WITH_INTERNAL_ROW_JSON = """
+            {"ok":true,"data":{"items":[{"id":"tx-uuid","wallet_id":"wallet-uuid","reference":"KIT-ABC123","amount":"85000.00","totals":{"added":"0.00","deducted":"85000.00"},"currency":{"code":"UGX","scale":"2"},"type":"internal_transfer","direction":"debit","status":"completed","counterparty":{"id":"contact-uuid","name":"Brian Kato","phone":"+256700000001"},"note":"Lunch","occurred_at":"2026-07-16T10:30:00Z"},{"id":"commission-uuid","wallet_id":"wallet-uuid","reference":"INTERNAL-COMMISSION","amount":"3000.00","currency":{"code":"UGX","scale":"2"},"type":"bank_outbound_commission","direction":"debit","status":"completed","counterparty":null,"note":"Institutional commission","occurred_at":"2026-07-16T10:30:00Z"},{"id":"principal-only-bank-row","wallet_id":"wallet-uuid","reference":"BANK-LEGACY","amount":"50000.00","currency":{"code":"UGX","scale":"2"},"type":"bank_transfer","direction":"debit","status":"completed","counterparty":{"name":"Legacy bank"},"note":null,"occurred_at":"2026-07-16T10:29:00Z"}],"page":{"next_cursor":null,"has_more":false,"limit":50}},"meta":{"request_id":"request-private-row","api_version":"v1","server_time":"2026-07-16T12:00:00Z"}}
+        """.trimIndent()
+
+        val TRANSACTIONS_WITH_SERVICE_COUNTERPARTY_JSON = """
+            {"ok":true,"data":{"items":[{"id":"bank-tx-uuid","wallet_id":"wallet-uuid","reference":"KWB-PRIVATE-COUNTERPARTY","amount":"56000.00","totals":{"added":"0.00","deducted":"56000.00"},"currency":{"code":"UGX","scale":"2"},"type":"bank_transfer","direction":"debit","status":"completed","counterparty":{"id":"service-user-uuid","name":"Kit institutional commission","phone":"+256700000999","account_number":"KIT-INTERNAL-1","avatar_url":"https://pay.kit.africa/media/internal-wallet","verification":{"designation":"verified","since":"2026-08-29T10:11:12Z"}},"note":"Bank transfer","occurred_at":"2026-07-16T10:30:00Z"}],"page":{"next_cursor":null,"has_more":false,"limit":50}},"meta":{"request_id":"request-private-counterparty","api_version":"v1","server_time":"2026-07-16T12:00:00Z"}}
         """.trimIndent()
 
         val NULL_BOOTSTRAP_WALLETS_JSON = """

@@ -146,13 +146,28 @@ data class Transaction(
      * from money that arrived reads the authoritative wire value, never the display kind.
      */
     val rawDirection: String? = null,
-    /** Public account ID for an internal counterparty; null for banks, merchants and legacy rows. */
+    /** Public account ID for a user or reviewed merchant; null for service-owned and legacy rows. */
     val counterpartyUserId: String? = null,
     /** Exact-ID profile photo resolved from the authenticated account directory. */
     val counterpartyAvatarUrl: String? = null,
     /** Server-owned blue seal resolved only by exact public account ID. */
     val accountVerification: AccountVerification? = null,
-)
+) {
+    /**
+     * The single customer-facing movement shown in rows, details, and shared receipts.
+     *
+     * Wallet-history records already put the combined customer total in [amountMinor]. Banking
+     * operation records additionally carry their authoritative aggregate debit/credit, while
+     * [amountMinor] can still be the recipient/requested amount. Prefer that aggregate whenever
+     * it is present so an operation never understates what left or entered the customer's wallet.
+     */
+    val customerVisibleAmountMinor: Long
+        get() = if (amountMinor < 0) {
+            customerDebitMinor ?: amountMinor
+        } else {
+            recipientAmountMinor ?: amountMinor
+        }
+}
 
 enum class DeliveryState {
     SENDING,

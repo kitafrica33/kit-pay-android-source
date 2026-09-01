@@ -3,7 +3,6 @@ package com.kit.wallet
 import com.kit.wallet.data.messaging.MediaAttachmentCipher
 import com.kit.wallet.data.messaging.MediaAttachmentStreamCipher
 import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.SecureRandom
 import org.junit.Assert.assertArrayEquals
@@ -67,15 +66,16 @@ class MediaAttachmentStreamCipherTest {
         for (size in listOf(1, 15, 16, 17, 63, 1_024, 65_537, 200_000)) {
             val source = plaintext(size)
             val (file, streamed) = encryptToFile(source)
-            val decrypted = ByteArrayOutputStream()
+            val decrypted = temporaryFolder.newFile()
             val plaintextBytes = MediaAttachmentStreamCipher.decrypt(
                 ciphertext = file,
                 keyMaterial = streamed.keyMaterial,
                 expectedSha256 = streamed.sha256,
+                expectedPlaintextBytes = size,
                 destination = decrypted,
             )
             assertEquals(size, plaintextBytes)
-            assertArrayEquals(source, decrypted.toByteArray())
+            assertArrayEquals(source, decrypted.readBytes())
         }
     }
 
@@ -95,14 +95,15 @@ class MediaAttachmentStreamCipherTest {
 
         val inHeap = MediaAttachmentCipher.encrypt(source, seededRandom())
         val sealed = temporaryFolder.newFile().apply { writeBytes(inHeap.ciphertext) }
-        val opened = ByteArrayOutputStream()
+        val opened = temporaryFolder.newFile()
         MediaAttachmentStreamCipher.decrypt(
             ciphertext = sealed,
             keyMaterial = inHeap.keyMaterial,
             expectedSha256 = inHeap.sha256,
+            expectedPlaintextBytes = source.size,
             destination = opened,
         )
-        assertArrayEquals(source, opened.toByteArray())
+        assertArrayEquals(source, opened.readBytes())
     }
 
     @Test
@@ -112,16 +113,17 @@ class MediaAttachmentStreamCipherTest {
         bytes[bytes.size / 2] = (bytes[bytes.size / 2] + 1).toByte()
         file.writeBytes(bytes)
 
-        val decrypted = ByteArrayOutputStream()
+        val decrypted = temporaryFolder.newFile()
         assertThrows(IllegalArgumentException::class.java) {
             MediaAttachmentStreamCipher.decrypt(
                 ciphertext = file,
                 keyMaterial = streamed.keyMaterial,
                 expectedSha256 = streamed.sha256,
+                expectedPlaintextBytes = 50_000,
                 destination = decrypted,
             )
         }
-        assertEquals(0, decrypted.size())
+        assertEquals(false, decrypted.exists())
     }
 
     @Test
@@ -131,16 +133,34 @@ class MediaAttachmentStreamCipherTest {
         val wrongKey = ByteArray(MediaAttachmentCipher.KEY_MATERIAL_BYTES).also {
             SecureRandom.getInstance("SHA1PRNG").apply { setSeed(99L) }.nextBytes(it)
         }
-        val decrypted = ByteArrayOutputStream()
+        val decrypted = temporaryFolder.newFile()
         assertThrows(IllegalArgumentException::class.java) {
             MediaAttachmentStreamCipher.decrypt(
                 ciphertext = file,
                 keyMaterial = wrongKey,
                 expectedSha256 = streamed.sha256,
+                expectedPlaintextBytes = 50_000,
                 destination = decrypted,
             )
         }
-        assertEquals(0, decrypted.size())
+        assertEquals(false, decrypted.exists())
+    }
+
+    @Test
+    fun `an authenticated blob with the wrong declared plaintext size is not published`() {
+        val (file, streamed) = encryptToFile(plaintext(50_000))
+        val decrypted = temporaryFolder.newFile()
+
+        assertThrows(IllegalStateException::class.java) {
+            MediaAttachmentStreamCipher.decrypt(
+                ciphertext = file,
+                keyMaterial = streamed.keyMaterial,
+                expectedSha256 = streamed.sha256,
+                expectedPlaintextBytes = 49_999,
+                destination = decrypted,
+            )
+        }
+        assertEquals(false, decrypted.exists())
     }
 
     /** The point of enforcing the cap mid-stream is that an oversized file is never fully copied. */

@@ -44,6 +44,88 @@ object DecimalMoney {
     }
 }
 
+/**
+ * Transaction kinds that have an explicitly reviewed customer presentation.
+ *
+ * This deliberately mirrors the server's customer-history allowlist. Unknown kinds stay out of
+ * the UI until their accounting semantics have been reviewed; a future commission or settlement
+ * posting must never become visible merely because an older app cached it.
+ */
+private val CUSTOMER_VISIBLE_WALLET_TRANSACTION_TYPES = setOf(
+    "airtime",
+    "bank_deposit",
+    "bank_reversal",
+    "bank_transfer",
+    "bank_withdrawal",
+    "bill_payment",
+    "internal_transfer",
+    "internal_transfer_reversal",
+    "merchant_escrow_release",
+    "merchant_payment",
+    "merchant_refund",
+    "provider_reversal",
+    "referral_reward",
+    "referral_reward_reversal",
+)
+
+/**
+ * Customer movements whose ledger counterparty is intrinsically a Kit/service account.
+ *
+ * The server suppresses these identities too, but this client-side boundary is deliberate:
+ * aggregate totals prove the customer's amount, not that an accidentally supplied counterparty
+ * is public. Never persist a service wallet's name, public ID, avatar, or verification badge in
+ * the offline customer cache.
+ */
+private val INSTITUTIONAL_COUNTERPARTY_TRANSACTION_TYPES = setOf(
+    "airtime",
+    "bank_deposit",
+    "bank_reversal",
+    "bank_transfer",
+    "bank_withdrawal",
+    "bill_payment",
+    "provider_reversal",
+    "referral_reward",
+    "referral_reward_reversal",
+)
+
+private fun String.hasInstitutionalCounterparty(): Boolean =
+    trim().lowercase() in INSTITUTIONAL_COUNTERPARTY_TRANSACTION_TYPES
+
+internal fun String.isCustomerVisibleWalletTransactionType(): Boolean =
+    trim().lowercase() in CUSTOMER_VISIBLE_WALLET_TRANSACTION_TYPES
+
+/**
+ * Verifies that a customer transaction contains one authoritative aggregate movement.
+ *
+ * All current wallet-history and transfer responses carry `totals`. Requiring that contract
+ * prevents a principal-only legacy bank row from being mistaken for the complete debit, while a
+ * malformed or newly split response is dropped without poisoning the rest of the refresh.
+ */
+internal fun TransactionDto.hasVerifiedCustomerProjection(): Boolean {
+    if (!type.isCustomerVisibleWalletTransactionType()) return false
+    val normalizedDirection = direction.trim().lowercase()
+    if (normalizedDirection != "credit" && normalizedDirection != "debit") return false
+    val scale = currency.scale.toIntOrNull()?.takeIf { it in 0..9 } ?: return false
+    val aggregate = totals ?: return false
+
+    fun nonnegativeMinor(value: String): Long? = runCatching {
+        DecimalMoney.toMinor(value.trim(), scale)
+    }.getOrNull()?.takeIf { it >= 0 }
+
+    val amountMinor = nonnegativeMinor(amount)?.takeIf { it > 0 } ?: return false
+    val addedMinor = nonnegativeMinor(aggregate.added) ?: return false
+    val deductedMinor = nonnegativeMinor(aggregate.deducted) ?: return false
+
+    return when (normalizedDirection) {
+        "credit" -> addedMinor == amountMinor && deductedMinor == 0L
+        "debit" -> deductedMinor == amountMinor && addedMinor == 0L
+        else -> false
+    }
+}
+
+internal fun WalletTransactionEntity.isCustomerVisibleWalletTransaction(): Boolean =
+    customerProjectionVerified && type.isCustomerVisibleWalletTransactionType()
+
 fun UserDto.toEntity(nowEpochMillis: Long): ProfileEntity {
     val verifiedLegalName = legalName?.takeIf(String::isNotBlank)
     val accountVerification = AccountVerification.fromServerValues(
@@ -109,13 +191,24 @@ fun WalletDto.toEntity(nowEpochMillis: Long): WalletEntity {
 }
 
 fun TransactionDto.toEntity(defaultWalletUuid: String): WalletTransactionEntity {
+    require(hasVerifiedCustomerProjection()) {
+        "Wallet transaction does not contain a verified customer-total projection"
+    }
     val scale = currency.scale.toInt()
-    val absoluteMinor = abs(DecimalMoney.toMinor(amount, scale))
+    val normalizedDirection = direction.trim().lowercase()
+    val customerAmount = when (normalizedDirection) {
+        "credit", "in", "incoming", "receive" -> totals?.added
+        else -> totals?.deducted
+    } ?: amount
+    val absoluteMinor = abs(DecimalMoney.toMinor(customerAmount, scale))
+    val publicCounterparty = counterparty.takeUnless {
+        type.hasInstitutionalCounterparty()
+    }
     val counterpartyVerification = AccountVerification.fromServerValues(
-        designation = counterparty?.verification?.designation,
-        since = counterparty?.verification?.since,
+        designation = publicCounterparty?.verification?.designation,
+        since = publicCounterparty?.verification?.since,
     )
-    val signedMinor = when (direction.lowercase()) {
+    val signedMinor = when (normalizedDirection) {
         "credit", "in", "incoming", "receive" -> absoluteMinor
         else -> -absoluteMinor
     }
@@ -129,12 +222,12 @@ fun TransactionDto.toEntity(defaultWalletUuid: String): WalletTransactionEntity 
         type = type,
         direction = direction,
         status = status,
-        counterpartyName = counterparty?.name
-            ?: counterparty?.phone
-            ?: counterparty?.accountNumber
+        counterpartyName = publicCounterparty?.name
+            ?: publicCounterparty?.phone
+            ?: publicCounterparty?.accountNumber
             ?: "Kit Pay",
-        counterpartyUserId = counterparty?.id?.trim()?.takeIf(String::isNotEmpty),
-        counterpartyAvatarUrl = counterparty?.avatarUrl
+        counterpartyUserId = publicCounterparty?.id?.trim()?.takeIf(String::isNotEmpty),
+        counterpartyAvatarUrl = publicCounterparty?.avatarUrl
             ?.trim()
             ?.takeIf(::isTrustedProfileAvatarUrl),
         counterpartyVerificationDesignation =
@@ -142,6 +235,7 @@ fun TransactionDto.toEntity(defaultWalletUuid: String): WalletTransactionEntity 
         counterpartyVerificationSince = counterpartyVerification?.since,
         note = note,
         occurredAtEpochMillis = occurredAt.toEpochMillisOrNull() ?: 0L,
+        customerProjectionVerified = true,
     )
 }
 
@@ -195,6 +289,9 @@ fun WalletTransactionEntity.toUiModel(
     now: Instant = Instant.now(),
     zoneId: ZoneId = ZoneId.systemDefault(),
 ): Transaction {
+    // Also redact on read: an app that already created a schema-v16 row before this policy landed
+    // must become safe immediately, without waiting for a successful network refresh.
+    val hasPublicCounterparty = !type.hasInstitutionalCounterparty()
     val occurred = Instant.ofEpochMilli(occurredAtEpochMillis).atZone(zoneId)
     val today = now.atZone(zoneId).toLocalDate()
     val date = occurred.toLocalDate()
@@ -205,7 +302,7 @@ fun WalletTransactionEntity.toUiModel(
     }
     return Transaction(
         id = id,
-        counterparty = counterpartyName,
+        counterparty = if (hasPublicCounterparty) counterpartyName else "Kit Pay",
         note = note,
         amountMinor = amountMinor,
         time = occurred.format(DateTimeFormatter.ofPattern("h:mm a")),
@@ -220,12 +317,16 @@ fun WalletTransactionEntity.toUiModel(
         // with debits, so the starter checklist reads the originals to refuse them.
         rawType = type,
         rawDirection = direction,
-        counterpartyUserId = counterpartyUserId,
-        counterpartyAvatarUrl = counterpartyAvatarUrl,
-        accountVerification = AccountVerification.fromServerValues(
-            counterpartyVerificationDesignation,
-            counterpartyVerificationSince,
-        ),
+        counterpartyUserId = counterpartyUserId.takeIf { hasPublicCounterparty },
+        counterpartyAvatarUrl = counterpartyAvatarUrl.takeIf { hasPublicCounterparty },
+        accountVerification = if (hasPublicCounterparty) {
+            AccountVerification.fromServerValues(
+                counterpartyVerificationDesignation,
+                counterpartyVerificationSince,
+            )
+        } else {
+            null
+        },
     )
 }
 

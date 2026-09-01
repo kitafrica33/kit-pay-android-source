@@ -122,13 +122,14 @@ internal class ImmediateSendIntentStore @Inject constructor(
                 when (existing.state) {
                     ImmediateSendState.RETRY_REQUIRED ->
                         writeLocked(existing.copy(state = ImmediateSendState.WAITING))
-                    // A failed record's ciphertext is gone for good, and failure is only ever
-                    // recorded before the encrypted outbox takes over — so sharing the same
-                    // content again is a fresh attempt. Adopt the caller's newly staged items
-                    // wholesale, under the same stable identity.
-                    ImmediateSendState.FAILED -> writeLocked(intent.withNormalizedCreatedAtLocked())
+                    // A failed media identity may already be bound by the attachment store to an
+                    // earlier ciphertext digest. Re-encrypting under that same client media ID
+                    // would either conflict or, worse, blur two artifacts. A fresh user action
+                    // must mint a fresh identity instead of resurrecting this terminal record.
+                    ImmediateSendState.FAILED -> Unit
                     ImmediateSendState.WAITING,
                     ImmediateSendState.PREPARING,
+                    ImmediateSendState.IMPORTING,
                     -> Unit
                 }
             }
@@ -154,7 +155,10 @@ internal class ImmediateSendIntentStore @Inject constructor(
     suspend fun markRetryRequiredForOwner(
         expectedOwner: SessionFence,
         expected: ImmediateSendIntent,
-    ): Boolean = if (expected.state == ImmediateSendState.PREPARING) {
+    ): Boolean = if (
+        expected.state == ImmediateSendState.IMPORTING ||
+        expected.state == ImmediateSendState.PREPARING
+    ) {
         false
     } else {
         replaceForOwner(
@@ -174,7 +178,8 @@ internal class ImmediateSendIntentStore @Inject constructor(
             // The bubble already tells the person to send the content afresh after failure.
             if (
                 existing.state == ImmediateSendState.FAILED ||
-                existing.state == ImmediateSendState.PREPARING
+                existing.state == ImmediateSendState.PREPARING ||
+                existing.state == ImmediateSendState.IMPORTING
             ) return@withOwner false
             writeLocked(existing.copy(state = ImmediateSendState.WAITING))
             publishLocked()
@@ -317,7 +322,19 @@ private fun ImmediateSendIntent.sameUserIntentAs(other: ImmediateSendIntent): Bo
         text == other.text &&
         mediaType == other.mediaType &&
         caption == other.caption &&
-        mediaPlaintextBytes == other.mediaPlaintextBytes &&
+        mediaOriginalType == other.mediaOriginalType &&
+        mediaProcessingPlan == other.mediaProcessingPlan &&
+        mediaVideoEditPlan == other.mediaVideoEditPlan &&
+        mediaDurationMillis == other.mediaDurationMillis &&
+        (
+            localPlaintextBytes == other.localPlaintextBytes ||
+                kind == ImmediateSendKind.MEDIA &&
+                (
+                    state == ImmediateSendState.IMPORTING && localPlaintextBytes == 0 ||
+                        other.state == ImmediateSendState.IMPORTING &&
+                        other.localPlaintextBytes == 0
+                )
+            ) &&
         replyToMessageId == other.replyToMessageId &&
         sameAlbumContentAs(other)
 
@@ -330,7 +347,16 @@ private fun ImmediateSendIntent.sameUserIntentAs(other: ImmediateSendIntent): Bo
 private fun ImmediateSendIntent.sameAlbumContentAs(other: ImmediateSendIntent): Boolean =
     mediaItems.size == other.mediaItems.size &&
         mediaItems.zip(other.mediaItems).all { (mine, theirs) ->
-            mine.mediaType == theirs.mediaType && mine.plaintextBytes == theirs.plaintextBytes
+            mine.mediaType == theirs.mediaType &&
+                mine.originalMediaType == theirs.originalMediaType &&
+                mine.processingPlan == theirs.processingPlan &&
+                mine.durationMillis == theirs.durationMillis &&
+                (
+                    mine.localPlaintextBytes == theirs.localPlaintextBytes ||
+                        state == ImmediateSendState.IMPORTING && mine.localPlaintextBytes == 0 ||
+                        other.state == ImmediateSendState.IMPORTING &&
+                        theirs.localPlaintextBytes == 0
+                )
         }
 
 private data class ImmediateSendOwnerSnapshot(

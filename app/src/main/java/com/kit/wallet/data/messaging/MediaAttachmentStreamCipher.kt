@@ -109,110 +109,105 @@ internal object MediaAttachmentStreamCipher {
     }
 
     /**
-     * Verifies [ciphertext] whole, then decrypts it into [destination]; returns the plaintext size.
+     * Reads [ciphertext] once and decrypts into an unpublished private [destination] scratch.
      *
-     * The file is read twice on purpose. Nothing is decrypted until both the authenticated SHA-256
-     * and the HMAC have been checked over every byte, which is the same order the in-heap
-     * [MediaAttachmentCipher.decrypt] enforces — a second sequential read of a local file is a
-     * cheap price for never writing out a byte of unauthenticated plaintext.
+     * SHA-256 and HMAC are accumulated beside CBC decryption in the same pass. The scratch is
+     * deleted unless the digest, authentication tag, CBC padding and [expectedPlaintextBytes] all
+     * validate. Callers must publish/rename it only after this function returns; this is the file
+     * supplied by [SecureMediaCache.store], never a user-visible or final media path.
      */
     fun decrypt(
         ciphertext: File,
         keyMaterial: ByteArray,
         expectedSha256: ByteArray,
-        destination: OutputStream,
+        expectedPlaintextBytes: Int,
+        destination: File,
     ): Int {
         require(keyMaterial.size == AES_KEY_BYTES + MAC_KEY_BYTES) {
             "Attachment key material is malformed"
+        }
+        require(expectedSha256.size == MAC_BYTES) { "Attachment digest is malformed" }
+        require(expectedPlaintextBytes > 0) { "Attachment plaintext size is malformed" }
+        require(ciphertext.canonicalFile != destination.canonicalFile) {
+            "Attachment ciphertext and plaintext scratch must differ"
         }
         val totalBytes = ciphertext.length()
         require(totalBytes >= IV_BYTES + MAC_BYTES) { "Attachment ciphertext is too short" }
         val bodyBytes = totalBytes - IV_BYTES - MAC_BYTES
 
         val iv = ByteArray(IV_BYTES)
-        verify(ciphertext, keyMaterial, expectedSha256, bodyBytes, iv)
-
-        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
-            init(
-                Cipher.DECRYPT_MODE,
-                SecretKeySpec(keyMaterial, 0, AES_KEY_BYTES, "AES"),
-                IvParameterSpec(iv),
-            )
-        }
+        val tag = ByteArray(MAC_BYTES)
         val buffer = ByteArray(CHUNK_BYTES)
+        val mac = macFor(keyMaterial)
+        val digest = MessageDigest.getInstance("SHA-256")
         var plaintextBytes = 0
         try {
-            ciphertext.inputStream().buffered().use { input ->
-                input.skipExactly(IV_BYTES.toLong())
-                var remaining = bodyBytes
-                while (remaining > 0) {
-                    val wanted = minOf(remaining, buffer.size.toLong()).toInt()
-                    val count = input.read(buffer, 0, wanted)
-                    if (count < 0) throw IllegalStateException("Attachment ciphertext ended early")
-                    remaining -= count
-                    val produced = cipher.update(buffer, 0, count)
-                    if (produced != null && produced.isNotEmpty()) {
-                        plaintextBytes = Math.addExact(plaintextBytes, produced.size)
-                        destination.write(produced)
-                        produced.fill(0)
+            destination.outputStream().buffered().use { output ->
+                ciphertext.inputStream().buffered().use { input ->
+                    input.readExactly(iv)
+                    mac.update(iv)
+                    digest.update(iv)
+                    val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
+                        init(
+                            Cipher.DECRYPT_MODE,
+                            SecretKeySpec(keyMaterial, 0, AES_KEY_BYTES, "AES"),
+                            IvParameterSpec(iv),
+                        )
+                    }
+
+                    var remaining = bodyBytes
+                    while (remaining > 0) {
+                        val wanted = minOf(remaining, buffer.size.toLong()).toInt()
+                        val count = input.read(buffer, 0, wanted)
+                        if (count < 0) {
+                            throw IllegalStateException("Attachment ciphertext ended early")
+                        }
+                        remaining -= count
+                        mac.update(buffer, 0, count)
+                        digest.update(buffer, 0, count)
+                        val produced = cipher.update(buffer, 0, count)
+                        if (produced != null && produced.isNotEmpty()) {
+                            plaintextBytes = Math.addExact(plaintextBytes, produced.size)
+                            check(plaintextBytes <= expectedPlaintextBytes) {
+                                "The decrypted media exceeds its authenticated size"
+                            }
+                            output.write(produced)
+                            produced.fill(0)
+                        }
+                    }
+                    input.readExactly(tag)
+                    check(input.read() < 0) { "Attachment ciphertext changed while being read" }
+                    digest.update(tag)
+                    require(MessageDigest.isEqual(digest.digest(), expectedSha256)) {
+                        "Attachment ciphertext failed its integrity digest"
+                    }
+                    require(MessageDigest.isEqual(mac.doFinal(), tag)) {
+                        "Attachment ciphertext failed its authentication tag"
+                    }
+
+                    // doFinal validates CBC padding only after both public integrity anchors pass.
+                    val tail = cipher.doFinal()
+                    try {
+                        plaintextBytes = Math.addExact(plaintextBytes, tail.size)
+                        check(plaintextBytes == expectedPlaintextBytes) {
+                            "The decrypted media does not match its authenticated size"
+                        }
+                        output.write(tail)
+                    } finally {
+                        tail.fill(0)
                     }
                 }
+                output.flush()
             }
-            val tail = cipher.doFinal()
-            plaintextBytes = Math.addExact(plaintextBytes, tail.size)
-            destination.write(tail)
-            tail.fill(0)
-            destination.flush()
+            return plaintextBytes
+        } catch (error: Throwable) {
+            runCatching { destination.delete() }
+                .exceptionOrNull()
+                ?.let(error::addSuppressed)
+            throw error
         } finally {
             buffer.fill(0)
             iv.fill(0)
-        }
-        return plaintextBytes
-    }
-
-    /**
-     * One pass that both digests the whole blob and MACs everything before the tag, so a tampered
-     * attachment is rejected without a second read.
-     */
-    private fun verify(
-        ciphertext: File,
-        keyMaterial: ByteArray,
-        expectedSha256: ByteArray,
-        bodyBytes: Long,
-        capturedIv: ByteArray,
-    ) {
-        val mac = macFor(keyMaterial)
-        val digest = MessageDigest.getInstance("SHA-256")
-        val tag = ByteArray(MAC_BYTES)
-        val buffer = ByteArray(CHUNK_BYTES)
-        try {
-            ciphertext.inputStream().buffered().use { input ->
-                input.readExactly(capturedIv)
-                mac.update(capturedIv)
-                digest.update(capturedIv)
-
-                var remaining = bodyBytes
-                while (remaining > 0) {
-                    val wanted = minOf(remaining, buffer.size.toLong()).toInt()
-                    val count = input.read(buffer, 0, wanted)
-                    if (count < 0) throw IllegalStateException("Attachment ciphertext ended early")
-                    remaining -= count
-                    mac.update(buffer, 0, count)
-                    digest.update(buffer, 0, count)
-                }
-                input.readExactly(tag)
-            }
-            digest.update(tag)
-            // `require`, not `check`, so a rejection is the same kind of failure the in-heap
-            // cipher raises for the same blob: callers must not have to know which one ran.
-            require(MessageDigest.isEqual(digest.digest(), expectedSha256)) {
-                "Attachment ciphertext failed its integrity digest"
-            }
-            require(MessageDigest.isEqual(mac.doFinal(), tag)) {
-                "Attachment ciphertext failed its authentication tag"
-            }
-        } finally {
-            buffer.fill(0)
             tag.fill(0)
         }
     }
@@ -244,16 +239,4 @@ internal object MediaAttachmentStreamCipher {
         }
     }
 
-    private fun InputStream.skipExactly(count: Long) {
-        var remaining = count
-        while (remaining > 0) {
-            val skipped = skip(remaining)
-            if (skipped <= 0) {
-                if (read() < 0) throw IllegalStateException("Attachment ciphertext ended early")
-                remaining -= 1
-            } else {
-                remaining -= skipped
-            }
-        }
-    }
 }

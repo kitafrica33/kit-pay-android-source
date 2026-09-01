@@ -41,6 +41,9 @@ class IncomingCallReplayLedger @Inject constructor(
             ) {
                 return@synchronized false
             }
+            // An exact duplicate is deliberately admitted again. The first delivery can be
+            // interrupted after this durable write but before Telecom/NotificationManager owns
+            // a visible surface; their stable call id and notification tag make replay safe.
             val committed = preferences.edit()
                 .putLong(ringKey(digest), serverExpiry.plus(RING_RETENTION).toEpochMilli())
                 .commit()
@@ -125,9 +128,17 @@ internal fun shouldAdmitIncomingRing(
     serverExpiry: Instant,
     recordedRingUntilEpochMillis: Long?,
     retiredUntilEpochMillis: Long?,
-): Boolean = serverExpiry.isAfter(now) &&
-    (recordedRingUntilEpochMillis == null || recordedRingUntilEpochMillis <= now.toEpochMilli()) &&
-    (retiredUntilEpochMillis == null || retiredUntilEpochMillis <= now.toEpochMilli())
+): Boolean {
+    val nowMillis = now.toEpochMilli()
+    val expectedRingRetention = serverExpiry.plus(Duration.ofMinutes(10)).toEpochMilli()
+    return serverExpiry.isAfter(now) &&
+        (retiredUntilEpochMillis == null || retiredUntilEpochMillis <= nowMillis) &&
+        (
+            recordedRingUntilEpochMillis == null ||
+                recordedRingUntilEpochMillis <= nowMillis ||
+                recordedRingUntilEpochMillis == expectedRingRetention
+            )
+}
 
 internal fun shouldAuthorizeIncomingCallLaunch(
     now: Instant,

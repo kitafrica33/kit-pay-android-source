@@ -3,12 +3,17 @@ package com.kit.wallet.feature.chat
 import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.OpenableColumns
+import com.kit.wallet.data.messaging.MAX_LOCAL_MEDIA_DURATION_MILLIS
+import com.kit.wallet.data.messaging.SecureMediaProcessingPlan
 import com.kit.wallet.data.messaging.SecureMediaSource
+import com.kit.wallet.data.messaging.normalizeLocalMediaType
 import com.kit.wallet.data.session.SessionFence
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
+import java.io.FileOutputStream
 import javax.inject.Inject
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -198,6 +203,13 @@ internal object SharedInboxStore {
         val reportedMediaType = resolver.getType(uri) ?: intentMediaType
         val mediaType = SharedInboxPolicy.normalizedMediaType(reportedMediaType)
         val requiresImageTranscode = SharedInboxPolicy.requiresImageTranscode(reportedMediaType)
+        val originalMediaType = if (requiresImageTranscode) {
+            normalizeLocalMediaType(reportedMediaType.orEmpty())
+                ?.takeIf { it.startsWith("image/") }
+                ?: "image/jpeg"
+        } else {
+            mediaType
+        }
         val suggestedName = resolver.suggestedName(uri)
         val id = SharedInboxPolicy.newId()
         val fileName = SharedInboxPolicy.storageFileName(id, suggestedName)
@@ -209,22 +221,11 @@ internal object SharedInboxStore {
         val destination = File(directory, fileName)
         val copied = runCatching {
             currentCoroutineContext().ensureActive()
-            if (requiresImageTranscode) {
-                val jpeg = transcodeChatImage(resolver, uri) ?: return@runCatching null
-                try {
-                    currentCoroutineContext().ensureActive()
-                    if (jpeg.size.toLong() > maximumBytes) return@runCatching -1L
-                    destination.outputStream().use { output -> output.write(jpeg) }
-                    destination.restrictSharedInboxFileToOwner()
-                    jpeg.size.toLong()
-                } finally {
-                    jpeg.fill(0)
-                }
-            } else {
-                resolver.openInputStream(uri)?.use { input ->
-                    destination.outputStream().use { output ->
-                        input.copyBounded(output, maximumBytes)
-                    }
+            resolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(destination).use { output ->
+                    val copied = input.copyBounded(output, maximumBytes)
+                    if (copied >= 0L) output.fd.sync()
+                    copied
                 }
             }
         }.getOrElse { error ->
@@ -245,6 +246,7 @@ internal object SharedInboxStore {
             return SharedInboxStaging.Failed(UNREADABLE_SHARE_MESSAGE)
         }
         destination.restrictSharedInboxFileToOwner()
+        val durationMillis = destination.mediaDurationMillis(originalMediaType)
         return SharedInboxStaging.Staged(
             SharedInboxItem(
                 id = id,
@@ -252,6 +254,13 @@ internal object SharedInboxStore {
                 mediaType = mediaType,
                 displayName = SharedInboxPolicy.displayName(suggestedName, mediaType),
                 byteCount = copied.toInt(),
+                originalMediaType = originalMediaType.takeUnless { it == mediaType },
+                processingPlan = if (requiresImageTranscode) {
+                    SecureMediaProcessingPlan.CHAT_IMAGE_JPEG
+                } else {
+                    SecureMediaProcessingPlan.PASSTHROUGH
+                },
+                durationMillis = durationMillis,
             ),
         )
     }
@@ -271,7 +280,28 @@ internal object SharedInboxStore {
         ) {
             "That shared file could no longer be read."
         }
-        return SecureMediaSource.ofFile(file)
+        return SecureMediaSource.ofFile(
+            file = file,
+            originalMediaType = item.originalMediaType,
+            durationMillis = item.durationMillis,
+            processingPlan = item.processingPlan,
+        )
+    }
+
+    /** Reads only bounded presentation metadata from the durable local copy, never its payload. */
+    private fun File.mediaDurationMillis(mediaType: String): Long? {
+        if (!mediaType.startsWith("audio/") && !mediaType.startsWith("video/")) return null
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(absolutePath)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull()
+                ?.takeIf { it in 1..MAX_LOCAL_MEDIA_DURATION_MILLIS }
+        } catch (_: Exception) {
+            null
+        } finally {
+            runCatching { retriever.release() }
+        }
     }
 
     fun remove(context: Context, batchId: String) {

@@ -9,6 +9,8 @@ import com.kit.wallet.data.local.WalletTransactionDao
 import com.kit.wallet.data.auth.normalizeProfileName
 import com.kit.wallet.data.auth.normalizeProfileTag
 import com.kit.wallet.data.mapper.DecimalMoney
+import com.kit.wallet.data.mapper.hasVerifiedCustomerProjection
+import com.kit.wallet.data.mapper.isCustomerVisibleWalletTransaction
 import com.kit.wallet.data.mapper.toEntity
 import com.kit.wallet.data.mapper.toUiModel
 import com.kit.wallet.data.remote.ApiCallExecutor
@@ -324,7 +326,10 @@ class OfflineWalletRepository @Inject constructor(
                 )
             }
         }
-        .map { rows -> rows.map { it.toUiModel() } }
+        .map { rows ->
+            rows.filter { it.isCustomerVisibleWalletTransaction() }
+                .map { it.toUiModel() }
+        }
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
 
     override val accountTransactions: StateFlow<OwnedTransactions> = selectedWallet
@@ -341,7 +346,9 @@ class OfflineWalletRepository @Inject constructor(
                     // session — the exact race an account switch used to open.
                     OwnedTransactions(
                         ownerAccountId = selected.ownerAccountId,
-                        transactions = rows.map { it.toUiModel() },
+                        transactions = rows
+                            .filter { it.isCustomerVisibleWalletTransaction() }
+                            .map { it.toUiModel() },
                     )
                 }
             }
@@ -950,7 +957,9 @@ class OfflineWalletSyncRepository @Inject constructor(
         }
             ?: return@withLock WalletSyncResult(wallets.size, 0, false)
         val page = apiCalls.execute { api.transactions(selected.uuid, limit = PAGE_SIZE) }
-        val transactions = page.items.map { it.toEntity(selected.uuid) }
+        val transactions = page.items
+            .filter { it.hasVerifiedCustomerProjection() }
+            .map { it.toEntity(selected.uuid) }
         sessions.withCurrentSession(fence) { current ->
             cache.replaceTransactions(
                 current.cacheScopeId,
