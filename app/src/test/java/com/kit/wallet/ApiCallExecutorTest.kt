@@ -43,6 +43,33 @@ class ApiCallExecutorTest {
     }
 
     @Test
+    fun `exact recovery requires affirmative idempotent replay proof`() = runTest {
+        assertEquals(
+            "payload",
+            executor.executeExactRecovery {
+                ApiEnvelope(
+                    ok = true,
+                    data = "payload",
+                    meta = ApiMetaDto(idempotentReplay = true),
+                )
+            },
+        )
+        listOf(null, false).forEach { replay ->
+            assertTrue(
+                runCatching {
+                    executor.executeExactRecovery {
+                        ApiEnvelope(
+                            ok = true,
+                            data = "payload",
+                            meta = replay?.let { ApiMetaDto(idempotentReplay = it) },
+                        )
+                    }
+                }.exceptionOrNull() is IllegalStateException,
+            )
+        }
+    }
+
+    @Test
     fun `parses canonical error envelope from non-2xx response`() = runTest {
         val body = """
             {

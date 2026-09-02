@@ -213,6 +213,11 @@ internal class ImmediateSendDispatcher @Inject constructor(
                 }
                 break
             }
+            // Exact financial recovery owns this intent until the server confirms the mutation.
+            // Keeping it at the head also preserves the conversation's event ordering.
+            if (original.state == ImmediateSendState.FINANCIAL_PENDING) {
+                break
+            }
             when (dispatchOne(owner, original)) {
                 DispatchOneResult.COMMITTED -> committedAny = true
                 DispatchOneResult.COMMITTED_RETRY -> {

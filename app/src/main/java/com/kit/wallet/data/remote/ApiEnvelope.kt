@@ -172,4 +172,15 @@ class ApiCallExecutor @Inject constructor(
             connectivity = true,
         )
     }
+
+    /** Accepts a successful exact-recovery response only with server replay provenance. */
+    internal suspend fun <T> executeExactRecovery(
+        call: suspend () -> ApiEnvelope<T>,
+    ): T {
+        val result = executeWithMeta(call)
+        check(result.meta?.idempotentReplay == true) {
+            "Exact recovery response omitted idempotent replay proof"
+        }
+        return result.data
+    }
 }

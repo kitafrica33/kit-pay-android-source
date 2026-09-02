@@ -23,6 +23,12 @@ import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedEx
 import com.kit.wallet.data.messaging.SecureMessagingCryptographicFailureException
 import com.kit.wallet.data.messaging.SecureMessagingProtocolUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingStateConflictException
+import com.kit.wallet.data.messaging.WalletTransferChatReceiptCoordinator
+import com.kit.wallet.data.messaging.WalletTransferReceiptRecoveryOutcome
+import com.kit.wallet.data.messaging.PendingFinancialEventCoordinator
+import com.kit.wallet.data.messaging.PendingFinancialEventRecoveryOutcome
+import com.kit.wallet.data.messaging.FinancialCreationReceiptCoordinator
+import com.kit.wallet.data.messaging.FinancialCreationRecoveryOutcome
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.session.SessionStore
 import dagger.assisted.Assisted
@@ -41,6 +47,9 @@ internal class SecureMessagingSyncWorker @AssistedInject constructor(
     private val syncEngine: SecureMessagingSyncEngine,
     private val wakeCoalescer: SecureMessagingWakeCoalescer,
     private val immediateSends: ImmediateSendDispatcher,
+    private val transferChatReceipts: WalletTransferChatReceiptCoordinator,
+    private val pendingFinancialEvents: PendingFinancialEventCoordinator,
+    private val financialCreationReceipts: FinancialCreationReceiptCoordinator,
 ) : CoroutineWorker(appContext, workerParameters) {
     override suspend fun doWork(): Result {
         val urgent = inputData.getBoolean(URGENT_MESSAGING_WAKE_INPUT_KEY, false)
@@ -51,12 +60,16 @@ internal class SecureMessagingSyncWorker @AssistedInject constructor(
 
         return try {
             syncEngine.synchronize()
-            when (immediateSends.dispatch()) {
-                ImmediateSendDispatchOutcome.RETRY -> Result.retry()
-                ImmediateSendDispatchOutcome.IDLE,
-                ImmediateSendDispatchOutcome.COMMITTED,
-                -> Result.success()
-            }
+            val receiptRecovery = transferChatReceipts.recover()
+            val creationRecovery = financialCreationReceipts.recover()
+            val pendingRecovery = pendingFinancialEvents.recover()
+            val immediateOutcome = immediateSends.dispatch()
+            if (
+                receiptRecovery == WalletTransferReceiptRecoveryOutcome.RETRY ||
+                creationRecovery == FinancialCreationRecoveryOutcome.RETRY ||
+                pendingRecovery == PendingFinancialEventRecoveryOutcome.RETRY ||
+                immediateOutcome == ImmediateSendDispatchOutcome.RETRY
+            ) Result.retry() else Result.success()
         } catch (error: Throwable) {
             debugSecureMessagingWorkerFailure(error)
             when (secureMessagingSyncFailureDisposition(error)) {

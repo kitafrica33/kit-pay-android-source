@@ -1,5 +1,6 @@
 package com.kit.wallet.data.remote
 
+import com.kit.wallet.data.messaging.deterministicUuid
 import com.squareup.moshi.Json
 import com.squareup.moshi.JsonClass
 import java.net.URLDecoder
@@ -140,9 +141,13 @@ data class GroupPaymentRequestContributionResultDto(
     val request: GroupPaymentRequestDto,
     val contribution: GroupPaymentRequestContributionDto,
 ) {
-    fun isStructurallyValid(): Boolean = request.isStructurallyValid() &&
-        contribution.isStructurallyValid(request.currencyScale ?: -1) &&
-        request.contributions.any { it == contribution }
+    fun isStructurallyValid(): Boolean {
+        if (!request.isStructurallyValid() ||
+            !contribution.isStructurallyValid(request.currencyScale ?: -1)
+        ) return false
+        val embedded = request.contributions.firstOrNull { it.id == contribution.id }
+        return if (embedded == null) request.contributionsHasMore else embedded == contribution
+    }
 }
 
 @JsonClass(generateAdapter = false)
@@ -234,6 +239,15 @@ data class KitGroupPaymentRequestMessage private constructor(
         currencyScale?.let { append("&sc=").append(it) }
         note?.let { append("&note=").append(percentEncode(it)) }
     }
+
+    /** One stable encrypted-outbox identity for this exact server-owned request event. */
+    fun deterministicMessageId(): String = deterministicUuid(
+        buildString {
+            append("kit-group-payment-request-event-v1|")
+            append(requestId.lowercase()).append('|').append(action.wire)
+            contributionId?.let { append('|').append(it.lowercase()) }
+        },
+    )
 
     companion object {
         const val PREFIX = "KITGREQ1:"

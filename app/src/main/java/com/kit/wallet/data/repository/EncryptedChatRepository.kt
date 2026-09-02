@@ -2499,7 +2499,8 @@ class EncryptedChatRepository @Inject internal constructor(
                     session != null && pending.any {
                         it.state == ImmediateSendState.WAITING ||
                             it.state == ImmediateSendState.IMPORTING ||
-                            it.state == ImmediateSendState.PREPARING
+                            it.state == ImmediateSendState.PREPARING ||
+                            it.state == ImmediateSendState.FINANCIAL_PENDING
                     }
                 }.distinctUntilChanged().collect { shouldWake ->
                     if (shouldWake) runCatching { immediateSendScheduler?.schedule() }
@@ -2869,6 +2870,33 @@ class EncryptedChatRepository @Inject internal constructor(
         return created.id
     }
 
+    override suspend fun openDirectConversationForOwner(
+        owner: SessionFence,
+        contact: Contact,
+    ): String {
+        require(contact.isKitUser) {
+            "Only contacts who are on Kit Pay can receive secure messages"
+        }
+        if (authenticationSessions?.current()?.fence() != owner) {
+            throw SessionInvalidatedException()
+        }
+        chats.value.singleOrNull { preview ->
+            !preview.isGroup && preview.peerUserId.equals(contact.id, ignoreCase = true)
+        }?.let { return it.id }
+        val session = requireReadySession()
+        if (
+            authenticationSessions?.current()?.fence() != owner ||
+            session.sessionEpoch != owner.sessionId
+        ) throw SessionInvalidatedException()
+        val created = runtime.createDirectConversation(session, contact.id)
+        if (authenticationSessions?.current()?.fence() != owner) {
+            throw SessionInvalidatedException()
+        }
+        refresh(session, contacts.contacts.value)
+        check(chat(created.id) != null) { "The secure conversation was not added to the projection" }
+        return created.id
+    }
+
     override suspend fun createGroupConversation(title: String, contacts: List<Contact>): String {
         val session = requireReadySession()
         val normalizedTitle = normalizeMessagingGroupTitle(title)
@@ -3031,8 +3059,100 @@ class EncryptedChatRepository @Inject internal constructor(
         require(KitUserAuthoredTextPolicy.allows(normalized)) {
             "Messages cannot start with one of Kit Pay's reserved prefixes"
         }
+        captureImmediateTextIntentForOwner(
+            owner = owner,
+            chatId = chatId,
+            text = normalized,
+            clientMessageId = clientMessageId,
+            kind = ImmediateSendKind.TEXT,
+        )
+    }
+
+    override suspend fun capturePaymentEventForOwner(
+        owner: SessionFence,
+        chatId: String,
+        descriptor: String,
+        clientMessageId: String,
+    ) {
+        val canonical = descriptor.trim()
+        require(KitPaymentMessage.parse(canonical) != null) {
+            "Kit Pay could not validate this payment event"
+        }
+        captureImmediateTextIntentForOwner(
+            owner = owner,
+            chatId = chatId,
+            text = canonical,
+            clientMessageId = clientMessageId,
+            kind = ImmediateSendKind.PAYMENT_EVENT,
+        )
+    }
+
+    override suspend fun captureGroupPaymentEventForOwner(
+        owner: SessionFence,
+        chatId: String,
+        descriptor: String,
+        clientMessageId: String,
+    ) {
+        val canonical = descriptor.trim()
+        require(KitGroupPaymentMessage.parse(canonical) != null) {
+            "Kit Pay could not validate this group payment event"
+        }
+        captureImmediateTextIntentForOwner(
+            owner = owner,
+            chatId = chatId,
+            text = canonical,
+            clientMessageId = clientMessageId,
+            kind = ImmediateSendKind.GROUP_PAYMENT_EVENT,
+        )
+    }
+
+    override suspend fun captureGroupPaymentRequestEventForOwner(
+        owner: SessionFence,
+        chatId: String,
+        descriptor: String,
+        clientMessageId: String,
+    ) {
+        val canonical = descriptor.trim()
+        require(com.kit.wallet.data.remote.KitGroupPaymentRequestMessage.parse(canonical) != null) {
+            "Kit Pay could not validate this group payment request event"
+        }
+        captureImmediateTextIntentForOwner(
+            owner = owner,
+            chatId = chatId,
+            text = canonical,
+            clientMessageId = clientMessageId,
+            kind = ImmediateSendKind.GROUP_PAYMENT_REQUEST_EVENT,
+        )
+    }
+
+    /**
+     * Commits one already-validated text-shaped event without requiring live chat hydration.
+     *
+     * The worker revalidates membership and the current roster before encryption. Skipping the
+     * display projection here is intentional: a successful financial operation must be able to
+     * hand its receipt to encrypted storage while messaging is offline or still starting.
+     */
+    private suspend fun captureImmediateTextIntentForOwner(
+        owner: SessionFence,
+        chatId: String,
+        text: String,
+        clientMessageId: String,
+        kind: ImmediateSendKind,
+    ) {
+        require(ImmediateSendIntent.CANONICAL_UUID.matches(chatId)) {
+            "Invalid secure-message conversation"
+        }
+        require(ImmediateSendIntent.CANONICAL_UUID.matches(clientMessageId)) {
+            "Invalid local-outbox message ID"
+        }
+        require(
+                kind == ImmediateSendKind.TEXT ||
+                kind == ImmediateSendKind.PAYMENT_EVENT ||
+                kind == ImmediateSendKind.GROUP_PAYMENT_EVENT ||
+                kind == ImmediateSendKind.GROUP_PAYMENT_REQUEST_EVENT
+        ) { "That immediate-send kind is not text-shaped" }
         val queue = checkNotNull(immediateSends) {
-            "Durable notification-reply capture is unavailable"
+            "Durable secure-message capture is unavailable"
         }
         immediateSendAcceptanceMutex(chatId).withLock {
             if (authenticationSessions?.current()?.fence() != owner) {
@@ -3043,9 +3163,9 @@ class EncryptedChatRepository @Inject internal constructor(
                 ImmediateSendIntent(
                     id = clientMessageId,
                     conversationId = chatId,
-                    kind = ImmediateSendKind.TEXT,
+                    kind = kind,
                     createdAtEpochMillis = clock.instant().toEpochMilli(),
-                    text = normalized,
+                    text = text,
                 ),
             )
         }
@@ -5905,7 +6025,8 @@ class EncryptedChatRepository @Inject internal constructor(
                 } == true
         val projectedClientIds = projections.mapTo(mutableSetOf(), AuthenticatedProjectedText::clientMessageId)
         val visiblePending = pendingIntents.filter {
-            it.conversationId in conversationIds && it.id !in projectedClientIds
+            it.state != ImmediateSendState.FINANCIAL_PENDING &&
+                it.conversationId in conversationIds && it.id !in projectedClientIds
         }
         val pendingIds = visiblePending.mapTo(mutableSetOf(), ImmediateSendIntent::id)
         val visibleStaging = stagingMedia.filter {
@@ -5931,6 +6052,8 @@ class EncryptedChatRepository @Inject internal constructor(
                         ImmediateSendState.IMPORTING,
                         ImmediateSendState.PREPARING,
                         -> AuthenticatedTextDeliveryState.PENDING
+                        ImmediateSendState.FINANCIAL_PENDING ->
+                            error("Unconfirmed financial events are not projected")
                         ImmediateSendState.RETRY_REQUIRED ->
                             AuthenticatedTextDeliveryState.RETRY_REQUIRED
                         ImmediateSendState.FAILED ->
@@ -6548,6 +6671,8 @@ class EncryptedChatRepository @Inject internal constructor(
                 ImmediateSendState.IMPORTING,
                 ImmediateSendState.PREPARING,
                 -> DeliveryState.SENDING
+                ImmediateSendState.FINANCIAL_PENDING ->
+                    error("Unconfirmed financial media cannot exist")
                 ImmediateSendState.RETRY_REQUIRED -> DeliveryState.RETRY_REQUIRED
                 ImmediateSendState.FAILED -> DeliveryState.FAILED
             },
@@ -6582,6 +6707,8 @@ class EncryptedChatRepository @Inject internal constructor(
             ImmediateSendState.IMPORTING,
             ImmediateSendState.PREPARING,
             -> DeliveryState.SENDING
+            ImmediateSendState.FINANCIAL_PENDING ->
+                error("Unconfirmed financial media cannot exist")
             ImmediateSendState.RETRY_REQUIRED -> DeliveryState.RETRY_REQUIRED
             ImmediateSendState.FAILED -> DeliveryState.FAILED
         },

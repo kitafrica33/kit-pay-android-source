@@ -53,6 +53,24 @@ data class SentTransfer(
     val claim: TransferClaim?,
 )
 
+/** Exact request facts persisted before a wallet transfer can reach the server. */
+data class WalletTransferSubmission(
+    val sourceWalletId: String,
+    val destinationWalletId: String,
+    val amount: String,
+    val amountMinor: Long,
+    val currencyCode: String,
+    val currencyScale: Int,
+    val note: String?,
+)
+
+/** Read-only resolution of one previously submitted wallet-transfer idempotency key. */
+sealed interface WalletTransferRecoveryResult {
+    data class Settled(val transfer: SentTransfer) : WalletTransferRecoveryResult
+    data object NotCommitted : WalletTransferRecoveryResult
+    data object InProgress : WalletTransferRecoveryResult
+}
+
 /** A backend payment request created from inside a secure conversation. */
 data class ChatPaymentRequest(
     val id: String,
@@ -126,6 +144,9 @@ interface WalletRepository {
     /** Resolves [WalletSpendingSource] for the account that is signed in right now. */
     suspend fun spendingSource(): WalletSpendingSource = error("No active wallet is selected")
 
+    /** Resolves the selected wallet without allowing a replacement login to supply it. */
+    suspend fun spendingSourceForOwner(owner: SessionFence): WalletSpendingSource = spendingSource()
+
     val transactions: StateFlow<List<Transaction>>
 
     /**
@@ -160,7 +181,60 @@ interface WalletRepository {
         amountMinor: Long,
         note: String?,
         paymentPin: String,
+        idempotencyKey: String? = null,
     ): SentTransfer = SentTransfer(send(recipient, amountMinor, note, paymentPin), null)
+
+    /**
+     * Owner-pinned transfer boundary used by the durable chat-receipt coordinator.
+     *
+     * [onSubmitting] durably records the exact request immediately before the irreversible POST,
+     * and [onSettled] runs with the exact validated server result before any best-effort cache
+     * refresh. Implementations must not replay the transfer during receipt recovery;
+     * [idempotencyKey] belongs only to this explicit user submission.
+     */
+    suspend fun sendToContactForOwner(
+        owner: SessionFence,
+        recipient: Contact,
+        amountMinor: Long,
+        note: String?,
+        paymentPin: String,
+        idempotencyKey: String,
+        onSubmitting: suspend (WalletTransferSubmission) -> Unit,
+        onSettled: suspend (SentTransfer) -> Unit,
+    ): SentTransfer {
+        val source = spendingSource()
+        onSubmitting(
+            WalletTransferSubmission(
+                sourceWalletId = source.walletId,
+                destinationWalletId = requireNotNull(recipient.receivingWalletId),
+                amount = java.math.BigDecimal.valueOf(amountMinor, source.currencyScale)
+                    .setScale(source.currencyScale)
+                    .toPlainString(),
+                amountMinor = amountMinor,
+                currencyCode = source.currencyCode,
+                currencyScale = source.currencyScale,
+                note = note,
+            ),
+        )
+        val sent = sendToContact(
+            recipient = recipient,
+            amountMinor = amountMinor,
+            note = note,
+            paymentPin = paymentPin,
+            idempotencyKey = idempotencyKey,
+        )
+        onSettled(sent)
+        return sent
+    }
+
+    /**
+     * Reads the exact result bound to [idempotencyKey] without issuing another transfer command.
+     */
+    suspend fun recoverSentTransferForOwner(
+        owner: SessionFence,
+        submission: WalletTransferSubmission,
+        idempotencyKey: String,
+    ): WalletTransferRecoveryResult = error("Wallet-transfer recovery is unavailable")
 
     /** Records an outgoing payment request (no balance change). */
     suspend fun request(from: Contact, amountMinor: Long, note: String?)
@@ -195,9 +269,19 @@ interface WalletRepository {
         paymentPin: String,
     ): Unit = error("Payment requests are unavailable")
 
+    suspend fun payChatPaymentRequestForOwner(
+        owner: SessionFence,
+        requestId: String,
+        amountMinor: Long,
+        paymentPin: String,
+    ): Unit = payChatPaymentRequest(requestId, amountMinor, paymentPin)
+
     /** Withdraws a payment request this account created; only the requester may. */
     suspend fun cancelChatPaymentRequest(requestId: String): Unit =
         error("Payment requests are unavailable")
+
+    suspend fun cancelChatPaymentRequestForOwner(owner: SessionFence, requestId: String): Unit =
+        cancelChatPaymentRequest(requestId)
 
     /**
      * Held Kit → Kit transfers this account is a party to, newest first.
@@ -214,13 +298,25 @@ interface WalletRepository {
     suspend fun transferClaim(claimId: String): TransferClaim =
         error("Held transfers are unavailable")
 
+    suspend fun transferClaimForOwner(owner: SessionFence, claimId: String): TransferClaim =
+        transferClaim(claimId)
+
     /** Takes a held transfer. Once accepted the payment is final and cannot be reversed. */
     suspend fun acceptTransferClaim(claimId: String): TransferClaim =
         error("Held transfers are unavailable")
 
+    suspend fun acceptTransferClaimForOwner(owner: SessionFence, claimId: String): TransferClaim =
+        acceptTransferClaim(claimId)
+
     /** Sends a held transfer back, recording why so the conversation can say so. */
     suspend fun rejectTransferClaim(claimId: String, reason: String?): TransferClaim =
         error("Held transfers are unavailable")
+
+    suspend fun rejectTransferClaimForOwner(
+        owner: SessionFence,
+        claimId: String,
+        reason: String?,
+    ): TransferClaim = rejectTransferClaim(claimId, reason)
 
     /** Takes back a transfer the recipient has not accepted yet, with the sender's reason. */
     suspend fun reverseTransferClaim(
@@ -229,6 +325,13 @@ interface WalletRepository {
         paymentPin: String,
     ): TransferClaim =
         error("Held transfers are unavailable")
+
+    suspend fun reverseTransferClaimForOwner(
+        owner: SessionFence,
+        claimId: String,
+        reason: String?,
+        paymentPin: String,
+    ): TransferClaim = reverseTransferClaim(claimId, reason, paymentPin)
 
     suspend fun payBill(
         provider: BillProvider,
@@ -418,6 +521,11 @@ interface ChatRepository {
      */
     fun searchMessages(query: String, limit: Int = 50): List<MessageSearchHit> = emptyList()
     suspend fun openDirectConversation(contact: Contact): String
+
+    /** Resolves one direct route without allowing an account switch to redirect the operation. */
+    suspend fun openDirectConversationForOwner(owner: SessionFence, contact: Contact): String =
+        openDirectConversation(contact)
+
     suspend fun sendMessage(
         chatId: String,
         text: String,
@@ -484,6 +592,20 @@ interface ChatRepository {
     ): Unit = error("Owner-pinned secure messaging is unavailable")
 
     /**
+     * Durably captures one server-confirmed payment event under the caller's stable identity.
+     *
+     * This boundary intentionally does not wait for conversation hydration or E2EE readiness.
+     * The exact-login encrypted immediate outbox owns the event when this returns; its worker
+     * performs session establishment and delivery later without ever replaying the money move.
+     */
+    suspend fun capturePaymentEventForOwner(
+        owner: SessionFence,
+        chatId: String,
+        descriptor: String,
+        clientMessageId: String,
+    ): Unit = error("Durable owner-pinned payment events are unavailable")
+
+    /**
      * Announces a group payment, or one member's answer to one. Its own entry point because the
      * group wire has its own reserved prefix and its own validation, and neither of those is
      * reachable from a text composer.
@@ -493,6 +615,22 @@ interface ChatRepository {
         descriptor: String,
         onDurablyCommitted: (clientMessageId: String) -> Unit = {},
     ) = sendPaymentEvent(chatId, descriptor, onDurablyCommitted)
+
+    /** Owner-pinned counterpart of [capturePaymentEventForOwner] for `KITGRP1` events. */
+    suspend fun captureGroupPaymentEventForOwner(
+        owner: SessionFence,
+        chatId: String,
+        descriptor: String,
+        clientMessageId: String,
+    ): Unit = error("Durable owner-pinned group-payment events are unavailable")
+
+    /** Owner-pinned durable capture for a canonical `KITGREQ1` event. */
+    suspend fun captureGroupPaymentRequestEventForOwner(
+        owner: SessionFence,
+        chatId: String,
+        descriptor: String,
+        clientMessageId: String,
+    ): Unit = error("Durable owner-pinned group-payment-request events are unavailable")
 
     /** Sends a canonical collaborative-request descriptor through its independently validated path. */
     suspend fun sendGroupPaymentRequestEvent(

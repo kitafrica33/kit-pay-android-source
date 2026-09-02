@@ -130,6 +130,7 @@ internal class ImmediateSendIntentStore @Inject constructor(
                     ImmediateSendState.WAITING,
                     ImmediateSendState.PREPARING,
                     ImmediateSendState.IMPORTING,
+                    ImmediateSendState.FINANCIAL_PENDING,
                     -> Unit
                 }
             }
@@ -179,7 +180,8 @@ internal class ImmediateSendIntentStore @Inject constructor(
             if (
                 existing.state == ImmediateSendState.FAILED ||
                 existing.state == ImmediateSendState.PREPARING ||
-                existing.state == ImmediateSendState.IMPORTING
+                existing.state == ImmediateSendState.IMPORTING ||
+                existing.state == ImmediateSendState.FINANCIAL_PENDING
             ) return@withOwner false
             writeLocked(existing.copy(state = ImmediateSendState.WAITING))
             publishLocked()

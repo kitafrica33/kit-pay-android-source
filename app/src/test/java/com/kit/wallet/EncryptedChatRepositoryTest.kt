@@ -2804,6 +2804,67 @@ class EncryptedChatRepositoryTest {
         }
 
     @Test
+    fun `unconfirmed financial event is hidden and blocks only its own conversation`() = runTest {
+        val runtime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+            conversations += directConversation(CONVERSATION_TWO, "Emma", USER_THREE)
+        }
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val queue = ImmediateSendIntentStore(TestSecureMessagingStateStore(), authentication)
+        val directory = Files.createTempDirectory("kit-financial-pending-dispatch-test").toFile()
+        try {
+            val spool = ImmediateMediaSpool(directory)
+            val repository = repository(
+                runtime,
+                authenticationSessions = authentication,
+                immediateSends = queue,
+                immediateMediaSpool = spool,
+            )
+            runCurrent()
+            val payment = KitPaymentMessage(
+                action = KitPaymentAction.PAID,
+                referenceId = PAYMENT_REFERENCE_ID,
+                amountMinor = 2_500,
+                currencyCode = "UGX",
+                currencyScale = 2,
+                note = "Lunch",
+            )
+            queue.enqueue(
+                ImmediateSendIntent(
+                    id = payment.deterministicMessageId(),
+                    conversationId = CONVERSATION_ONE,
+                    kind = ImmediateSendKind.PAYMENT_EVENT,
+                    createdAtEpochMillis = 1L,
+                    state = ImmediateSendState.FINANCIAL_PENDING,
+                    text = payment.encode(),
+                ),
+            )
+            queue.enqueue(textIntent(OUTBOX_ID_TWO, CONVERSATION_ONE, "after payment", 2L))
+            queue.enqueue(textIntent(OUTBOX_ID_THREE, CONVERSATION_TWO, "other chat", 3L))
+            runCurrent()
+
+            assertFalse(
+                repository.conversation(CONVERSATION_ONE).value.any {
+                    it.id == payment.deterministicMessageId()
+                },
+            )
+            assertEquals(
+                ImmediateSendDispatchOutcome.COMMITTED,
+                ImmediateSendDispatcher(queue, spool, repository).dispatch(),
+            )
+            assertEquals(listOf("other chat"), runtime.sendAttempts.map { it.second })
+            assertEquals(
+                listOf(payment.deterministicMessageId(), OUTBOX_ID_TWO),
+                queue.items.value.map { it.id },
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `immediate dispatcher preserves per chat fifo while another chat continues`() = runTest {
         var failFirst = true
         val runtime = FakeRuntime(beforeSend = { text ->

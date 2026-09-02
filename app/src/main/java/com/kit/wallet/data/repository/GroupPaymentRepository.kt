@@ -5,10 +5,13 @@ import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.CreateGroupPaymentRequest
 import com.kit.wallet.data.remote.GroupPaymentResolutionRequest
 import com.kit.wallet.data.remote.KitWalletApi
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.ui.model.GroupPaymentShareStatus
 import com.kit.wallet.ui.model.GroupPaymentSummary
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 
 /**
  * Server-authoritative group payments.
@@ -30,9 +33,12 @@ class GroupPaymentRepository @Inject constructor(
     private val paymentAuthorizer: PaymentAuthorizer,
     private val walletSync: WalletSyncRepository,
 ) {
-    suspend fun groupPayment(groupPaymentId: String): GroupPaymentSummary {
+    suspend fun groupPayment(
+        groupPaymentId: String,
+        expectedOwner: SessionFence? = null,
+    ): GroupPaymentSummary {
         require(groupPaymentId.isNotBlank()) { "This payment has no id to verify" }
-        val payment = apiCalls.execute { api.groupPayment(groupPaymentId) }.toUiModel()
+        val payment = apiCalls.execute { api.groupPayment(groupPaymentId, expectedOwner) }.toUiModel()
             ?: error("The group payment state could not be read")
         check(payment.id.equals(groupPaymentId, ignoreCase = true)) {
             "The group payment state did not match this announcement"
@@ -52,6 +58,7 @@ class GroupPaymentRepository @Inject constructor(
         request: CreateGroupPaymentRequest,
         idempotencyKey: String,
         paymentPin: String,
+        expectedOwner: SessionFence? = null,
     ): GroupPaymentSummary {
         require(conversationId.isNotBlank()) { "This conversation cannot receive a payment" }
         require(idempotencyKey.isNotBlank()) { "This payment has no retry key" }
@@ -60,27 +67,42 @@ class GroupPaymentRepository @Inject constructor(
             GroupPaymentStepUpPolicy.sendIntent(request, conversationId),
             paymentPin,
             "Approve this group payment",
+            expectedOwner,
         )
         val payment = apiCalls.execute {
-            api.createGroupPayment(conversationId, idempotencyKey, stepUpToken, request)
+            api.createGroupPayment(
+                conversationId,
+                idempotencyKey,
+                stepUpToken,
+                request,
+                expectedOwner,
+            )
         }.toUiModel() ?: error("The group payment was sent, but its state could not be read")
-        walletSync.refresh()
+        withContext(NonCancellable) { runCatching { walletSync.refresh() } }
         return payment
     }
 
     /** Takes your own share. Never a step-up: this releases money already held for you. */
-    suspend fun acceptShare(groupPaymentId: String): GroupPaymentSummary =
-        settleShare(groupPaymentId, GroupPaymentShareStatus.ACCEPTED) {
-            apiCalls.execute { api.acceptGroupPaymentShare(groupPaymentId) }
+    suspend fun acceptShare(
+        groupPaymentId: String,
+        expectedOwner: SessionFence? = null,
+    ): GroupPaymentSummary =
+        settleShare(groupPaymentId, GroupPaymentShareStatus.ACCEPTED, expectedOwner) {
+            apiCalls.execute { api.acceptGroupPaymentShare(groupPaymentId, expectedOwner) }
         }
 
     /** Turns down your own share; it goes back to the sender, and nobody else's moves. */
-    suspend fun rejectShare(groupPaymentId: String, reason: String?): GroupPaymentSummary =
-        settleShare(groupPaymentId, GroupPaymentShareStatus.REJECTED) {
+    suspend fun rejectShare(
+        groupPaymentId: String,
+        reason: String?,
+        expectedOwner: SessionFence? = null,
+    ): GroupPaymentSummary =
+        settleShare(groupPaymentId, GroupPaymentShareStatus.REJECTED, expectedOwner) {
             apiCalls.execute {
                 api.rejectGroupPaymentShare(
                     groupPaymentId,
                     GroupPaymentResolutionRequest(reason.orNullIfBlank()),
+                    expectedOwner,
                 )
             }
         }
@@ -94,12 +116,13 @@ class GroupPaymentRepository @Inject constructor(
         groupPaymentId: String,
         reason: String?,
         paymentPin: String,
+        expectedOwner: SessionFence? = null,
     ): GroupPaymentSummary {
         require(paymentPin.isEmpty() || paymentPin.matches(Regex("^[0-9]{4}$"))) {
             "Enter the four-digit wallet PIN"
         }
         val canonicalReason = reason.orNullIfBlank()
-        val payment = groupPayment(groupPaymentId)
+        val payment = groupPayment(groupPaymentId, expectedOwner)
         check(payment.canReverseUnclaimed && payment.pendingCount > 0) {
             "There is nothing left to return on this payment."
         }
@@ -108,18 +131,20 @@ class GroupPaymentRepository @Inject constructor(
             GroupPaymentStepUpPolicy.reverseIntent(payment.id, canonicalReason),
             paymentPin,
             "Approve returning the unclaimed shares",
+            expectedOwner,
         )
         val resolved = apiCalls.execute {
             api.reverseUnclaimedGroupPayment(
                 payment.id,
                 stepUpToken,
                 GroupPaymentResolutionRequest(canonicalReason),
+                expectedOwner,
             )
         }.toUiModel() ?: error("The shares were returned, but the payment state could not be read")
-        walletSync.refresh()
         check(resolved.id.equals(payment.id, ignoreCase = true) && resolved.pendingCount == 0) {
             "Kit did not confirm returning the unclaimed shares. Refresh and try again."
         }
+        withContext(NonCancellable) { runCatching { walletSync.refresh() } }
         return resolved
     }
 
@@ -131,9 +156,10 @@ class GroupPaymentRepository @Inject constructor(
     private suspend fun settleShare(
         groupPaymentId: String,
         expected: GroupPaymentShareStatus,
+        expectedOwner: SessionFence?,
         operation: suspend () -> com.kit.wallet.data.remote.GroupPaymentDto,
     ): GroupPaymentSummary {
-        val payment = groupPayment(groupPaymentId)
+        val payment = groupPayment(groupPaymentId, expectedOwner)
         val share = payment.yourShare
         val allowed = when (expected) {
             GroupPaymentShareStatus.ACCEPTED -> share?.canAccept == true
@@ -145,13 +171,13 @@ class GroupPaymentRepository @Inject constructor(
         }
         val resolved = operation().toUiModel()
             ?: error("Your share was settled, but its new state could not be read")
-        walletSync.refresh()
         check(
             resolved.id.equals(payment.id, ignoreCase = true) &&
                 resolved.yourShare?.status == expected,
         ) {
             "Kit did not confirm your decision. Refresh and try again."
         }
+        withContext(NonCancellable) { runCatching { walletSync.refresh() } }
         return resolved
     }
 

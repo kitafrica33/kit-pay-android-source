@@ -156,6 +156,12 @@ internal enum class ImmediateSendState {
      * cache entry and advances it, or leaves a visible terminal failure; it never loses the row.
      */
     IMPORTING,
+
+    /**
+     * A financial event staged before its server mutation. Only exact authoritative recovery may
+     * advance it to [WAITING], so the ordinary dispatcher can never publish an unconfirmed event.
+     */
+    FINANCIAL_PENDING,
 }
 
 /** A retained plaintext preparation vanished before the background cipher could adopt it. */
@@ -430,6 +436,30 @@ internal data class ImmediateSendIntent(
                 kind in MEDIA_KINDS,
         ) {
             "Only queued media can be importing or preparing"
+        }
+        if (state == ImmediateSendState.FINANCIAL_PENDING) {
+            require(
+                when (kind) {
+                    ImmediateSendKind.PAYMENT_EVENT ->
+                        KitPaymentMessage.parse(text)?.action in setOf(
+                            KitPaymentAction.PAID,
+                            KitPaymentAction.CANCELLED,
+                            KitPaymentAction.ACCEPTED,
+                            KitPaymentAction.REJECTED,
+                            KitPaymentAction.REVERSED,
+                        )
+                    ImmediateSendKind.GROUP_PAYMENT_EVENT ->
+                        KitGroupPaymentMessage.parse(text)?.action in setOf(
+                            KitGroupPaymentAction.ACCEPTED,
+                            KitGroupPaymentAction.REJECTED,
+                            KitGroupPaymentAction.RETURNED,
+                        )
+                    ImmediateSendKind.GROUP_PAYMENT_REQUEST_EVENT ->
+                        com.kit.wallet.data.remote.KitGroupPaymentRequestMessage.parse(text)?.action ==
+                            com.kit.wallet.data.remote.KitGroupPaymentRequestAction.CANCELLED
+                    else -> false
+                },
+            ) { "Only exactly recoverable financial outcomes may be staged" }
         }
     }
 

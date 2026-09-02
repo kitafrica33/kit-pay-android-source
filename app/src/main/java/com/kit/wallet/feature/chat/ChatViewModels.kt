@@ -6,6 +6,8 @@ import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.messaging.KitChatMediaLimits
 import com.kit.wallet.data.messaging.GroupPaymentAudience
 import com.kit.wallet.data.messaging.GroupPaymentSplitMode
+import com.kit.wallet.data.messaging.FinancialCreationReceiptCoordinator
+import com.kit.wallet.data.messaging.FinancialCreationReceiptPhase
 import com.kit.wallet.data.messaging.KitEditMessage
 import com.kit.wallet.data.messaging.KitGroupPaymentAction
 import com.kit.wallet.data.messaging.KitGroupPaymentMessage
@@ -14,6 +16,7 @@ import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.KitReactionMessage
 import com.kit.wallet.data.messaging.KitUserAuthoredTextPolicy
 import com.kit.wallet.data.messaging.MessagingRichMediaCapability
+import com.kit.wallet.data.messaging.PendingFinancialEventCoordinator
 import com.kit.wallet.data.messaging.ScheduledSend
 import com.kit.wallet.data.messaging.ScheduledSendDispatcher
 import com.kit.wallet.data.messaging.ScheduledSendKind
@@ -344,6 +347,7 @@ internal suspend fun executeGroupPaymentRequestCreation(
     amountMinor: Long,
     currencyScale: Int,
     note: String?,
+    expectedOwner: com.kit.wallet.data.session.SessionFence? = null,
 ): GroupPaymentRequestDto = try {
     repository.create(
         conversationId = conversationId,
@@ -361,6 +365,7 @@ internal suspend fun executeGroupPaymentRequestCreation(
                 note,
             )
         },
+        expectedOwner = expectedOwner,
     )
 } catch (error: DefinitiveFinancialMutationRejection) {
     retryKeys.complete(
@@ -470,6 +475,7 @@ internal suspend fun executeGroupPaymentRequestContribution(
     amountMinor: Long,
     amount: String,
     paymentPin: String,
+    expectedOwner: com.kit.wallet.data.session.SessionFence? = null,
 ): GroupPaymentRequestContributionResolution {
     // Exact preflight can reconcile a changed request without ever asking for the key. Prove the
     // user's current intent first so that outcome cannot erase a different ambiguous operation.
@@ -483,6 +489,7 @@ internal suspend fun executeGroupPaymentRequestContribution(
                 retryKeys.keyFor(requestId, sourceWalletId, amountMinor)
             },
             paymentPin = paymentPin,
+            expectedOwner = expectedOwner,
         )
     } catch (error: DefinitiveFinancialMutationRejection) {
         retryKeys.reconcile(requestId)
@@ -642,6 +649,8 @@ class ConversationViewModel @Inject internal constructor(
     private val scheduledDispatcher: ScheduledSendDispatcher? = null,
     private val clock: Clock = Clock.systemUTC(),
     private val sessions: SessionStore? = null,
+    private val pendingFinancialEvents: PendingFinancialEventCoordinator? = null,
+    private val financialCreationReceipts: FinancialCreationReceiptCoordinator? = null,
 ) : ViewModel() {
 
     private val groupRequestCreationRetryKeys =
@@ -1037,9 +1046,6 @@ class ConversationViewModel @Inject internal constructor(
     /** Expiries this session has already written into the conversation, to avoid a second line. */
     private val announcedExpiries = mutableSetOf<String>()
 
-    /** Group-payment answers this session has already written, keyed by payment, act and actor. */
-    private val announcedGroupOutcomes = mutableSetOf<String>()
-
     // Encrypted composer draft restored once per conversation entry; consumed by the screen.
     private val mutableRestoredDraft = MutableStateFlow<String?>(null)
     val restoredDraft = mutableRestoredDraft.asStateFlow()
@@ -1256,6 +1262,166 @@ class ConversationViewModel @Inject internal constructor(
 
     fun clearTopUpRequired() {
         mutableTopUpRequired.value = null
+    }
+
+    /**
+     * Hands one exact server-owned event to the encrypted immediate outbox.
+     *
+     * Production always supplies [sessions], so this path is owner-pinned and returns only after
+     * the deterministic intent is durable. The fallback keeps isolated repository test doubles
+     * source-compatible; it is not used by the injected application graph.
+     */
+    private suspend fun capturePaymentEvent(
+        owner: com.kit.wallet.data.session.SessionFence?,
+        conversationId: String,
+        event: KitPaymentMessage,
+    ): Boolean {
+        var durablyCommitted = false
+        return try {
+            val descriptor = event.encode()
+            check(KitPaymentMessage.parse(descriptor) == event) {
+                "Kit Pay could not validate this payment event"
+            }
+            if (owner == null) {
+                chatRepo.sendPaymentEvent(conversationId, descriptor) { durablyCommitted = true }
+            } else {
+                chatRepo.capturePaymentEventForOwner(
+                    owner = owner,
+                    chatId = conversationId,
+                    descriptor = descriptor,
+                    clientMessageId = event.deterministicMessageId(),
+                )
+            }
+            true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            durablyCommitted
+        }
+    }
+
+    private suspend fun captureGroupPaymentEvent(
+        owner: com.kit.wallet.data.session.SessionFence?,
+        conversationId: String,
+        event: KitGroupPaymentMessage,
+        clientMessageId: String,
+    ): Boolean {
+        var durablyCommitted = false
+        return try {
+            val descriptor = event.encode()
+            check(KitGroupPaymentMessage.parse(descriptor) == event) {
+                "Kit Pay could not validate this group payment event"
+            }
+            if (owner == null) {
+                chatRepo.sendGroupPaymentEvent(conversationId, descriptor) {
+                    durablyCommitted = true
+                }
+            } else {
+                chatRepo.captureGroupPaymentEventForOwner(
+                    owner = owner,
+                    chatId = conversationId,
+                    descriptor = descriptor,
+                    clientMessageId = clientMessageId,
+                )
+            }
+            true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            durablyCommitted
+        }
+    }
+
+    private suspend fun captureGroupPaymentRequestEvent(
+        owner: com.kit.wallet.data.session.SessionFence?,
+        conversationId: String,
+        event: KitGroupPaymentRequestMessage,
+    ): Boolean {
+        var durablyCommitted = false
+        return try {
+            val descriptor = event.encode()
+            check(KitGroupPaymentRequestMessage.parse(descriptor) == event) {
+                "Kit Pay could not validate this group payment request event"
+            }
+            if (owner == null) {
+                chatRepo.sendGroupPaymentRequestEvent(conversationId, descriptor) {
+                    durablyCommitted = true
+                }
+            } else {
+                chatRepo.captureGroupPaymentRequestEventForOwner(
+                    owner = owner,
+                    chatId = conversationId,
+                    descriptor = descriptor,
+                    clientMessageId = event.deterministicMessageId(),
+                )
+            }
+            true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            durablyCommitted
+        }
+    }
+
+    private suspend fun stagePaymentEvent(
+        owner: com.kit.wallet.data.session.SessionFence?,
+        conversationId: String,
+        event: KitPaymentMessage,
+    ): String? = if (owner != null && pendingFinancialEvents != null) {
+        pendingFinancialEvents.stagePaymentEvent(owner, conversationId, event)
+    } else {
+        null
+    }
+
+    private suspend fun stageGroupPaymentEvent(
+        owner: com.kit.wallet.data.session.SessionFence?,
+        conversationId: String,
+        event: KitGroupPaymentMessage,
+        clientMessageId: String,
+    ): String? = if (owner != null && pendingFinancialEvents != null) {
+        pendingFinancialEvents.stageGroupPaymentEvent(
+            owner,
+            conversationId,
+            event,
+            clientMessageId,
+        )
+    } else {
+        null
+    }
+
+    private suspend fun stageGroupPaymentRequestEvent(
+        owner: com.kit.wallet.data.session.SessionFence?,
+        conversationId: String,
+        event: KitGroupPaymentRequestMessage,
+    ): String? = if (owner != null && pendingFinancialEvents != null) {
+        pendingFinancialEvents.stageGroupPaymentRequestEvent(owner, conversationId, event)
+    } else {
+        null
+    }
+
+    private suspend fun commitStagedEvent(
+        owner: com.kit.wallet.data.session.SessionFence?,
+        clientMessageId: String?,
+        fallback: suspend () -> Boolean,
+    ): Boolean = if (owner != null && clientMessageId != null && pendingFinancialEvents != null) {
+        try {
+            pendingFinancialEvents.commit(owner, clientMessageId)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
+        }
+    } else {
+        fallback()
+    }
+
+    private suspend fun releaseStagedEvent(
+        owner: com.kit.wallet.data.session.SessionFence?,
+        clientMessageId: String?,
+    ) {
+        if (owner != null && clientMessageId != null && pendingFinancialEvents != null) {
+            pendingFinancialEvents.releaseForRecovery(owner, clientMessageId)
+        }
     }
 
     /** Uses the authenticated request descriptor and current wallet row for the preflight offer. */
@@ -1680,6 +1846,7 @@ class ConversationViewModel @Inject internal constructor(
     fun sendPaymentRequest(amountMinor: Long, note: String?, onSent: () -> Unit = {}) {
         val selectedChat = chat.value ?: return
         val peerUserId = selectedChat.peerUserId
+        val operationOwner = sessions?.current()?.fence()
         if (!historyAvailable.value || mutableSending.value) return
         if (amountMinor <= 0) {
             mutableError.value = "Enter an amount to request"
@@ -1694,39 +1861,94 @@ class ConversationViewModel @Inject internal constructor(
             mutableSending.value = true
             mutableError.value = null
             var durablyShared = false
+            var recoveryReceipt: com.kit.wallet.data.messaging.FinancialCreationReceipt? = null
             try {
                 // A request the server already confirmed for these exact details is reused, so a
                 // create-success/share-failure retry never mints a second financial request. The
                 // request UUID stays the stable identity of the eventual card, matching iOS.
-                val retained = unsharedPaymentRequest?.takeIf {
-                    it.chatId == selectedChat.id && it.peerUserId == peerUserId &&
-                        it.amountMinor == amountMinor && it.note == normalizedNote
-                }?.request
-                val created = retained
-                    ?: walletRepo.createChatPaymentRequest(peerUserId, amountMinor, normalizedNote)
-                        .also { confirmed ->
-                            unsharedPaymentRequest = UnsharedPaymentRequest(
-                                chatId = selectedChat.id,
-                                peerUserId = peerUserId,
-                                amountMinor = amountMinor,
-                                note = normalizedNote,
-                                request = confirmed,
-                            )
-                        }
-                val descriptor = KitPaymentMessage(
-                    action = KitPaymentAction.REQUEST,
-                    referenceId = created.id,
-                    amountMinor = created.amountMinor,
-                    currencyCode = created.currencyCode,
-                    currencyScale = created.currencyScale,
-                    note = created.note?.takeIf(String::isNotBlank),
-                ).encode()
-                chatRepo.sendPaymentEvent(selectedChat.id, descriptor) { durablyShared = true }
+                if (operationOwner != null && financialCreationReceipts != null) {
+                    val source = walletRepo.spendingSourceForOwner(operationOwner)
+                    val receipt = financialCreationReceipts.preparePaymentRequest(
+                        owner = operationOwner,
+                        conversationId = selectedChat.id,
+                        destinationWalletId = source.walletId,
+                        peerUserId = peerUserId,
+                        amountMinor = amountMinor,
+                        currencyCode = source.currencyCode,
+                        currencyScale = source.currencyScale,
+                        note = normalizedNote,
+                    )
+                    recoveryReceipt = receipt
+                    check(receipt.phase == FinancialCreationReceiptPhase.PREPARED) {
+                        "This payment request is still being recovered"
+                    }
+                    financialCreationReceipts.markSubmitted(operationOwner, receipt.id)
+                    val created = walletRepo.createChatPaymentRequestForOwner(
+                        owner = operationOwner,
+                        peerUserId = peerUserId,
+                        amountMinor = amountMinor,
+                        note = normalizedNote,
+                        idempotencyKey = receipt.idempotencyKey,
+                    )
+                    val settled = withContext(NonCancellable) {
+                        financialCreationReceipts.bindPaymentRequest(
+                            operationOwner,
+                            receipt,
+                            created,
+                        )
+                    }
+                    withContext(NonCancellable) {
+                        financialCreationReceipts.handoff(operationOwner, settled)
+                    }
+                    durablyShared = true
+                } else {
+                    val retained = unsharedPaymentRequest?.takeIf {
+                        it.chatId == selectedChat.id && it.peerUserId == peerUserId &&
+                            it.amountMinor == amountMinor && it.note == normalizedNote
+                    }?.request
+                    val created = retained
+                        ?: walletRepo.createChatPaymentRequest(peerUserId, amountMinor, normalizedNote)
+                            .also { confirmed ->
+                                unsharedPaymentRequest = UnsharedPaymentRequest(
+                                    chatId = selectedChat.id,
+                                    peerUserId = peerUserId,
+                                    amountMinor = amountMinor,
+                                    note = normalizedNote,
+                                    request = confirmed,
+                                )
+                            }
+                    val event = KitPaymentMessage(
+                        action = KitPaymentAction.REQUEST,
+                        referenceId = created.id,
+                        amountMinor = created.amountMinor,
+                        currencyCode = created.currencyCode,
+                        currencyScale = created.currencyScale,
+                        note = created.note
+                            ?.takeIf(String::isNotBlank)
+                            ?.take(KitPaymentMessage.MAX_NOTE_LENGTH),
+                    )
+                    durablyShared = withContext(NonCancellable) {
+                        capturePaymentEvent(operationOwner, selectedChat.id, event)
+                    }
+                }
+                check(durablyShared) { "The payment request could not be saved to this chat" }
                 unsharedPaymentRequest = null
                 onSent()
             } catch (cancelled: CancellationException) {
+                recoveryReceipt?.let { receipt ->
+                    withContext(NonCancellable) {
+                        financialCreationReceipts?.discardPrepared(operationOwner!!, receipt.id)
+                    }
+                }
                 throw cancelled
             } catch (error: Exception) {
+                recoveryReceipt?.let { receipt ->
+                    withContext(NonCancellable) {
+                        runCatching {
+                            financialCreationReceipts?.discardPrepared(operationOwner!!, receipt.id)
+                        }
+                    }
+                }
                 if (durablyShared) {
                     // The encrypted card is committed to the outbox, appears in the conversation
                     // as a pending bubble, and owns replay from here. Close the composer like a
@@ -1746,6 +1968,7 @@ class ConversationViewModel @Inject internal constructor(
     /** Pays a request received in this conversation, then confirms it in-chat once debited. */
     fun payPaymentRequest(message: Message, paymentPin: String, onPaid: () -> Unit = {}) {
         val selectedChat = chat.value ?: return
+        val operationOwner = sessions?.current()?.fence()
         val descriptor = message.mediaDescriptor?.let(KitPaymentMessage::parse) ?: return
         if (
             !historyAvailable.value || mutableSending.value ||
@@ -1754,23 +1977,42 @@ class ConversationViewModel @Inject internal constructor(
         viewModelScope.launch {
             mutableSending.value = true
             mutableError.value = null
+            var stagedId: String? = null
             try {
-                walletRepo.payChatPaymentRequest(
-                    requestId = descriptor.referenceId,
-                    amountMinor = descriptor.amountMinor,
-                    paymentPin = paymentPin,
-                )
-                // The paid confirmation is best-effort: the debit already completed above.
-                runCatching {
-                    chatRepo.sendPaymentEvent(
-                        selectedChat.id,
-                        descriptor.copy(action = KitPaymentAction.PAID).encode(),
+                val event = descriptor.copy(action = KitPaymentAction.PAID)
+                stagedId = stagePaymentEvent(operationOwner, selectedChat.id, event)
+                if (operationOwner == null) {
+                    walletRepo.payChatPaymentRequest(
+                        descriptor.referenceId,
+                        descriptor.amountMinor,
+                        paymentPin,
+                    )
+                } else {
+                    walletRepo.payChatPaymentRequestForOwner(
+                        operationOwner,
+                        descriptor.referenceId,
+                        descriptor.amountMinor,
+                        paymentPin,
                     )
                 }
+                val receiptQueued = withContext(NonCancellable) {
+                    commitStagedEvent(operationOwner, stagedId) {
+                        capturePaymentEvent(operationOwner, selectedChat.id, event)
+                    }
+                }
                 onPaid()
+                if (!receiptQueued) {
+                    mutableError.value = PAYMENT_CHAT_RECEIPT_WARNING
+                }
             } catch (cancelled: CancellationException) {
+                withContext(NonCancellable) {
+                    runCatching { releaseStagedEvent(operationOwner, stagedId) }
+                }
                 throw cancelled
             } catch (error: Exception) {
+                withContext(NonCancellable) {
+                    runCatching { releaseStagedEvent(operationOwner, stagedId) }
+                }
                 if (error.isKitInsufficientFundsError()) {
                     try {
                         // The request payment raced a balance change. Re-read the server-owned
@@ -1835,6 +2077,7 @@ class ConversationViewModel @Inject internal constructor(
     /** Withdraws a payment request this account sent, and records the withdrawal in-chat. */
     fun cancelPaymentRequest(message: Message, onDone: () -> Unit = {}) {
         val selectedChat = chat.value ?: return
+        val operationOwner = sessions?.current()?.fence()
         val descriptor = message.mediaDescriptor?.let(KitPaymentMessage::parse) ?: return
         if (
             !historyAvailable.value || mutableSending.value ||
@@ -1843,19 +2086,36 @@ class ConversationViewModel @Inject internal constructor(
         viewModelScope.launch {
             mutableSending.value = true
             mutableError.value = null
+            var stagedId: String? = null
             try {
-                walletRepo.cancelChatPaymentRequest(descriptor.referenceId)
-                // The request is already withdrawn server-side; saying so in chat is best-effort.
-                runCatching {
-                    chatRepo.sendPaymentEvent(
-                        selectedChat.id,
-                        descriptor.copy(action = KitPaymentAction.CANCELLED).encode(),
+                val event = descriptor.copy(action = KitPaymentAction.CANCELLED)
+                stagedId = stagePaymentEvent(operationOwner, selectedChat.id, event)
+                if (operationOwner == null) {
+                    walletRepo.cancelChatPaymentRequest(descriptor.referenceId)
+                } else {
+                    walletRepo.cancelChatPaymentRequestForOwner(
+                        operationOwner,
+                        descriptor.referenceId,
                     )
                 }
+                val receiptQueued = withContext(NonCancellable) {
+                    commitStagedEvent(operationOwner, stagedId) {
+                        capturePaymentEvent(operationOwner, selectedChat.id, event)
+                    }
+                }
                 onDone()
+                if (!receiptQueued) {
+                    mutableError.value = PAYMENT_CHAT_RECEIPT_WARNING
+                }
             } catch (cancelled: CancellationException) {
+                withContext(NonCancellable) {
+                    runCatching { releaseStagedEvent(operationOwner, stagedId) }
+                }
                 throw cancelled
             } catch (error: Exception) {
+                withContext(NonCancellable) {
+                    runCatching { releaseStagedEvent(operationOwner, stagedId) }
+                }
                 mutableError.value = error.message ?: "The request could not be cancelled"
             } finally {
                 mutableSending.value = false
@@ -1876,8 +2136,9 @@ class ConversationViewModel @Inject internal constructor(
         reason = null,
         claimableTransfersEnabled = claimableTransfersEnabled,
         onDone = onDone,
-    ) { claimId ->
-        walletRepo.acceptTransferClaim(claimId)
+    ) { claimId, owner ->
+        if (owner == null) walletRepo.acceptTransferClaim(claimId)
+        else walletRepo.acceptTransferClaimForOwner(owner, claimId)
     }
 
     /** Sends a held transfer back, recording the recipient's reason in the conversation. */
@@ -1896,8 +2157,9 @@ class ConversationViewModel @Inject internal constructor(
             reason = canonicalReason,
             claimableTransfersEnabled = claimableTransfersEnabled,
             onDone = onDone,
-        ) { claimId ->
-            walletRepo.rejectTransferClaim(claimId, canonicalReason)
+        ) { claimId, owner ->
+            if (owner == null) walletRepo.rejectTransferClaim(claimId, canonicalReason)
+            else walletRepo.rejectTransferClaimForOwner(owner, claimId, canonicalReason)
         }
     }
 
@@ -1918,8 +2180,17 @@ class ConversationViewModel @Inject internal constructor(
             reason = canonicalReason,
             claimableTransfersEnabled = claimableTransfersEnabled,
             onDone = onDone,
-        ) { claimId ->
-            walletRepo.reverseTransferClaim(claimId, canonicalReason, paymentPin)
+        ) { claimId, owner ->
+            if (owner == null) {
+                walletRepo.reverseTransferClaim(claimId, canonicalReason, paymentPin)
+            } else {
+                walletRepo.reverseTransferClaimForOwner(
+                    owner,
+                    claimId,
+                    canonicalReason,
+                    paymentPin,
+                )
+            }
         }
     }
 
@@ -1931,7 +2202,7 @@ class ConversationViewModel @Inject internal constructor(
         reason: String?,
         claimableTransfersEnabled: Boolean,
         onDone: () -> Unit,
-        settle: suspend (String) -> TransferClaim,
+        settle: suspend (String, com.kit.wallet.data.session.SessionFence?) -> TransferClaim,
     ) {
         val selectedChat = chat.value ?: return
         val claimId = message.paymentReferenceId?.takeIf(String::isNotBlank) ?: return
@@ -1944,17 +2215,23 @@ class ConversationViewModel @Inject internal constructor(
             return
         }
         if (mutableSending.value) return
+        val operationOwner = sessions?.current()?.fence()
         // Claim the in-flight marker before the first suspension so two fast taps cannot race.
         mutableSending.value = true
         mutableError.value = null
         viewModelScope.launch {
             var settlementAttempted = false
+            var stagedId: String? = null
             try {
                 check(walletRepo.refreshClaimableTransfersCapability()) {
                     "Transfer decisions are not available right now"
                 }
                 // A failed or malformed fresh read never falls back to the polled claim map.
-                val authoritative = walletRepo.transferClaim(claimId)
+                val authoritative = if (operationOwner == null) {
+                    walletRepo.transferClaim(claimId)
+                } else {
+                    walletRepo.transferClaimForOwner(operationOwner, claimId)
+                }
                 mutableTransferClaims.value += authoritative.id to authoritative
                 check(
                     TransferClaimResolutionPolicy.allows(
@@ -1969,25 +2246,46 @@ class ConversationViewModel @Inject internal constructor(
                 check(walletRepo.currentAccountId.equals(binding.currentUserId, ignoreCase = true)) {
                     "The signed-in account changed while approving this payment"
                 }
+                val event = transferEvent(authoritative, outcome, reason)
+                stagedId = stagePaymentEvent(operationOwner, selectedChat.id, event)
                 settlementAttempted = true
-                val settled = settle(authoritative.id)
+                val settled = settle(authoritative.id, operationOwner)
                 check(settled.id.equals(authoritative.id, ignoreCase = true)) {
                     "The server returned a different transfer"
                 }
                 check(settled.status == expectedStatus) {
                     "The server did not confirm this transfer update"
                 }
+                check(transferEvent(settled, outcome, reason) == event) {
+                    "The server changed this transfer while settling it"
+                }
                 mutableTransferClaims.value += settled.id to settled
-                postTransferEvent(selectedChat.id, settled, outcome, reason)
+                val receiptQueued = withContext(NonCancellable) {
+                    commitStagedEvent(operationOwner, stagedId) {
+                        capturePaymentEvent(operationOwner, selectedChat.id, event)
+                    }
+                }
                 onDone()
+                if (!receiptQueued) {
+                    mutableError.value = PAYMENT_CHAT_RECEIPT_WARNING
+                }
             } catch (cancelled: CancellationException) {
+                withContext(NonCancellable) {
+                    runCatching { releaseStagedEvent(operationOwner, stagedId) }
+                }
                 throw cancelled
             } catch (error: Exception) {
+                withContext(NonCancellable) {
+                    runCatching { releaseStagedEvent(operationOwner, stagedId) }
+                }
                 mutableError.value = error.message ?: "This transfer could not be updated"
                 if (settlementAttempted) {
                     // A race can settle between the preflight GET and POST. Re-read this exact
                     // claim; never replace the fresh result with a cached or broad-list fallback.
-                    runCatching { walletRepo.transferClaim(claimId) }
+                    runCatching {
+                        if (operationOwner == null) walletRepo.transferClaim(claimId)
+                        else walletRepo.transferClaimForOwner(operationOwner, claimId)
+                    }
                         .getOrNull()
                         ?.let { refreshed ->
                             mutableTransferClaims.value += refreshed.id to refreshed
@@ -2002,17 +2300,26 @@ class ConversationViewModel @Inject internal constructor(
     /**
      * Writes the outcome of a held transfer into the conversation, reason and all.
      *
-     * Best-effort on purpose: the money has already moved, and the card's own state comes from
-     * the wallet API. A failure here costs the written record of why, not the truth of what
-     * happened — so it must not be reported as a failed settlement.
+     * The money has already moved, so this exact event is owner-pinned and durably captured under
+     * a deterministic ID before the action closes. Network and E2EE preparation remain background
+     * work owned by the immediate outbox; a failure here is reported as a receipt warning, never
+     * as a failed settlement.
      */
     private suspend fun postTransferEvent(
+        owner: com.kit.wallet.data.session.SessionFence?,
         chatId: String,
         claim: TransferClaim,
         outcome: KitPaymentAction,
         reason: String?,
-    ) {
-        val descriptor = KitPaymentMessage(
+    ): Boolean {
+        return capturePaymentEvent(owner, chatId, transferEvent(claim, outcome, reason))
+    }
+
+    private fun transferEvent(
+        claim: TransferClaim,
+        outcome: KitPaymentAction,
+        reason: String?,
+    ): KitPaymentMessage = KitPaymentMessage(
             action = outcome,
             referenceId = claim.id,
             amountMinor = claim.amountMinor,
@@ -2024,16 +2331,7 @@ class ConversationViewModel @Inject internal constructor(
             reason = reason?.trim()
                 ?.takeIf(String::isNotBlank)
                 ?.take(KitPaymentMessage.MAX_REASON_LENGTH),
-        ).encode()
-        if (KitPaymentMessage.parse(descriptor) == null) return
-        try {
-            chatRepo.sendPaymentEvent(chatId, descriptor)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            // Swallowed on purpose; see the note above.
-        }
-    }
+        )
 
     // MARK: - Group payments
 
@@ -2068,11 +2366,17 @@ class ConversationViewModel @Inject internal constructor(
             return false
         }
         if (!historyAvailable.value || mutableSending.value) return false
+        val operationOwner = sessions?.current()?.fence()
         mutableSending.value = true
         mutableError.value = null
         viewModelScope.launch {
+            var recoveryReceipt: com.kit.wallet.data.messaging.FinancialCreationReceipt? = null
             try {
-                val source = walletRepo.spendingSource()
+                val source = if (operationOwner == null) {
+                    walletRepo.spendingSource()
+                } else {
+                    walletRepo.spendingSourceForOwner(operationOwner)
+                }
                 val drafted = GroupPaymentDraftPolicy.draft(
                     sourceWalletId = source.walletId,
                     splitMode = splitMode,
@@ -2091,27 +2395,75 @@ class ConversationViewModel @Inject internal constructor(
                         return@launch
                     }
                 }
+                if (operationOwner != null && financialCreationReceipts != null) {
+                    recoveryReceipt = financialCreationReceipts.prepareGroupPayment(
+                        operationOwner,
+                        selectedChat.id,
+                        idempotencyKey,
+                        request,
+                    )
+                    check(recoveryReceipt.phase == FinancialCreationReceiptPhase.PREPARED) {
+                        "This group payment is still being recovered"
+                    }
+                    financialCreationReceipts.markSubmitted(operationOwner, recoveryReceipt.id)
+                }
                 val payment = repo.send(
                     conversationId = selectedChat.id,
                     request = request,
                     idempotencyKey = idempotencyKey,
                     paymentPin = paymentPin,
+                    expectedOwner = operationOwner,
                 )
                 storeGroupPayment(payment)
-                // The server has confirmed the payment and its authoritative state is already in
-                // the local projection. Close the composer now: the encrypted announcement below
-                // is deliberately best-effort and must never leave a successful payment looking
-                // as though it is still being submitted.
-                onSent()
                 // The roster in the descriptor is the server's answer, not the composer's: for
                 // "everybody" this device never chose the members in the first place.
                 val roster = payment.recipients.mapNotNull { it.userId }
-                KitGroupPaymentMessage.announcing(payment, roster)?.encode()?.let { descriptor ->
-                    runCatching { chatRepo.sendGroupPaymentEvent(selectedChat.id, descriptor) }
+                val event = checkNotNull(KitGroupPaymentMessage.announcing(payment, roster)) {
+                    "Kit returned a group payment that cannot be announced"
+                }
+                val receiptQueued = if (
+                    operationOwner != null && recoveryReceipt != null &&
+                    financialCreationReceipts != null
+                ) {
+                    val settled = withContext(NonCancellable) {
+                        financialCreationReceipts.bindGroupPayment(
+                            operationOwner,
+                            recoveryReceipt,
+                            payment,
+                        )
+                    }
+                    withContext(NonCancellable) {
+                        runCatching {
+                            financialCreationReceipts.handoff(operationOwner, settled)
+                        }.isSuccess
+                    }
+                } else withContext(NonCancellable) {
+                    captureGroupPaymentEvent(
+                        operationOwner,
+                        selectedChat.id,
+                        event,
+                        event.announcementMessageId(),
+                    )
+                }
+                onSent()
+                if (!receiptQueued) {
+                    mutableError.value = PAYMENT_CHAT_RECEIPT_WARNING
                 }
             } catch (cancelled: CancellationException) {
+                recoveryReceipt?.let { receipt ->
+                    withContext(NonCancellable) {
+                        financialCreationReceipts?.discardPrepared(operationOwner!!, receipt.id)
+                    }
+                }
                 throw cancelled
             } catch (error: Exception) {
+                recoveryReceipt?.let { receipt ->
+                    withContext(NonCancellable) {
+                        runCatching {
+                            financialCreationReceipts?.discardPrepared(operationOwner!!, receipt.id)
+                        }
+                    }
+                }
                 mutableError.value = error.message ?: "This group payment could not be sent"
             } finally {
                 mutableSending.value = false
@@ -2130,7 +2482,7 @@ class ConversationViewModel @Inject internal constructor(
         outcome = KitGroupPaymentAction.ACCEPTED,
         groupPaymentsEnabled = groupPaymentsEnabled,
         onDone = onDone,
-    ) { repo, paymentId -> repo.acceptShare(paymentId) }
+    ) { repo, paymentId, owner -> repo.acceptShare(paymentId, owner) }
 
     /** Turns this account's own share down; it goes back to the sender and nobody else's moves. */
     fun rejectGroupPaymentShare(
@@ -2145,7 +2497,7 @@ class ConversationViewModel @Inject internal constructor(
             outcome = KitGroupPaymentAction.REJECTED,
             groupPaymentsEnabled = groupPaymentsEnabled,
             onDone = onDone,
-        ) { repo, paymentId -> repo.rejectShare(paymentId, canonicalReason) }
+        ) { repo, paymentId, owner -> repo.rejectShare(paymentId, canonicalReason, owner) }
     }
 
     /** The sender pulls back every share nobody has taken, after approving that one payment. */
@@ -2162,7 +2514,9 @@ class ConversationViewModel @Inject internal constructor(
             outcome = KitGroupPaymentAction.RETURNED,
             groupPaymentsEnabled = groupPaymentsEnabled,
             onDone = onDone,
-        ) { repo, paymentId -> repo.reverseUnclaimed(paymentId, canonicalReason, paymentPin) }
+        ) { repo, paymentId, owner ->
+            repo.reverseUnclaimed(paymentId, canonicalReason, paymentPin, owner)
+        }
     }
 
     /**
@@ -2177,7 +2531,11 @@ class ConversationViewModel @Inject internal constructor(
         outcome: KitGroupPaymentAction,
         groupPaymentsEnabled: Boolean,
         onDone: () -> Unit,
-        settle: suspend (GroupPaymentRepository, String) -> GroupPaymentSummary,
+        settle: suspend (
+            GroupPaymentRepository,
+            String,
+            com.kit.wallet.data.session.SessionFence?,
+        ) -> GroupPaymentSummary,
     ) {
         val selectedChat = chat.value ?: return
         val descriptor = message.groupPaymentDescriptor() ?: return
@@ -2188,59 +2546,65 @@ class ConversationViewModel @Inject internal constructor(
         }
         if (!historyAvailable.value || mutableSending.value) return
         val actor = walletRepo.currentAccountId?.takeIf(String::isNotBlank) ?: return
+        val operationOwner = sessions?.current()?.fence()
         // Claim the in-flight marker before the first suspension so two fast taps cannot settle
         // the same share twice.
         mutableSending.value = true
         mutableError.value = null
         viewModelScope.launch {
+            var stagedId: String? = null
             try {
-                val settled = settle(repo, descriptor.groupPaymentId)
+                val event = checkNotNull(
+                    KitGroupPaymentMessage.outcome(outcome, descriptor.groupPaymentId),
+                ) { "This group payment outcome cannot be announced" }
+                val eventId = KitGroupPaymentMessage.outcomeMessageId(
+                    descriptor.groupPaymentId,
+                    outcome,
+                    actor,
+                )
+                stagedId = stageGroupPaymentEvent(
+                    operationOwner,
+                    selectedChat.id,
+                    event,
+                    eventId,
+                )
+                val settled = settle(repo, descriptor.groupPaymentId, operationOwner)
                 storeGroupPayment(settled)
                 check(walletRepo.currentAccountId.equals(actor, ignoreCase = true)) {
                     "The signed-in account changed while answering this payment"
                 }
-                postGroupPaymentEvent(selectedChat.id, descriptor.groupPaymentId, outcome, actor)
+                val receiptQueued = withContext(NonCancellable) {
+                    commitStagedEvent(operationOwner, stagedId) {
+                        captureGroupPaymentEvent(
+                            operationOwner,
+                            selectedChat.id,
+                            event,
+                            eventId,
+                        )
+                    }
+                }
                 onDone()
+                if (!receiptQueued) {
+                    mutableError.value = PAYMENT_CHAT_RECEIPT_WARNING
+                }
             } catch (cancelled: CancellationException) {
+                withContext(NonCancellable) {
+                    runCatching { releaseStagedEvent(operationOwner, stagedId) }
+                }
                 throw cancelled
             } catch (error: Exception) {
+                withContext(NonCancellable) {
+                    runCatching { releaseStagedEvent(operationOwner, stagedId) }
+                }
                 mutableError.value = error.message ?: "This group payment could not be updated"
                 // A race can settle between the preflight read and the POST. Re-read this exact
                 // payment so the card stops offering an action over money that has already moved.
-                runCatching { repo.groupPayment(descriptor.groupPaymentId) }
+                runCatching { repo.groupPayment(descriptor.groupPaymentId, operationOwner) }
                     .getOrNull()
                     ?.let(::storeGroupPayment)
             } finally {
                 mutableSending.value = false
             }
-        }
-    }
-
-    /**
-     * Writes one member's answer into the conversation. Best-effort, for the same reason a
-     * one-to-one outcome is: the money has already moved and the card reads its state from the
-     * server.
-     *
-     * The guard key is derived from the payment, the act and this account, so the same decision
-     * taken twice in one session writes one line instead of announcing "Ama took their share"
-     * again. The timeline drops repeats when it renders; this stops them being sent at all.
-     */
-    private suspend fun postGroupPaymentEvent(
-        chatId: String,
-        groupPaymentId: String,
-        outcome: KitGroupPaymentAction,
-        actorUserId: String,
-    ) {
-        val descriptor = KitGroupPaymentMessage.outcome(outcome, groupPaymentId)?.encode() ?: return
-        if (KitGroupPaymentMessage.parse(descriptor) == null) return
-        val guard = KitGroupPaymentMessage.outcomeMessageId(groupPaymentId, outcome, actorUserId)
-        if (!announcedGroupOutcomes.add(guard)) return
-        try {
-            chatRepo.sendGroupPaymentEvent(chatId, descriptor)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            // Swallowed on purpose; see the note above.
         }
     }
 
@@ -2637,12 +3001,17 @@ class ConversationViewModel @Inject internal constructor(
             return
         }
         if (amountMinor <= 0 || mutableSending.value || !historyAvailable.value) return
+        val operationOwner = sessions?.current()?.fence()
         viewModelScope.launch {
             mutableSending.value = true
             mutableError.value = null
             var durablyShared = false
             try {
-                val destination = walletRepo.spendingSource()
+                val destination = if (operationOwner == null) {
+                    walletRepo.spendingSource()
+                } else {
+                    walletRepo.spendingSourceForOwner(operationOwner)
+                }
                 val scale = destination.currencyScale
                 val normalizedNote = note?.trim()?.takeIf(String::isNotBlank)?.take(280)
                 val created = unsharedGroupPaymentRequest?.takeIf {
@@ -2658,6 +3027,7 @@ class ConversationViewModel @Inject internal constructor(
                     amountMinor = amountMinor,
                     currencyScale = scale,
                     note = normalizedNote,
+                    expectedOwner = operationOwner,
                 ).also { confirmed ->
                     unsharedGroupPaymentRequest = UnsharedGroupPaymentRequest(
                         selectedChat.id,
@@ -2679,8 +3049,10 @@ class ConversationViewModel @Inject internal constructor(
                         note = created.note,
                     ),
                 )
-                chatRepo.sendGroupPaymentRequestEvent(selectedChat.id, descriptor.encode()) {
-                    durablyShared = true
+                durablyShared = withContext(NonCancellable) {
+                    captureGroupPaymentRequestEvent(operationOwner, selectedChat.id, descriptor)
+                }
+                if (durablyShared) {
                     groupRequestCreationRetryKeys.complete(
                         selectedChat.id,
                         destination.walletId,
@@ -2689,15 +3061,7 @@ class ConversationViewModel @Inject internal constructor(
                         normalizedNote,
                     )
                 }
-                // Every production send path invokes the callback at durable commit. Retiring here
-                // as well makes the lifecycle explicit for compatible repository implementations.
-                groupRequestCreationRetryKeys.complete(
-                    selectedChat.id,
-                    destination.walletId,
-                    amountMinor,
-                    scale,
-                    normalizedNote,
-                )
+                check(durablyShared) { "The group payment request could not be saved to this chat" }
                 unsharedGroupPaymentRequest = null
                 onSent()
             } catch (cancelled: CancellationException) {
@@ -2734,13 +3098,40 @@ class ConversationViewModel @Inject internal constructor(
         if (amountMinor <= 0 || amountMinor > (authority.remainingMinor ?: 0L) ||
             mutableSending.value || !historyAvailable.value
         ) return
+        val operationOwner = sessions?.current()?.fence()
         viewModelScope.launch {
             mutableSending.value = true
             mutableError.value = null
+            var recoveryReceipt: com.kit.wallet.data.messaging.FinancialCreationReceipt? = null
             try {
-                val source = walletRepo.spendingSource()
+                val source = if (operationOwner == null) {
+                    walletRepo.spendingSource()
+                } else {
+                    walletRepo.spendingSourceForOwner(operationOwner)
+                }
                 check(source.currencyCode == authority.currency.code && source.currencyScale == scale) {
                     "This request uses another currency"
+                }
+                val canonicalAmount = BigDecimal.valueOf(amountMinor, scale).toPlainString()
+                val retryKey = groupContributionRetryKeys.keyFor(
+                    authority.id,
+                    source.walletId,
+                    amountMinor,
+                )
+                if (operationOwner != null && financialCreationReceipts != null) {
+                    recoveryReceipt = financialCreationReceipts.prepareGroupRequestContribution(
+                        operationOwner,
+                        selectedChat.id,
+                        retryKey,
+                        authority.id,
+                        source.walletId,
+                        amountMinor,
+                        canonicalAmount,
+                    )
+                    check(recoveryReceipt.phase == FinancialCreationReceiptPhase.PREPARED) {
+                        "This contribution is still being recovered"
+                    }
+                    financialCreationReceipts.markSubmitted(operationOwner, recoveryReceipt.id)
                 }
                 when (val resolution = executeGroupPaymentRequestContribution(
                     repository = repo,
@@ -2748,39 +3139,81 @@ class ConversationViewModel @Inject internal constructor(
                     requestId = authority.id,
                     sourceWalletId = source.walletId,
                     amountMinor = amountMinor,
-                    amount = BigDecimal.valueOf(amountMinor, scale).toPlainString(),
+                    amount = canonicalAmount,
                     paymentPin = paymentPin,
+                    expectedOwner = operationOwner,
                 )) {
                     is GroupPaymentRequestContributionResolution.Confirmed -> {
                         val result = resolution.result
                         mutableGroupPaymentRequests.value += result.request.id to result.request
                         mutableGroupPaymentRequestContributions.value +=
                             result.contribution.id to result.contribution
-                        // Keep the exact contribution id even when this row closes the request. The
-                        // authoritative status decides whether the actor contributed or completed it.
-                        KitGroupPaymentRequestMessage.create(
-                            action = KitGroupPaymentRequestAction.CONTRIBUTED,
-                            requestId = result.request.id,
-                            contributionId = result.contribution.id,
-                            amountMinor = result.contribution.amountMinor.toLong(),
-                        )?.let { descriptor ->
-                            runCatching {
-                                chatRepo.sendGroupPaymentRequestEvent(
+                        val receiptQueued = if (
+                            operationOwner != null && recoveryReceipt != null &&
+                            financialCreationReceipts != null
+                        ) {
+                            val settled = withContext(NonCancellable) {
+                                financialCreationReceipts.bindGroupRequestContribution(
+                                    operationOwner,
+                                    recoveryReceipt,
+                                    result,
+                                )
+                            }
+                            withContext(NonCancellable) {
+                                runCatching {
+                                    financialCreationReceipts.handoff(operationOwner, settled)
+                                }.isSuccess
+                            }
+                        } else {
+                            // Keep the exact contribution id even when this row closes the request.
+                            val event = KitGroupPaymentRequestMessage.create(
+                                action = KitGroupPaymentRequestAction.CONTRIBUTED,
+                                requestId = result.request.id,
+                                contributionId = result.contribution.id,
+                                amountMinor = result.contribution.amountMinor.toLong(),
+                            )
+                            event != null && withContext(NonCancellable) {
+                                captureGroupPaymentRequestEvent(
+                                    operationOwner,
                                     selectedChat.id,
-                                    descriptor.encode(),
+                                    event,
                                 )
                             }
                         }
+                        if (!receiptQueued) {
+                            mutableError.value = PAYMENT_CHAT_RECEIPT_WARNING
+                        }
                     }
                     is GroupPaymentRequestContributionResolution.Reconciled -> {
+                        recoveryReceipt?.let { receipt ->
+                            withContext(NonCancellable) {
+                                financialCreationReceipts?.discardNotSubmitted(
+                                    operationOwner!!,
+                                    receipt.id,
+                                )
+                            }
+                            recoveryReceipt = null
+                        }
                         mutableGroupPaymentRequests.value +=
                             resolution.request.id to resolution.request
                     }
                 }
                 onDone()
             } catch (cancelled: CancellationException) {
+                recoveryReceipt?.let { receipt ->
+                    withContext(NonCancellable) {
+                        financialCreationReceipts?.discardPrepared(operationOwner!!, receipt.id)
+                    }
+                }
                 throw cancelled
             } catch (error: Exception) {
+                recoveryReceipt?.let { receipt ->
+                    withContext(NonCancellable) {
+                        runCatching {
+                            financialCreationReceipts?.discardPrepared(operationOwner!!, receipt.id)
+                        }
+                    }
+                }
                 mutableError.value = error.message ?: "The contribution could not be completed"
             } finally {
                 mutableSending.value = false
@@ -2799,31 +3232,54 @@ class ConversationViewModel @Inject internal constructor(
         if (!enabled || !groupPaymentRequestsEnabled || repo == null || authority?.canCancel != true ||
             mutableSending.value || !historyAvailable.value
         ) return
+        val operationOwner = sessions?.current()?.fence()
         viewModelScope.launch {
             mutableSending.value = true
             mutableError.value = null
+            var stagedId: String? = null
             try {
                 val operation = authority.id.lowercase()
+                val event = checkNotNull(
+                    KitGroupPaymentRequestMessage.create(
+                        KitGroupPaymentRequestAction.CANCELLED,
+                        authority.id,
+                    ),
+                ) { "This group payment request cannot be cancelled" }
+                stagedId = stageGroupPaymentRequestEvent(
+                    operationOwner,
+                    selectedChat.id,
+                    event,
+                )
                 val cancelled = repo.cancel(
                     requestId = authority.id,
                     idempotencyKey = groupRequestCancellationKeys.getOrPut(operation) {
                         "group-request-cancel:${UUID.randomUUID()}"
                     },
+                    expectedOwner = operationOwner,
                 )
                 groupRequestCancellationKeys.remove(operation)
                 mutableGroupPaymentRequests.value += cancelled.id to cancelled
-                KitGroupPaymentRequestMessage.create(
-                    KitGroupPaymentRequestAction.CANCELLED,
-                    cancelled.id,
-                )?.let { descriptor ->
-                    runCatching {
-                        chatRepo.sendGroupPaymentRequestEvent(selectedChat.id, descriptor.encode())
+                check(cancelled.id == event.requestId) {
+                    "Kit returned another group payment request"
+                }
+                val receiptQueued = withContext(NonCancellable) {
+                    commitStagedEvent(operationOwner, stagedId) {
+                        captureGroupPaymentRequestEvent(operationOwner, selectedChat.id, event)
                     }
+                }
+                if (!receiptQueued) {
+                    mutableError.value = PAYMENT_CHAT_RECEIPT_WARNING
                 }
                 onDone()
             } catch (cancelled: CancellationException) {
+                withContext(NonCancellable) {
+                    runCatching { releaseStagedEvent(operationOwner, stagedId) }
+                }
                 throw cancelled
             } catch (error: Exception) {
+                withContext(NonCancellable) {
+                    runCatching { releaseStagedEvent(operationOwner, stagedId) }
+                }
                 mutableError.value = error.message ?: "The request could not be cancelled"
             } finally {
                 mutableSending.value = false
@@ -2868,7 +3324,13 @@ class ConversationViewModel @Inject internal constructor(
             // The projection lags the send by a round trip; this keeps one poll from writing the
             // same line twice while the first is still in flight.
             if (!announcedExpiries.add(reference)) continue
-            postTransferEvent(chatId, claim, KitPaymentAction.EXPIRED, claim.reason)
+            postTransferEvent(
+                owner = sessions?.current()?.fence(),
+                chatId = chatId,
+                claim = claim,
+                outcome = KitPaymentAction.EXPIRED,
+                reason = claim.reason,
+            )
         }
     }
 
@@ -3284,5 +3746,7 @@ class ConversationViewModel @Inject internal constructor(
         const val MAX_TRACKED_GROUP_PAYMENTS = 24
         const val MAX_TRACKED_GROUP_PAYMENT_REQUESTS = 100
         const val MAX_TRACKED_GROUP_PAYMENT_REQUEST_CONTRIBUTIONS = 100
+        const val PAYMENT_CHAT_RECEIPT_WARNING =
+            "The payment succeeded, but its chat receipt is waiting to be recovered."
     }
 }

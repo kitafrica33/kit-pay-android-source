@@ -65,6 +65,59 @@ class GroupPaymentRequestContractTest {
     }
 
     @Test
+    fun `exact contribution older than the embedded fifty remains structurally valid`() {
+        val embedded = (1..50).map { index ->
+            contribution("00000000-0000-4000-8000-${index.toString().padStart(12, '0')}", "1")
+        }
+        val older = contribution("00000000-0000-4000-8000-000000000999", "1")
+        val truncated = request(
+            contributionCount = 51,
+            contributorCount = 1,
+            contributed = "51",
+            remaining = "99999949",
+            progress = 0,
+            contributions = embedded,
+            hasMore = true,
+            nextBefore = embedded.first().id,
+        )
+
+        assertTrue(GroupPaymentRequestContributionResultDto(truncated, older).isStructurallyValid())
+        assertFalse(
+            GroupPaymentRequestContributionResultDto(
+                request(
+                    contributionCount = 50,
+                    contributorCount = 1,
+                    contributed = "50",
+                    remaining = "99999950",
+                    progress = 0,
+                    contributions = embedded,
+                ),
+                older,
+            ).isStructurallyValid(),
+        )
+    }
+
+    @Test
+    fun `same id embedded contribution mismatch fails structural validation`() {
+        val embedded = contribution("00000000-0000-4000-8000-000000000006", "1")
+        val authority = request(
+            contributionCount = 1,
+            contributorCount = 1,
+            contributed = "1",
+            remaining = "99999999",
+            progress = 0,
+            contributions = listOf(embedded),
+        )
+
+        assertFalse(
+            GroupPaymentRequestContributionResultDto(
+                authority,
+                embedded.copy(amount = "2", amountMinor = "2"),
+            ).isStructurallyValid(),
+        )
+    }
+
+    @Test
     fun `KITGREQ1 is canonical and contribution hints carry exact row id`() {
         val contributionId = "00000000-0000-4000-8000-000000000006"
         val descriptor = KitGroupPaymentRequestMessage.create(

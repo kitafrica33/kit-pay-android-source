@@ -11,9 +11,11 @@ import com.kit.wallet.data.remote.GroupPaymentRequestDto
 import com.kit.wallet.data.remote.GroupPaymentRequestStatus
 import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.KitWalletApiException
+import com.kit.wallet.data.session.SessionFence
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 
 sealed interface GroupPaymentRequestContributionResolution {
     data class Confirmed(
@@ -55,10 +57,11 @@ class GroupPaymentRequestRepository @Inject constructor(
         conversationId: String,
         request: CreateCollaborativeGroupPaymentRequest,
         idempotencyKey: () -> String,
+        expectedOwner: SessionFence? = null,
     ): GroupPaymentRequestDto {
         val key = idempotencyKey().also(::requireRetryKey)
         val created = executeFinancialMutation {
-            api.createGroupPaymentRequest(conversationId, key, request)
+            api.createGroupPaymentRequest(conversationId, key, request, expectedOwner)
         }
         return requireValid(created, conversationId).also { confirmed ->
             check(
@@ -69,8 +72,11 @@ class GroupPaymentRequestRepository @Inject constructor(
         }
     }
 
-    suspend fun get(requestId: String): GroupPaymentRequestDto {
-        val request = apiCalls.execute { api.groupPaymentRequest(requestId) }
+    suspend fun get(
+        requestId: String,
+        expectedOwner: SessionFence? = null,
+    ): GroupPaymentRequestDto {
+        val request = apiCalls.execute { api.groupPaymentRequest(requestId, expectedOwner) }
         check(request.id == requestId.lowercase()) { "The request response did not match the requested id" }
         return requireValid(request)
     }
@@ -111,8 +117,9 @@ class GroupPaymentRequestRepository @Inject constructor(
         amount: String,
         idempotencyKey: () -> String,
         paymentPin: String,
+        expectedOwner: SessionFence? = null,
     ): GroupPaymentRequestContributionResolution {
-        val authority = get(requestId)
+        val authority = get(requestId, expectedOwner)
         if (authority.knownStatus != GroupPaymentRequestStatus.OPEN || !authority.canContribute) {
             return GroupPaymentRequestContributionResolution.Reconciled(authority)
         }
@@ -136,6 +143,7 @@ class GroupPaymentRequestRepository @Inject constructor(
             ),
             paymentPin,
             "Approve this group contribution",
+            expectedOwner,
         )
         val key = idempotencyKey().also(::requireRetryKey)
         val result = executeFinancialMutation {
@@ -144,32 +152,32 @@ class GroupPaymentRequestRepository @Inject constructor(
                 key,
                 stepUp,
                 ContributeGroupPaymentRequest(sourceWalletId.lowercase(), canonicalAmount),
+                expectedOwner,
             )
         }
         check(result.matchesContributionIntent(authority, canonicalAmount)) {
             "Kit did not confirm this contribution against the request"
         }
-        try {
-            walletSync.refresh()
-        } catch (cancelled: CancellationException) {
-            // Cancellation can hide the already-confirmed result from the caller. Its saved retry
-            // key must survive so the server can replay or exact state can reconcile it later.
-            throw cancelled
-        } catch (_: Exception) {
-            // The validated POST response is authoritative. A secondary balance refresh must not
-            // turn it into an ambiguous failure that invites a second logical contribution.
-        }
+        // The validated POST response is authoritative. A secondary cache refresh must neither
+        // be cancelled nor turn success into an ambiguous failure that invites another debit.
+        withContext(NonCancellable) { runCatching { walletSync.refresh() } }
         return GroupPaymentRequestContributionResolution.Confirmed(result)
     }
 
-    suspend fun cancel(requestId: String, idempotencyKey: String): GroupPaymentRequestDto {
+    suspend fun cancel(
+        requestId: String,
+        idempotencyKey: String,
+        expectedOwner: SessionFence? = null,
+    ): GroupPaymentRequestDto {
         requireRetryKey(idempotencyKey)
-        val authority = get(requestId)
+        val authority = get(requestId, expectedOwner)
         if (authority.knownStatus == GroupPaymentRequestStatus.CANCELLED) return authority
         check(authority.knownStatus == GroupPaymentRequestStatus.OPEN && authority.canCancel) {
             "This request can no longer be cancelled"
         }
-        val cancelled = apiCalls.execute { api.cancelGroupPaymentRequest(authority.id, idempotencyKey) }
+        val cancelled = apiCalls.execute {
+            api.cancelGroupPaymentRequest(authority.id, idempotencyKey, expectedOwner)
+        }
         check(cancelled.id == authority.id && cancelled.isStructurallyValid() &&
             cancelled.knownStatus == GroupPaymentRequestStatus.CANCELLED
         ) { "Kit did not confirm cancellation" }

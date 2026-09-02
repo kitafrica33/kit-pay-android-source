@@ -277,6 +277,16 @@ interface KitWalletApi {
         @Header("Idempotency-Key") idempotencyKey: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: WalletTransferRequest,
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<TransactionDto>
+
+    /** Read-only exact lookup of a transfer previously submitted under this idempotency key. */
+    @POST("api/kit-wallet/v1/wallets/{walletId}/transfers/recovery")
+    suspend fun recoverTransfer(
+        @Path("walletId") walletId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Body request: WalletTransferRequest,
+        @Tag expectedOwner: SessionFence,
     ): ApiEnvelope<TransactionDto>
 
     @GET("api/kit-wallet/v1/transfer-claims")
@@ -289,17 +299,20 @@ interface KitWalletApi {
     @GET("api/kit-wallet/v1/transfer-claims/{claimId}")
     suspend fun transferClaim(
         @Path("claimId") claimId: String,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<TransferClaimDto>
 
     @POST("api/kit-wallet/v1/transfer-claims/{claimId}/accept")
     suspend fun acceptTransferClaim(
         @Path("claimId") claimId: String,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<TransferClaimDto>
 
     @POST("api/kit-wallet/v1/transfer-claims/{claimId}/reject")
     suspend fun rejectTransferClaim(
         @Path("claimId") claimId: String,
         @Body request: TransferClaimResolutionRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<TransferClaimDto>
 
     @POST("api/kit-wallet/v1/transfer-claims/{claimId}/reverse")
@@ -307,6 +320,7 @@ interface KitWalletApi {
         @Path("claimId") claimId: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: TransferClaimResolutionRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<TransferClaimDto>
 
     /**
@@ -319,11 +333,21 @@ interface KitWalletApi {
         @Header("Idempotency-Key") idempotencyKey: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: CreateGroupPaymentRequest,
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<GroupPaymentDto>
+
+    @POST("api/kit-wallet/v1/conversations/{conversationId}/group-payments/recovery")
+    suspend fun recoverGroupPayment(
+        @Path("conversationId") conversationId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Body request: CreateGroupPaymentRequest,
+        @Tag expectedOwner: SessionFence,
     ): ApiEnvelope<GroupPaymentDto>
 
     @GET("api/kit-wallet/v1/group-payments/{groupPaymentId}")
     suspend fun groupPayment(
         @Path("groupPaymentId") groupPaymentId: String,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<GroupPaymentDto>
 
     /**
@@ -333,12 +357,14 @@ interface KitWalletApi {
     @POST("api/kit-wallet/v1/group-payments/{groupPaymentId}/accept")
     suspend fun acceptGroupPaymentShare(
         @Path("groupPaymentId") groupPaymentId: String,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<GroupPaymentDto>
 
     @POST("api/kit-wallet/v1/group-payments/{groupPaymentId}/reject")
     suspend fun rejectGroupPaymentShare(
         @Path("groupPaymentId") groupPaymentId: String,
         @Body request: GroupPaymentResolutionRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<GroupPaymentDto>
 
     /** The sender pulls back every share nobody has taken yet. Accepted shares are untouched. */
@@ -347,6 +373,7 @@ interface KitWalletApi {
         @Path("groupPaymentId") groupPaymentId: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: GroupPaymentResolutionRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<GroupPaymentDto>
 
     @GET("api/kit-wallet/v1/conversations/{conversationId}/group-payment-requests")
@@ -360,11 +387,13 @@ interface KitWalletApi {
         @Path("conversationId") conversationId: String,
         @Header("Idempotency-Key") idempotencyKey: String,
         @Body request: CreateCollaborativeGroupPaymentRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<GroupPaymentRequestDto>
 
     @GET("api/kit-wallet/v1/group-payment-requests/{requestId}")
     suspend fun groupPaymentRequest(
         @Path("requestId") requestId: String,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<GroupPaymentRequestDto>
 
     @GET("api/kit-wallet/v1/group-payment-requests/{requestId}/contributions")
@@ -387,12 +416,22 @@ interface KitWalletApi {
         @Header("Idempotency-Key") idempotencyKey: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: ContributeGroupPaymentRequest,
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<GroupPaymentRequestContributionResultDto>
+
+    @POST("api/kit-wallet/v1/group-payment-requests/{requestId}/contributions/recovery")
+    suspend fun recoverGroupPaymentRequestContribution(
+        @Path("requestId") requestId: String,
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Body request: ContributeGroupPaymentRequest,
+        @Tag expectedOwner: SessionFence,
     ): ApiEnvelope<GroupPaymentRequestContributionResultDto>
 
     @POST("api/kit-wallet/v1/group-payment-requests/{requestId}/cancel")
     suspend fun cancelGroupPaymentRequest(
         @Path("requestId") requestId: String,
         @Header("Idempotency-Key") idempotencyKey: String,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<GroupPaymentRequestDto>
 
     @POST("api/kit-wallet/v1/payments/requests")
@@ -402,8 +441,23 @@ interface KitWalletApi {
         @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<PaymentRequestDto>
 
+    @POST("api/kit-wallet/v1/payments/requests/recovery")
+    suspend fun recoverPaymentRequestCreation(
+        @Header("Idempotency-Key") idempotencyKey: String,
+        @Body request: CreatePaymentRequestDto,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<PaymentRequestDto>
+
     @GET("api/kit-wallet/v1/payments/requests")
-    suspend fun paymentRequests(): ApiEnvelope<PaymentRequestListDto>
+    suspend fun paymentRequests(
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<PaymentRequestListDto>
+
+    @GET("api/kit-wallet/v1/payments/requests/{requestId}")
+    suspend fun paymentRequest(
+        @Path("requestId") requestId: String,
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<PaymentRequestDto>
 
     @POST("api/kit-wallet/v1/payments/requests/{requestId}/pay")
     suspend fun payPaymentRequest(
@@ -411,6 +465,7 @@ interface KitWalletApi {
         @Header("Idempotency-Key") idempotencyKey: String,
         @Header("X-Kit-Wallet-Step-Up") stepUpToken: String,
         @Body request: PayPaymentRequestDto,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<PaymentRequestDto>
 
     @GET("api/kit-wallet/v1/payments/scheduled")
@@ -479,6 +534,7 @@ interface KitWalletApi {
     suspend fun cancelPaymentRequest(
         @Path("requestId") requestId: String,
         @Header("Idempotency-Key") idempotencyKey: String,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<PaymentRequestDto>
 
     @GET("api/kit-wallet/v1/search")

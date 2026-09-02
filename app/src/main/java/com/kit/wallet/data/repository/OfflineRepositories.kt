@@ -49,6 +49,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.ceil
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -62,6 +63,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+
+private val TRANSFER_IDEMPOTENCY_KEY = Regex("^android-transfer-[0-9a-f-]{36}$")
 
 @Singleton
 class OfflineUserRepository @Inject constructor(
@@ -380,14 +384,58 @@ class OfflineWalletRepository @Inject constructor(
         amountMinor: Long,
         note: String?,
         paymentPin: String,
+        idempotencyKey: String?,
+    ): SentTransfer = sendToContactForOwnerOrCurrent(
+        owner = null,
+        recipient = recipient,
+        amountMinor = amountMinor,
+        note = note,
+        paymentPin = paymentPin,
+        idempotencyKey = idempotencyKey ?: "android-transfer-${java.util.UUID.randomUUID()}",
+        onSubmitting = {},
+        onSettled = {},
+    )
+
+    override suspend fun sendToContactForOwner(
+        owner: SessionFence,
+        recipient: Contact,
+        amountMinor: Long,
+        note: String?,
+        paymentPin: String,
+        idempotencyKey: String,
+        onSubmitting: suspend (WalletTransferSubmission) -> Unit,
+        onSettled: suspend (SentTransfer) -> Unit,
+    ): SentTransfer = sendToContactForOwnerOrCurrent(
+        owner = owner,
+        recipient = recipient,
+        amountMinor = amountMinor,
+        note = note,
+        paymentPin = paymentPin,
+        idempotencyKey = idempotencyKey,
+        onSubmitting = onSubmitting,
+        onSettled = onSettled,
+    )
+
+    private suspend fun sendToContactForOwnerOrCurrent(
+        owner: SessionFence?,
+        recipient: Contact,
+        amountMinor: Long,
+        note: String?,
+        paymentPin: String,
+        idempotencyKey: String,
+        onSubmitting: suspend (WalletTransferSubmission) -> Unit,
+        onSettled: suspend (SentTransfer) -> Unit,
     ): SentTransfer {
         require(amountMinor > 0) { "Amount must be positive" }
+        require(idempotencyKey.matches(TRANSFER_IDEMPOTENCY_KEY)) {
+            "Invalid transfer idempotency key"
+        }
         // An empty PIN defers to PaymentAuthorizer, which uses biometric approval when the server
         // advertises it and otherwise requires the four-digit wallet PIN itself.
         require(paymentPin.isEmpty() || paymentPin.matches(Regex("^[0-9]{4}$"))) {
             "Enter the four-digit wallet PIN"
         }
-        val source = requireSelectedWallet()
+        val source = if (owner == null) requireSelectedWallet() else requireSelectedWallet(owner)
         val destinationWalletId = requireNotNull(recipient.receivingWalletId) {
             "This contact cannot receive Kit Pay transfers yet"
         }
@@ -398,21 +446,39 @@ class OfflineWalletRepository @Inject constructor(
             "amount" to amount,
             "note" to note,
         )
-        val stepUpToken = paymentAuthorizer.authorize("wallet_transfer", intent, paymentPin)
+        val stepUpToken = paymentAuthorizer.authorize(
+            purpose = "wallet_transfer",
+            intent = intent,
+            paymentPin = paymentPin,
+            expectedOwner = owner,
+        )
+        owner?.let { expected -> sessions.withCurrentSession(expected) { } }
+        onSubmitting(
+            WalletTransferSubmission(
+                sourceWalletId = source.uuid,
+                destinationWalletId = destinationWalletId,
+                amount = amount,
+                amountMinor = amountMinor,
+                currencyCode = source.currencyCode,
+                currencyScale = source.currencyScale,
+                note = note,
+            ),
+        )
+        owner?.let { expected -> sessions.withCurrentSession(expected) { } }
         val transaction = apiCalls.execute {
             api.transfer(
                 walletId = source.uuid,
-                idempotencyKey = "android-transfer-${java.util.UUID.randomUUID()}",
+                idempotencyKey = idempotencyKey,
                 stepUpToken = stepUpToken,
                 request = com.kit.wallet.data.remote.WalletTransferRequest(
                     destinationWalletId = destinationWalletId,
                     amount = amount,
                     note = note,
                 ),
+                expectedOwner = owner,
             )
         }
-        walletSync.refresh()
-        return SentTransfer(
+        val sent = SentTransfer(
             transaction = transaction.toEntity(
                 source.uuid,
                 source.currencyCode,
@@ -420,6 +486,64 @@ class OfflineWalletRepository @Inject constructor(
             ).toUiModel(),
             claim = transaction.claim?.toUiModel(),
         )
+        // Bind the exact server result before any cache refresh can suspend, fail, or be cancelled.
+        // The callback is owner-pinned by the durable receipt store used in production.
+        withContext(NonCancellable) { onSettled(sent) }
+        // A refresh failure after a confirmed transfer must not make the UI invite a duplicate.
+        withContext(NonCancellable) { runCatching { walletSync.refresh() } }
+        return sent
+    }
+
+    override suspend fun recoverSentTransferForOwner(
+        owner: SessionFence,
+        submission: WalletTransferSubmission,
+        idempotencyKey: String,
+    ): WalletTransferRecoveryResult {
+        require(idempotencyKey.matches(TRANSFER_IDEMPOTENCY_KEY)) {
+            "Invalid transfer idempotency key"
+        }
+        require(submission.amountMinor > 0L) { "Amount must be positive" }
+        require(
+            DecimalMoney.fromMinor(submission.amountMinor, submission.currencyScale) ==
+                submission.amount
+        ) { "The transfer recovery amount is not canonical" }
+        sessions.withCurrentSession(owner) { }
+        val transaction = try {
+            apiCalls.executeExactRecovery {
+                api.recoverTransfer(
+                    walletId = submission.sourceWalletId,
+                    idempotencyKey = idempotencyKey,
+                    request = com.kit.wallet.data.remote.WalletTransferRequest(
+                        destinationWalletId = submission.destinationWalletId,
+                        amount = submission.amount,
+                        note = submission.note,
+                    ),
+                    expectedOwner = owner,
+                )
+            }
+        } catch (error: KitWalletApiException) {
+            return when {
+                error.statusCode == 404 && error.code == "TRANSFER_RECOVERY_NOT_FOUND" ->
+                    WalletTransferRecoveryResult.NotCommitted
+                error.statusCode == 409 && error.code == "IDEMPOTENCY_REQUEST_IN_PROGRESS" ->
+                    WalletTransferRecoveryResult.InProgress
+                else -> throw error
+            }
+        }
+        sessions.withCurrentSession(owner) { }
+        val sent = SentTransfer(
+            transaction = transaction.toEntity(
+                submission.sourceWalletId,
+                submission.currencyCode,
+                submission.currencyScale,
+            ).toUiModel(),
+            claim = transaction.claim?.toUiModel(),
+        )
+        require(
+            sent.transaction.amountMinor != Long.MIN_VALUE &&
+                kotlin.math.abs(sent.transaction.amountMinor) == submission.amountMinor
+        ) { "The recovered transfer amount does not match its submitted intent" }
+        return WalletTransferRecoveryResult.Settled(sent)
     }
 
     override suspend fun request(from: Contact, amountMinor: Long, note: String?) {
@@ -445,6 +569,7 @@ class OfflineWalletRepository @Inject constructor(
             amount = amount,
             currencyCode = destination.currencyCode,
             currencyScale = destination.currencyScale,
+            note = note,
         )
     }
 
@@ -510,6 +635,7 @@ class OfflineWalletRepository @Inject constructor(
             amount = amount,
             currencyCode = destination.currencyCode,
             currencyScale = destination.currencyScale,
+            note = note?.trim()?.takeIf(String::isNotBlank),
         )
         owner?.let { expected -> sessions.withCurrentSession(expected) { } }
         return ChatPaymentRequest(
@@ -525,18 +651,32 @@ class OfflineWalletRepository @Inject constructor(
         requestId: String,
         amountMinor: Long,
         paymentPin: String,
+    ) = payChatPaymentRequestForOwnerOrCurrent(null, requestId, amountMinor, paymentPin)
+
+    override suspend fun payChatPaymentRequestForOwner(
+        owner: SessionFence,
+        requestId: String,
+        amountMinor: Long,
+        paymentPin: String,
+    ) = payChatPaymentRequestForOwnerOrCurrent(owner, requestId, amountMinor, paymentPin)
+
+    private suspend fun payChatPaymentRequestForOwnerOrCurrent(
+        owner: SessionFence?,
+        requestId: String,
+        amountMinor: Long,
+        paymentPin: String,
     ) {
         require(amountMinor > 0) { "The payment request amount is invalid" }
         // An empty PIN defers to PaymentAuthorizer's biometric-or-PIN selection.
         require(paymentPin.isEmpty() || paymentPin.matches(Regex("^[0-9]{4}$"))) {
             "Enter the four-digit wallet PIN"
         }
-        val source = requireSelectedWallet()
+        val source = if (owner == null) requireSelectedWallet() else requireSelectedWallet(owner)
         // Reconcile the card with the authoritative request list before any step-up, so paid,
         // cancelled, expired, mutated or unknown requests are refused with clear reasons instead
         // of asking for approval first. Older services without the read endpoint skip this check.
         val listed = try {
-            apiCalls.execute { api.paymentRequests() }.items
+            apiCalls.execute { api.paymentRequests(owner) }.items
         } catch (error: KitWalletApiException) {
             if (error.statusCode != 404) throw error
             null
@@ -560,7 +700,12 @@ class OfflineWalletRepository @Inject constructor(
             "amount" to amount,
             "currency" to source.currencyCode,
         )
-        val stepUpToken = paymentAuthorizer.authorize("payment_request", intent, paymentPin)
+        val stepUpToken = paymentAuthorizer.authorize(
+            "payment_request",
+            intent,
+            paymentPin,
+            expectedOwner = owner,
+        )
         val paid = apiCalls.execute {
             api.payPaymentRequest(
                 requestId = requestId,
@@ -569,20 +714,38 @@ class OfflineWalletRepository @Inject constructor(
                 request = com.kit.wallet.data.remote.PayPaymentRequestDto(
                     sourceWalletId = source.uuid,
                 ),
+                expectedOwner = owner,
             )
         }
         validatePaidPaymentRequest(paid, requestId)
-        walletSync.refresh()
+        owner?.let { sessions.withCurrentSession(it) { } }
+        withContext(NonCancellable) { runCatching { walletSync.refresh() } }
     }
 
-    override suspend fun cancelChatPaymentRequest(requestId: String) {
+    override suspend fun cancelChatPaymentRequest(requestId: String) =
+        cancelChatPaymentRequestForOwnerOrCurrent(null, requestId)
+
+    override suspend fun cancelChatPaymentRequestForOwner(owner: SessionFence, requestId: String) =
+        cancelChatPaymentRequestForOwnerOrCurrent(owner, requestId)
+
+    private suspend fun cancelChatPaymentRequestForOwnerOrCurrent(
+        owner: SessionFence?,
+        requestId: String,
+    ) {
         require(requestId.isNotBlank()) { "This card has no payment request to cancel" }
-        apiCalls.execute {
+        val cancelled = apiCalls.execute {
             api.cancelPaymentRequest(
                 requestId = requestId,
                 idempotencyKey = "android-chat-cancel-${java.util.UUID.randomUUID()}",
+                expectedOwner = owner,
             )
         }
+        check(
+            cancelled.id.equals(requestId, ignoreCase = true) &&
+                cancelled.type == "payment_request" &&
+                cancelled.status.equals("cancelled", ignoreCase = true)
+        ) { "The server did not confirm cancellation of this payment request" }
+        owner?.let { sessions.withCurrentSession(it) { } }
     }
 
     override suspend fun transferClaims(): List<TransferClaim> {
@@ -606,8 +769,20 @@ class OfflineWalletRepository @Inject constructor(
     }
 
     override suspend fun transferClaim(claimId: String): TransferClaim {
+        return transferClaimForOwnerOrCurrent(null, claimId)
+    }
+
+    override suspend fun transferClaimForOwner(
+        owner: SessionFence,
+        claimId: String,
+    ): TransferClaim = transferClaimForOwnerOrCurrent(owner, claimId)
+
+    private suspend fun transferClaimForOwnerOrCurrent(
+        owner: SessionFence?,
+        claimId: String,
+    ): TransferClaim {
         require(claimId.isNotBlank()) { "This transfer has no claim to verify" }
-        val claim = apiCalls.execute { api.transferClaim(claimId) }.toUiModel()
+        val claim = apiCalls.execute { api.transferClaim(claimId, owner) }.toUiModel()
             ?: error("The transfer state could not be verified")
         check(claim.id.equals(claimId, ignoreCase = true)) {
             "The transfer state did not match this payment"
@@ -616,12 +791,31 @@ class OfflineWalletRepository @Inject constructor(
     }
 
     override suspend fun acceptTransferClaim(claimId: String): TransferClaim =
-        settleTransferClaim(claimId) { api.acceptTransferClaim(claimId) }
+        settleTransferClaim(claimId, null) { api.acceptTransferClaim(claimId) }
+
+    override suspend fun acceptTransferClaimForOwner(
+        owner: SessionFence,
+        claimId: String,
+    ): TransferClaim = settleTransferClaim(claimId, owner) {
+        api.acceptTransferClaim(claimId, owner)
+    }
 
     override suspend fun rejectTransferClaim(claimId: String, reason: String?): TransferClaim =
-        settleTransferClaim(claimId) {
+        settleTransferClaim(claimId, null) {
             api.rejectTransferClaim(claimId, TransferClaimResolutionRequest(reason.orNullIfBlank()))
         }
+
+    override suspend fun rejectTransferClaimForOwner(
+        owner: SessionFence,
+        claimId: String,
+        reason: String?,
+    ): TransferClaim = settleTransferClaim(claimId, owner) {
+        api.rejectTransferClaim(
+            claimId,
+            TransferClaimResolutionRequest(reason.orNullIfBlank()),
+            owner,
+        )
+    }
 
     override suspend fun reverseTransferClaim(
         claimId: String,
@@ -639,11 +833,38 @@ class OfflineWalletRepository @Inject constructor(
             paymentPin,
             "Approve reversing this payment",
         )
-        return settleTransferClaim(claimId) {
+        return settleTransferClaim(claimId, null) {
             api.reverseTransferClaim(
                 claimId,
                 stepUpToken,
                 TransferClaimResolutionRequest(canonicalReason),
+            )
+        }
+    }
+
+    override suspend fun reverseTransferClaimForOwner(
+        owner: SessionFence,
+        claimId: String,
+        reason: String?,
+        paymentPin: String,
+    ): TransferClaim {
+        require(paymentPin.isEmpty() || paymentPin.matches(Regex("^[0-9]{4}$"))) {
+            "Enter the four-digit wallet PIN"
+        }
+        val canonicalReason = canonicalTransferClaimReason(reason)
+        val stepUpToken = paymentAuthorizer.authorize(
+            "wallet_transfer_reverse",
+            transferClaimReverseIntent(claimId, canonicalReason),
+            paymentPin,
+            "Approve reversing this payment",
+            owner,
+        )
+        return settleTransferClaim(claimId, owner) {
+            api.reverseTransferClaim(
+                claimId,
+                stepUpToken,
+                TransferClaimResolutionRequest(canonicalReason),
+                owner,
             )
         }
     }
@@ -657,13 +878,16 @@ class OfflineWalletRepository @Inject constructor(
      */
     private suspend fun settleTransferClaim(
         claimId: String,
+        owner: SessionFence?,
         call: suspend () -> ApiEnvelope<TransferClaimDto>,
     ): TransferClaim {
         require(claimId.isNotBlank()) { "This transfer has no claim to settle" }
         val settled = apiCalls.execute(call)
-        walletSync.refresh()
-        return settled.toUiModel()
+        val mapped = settled.toUiModel()
             ?: error("The transfer was settled, but its new state could not be read")
+        owner?.let { sessions.withCurrentSession(it) { } }
+        withContext(NonCancellable) { runCatching { walletSync.refresh() } }
+        return mapped
     }
 
     private fun String?.orNullIfBlank(): String? = this?.trim()?.takeIf(String::isNotBlank)
@@ -854,11 +1078,20 @@ class OfflineWalletRepository @Inject constructor(
 
     override suspend fun spendingSource(): WalletSpendingSource {
         val wallet = requireSelectedWallet()
+        return wallet.spendingSource()
+    }
+
+    override suspend fun spendingSourceForOwner(owner: SessionFence): WalletSpendingSource {
+        val wallet = requireSelectedWallet(owner)
+        return wallet.spendingSource()
+    }
+
+    private fun com.kit.wallet.data.local.WalletEntity.spendingSource(): WalletSpendingSource {
         return WalletSpendingSource(
-            walletId = wallet.uuid,
-            currencyCode = wallet.currencyCode,
-            currencyScale = wallet.currencyScale,
-            availableBalanceMinor = wallet.availableBalanceMinor,
+            walletId = uuid,
+            currencyCode = currencyCode,
+            currencyScale = currencyScale,
+            availableBalanceMinor = availableBalanceMinor,
         )
     }
 
@@ -1042,6 +1275,7 @@ internal fun validateCreatedPaymentRequest(
     amount: String,
     currencyCode: String,
     currencyScale: Int,
+    note: String? = null,
 ) {
     check(
         runCatching { java.util.UUID.fromString(created.id) }.isSuccess &&
@@ -1051,7 +1285,8 @@ internal fun validateCreatedPaymentRequest(
             created.requestedFromUserId.equals(requestedFromUserId, ignoreCase = true) &&
             created.amount == amount &&
             created.currency.code.equals(currencyCode, ignoreCase = true) &&
-            created.currency.scale.toIntOrNull() == currencyScale,
+            created.currency.scale.toIntOrNull() == currencyScale &&
+            created.note == note,
     ) { "The server did not confirm this exact payment request" }
 }
 

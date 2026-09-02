@@ -107,6 +107,19 @@ internal data class KitPaymentMessage(
 
     val isRequest: Boolean get() = action == KitPaymentAction.REQUEST
 
+    /**
+     * One stable encrypted-outbox identity for this server-owned financial event.
+     *
+     * The reference is globally unique and the action identifies the one transition being
+     * announced. Keeping presentation fields such as the note out of the identity means a retry
+     * after process death cannot mint a second bubble merely because a later projection supplied
+     * slightly different display copy. The outbox still compares the complete descriptor and
+     * fails closed if the same identity is ever presented with different authenticated content.
+     */
+    fun deterministicMessageId(): String = deterministicUuid(
+        "kit-payment-event-v1|${referenceId.lowercase()}|${action.wire}",
+    )
+
     companion object {
         const val PREFIX = "KITPAY1:"
         private const val MAX_DESCRIPTOR_LENGTH = 1_024

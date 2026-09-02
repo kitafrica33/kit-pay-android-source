@@ -5,6 +5,7 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
+import com.kit.wallet.data.messaging.WalletTransferChatReceiptCoordinator
 import com.kit.wallet.data.remote.isKitInsufficientFundsError
 import com.kit.wallet.data.repository.ChatRepository
 import com.kit.wallet.data.repository.ContactRepository
@@ -29,11 +30,12 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 
 @HiltViewModel
-class SendMoneyViewModel @Inject constructor(
+class SendMoneyViewModel @Inject internal constructor(
     private val wallet: WalletRepository,
     private val walletSync: WalletSyncRepository,
     private val chats: ChatRepository,
     private val contactRepo: ContactRepository,
+    private val transferChatReceipts: WalletTransferChatReceiptCoordinator? = null,
 ) : ViewModel() {
 
     val contacts = contactRepo.contacts
@@ -111,9 +113,19 @@ class SendMoneyViewModel @Inject constructor(
             _sending.value = true
             _error.value = null
             try {
-                val sent = wallet.sendToContact(recipient, amountMinor, note, paymentPin)
+                val sent = if (transferChatReceipts == null) {
+                    wallet.sendToContact(recipient, amountMinor, note, paymentPin).also {
+                        announceInChat(recipient, it)
+                    }
+                } else {
+                    transferChatReceipts.send(
+                        recipient = recipient,
+                        amountMinor = amountMinor,
+                        note = note,
+                        paymentPin = paymentPin,
+                    )
+                }
                 _lastSent.value = sent.transaction
-                announceInChat(recipient, sent)
                 onSent()
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -157,19 +169,11 @@ class SendMoneyViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Puts the payment into the conversation with the person who received it, so money sent from
-     * the wallet still reads as part of the chat rather than vanishing into a separate history.
-     *
-     * Deliberately best-effort: the debit has already happened and the receipt is already in the
-     * wallet. A messaging failure here must never surface as a failed payment — the recipient
-     * still sees the transfer in their wallet, and a held transfer's card is rebuilt from the
-     * wallet API whenever the conversation is opened.
-     */
+    /** Compatibility fallback for isolated tests and repository-only embeddings without recovery. */
     private suspend fun announceInChat(recipient: Contact, sent: SentTransfer) {
         if (!recipient.isKitUser) return
         val claim = sent.claim
-        val descriptor = KitPaymentMessage(
+        val event = KitPaymentMessage(
             action = if (claim == null) KitPaymentAction.SENT else KitPaymentAction.TRANSFER,
             referenceId = claim?.id ?: sent.transaction.id,
             amountMinor = abs(sent.transaction.amountMinor),
@@ -178,16 +182,15 @@ class SendMoneyViewModel @Inject constructor(
             note = sent.transaction.note
                 ?.takeIf(String::isNotBlank)
                 ?.take(KitPaymentMessage.MAX_NOTE_LENGTH),
-        ).encode()
-        // Post nothing rather than something neither side can read back: a descriptor that fails
-        // its own canonical round trip would render as raw text in every client that receives it.
+        )
+        val descriptor = event.encode()
         if (KitPaymentMessage.parse(descriptor) == null) return
         try {
             chats.sendPaymentEvent(chats.openDirectConversation(recipient), descriptor)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
-            // Swallowed on purpose; see the note above.
+            // The production graph uses the durable coordinator. This fallback remains best effort.
         }
     }
 }

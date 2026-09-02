@@ -94,6 +94,14 @@ internal data class KitGroupPaymentMessage(
         }
     }
 
+    /** Stable identity for the creator's one announcement of this server-owned payment. */
+    fun announcementMessageId(): String {
+        require(action == KitGroupPaymentAction.SENT) {
+            "Only a sent group payment has an announcement identity"
+        }
+        return deterministicUuid("kit-group-payment-event-v1|${groupPaymentId.lowercase()}|sent")
+    }
+
     /**
      * What one member gets from an evenly-split pot, before the remainder is dealt. Shown only as
      * "about", because the odd minor unit goes to one member and not the others.
