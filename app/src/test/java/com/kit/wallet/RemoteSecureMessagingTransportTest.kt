@@ -24,6 +24,7 @@ import com.kit.wallet.data.messaging.SecureMessagingProtocolUnavailableException
 import com.kit.wallet.data.messaging.SecureMessagingProjectionDeliveryState
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingProvisioningPlan
+import com.kit.wallet.data.messaging.SecureMessagingQuarantineReason
 import com.kit.wallet.data.messaging.SecureMessagingRemoteContext
 import com.kit.wallet.data.messaging.SecureMessagingSessionEstablishmentRequest
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
@@ -550,6 +551,24 @@ class RemoteSecureMessagingTransportTest {
         assertTrue(failure is IllegalStateException)
         assertEquals("QUARANTINED", lifecycle.snapshot().stage.name)
         assertEquals(2, server.requestCount)
+    }
+
+    @Test
+    fun `current device substitution returns no handle and quarantines activation`() = runTest {
+        val (lifecycle, fence) = newActivation()
+        server.enqueue(jsonResponse(READY_CAPABILITIES))
+        server.enqueue(jsonResponse(PROFILE))
+        server.enqueue(jsonResponse(DEVICES.replace(CURRENT_DEVICE_ID, OUTSIDER_DEVICE_ID)))
+
+        val failure = runCatching { transport.openSession(lifecycle, fence) }.exceptionOrNull()
+
+        assertTrue(failure is IllegalStateException)
+        assertEquals("QUARANTINED", lifecycle.snapshot().stage.name)
+        assertEquals(
+            SecureMessagingQuarantineReason.CURRENT_DEVICE_REVOKED,
+            lifecycle.snapshot().quarantineReason,
+        )
+        assertEquals(3, server.requestCount)
     }
 
     @Test

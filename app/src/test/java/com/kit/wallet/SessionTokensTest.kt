@@ -3,6 +3,7 @@ package com.kit.wallet
 import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionDiskPayload
 import com.kit.wallet.data.session.CachedSessionAssurance
+import com.kit.wallet.data.session.CachedSessionCapabilities
 import com.kit.wallet.data.session.SessionTokens
 import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.kit.wallet.data.session.decodeSessionPersistingLegacyNonce
@@ -79,6 +80,22 @@ class SessionTokensTest {
     }
 
     @Test
+    fun `read only capability snapshot survives encrypted session restart`() {
+        val cached = CachedSessionCapabilities(
+            messaging = true,
+            calls = true,
+            messagingGroups = false,
+        )
+        val encoded = diskAdapter.toJson(
+            tokens.copy(cachedCapabilities = cached).toDiskPayload(),
+        )
+
+        val restored = checkNotNull(diskAdapter.fromJson(encoded)).toSessionTokens()
+
+        assertEquals(cached, restored.cachedCapabilities)
+    }
+
+    @Test
     fun `pre scoped encrypted assurance restores with compatibility defaults`() {
         val legacy = checkNotNull(
             diskAdapter.fromJson(
@@ -128,6 +145,7 @@ class SessionTokensTest {
         listOf(
             "-keep class com.kit.wallet.data.session.SessionDiskPayload { *; }",
             "-keep class com.kit.wallet.data.session.CachedSessionAssurance { *; }",
+            "-keep class com.kit.wallet.data.session.CachedSessionCapabilities { *; }",
             "-keep class com.kit.wallet.data.session.SecureMessagingResetProofFence { *; }",
         ).forEach { requiredRule ->
             assertEquals(1, rules.count { it == requiredRule })

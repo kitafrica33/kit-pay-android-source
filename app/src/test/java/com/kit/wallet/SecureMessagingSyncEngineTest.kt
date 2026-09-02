@@ -4,7 +4,10 @@ import com.kit.wallet.data.auth.AuthRepository
 import com.kit.wallet.data.auth.DeviceIdentityProvider
 import com.kit.wallet.data.auth.SecureMessagingEnrollmentResetTarget
 import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
+import com.kit.wallet.data.messaging.LibSignalProtocolStore
+import com.kit.wallet.data.messaging.SecureMessagingAuthBindingPersistence
 import com.kit.wallet.data.messaging.SecureMessagingAuthBindingResolver
+import com.kit.wallet.data.messaging.SecureMessagingAuthBindingStore
 import com.kit.wallet.data.messaging.SecureMessagingAuthenticationEpochChangedException
 import com.kit.wallet.data.messaging.RealSecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.RealSecureMessagingSyncEngine
@@ -21,6 +24,7 @@ import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
 import com.kit.wallet.data.messaging.SecureMessagingLegacyConfirmedEnrollmentUnreadableException
 import com.kit.wallet.data.messaging.SecureMessagingLegacyInitialEnrollmentUnreadableException
+import com.kit.wallet.data.messaging.SecureMessagingLegacyStateUnreadableException
 import com.kit.wallet.data.messaging.SecureMessagingLocalEnrollmentResetRequiredException
 import com.kit.wallet.data.messaging.SecureMessagingProjectionStore
 import com.kit.wallet.data.messaging.SecureMessagingReauthenticationRequiredException
@@ -48,6 +52,8 @@ import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.lang.reflect.Proxy
 import java.security.ProviderException
 import java.util.concurrent.CountDownLatch
@@ -67,6 +73,8 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -156,7 +164,7 @@ class SecureMessagingSyncEngineTest {
     }
 
     @Test
-    fun `binding resolver resolves one profile and device pair per authentication epoch`() =
+    fun `binding resolver resolves one profile and device pair per exact owner`() =
         runTest {
             val server = MockWebServer().apply { start() }
             try {
@@ -171,8 +179,20 @@ class SecureMessagingSyncEngineTest {
 
                 assertEquals(first, second)
                 assertEquals(first, third)
-                // One profile call and one devices call for the whole epoch, not per resolve.
+                // One profile call and one devices call for the whole owner, not per resolve.
                 assertEquals(2, server.requestCount)
+
+                // Even when a backend accidentally reuses an epoch, a new local cache owner must
+                // not inherit the previous process-local binding.
+                val replacementScope = TOKENS.copy(cacheScopeId = "replacement-cache-scope")
+                sessionStore.replace(replacementScope)
+                server.enqueue(jsonResponse(PROFILE))
+                server.enqueue(jsonResponse(DEVICES))
+
+                val reboundScope = resolver.resolve(replacementScope.sessionId)
+
+                assertEquals(replacementScope.sessionId, reboundScope.sessionEpoch)
+                assertEquals(4, server.requestCount)
 
                 // A replaced epoch is a different key, so it must re-resolve rather than reuse a
                 // binding that was authenticated for the session it replaced.
@@ -184,14 +204,278 @@ class SecureMessagingSyncEngineTest {
                 val rebound = resolver.resolve(replacement.sessionId)
 
                 assertEquals(replacement.sessionId, rebound.sessionEpoch)
-                assertEquals(4, server.requestCount)
+                assertEquals(6, server.requestCount)
             } finally {
                 server.shutdown()
             }
         }
 
     @Test
-    fun `ready implementation activates a fresh login when registry starts empty`() = runTest {
+    fun `durable binding requires the exact owner and installation`() = runTest {
+        val stateStore = TestSecureMessagingStateStore()
+        val persistence = SecureMessagingAuthBindingStore(stateStore)
+        val owner = TOKENS.copy(
+            accountId = USER_ID,
+            cacheScopeId = "owner-cache-scope",
+        ).fence()
+        val binding = SecureMessagingSessionBinding(
+            sessionEpoch = owner.sessionId,
+            userId = USER_ID,
+            serverDeviceId = DEVICE_ID,
+            installationId = INSTALLATION_ID,
+        )
+        persistence.persist(owner, binding)
+
+        val exact = persistence.read(owner, INSTALLATION_ID)
+        assertEquals(binding, exact?.binding)
+        assertFalse(checkNotNull(exact).requiresMigration)
+
+        assertNull(
+            persistence.read(
+                owner.copy(cacheScopeId = "replacement-cache-scope"),
+                INSTALLATION_ID,
+            ),
+        )
+        assertNull(
+            persistence.read(
+                owner.copy(sessionId = "replacement-session"),
+                INSTALLATION_ID,
+            ),
+        )
+        assertNull(
+            persistence.read(
+                owner.copy(accountId = "22222222-2222-4222-8222-222222222222"),
+                INSTALLATION_ID,
+            ),
+        )
+        assertNull(persistence.read(owner, "replacement-installation"))
+    }
+
+    @Test
+    fun `binding persistence never swallows coroutine cancellation`() = runTest {
+        val server = MockWebServer().apply { start() }
+        try {
+            val owner = TOKENS.copy(accountId = USER_ID).fence()
+            val cancelled = CancellationException("cancel binding write")
+            val persistence = object : SecureMessagingAuthBindingPersistence {
+                override suspend fun read(
+                    expectedOwner: com.kit.wallet.data.session.SessionFence,
+                    expectedInstallationId: String,
+                ) = null
+
+                override suspend fun persist(
+                    expectedOwner: com.kit.wallet.data.session.SessionFence,
+                    binding: SecureMessagingSessionBinding,
+                ): Nothing = throw cancelled
+            }
+            val resolver = resolver(
+                server = server,
+                sessions = FakeSessionStore(TOKENS.copy(accountId = USER_ID)),
+                persistence = persistence,
+            )
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            val binding = resolver.resolve(owner)
+
+            val failure = runCatching {
+                resolver.persistActivated(owner, binding)
+            }.exceptionOrNull()
+
+            assertSame(cancelled, failure)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `malformed exact binding is a miss and live resolution replaces it`() = runTest {
+        val stateStore = TestSecureMessagingStateStore()
+        stateStore.write(
+            namespace = "secure-messaging-auth-binding-v1",
+            recordKey = "active-owner",
+            expectedVersion = null,
+            bytes = ByteArray(64) { 0x5a },
+        )
+        val server = MockWebServer().apply { start() }
+        try {
+            val sessions = FakeSessionStore(TOKENS.copy(accountId = USER_ID))
+            val resolver = resolver(
+                server = server,
+                sessions = sessions,
+                persistence = SecureMessagingAuthBindingStore(stateStore),
+            )
+            val owner = checkNotNull(sessions.current()).fence()
+
+            assertNull(resolver.resolvePersisted(owner))
+            assertEquals(0, server.requestCount)
+
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            assertEquals(expectedBinding(owner), resolver.resolve(owner))
+            assertEquals(2, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `permanently missing binding key is a miss before live activation`() = runTest {
+        assertUnreadableBindingMetadataResolvesLive(
+            SecureMessagingRecordKeyPermanentlyMissingException(),
+        )
+    }
+
+    @Test
+    fun `legacy unreadable binding is a miss before live activation`() = runTest {
+        assertUnreadableBindingMetadataResolvesLive(
+            SecureMessagingLegacyStateUnreadableException(
+                SecureMessagingRecordAuthenticationFailedException(
+                    IllegalStateException("legacy authentication failed"),
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `binding metadata read never swallows coroutine cancellation`() = runTest {
+        val server = MockWebServer().apply { start() }
+        try {
+            val cancellation = CancellationException("cancel binding read")
+            val sessions = FakeSessionStore(TOKENS.copy(accountId = USER_ID))
+            val persistence = object : SecureMessagingAuthBindingPersistence {
+                override suspend fun read(
+                    expectedOwner: com.kit.wallet.data.session.SessionFence,
+                    expectedInstallationId: String,
+                ): Nothing = throw cancellation
+
+                override suspend fun persist(
+                    expectedOwner: com.kit.wallet.data.session.SessionFence,
+                    binding: SecureMessagingSessionBinding,
+                ) = Unit
+            }
+            val failure = runCatching {
+                resolver(server, sessions, persistence).resolvePersisted(
+                    checkNotNull(sessions.current()).fence(),
+                )
+            }.exceptionOrNull()
+
+            assertSame(cancellation, failure)
+            assertEquals(0, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `legacy protocol binding migrates offline and malformed legacy state resolves live`() =
+        runTest {
+            val owner = TOKENS.copy(accountId = USER_ID).fence()
+            val binding = SecureMessagingSessionBinding(
+                sessionEpoch = owner.sessionId,
+                userId = USER_ID,
+                serverDeviceId = DEVICE_ID,
+                installationId = INSTALLATION_ID,
+            )
+            val stateStore = TestSecureMessagingStateStore()
+            val legacyBytes = legacyProtocolBinding(binding)
+            try {
+                stateStore.write(
+                    namespace = "libsignal-v2",
+                    recordKey = "active-protocol-state",
+                    expectedVersion = null,
+                    bytes = legacyBytes,
+                )
+            } finally {
+                legacyBytes.fill(0)
+            }
+            val persistence = SecureMessagingAuthBindingStore(stateStore)
+
+            val legacy = persistence.read(owner, INSTALLATION_ID)
+            assertEquals(binding, legacy?.binding)
+            assertTrue(checkNotNull(legacy).requiresMigration)
+
+            val offlineServer = MockWebServer().apply {
+                dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest) =
+                        MockResponse().setResponseCode(503)
+                }
+                start()
+            }
+            try {
+                val offlineResolver = resolver(
+                    server = offlineServer,
+                    sessions = FakeSessionStore(TOKENS.copy(accountId = USER_ID)),
+                    persistence = persistence,
+                )
+
+                assertEquals(binding, offlineResolver.resolve(owner))
+                assertEquals(0, offlineServer.requestCount)
+            } finally {
+                offlineServer.shutdown()
+            }
+
+            // A successful live activation promotes the legacy header to the complete owner
+            // record. The protocol state itself remains untouched.
+            persistence.persist(owner, binding)
+            val migrated = persistence.read(owner, INSTALLATION_ID)
+            assertEquals(binding, migrated?.binding)
+            assertFalse(checkNotNull(migrated).requiresMigration)
+
+            val malformedState = TestSecureMessagingStateStore()
+            malformedState.write(
+                namespace = "libsignal-v2",
+                recordKey = "active-protocol-state",
+                expectedVersion = null,
+                bytes = "not-a-protocol-binding".toByteArray(),
+            )
+            val server = MockWebServer().apply { start() }
+            try {
+                val sessions = FakeSessionStore(TOKENS.copy(accountId = USER_ID))
+                val resolver = resolver(
+                    server = server,
+                    sessions = sessions,
+                    persistence = SecureMessagingAuthBindingStore(malformedState),
+                )
+                server.enqueue(jsonResponse(PROFILE))
+                server.enqueue(jsonResponse(DEVICES))
+
+                assertEquals(binding, resolver.resolve(sessions.current()!!.fence()))
+                assertEquals(2, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+
+    @Test
+    fun `logout and account replacement erase the durable binding namespace`() = runTest {
+        val stateStore = TestSecureMessagingStateStore()
+        val persistence = SecureMessagingAuthBindingStore(stateStore)
+        val owner = TOKENS.copy(accountId = USER_ID).fence()
+        val binding = SecureMessagingSessionBinding(
+            sessionEpoch = owner.sessionId,
+            userId = USER_ID,
+            serverDeviceId = DEVICE_ID,
+            installationId = INSTALLATION_ID,
+        )
+        val lifecycle = SecureMessagingSessionLifecycle(
+            stateStore,
+            SecureMessagingLifecycleGuard(),
+        )
+        lifecycle.afterSessionSave()
+        persistence.persist(owner, binding)
+        assertNotNull(persistence.read(owner, INSTALLATION_ID))
+
+        lifecycle.beforeSessionClear()
+        assertNull(persistence.read(owner, INSTALLATION_ID))
+
+        lifecycle.afterSessionSave()
+        persistence.persist(owner, binding)
+        lifecycle.beforeSessionSave(isSameSession = false)
+        assertNull(persistence.read(owner, INSTALLATION_ID))
+    }
+
+    @Test
+    fun `online activation persists binding and cold offline restart opens local history only`() = runTest {
         val server = MockWebServer().apply { start() }
         try {
             val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
@@ -233,6 +517,7 @@ class SecureMessagingSyncEngineTest {
                     api,
                     ApiCallExecutor(moshi),
                     deviceIdentity(),
+                    SecureMessagingAuthBindingStore(stateStore),
                 ),
                 activation = coordinator,
                 processor = processor,
@@ -255,6 +540,54 @@ class SecureMessagingSyncEngineTest {
             assertEquals(TOKENS.sessionId, registry.requireCurrent().binding.sessionEpoch)
             assertEquals(8, server.requestCount)
 
+            // A fresh resolver/process must bootstrap from encrypted state without consulting
+            // profile or devices. The only offline request is the transport's uncached capability
+            // validation, which cannot publish an exchange session.
+            var offlineRequestPath: String? = null
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    offlineRequestPath = request.path
+                    return MockResponse().setResponseCode(503)
+                }
+            }
+            val restartedGuard = SecureMessagingLifecycleGuard()
+            val restartedRegistry = SecureMessagingActiveSessionRegistry(restartedGuard)
+            val restartedLifecycle = SecureMessagingSessionLifecycle(stateStore, restartedGuard)
+            restartedLifecycle.afterSessionSave()
+            val restartedCoordinator = SecureMessagingActivationCoordinator(
+                transport = transport,
+                lifecycle = restartedGuard,
+                sessions = restartedRegistry,
+                keyActivation = SecureMessagingKeyActivation { },
+                initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+            )
+            val restartedEngine = RealSecureMessagingSyncEngine(
+                bindingResolver = SecureMessagingAuthBindingResolver(
+                    sessions,
+                    api,
+                    ApiCallExecutor(moshi),
+                    deviceIdentity(),
+                    SecureMessagingAuthBindingStore(stateStore),
+                ),
+                activation = restartedCoordinator,
+                processor = processor,
+                sessions = sessions,
+                sessionLifecycle = restartedLifecycle,
+                authRepository = unusedAuthRepository(),
+            )
+
+            val offlineFailure = runCatching { restartedEngine.synchronize() }.exceptionOrNull()
+
+            assertNotNull(offlineFailure)
+            assertEquals("/api/kit-wallet/v1/capabilities", offlineRequestPath)
+            assertEquals(9, server.requestCount)
+            assertNotNull(restartedGuard.localReadActivation.value)
+            assertNull(restartedRegistry.currentOrNull())
+            assertEquals(
+                SecureMessagingRuntimeStage.CHECKING_CAPABILITIES,
+                restartedGuard.snapshot().stage,
+            )
+
             val active = registry.requireCurrent()
             val staleFence = com.kit.wallet.data.messaging.SecureMessagingSessionFence(
                 binding = active.binding,
@@ -263,7 +596,7 @@ class SecureMessagingSyncEngineTest {
             val redirected = runCatching { engine.synchronize(staleFence) }.exceptionOrNull()
 
             assertTrue(redirected is SecureMessagingAuthenticationEpochChangedException)
-            assertEquals(8, server.requestCount)
+            assertEquals(9, server.requestCount)
 
             val expectedSession = TOKENS.fence()
             sessions.replace(TOKENS.copy(sessionId = "replacement-session"))
@@ -274,7 +607,7 @@ class SecureMessagingSyncEngineTest {
             assertTrue(
                 staleSessionContinuation is SecureMessagingAuthenticationEpochChangedException,
             )
-            assertEquals(8, server.requestCount)
+            assertEquals(9, server.requestCount)
         } finally {
             server.shutdown()
         }
@@ -367,6 +700,77 @@ class SecureMessagingSyncEngineTest {
                 assertEquals(1, server.requestCount)
             } finally {
                 releaseProfile.countDown()
+                server.shutdown()
+            }
+        }
+
+    @Test
+    fun `replacement after binding resolution cannot recreate the erased owner generation`() =
+        runTest {
+            val server = MockWebServer().apply { start() }
+            try {
+                val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+                val retrofit = Retrofit.Builder()
+                    .baseUrl(server.url("/"))
+                    .addConverterFactory(MoshiConverterFactory.create(moshi))
+                    .build()
+                val api = retrofit.create(KitWalletApi::class.java)
+                val sessions = FakeSessionStore(TOKENS)
+                val guard = SecureMessagingLifecycleGuard()
+                val registry = SecureMessagingActiveSessionRegistry(guard)
+                val stateStore = TestSecureMessagingStateStore()
+                val processor = SecureMessagingEventProcessor(
+                    UnusedCryptoEngine,
+                    SecureMessagingProjectionStore(
+                        stateStore,
+                        com.kit.wallet.data.messaging.LibSignalCompanionStateReader(stateStore),
+                    ),
+                    SecureMessagingSyncCursorStore(stateStore),
+                )
+                val coordinator = SecureMessagingActivationCoordinator(
+                    transport = RemoteSecureMessagingTransport(
+                        api,
+                        retrofit.create(SecureMessagingWireApi::class.java),
+                        ApiCallExecutor(moshi),
+                    ),
+                    lifecycle = guard,
+                    sessions = registry,
+                    keyActivation = SecureMessagingKeyActivation { },
+                    initialSyncActivation = RealSecureMessagingInitialSyncActivation(processor),
+                )
+                val sessionLifecycle = SecureMessagingSessionLifecycle(stateStore, guard)
+                sessionLifecycle.afterSessionSave()
+                val engine = RealSecureMessagingSyncEngine(
+                    bindingResolver = SecureMessagingAuthBindingResolver(
+                        sessions,
+                        api,
+                        ApiCallExecutor(moshi),
+                        deviceIdentity(),
+                    ),
+                    activation = coordinator,
+                    processor = processor,
+                    sessions = sessions,
+                    sessionLifecycle = sessionLifecycle,
+                    authRepository = unusedAuthRepository(),
+                )
+                sessions.beforeCurrentSessionLease = { lease ->
+                    if (lease == 2) {
+                        // Resolver lease #1 completed for A. Keep its epoch/cache scope but replace
+                        // the account just before the atomic generation-preparation lease.
+                        sessions.replace(TOKENS.copy(accountId = DEVICE_ID))
+                    }
+                }
+                server.enqueue(jsonResponse(PROFILE))
+                server.enqueue(jsonResponse(DEVICES))
+
+                val failure = runCatching { engine.synchronize() }.exceptionOrNull()
+
+                assertTrue(failure is SecureMessagingAuthenticationEpochChangedException)
+                assertEquals(SecureMessagingRuntimeStage.NO_SESSION, guard.snapshot().stage)
+                assertNull(guard.localReadActivation.value)
+                assertNull(registry.currentOrNull())
+                assertEquals(2, server.requestCount)
+            } finally {
                 server.shutdown()
             }
         }
@@ -1544,6 +1948,7 @@ class SecureMessagingSyncEngineTest {
     private fun resolver(
         server: MockWebServer,
         sessions: SessionStore,
+        persistence: SecureMessagingAuthBindingPersistence? = null,
     ): SecureMessagingAuthBindingResolver {
         val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
         val api = Retrofit.Builder()
@@ -1551,12 +1956,99 @@ class SecureMessagingSyncEngineTest {
             .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
             .create(KitWalletApi::class.java)
-        return SecureMessagingAuthBindingResolver(
-            sessions,
-            api,
-            ApiCallExecutor(moshi),
-            deviceIdentity(),
-        )
+        return if (persistence == null) {
+            SecureMessagingAuthBindingResolver(
+                sessions,
+                api,
+                ApiCallExecutor(moshi),
+                deviceIdentity(),
+            )
+        } else {
+            SecureMessagingAuthBindingResolver(
+                sessions,
+                api,
+                ApiCallExecutor(moshi),
+                deviceIdentity(),
+                persistence,
+            )
+        }
+    }
+
+    private suspend fun assertUnreadableBindingMetadataResolvesLive(error: Exception) {
+        val server = MockWebServer().apply { start() }
+        try {
+            val sessions = FakeSessionStore(TOKENS.copy(accountId = USER_ID))
+            val persistence = object : SecureMessagingAuthBindingPersistence {
+                override suspend fun read(
+                    expectedOwner: com.kit.wallet.data.session.SessionFence,
+                    expectedInstallationId: String,
+                ): Nothing = throw error
+
+                override suspend fun persist(
+                    expectedOwner: com.kit.wallet.data.session.SessionFence,
+                    binding: SecureMessagingSessionBinding,
+                ) = Unit
+            }
+            val resolver = resolver(server, sessions, persistence)
+            val owner = checkNotNull(sessions.current()).fence()
+
+            // The application bootstrap is strictly local and simply declines to activate.
+            assertNull(resolver.resolvePersisted(owner))
+            assertEquals(0, server.requestCount)
+
+            // The connected path can still establish the binding and therefore a normal
+            // activation generation whose real state access owns any subsequent recovery.
+            server.enqueue(jsonResponse(PROFILE))
+            server.enqueue(jsonResponse(DEVICES))
+            assertEquals(expectedBinding(owner), resolver.resolve(owner))
+            assertEquals(2, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    private fun expectedBinding(
+        owner: com.kit.wallet.data.session.SessionFence,
+    ) = SecureMessagingSessionBinding(
+        sessionEpoch = owner.sessionId,
+        userId = USER_ID,
+        serverDeviceId = DEVICE_ID,
+        installationId = INSTALLATION_ID,
+    )
+
+    private fun legacyProtocolBinding(binding: SecureMessagingSessionBinding): ByteArray {
+        val protocolStore = LibSignalProtocolStore.create()
+        val protocolBytes = try {
+            protocolStore.serialize()
+        } finally {
+            protocolStore.close()
+        }
+        val output = ByteArrayOutputStream()
+        try {
+            DataOutputStream(output).use { data ->
+                data.write(byteArrayOf(0x4b, 0x49, 0x54, 0x4c, 0x53, 0x42, 0x32))
+                data.writeInt(2)
+                data.writeBindingString(binding.sessionEpoch)
+                data.writeBindingString(binding.userId)
+                data.writeBindingString(binding.serverDeviceId)
+                data.writeBindingString(binding.installationId)
+                data.writeBoolean(false)
+                data.writeInt(0)
+                data.writeBoolean(false)
+                data.writeInt(protocolBytes.size)
+                data.write(protocolBytes)
+            }
+            return output.toByteArray()
+        } finally {
+            protocolBytes.fill(0)
+        }
+    }
+
+    private fun DataOutputStream.writeBindingString(value: String) {
+        val bytes = value.toByteArray(Charsets.UTF_8)
+        writeInt(bytes.size)
+        write(bytes)
+        bytes.fill(0)
     }
 
     private fun deviceIdentity() = object : DeviceIdentityProvider {
@@ -1638,6 +2130,8 @@ class SecureMessagingSyncEngineTest {
         var beforeProvedMessagingReset: () -> Unit = {}
         var provedMessagingResetCalls: Int = 0
             private set
+        var beforeCurrentSessionLease: suspend (Int) -> Unit = {}
+        private var currentSessionLeases = 0
 
         override fun current(): SessionTokens? = mutable.value
 
@@ -1674,8 +2168,12 @@ class SecureMessagingSyncEngineTest {
             expected: com.kit.wallet.data.session.SessionFence,
             block: suspend (SessionTokens) -> T,
         ): T {
-            val current = requireNotNull(mutable.value)
-            check(current.fence() == expected)
+            beforeCurrentSessionLease(++currentSessionLeases)
+            val current = mutable.value
+                ?: throw com.kit.wallet.data.session.SessionInvalidatedException()
+            if (current.fence() != expected) {
+                throw com.kit.wallet.data.session.SessionInvalidatedException()
+            }
             return block(current)
         }
 

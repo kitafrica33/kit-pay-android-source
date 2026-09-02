@@ -5,6 +5,7 @@
 -keep class com.kit.wallet.data.remote.** { *; }
 -keep class com.kit.wallet.data.session.SessionDiskPayload { *; }
 -keep class com.kit.wallet.data.session.CachedSessionAssurance { *; }
+-keep class com.kit.wallet.data.session.CachedSessionCapabilities { *; }
 -keep class com.kit.wallet.data.session.SecureMessagingResetProofFence { *; }
 -keepattributes Signature,*Annotation*,InnerClasses,EnclosingMethod
 

@@ -1,5 +1,6 @@
 package com.kit.wallet.data.messaging
 
+import com.kit.wallet.data.session.SessionFence
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -244,6 +245,7 @@ class SecureMessagingActivationCoordinator @Inject constructor(
 ) {
     private data class Attempt(
         val binding: SecureMessagingSessionBinding,
+        val owner: SessionFence?,
         val fence: SecureMessagingSessionFence,
         var transportSession: RemoteSecureMessagingTransport.Session? = null,
     )
@@ -260,20 +262,95 @@ class SecureMessagingActivationCoordinator @Inject constructor(
     internal fun hasNoGeneration(): Boolean =
         lifecycle.snapshot().stage == SecureMessagingRuntimeStage.NO_SESSION
 
+    /**
+     * Starts (or reuses) the exact activation generation needed to read encrypted local history.
+     *
+     * No transport is opened and no activation stage is advanced here. The ordinary
+     * [ensureActivated] call later reuses [pendingAttempt] and advances this same generation once
+     * connectivity is available, so offline display authority can never become a parallel or
+     * weaker messaging session.
+     */
+    internal fun prepareActivationIfIdle(
+        expectedOwner: SessionFence,
+        binding: SecureMessagingSessionBinding,
+    ): SecureMessagingActivationCapability? {
+        lifecycle.localReadActivation.value
+            ?.takeIf { it.owner == expectedOwner && it.binding == binding }
+            ?.let { return it }
+        // Never hold the authentication-session mutex while waiting behind a network activation.
+        // Null means the caller must release that mutex and retry: the winner may still belong to
+        // an owner being erased, so contention alone is never proof that this owner is prepared.
+        if (!mutex.tryLock()) return null
+        return try {
+            sessions.currentOrNull()?.let { active ->
+                check(active.binding == binding) {
+                    "Secure messaging must erase the active epoch before session replacement"
+                }
+                check(active.activation.owner == expectedOwner) {
+                    "Secure messaging active session belongs to another authenticated owner"
+                }
+                return active.activation
+            }
+            sessions.retainedForRevalidation(binding)?.let { retained ->
+                check(retained.activation.owner == expectedOwner) {
+                    "Secure messaging retained session belongs to another authenticated owner"
+                }
+                return retained.activation
+            }
+            val attempt = currentOrNewAttempt(binding, expectedOwner)
+            lifecycle.activationCapability(attempt.fence)
+        } finally {
+            mutex.unlock()
+        }
+    }
+
     suspend fun ensureActivated(
         binding: SecureMessagingSessionBinding,
+    ): SecureMessagingActiveSession = ensureActivatedForOwner(
+        expectedOwner = null,
+        binding = binding,
+        preparedOnly = false,
+    )
+
+    internal suspend fun advancePreparedActivation(
+        expectedOwner: SessionFence,
+        binding: SecureMessagingSessionBinding,
+    ): SecureMessagingActiveSession = ensureActivatedForOwner(
+        expectedOwner = expectedOwner,
+        binding = binding,
+        preparedOnly = true,
+    )
+
+    private suspend fun ensureActivatedForOwner(
+        expectedOwner: SessionFence?,
+        binding: SecureMessagingSessionBinding,
+        preparedOnly: Boolean,
     ): SecureMessagingActiveSession = mutex.withLock {
         sessions.currentOrNull()?.let { active ->
             check(active.binding == binding) {
                 "Secure messaging must erase the active epoch before session replacement"
             }
+            if (expectedOwner != null) {
+                check(active.activation.owner == expectedOwner) {
+                    "Secure messaging active session belongs to another authenticated owner"
+                }
+            }
             return@withLock active
         }
         sessions.retainedForRevalidation(binding)?.let { retained ->
+            if (expectedOwner != null) {
+                check(retained.activation.owner == expectedOwner) {
+                    "Secure messaging retained session belongs to another authenticated owner"
+                }
+            }
             return@withLock retained
         }
 
-        val attempt = currentOrNewAttempt(binding)
+        val attempt = if (preparedOnly) {
+            requirePreparedAttempt(binding, checkNotNull(expectedOwner))
+        } else {
+            currentOrNewAttempt(binding, expectedOwner)
+        }
         try {
             val active = advance(attempt)
             pendingAttempt = null
@@ -350,13 +427,21 @@ class SecureMessagingActivationCoordinator @Inject constructor(
         return SecureMessagingFreshProvisioningUnreadableException(error)
     }
 
-    private fun currentOrNewAttempt(binding: SecureMessagingSessionBinding): Attempt {
+    private fun currentOrNewAttempt(
+        binding: SecureMessagingSessionBinding,
+        expectedOwner: SessionFence?,
+    ): Attempt {
         pendingAttempt?.let { pending ->
             if (!isCurrent(pending)) {
                 pendingAttempt = null
             } else {
                 check(pending.binding == binding) {
                     "Secure messaging must erase the pending epoch before session replacement"
+                }
+                if (expectedOwner != null) {
+                    check(pending.owner == expectedOwner) {
+                        "Secure messaging pending activation belongs to another authenticated owner"
+                    }
                 }
                 return pending
             }
@@ -365,7 +450,30 @@ class SecureMessagingActivationCoordinator @Inject constructor(
         check(lifecycle.snapshot().stage == SecureMessagingRuntimeStage.NO_SESSION) {
             "Secure messaging lifecycle is already owned by another activation"
         }
-        return Attempt(binding, lifecycle.beginSession(binding)).also { pendingAttempt = it }
+        return Attempt(
+            binding = binding,
+            owner = expectedOwner,
+            fence = lifecycle.beginSession(binding, expectedOwner),
+        ).also { pendingAttempt = it }
+    }
+
+    private fun requirePreparedAttempt(
+        binding: SecureMessagingSessionBinding,
+        expectedOwner: SessionFence,
+    ): Attempt {
+        val pending = pendingAttempt
+        if (pending == null || !isCurrent(pending)) {
+            pendingAttempt = null
+            throw SecureMessagingAuthenticationEpochChangedException(
+                "Prepared secure messaging activation is no longer current",
+            )
+        }
+        if (pending.binding != binding || pending.owner != expectedOwner) {
+            throw SecureMessagingAuthenticationEpochChangedException(
+                "Prepared secure messaging activation belongs to another owner",
+            )
+        }
+        return pending
     }
 
     private suspend fun advance(attempt: Attempt): SecureMessagingActiveSession {

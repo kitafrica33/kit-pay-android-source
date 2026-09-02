@@ -271,6 +271,8 @@ internal data class AuthenticatedProjectionPage(
 internal class SecureMessagingChatSession internal constructor(
     val sessionEpoch: String,
     internal val identity: Any,
+    /** Exact login owner carried from the lifecycle-issued activation capability. */
+    internal val authenticationOwner: SessionFence? = null,
     /**
      * Whether the server advertised message corrections for this authenticated account.
      *
@@ -762,6 +764,7 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
                 SecureMessagingChatSession(
                     sessionEpoch = it.binding.sessionEpoch,
                     identity = it,
+                    authenticationOwner = it.activation.owner,
                     messageEditsEnabled = it.transport.messageEditsEnabled,
                     mediaAlbumsEnabled = it.transport.mediaMessageV2Enabled,
                     ownerAccountId = it.binding.userId,
@@ -2248,6 +2251,13 @@ class EncryptedChatRepository @Inject internal constructor(
     private val mutableLocalHistoryReady = MutableStateFlow(false)
     override val localHistoryReady: StateFlow<Boolean> = mutableLocalHistoryReady.asStateFlow()
 
+    // Carries the exact authentication fence in the same publication lifecycle as the Boolean
+    // above. Session-scoped consumers must compare this value with their current owner instead of
+    // attributing a still-true A projection to B during an authenticated account replacement.
+    private val mutableLocalHistoryOwner = MutableStateFlow<SessionFence?>(null)
+    override val localHistoryOwner: StateFlow<SessionFence?> =
+        mutableLocalHistoryOwner.asStateFlow()
+
     // Corrections need a live authenticated session to be gated at all: the capability is a fact
     // about the account, and the local store cannot know it. So this is published only alongside
     // the message-ready publication and withdrawn with it, which leaves an offline or still
@@ -2690,6 +2700,7 @@ class EncryptedChatRepository @Inject internal constructor(
                 synchronized(publicationLock) {
                     if (mutableReadiness.value || publishedSession != null) return@synchronized
                     publishedLocalActivation = activation
+                    mutableLocalHistoryOwner.value = activation.owner
                     mutableLocalHistoryReady.value = true
                 }
             }
@@ -2723,6 +2734,7 @@ class EncryptedChatRepository @Inject internal constructor(
                     // session signed in at commit time, which an account switch may have replaced.
                     commitPublicationBodyLocked(publication, activation.binding.userId)
                     publishedLocalActivation = activation
+                    mutableLocalHistoryOwner.value = activation.owner
                     mutableLocalHistoryReady.value = true
                     committed = true
                 }
@@ -6544,6 +6556,7 @@ class EncryptedChatRepository @Inject internal constructor(
         publishedSession = session
         mutableMessageEditsAvailable.value = session.messageEditsEnabled
         mutableMediaAlbumsAvailable.value = session.mediaAlbumsEnabled
+        mutableLocalHistoryOwner.value = session.authenticationOwner
         // Publish readiness last: observing true implies this activation's chats/messages were
         // already committed under the same repository publication lock.
         mutableReadiness.value = true
@@ -7129,6 +7142,7 @@ class EncryptedChatRepository @Inject internal constructor(
     /** Called only while [publicationLock] is held. */
     private fun clearPublishedStateLocked(owner: SecureMessagingChatSession?) {
         mutableReadiness.value = false
+        mutableLocalHistoryOwner.value = null
         mutableLocalHistoryReady.value = false
         mutableMessageEditsAvailable.value = false
         mutableMediaAlbumsAvailable.value = false

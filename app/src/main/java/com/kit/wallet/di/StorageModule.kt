@@ -41,6 +41,8 @@ import com.kit.wallet.data.messaging.RealSecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.RoomSecureMessagingStateStore
 import com.kit.wallet.data.messaging.RoomAccountMessageArchiveStore
 import com.kit.wallet.data.messaging.SecureMessagingCryptoEngine
+import com.kit.wallet.data.messaging.SecureMessagingAuthBindingPersistence
+import com.kit.wallet.data.messaging.SecureMessagingAuthBindingStore
 import com.kit.wallet.data.messaging.SecureMessagingInitialSyncActivation
 import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingLegacyStateValidator
@@ -84,6 +86,12 @@ abstract class SessionModule {
 @Module
 @InstallIn(SingletonComponent::class)
 internal abstract class SecureMessagingStorageModule {
+    @Binds
+    @Singleton
+    abstract fun bindSecureMessagingAuthBindingPersistence(
+        implementation: SecureMessagingAuthBindingStore,
+    ): SecureMessagingAuthBindingPersistence
+
     @Binds
     @Singleton
     abstract fun bindAccountMessageHistoryAccess(

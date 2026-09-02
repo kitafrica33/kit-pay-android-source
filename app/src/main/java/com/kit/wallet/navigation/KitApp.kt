@@ -499,10 +499,6 @@ internal fun KitApp(
         }
     }
 
-    LaunchedEffect(signedIn) {
-        capabilitiesViewModel.onSessionChanged()
-    }
-
     // Session assurance is independent of biometric availability: a locked login must always be
     // able to unlock with the wallet PIN (or create its first PIN), so the check only waits for
     // capability discovery to finish rather than for any specific authentication method.

@@ -218,6 +218,7 @@ class KeystoreSessionStore @Inject constructor(
                     } else {
                         refreshedCredentials.cachedAssurance
                     },
+                    cachedCapabilities = latest.cachedCapabilities,
                     messagingResetProof = latest.messagingResetProof,
                 ),
             )
@@ -245,6 +246,18 @@ class KeystoreSessionStore @Inject constructor(
         if (current?.fence() != expected) return@withLock false
         if (current.cachedAssurance != assurance) {
             persistLocked(current.copy(cachedAssurance = assurance))
+        }
+        true
+    }
+
+    override suspend fun updateCachedCapabilities(
+        expected: SessionFence,
+        capabilities: CachedSessionCapabilities,
+    ): Boolean = mutex.withLock {
+        val current = _session.value
+        if (current?.fence() != expected) return@withLock false
+        if (current.cachedCapabilities != capabilities) {
+            persistLocked(current.copy(cachedCapabilities = capabilities))
         }
         true
     }
@@ -1161,6 +1174,7 @@ internal data class SessionDiskPayload(
     val cacheScopeId: String? = null,
     val profileSetupState: String? = null,
     val cachedAssurance: CachedSessionAssurance? = null,
+    val cachedCapabilities: CachedSessionCapabilities? = null,
     val messagingResetProof: SecureMessagingResetProofFence? = null,
     val refreshReplayNonce: String? = null,
 )
@@ -1179,6 +1193,7 @@ internal fun SessionTokens.toDiskPayload() = SessionDiskPayload(
         ProfileSetupState.COMPLETED -> "completed"
     },
     cachedAssurance = cachedAssurance,
+    cachedCapabilities = cachedCapabilities,
     messagingResetProof = messagingResetProof,
     refreshReplayNonce = refreshReplayNonce,
 )
@@ -1197,6 +1212,7 @@ internal fun SessionDiskPayload.toSessionTokens() = SessionTokens(
         else -> ProfileSetupState.UNKNOWN
     },
     cachedAssurance = cachedAssurance,
+    cachedCapabilities = cachedCapabilities,
     messagingResetProof = messagingResetProof,
     refreshReplayNonce = refreshReplayNonce ?: java.util.UUID.randomUUID().toString(),
 )

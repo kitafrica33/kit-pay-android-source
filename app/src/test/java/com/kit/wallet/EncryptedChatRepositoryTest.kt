@@ -199,6 +199,34 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `local history publication retains its issuing session fence`() = runTest {
+        val sessionA = testSession(
+            accountId = USER_TWO,
+            sessionId = "shared-epoch",
+            cacheScopeId = "scope-a",
+        )
+        val sessionB = sessionA.copy(cacheScopeId = "scope-b")
+        val sessions = MutableTestSessionStore(sessionA)
+        val runtime = FakeRuntime(epoch = null)
+        val repository = repository(runtime, authenticationSessions = sessions)
+
+        runtime.localHistoryActivations.value = localActivation(
+            userId = USER_TWO,
+            owner = sessionA.fence(),
+            sessionEpoch = sessionA.sessionId,
+        )
+        runCurrent()
+
+        assertEquals(sessionA.fence(), repository.localHistoryOwner.value)
+
+        // Even if the current session is replaced with a byte-identical epoch/account, the
+        // already-published projection remains labelled with A's issuing cache scope.
+        sessions.save(sessionB)
+        assertEquals(sessionA.fence(), repository.localHistoryOwner.value)
+        assertFalse(repository.localHistoryOwner.value == sessions.current()?.fence())
+    }
+
+    @Test
     fun `a ready session supersedes the local view without blanking the screen`() = runTest {
         val runtime = FakeRuntime(epoch = null).apply {
             cachedConversations += conversation(CONVERSATION_ONE, "Grace")
@@ -5434,15 +5462,20 @@ class EncryptedChatRepositoryTest {
      * cold start. Using the real guard means a change that stops publishing it that early breaks
      * these tests rather than silently reintroducing the blank Messages screen.
      */
-    private fun localActivation(userId: String = USER_TWO): SecureMessagingActivationCapability {
+    private fun localActivation(
+        userId: String = USER_TWO,
+        owner: com.kit.wallet.data.session.SessionFence? = null,
+        sessionEpoch: String = "local-epoch",
+    ): SecureMessagingActivationCapability {
         val guard = SecureMessagingLifecycleGuard()
         guard.beginSession(
             SecureMessagingSessionBinding(
-                sessionEpoch = "local-epoch",
+                sessionEpoch = sessionEpoch,
                 userId = userId,
                 serverDeviceId = "device-one",
                 installationId = "install-one",
             ),
+            owner,
         )
         return checkNotNull(guard.localReadActivation.value) {
             "The guard must publish a local read authority as soon as an activation begins"
@@ -5615,6 +5648,7 @@ class EncryptedChatRepositoryTest {
                 val rewrapped = SecureMessagingChatSession(
                     sessionEpoch = current.sessionEpoch,
                     identity = current.identity,
+                    authenticationOwner = current.authenticationOwner,
                     messageEditsEnabled = current.messageEditsEnabled,
                     mediaAlbumsEnabled = current.mediaAlbumsEnabled,
                     ownerAccountId = current.ownerAccountId,

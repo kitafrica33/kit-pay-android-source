@@ -12,12 +12,17 @@ import com.kit.wallet.data.notifications.PushMessagingTransport
 import com.kit.wallet.data.realtime.KitNetworkEvent
 import com.kit.wallet.data.realtime.KitNetworkSource
 import com.kit.wallet.data.repository.ChatRepository
+import com.kit.wallet.data.session.CachedSessionCapabilities
+import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.data.session.SessionTokens
 import com.kit.wallet.navigation.AppCapabilitiesViewModel
 import com.kit.wallet.ui.model.ChatPreview
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.Message
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import java.io.IOException
 import java.lang.reflect.Proxy
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
@@ -57,6 +62,7 @@ class AppCapabilitiesViewModelTest {
     @Test
     fun `session transitions fence stale discovery and refresh both login and logout`() = runTest {
         val api = ScriptedCapabilitiesApi()
+        val sessions = MutableTestSessionStore(null)
         val viewModel = AppCapabilitiesViewModel(
             api = api.proxy,
             apiCalls = ApiCallExecutor(
@@ -65,6 +71,7 @@ class AppCapabilitiesViewModelTest {
             chatRepository = FakeChatRepository(),
             pushMessagingTransport = FakePushMessagingTransport,
             networkSource = FakeNetworkSource(),
+            sessions = sessions,
         )
 
         assertEquals(1, api.calls)
@@ -72,7 +79,7 @@ class AppCapabilitiesViewModelTest {
         assertTrue(viewModel.state.value.pushMessagingConfigured)
 
         // Login must cancel the still-running anonymous request and load the cohort response.
-        viewModel.onSessionChanged()
+        sessions.save(testSession(accountId = "account-1"))
 
         assertEquals(2, api.calls)
         assertTrue(viewModel.state.value.loaded)
@@ -86,7 +93,7 @@ class AppCapabilitiesViewModelTest {
 
         // Logout is also a session transition. It clears personalized readiness synchronously
         // while the replacement anonymous discovery request is still outstanding.
-        viewModel.onSessionChanged()
+        sessions.clear()
 
         assertEquals(3, api.calls)
         assertFalse(viewModel.state.value.loaded)
@@ -114,6 +121,7 @@ class AppCapabilitiesViewModelTest {
             chatRepository = chatRepository,
             pushMessagingTransport = FakePushMessagingTransport,
             networkSource = FakeNetworkSource(),
+            sessions = MutableTestSessionStore(null),
         )
 
         assertEquals(1, api.calls)
@@ -129,6 +137,201 @@ class AppCapabilitiesViewModelTest {
     }
 
     @Test
+    fun `offline cold start restores only read surfaces from the encrypted session`() = runTest {
+        val sessions = MutableTestSessionStore(
+            testSession(accountId = "account-1").copy(
+                cachedCapabilities = CachedSessionCapabilities(
+                    messaging = true,
+                    calls = true,
+                    messagingGroups = true,
+                ),
+            ),
+        )
+        val viewModel = AppCapabilitiesViewModel(
+            api = OfflineCapabilitiesApi.proxy,
+            apiCalls = ApiCallExecutor(
+                Moshi.Builder().add(KotlinJsonAdapterFactory()).build(),
+            ),
+            chatRepository = FakeChatRepository(initiallyReady = false),
+            pushMessagingTransport = FakePushMessagingTransport,
+            networkSource = FakeNetworkSource(),
+            sessions = sessions,
+        )
+
+        assertTrue(viewModel.state.value.loaded)
+        assertTrue(viewModel.state.value.loadFailed)
+        assertTrue(viewModel.state.value.messagingEntryVisible)
+        assertTrue(viewModel.state.value.routeUsable(com.kit.wallet.navigation.Dest.CALLS))
+        assertTrue(viewModel.state.value.lastKnownEnabled("messaging_groups"))
+        assertFalse(viewModel.state.value.enabled(KitFeature.MESSAGING))
+
+        // Logout removes the encrypted credential and its owner-scoped display snapshot.
+        sessions.clear()
+        assertFalse(viewModel.state.value.messagingEntryVisible)
+        assertFalse(viewModel.state.value.routeUsable(com.kit.wallet.navigation.Dest.CALLS))
+    }
+
+    @Test
+    fun `legacy offline session discovers messaging from owner fenced local history`() = runTest {
+        val sessions = MutableTestSessionStore(testSession(accountId = "account-1"))
+        val viewModel = AppCapabilitiesViewModel(
+            api = OfflineCapabilitiesApi.proxy,
+            apiCalls = ApiCallExecutor(
+                Moshi.Builder().add(KotlinJsonAdapterFactory()).build(),
+            ),
+            chatRepository = FakeChatRepository(
+                initiallyReady = false,
+                initiallyLocalHistoryReady = true,
+                initiallyLocalHistoryOwner = sessions.current()?.fence(),
+            ),
+            pushMessagingTransport = FakePushMessagingTransport,
+            networkSource = FakeNetworkSource(),
+            sessions = sessions,
+        )
+
+        assertTrue(viewModel.state.value.loadFailed)
+        assertTrue(viewModel.state.value.messagingEntryVisible)
+        assertFalse(viewModel.state.value.messagingUsable)
+    }
+
+    @Test
+    fun `authenticated account replacement invalidates capability and local history owners`() =
+        runTest {
+            val ownerA = testSession(accountId = "account-a")
+            // Keep the epoch and cache scope byte-for-byte identical so only the account component
+            // of SessionFence can invalidate A's state.
+            val ownerB = ownerA.copy(accountId = "account-b")
+            val sessions = MutableTestSessionStore(ownerA)
+            val chatRepository = FakeChatRepository(
+                initiallyReady = false,
+                initiallyLocalHistoryReady = true,
+                initiallyLocalHistoryOwner = ownerA.fence(),
+            )
+            val api = ReplacementCapabilitiesApi()
+            val viewModel = AppCapabilitiesViewModel(
+                api = api.proxy,
+                apiCalls = ApiCallExecutor(
+                    Moshi.Builder().add(KotlinJsonAdapterFactory()).build(),
+                ),
+                chatRepository = chatRepository,
+                pushMessagingTransport = FakePushMessagingTransport,
+                networkSource = FakeNetworkSource(),
+                sessions = sessions,
+            )
+
+            assertTrue(viewModel.state.value.loaded)
+            assertTrue(viewModel.state.value.messagingProtocolReady)
+            assertTrue(viewModel.state.value.secureMessagingLocalHistoryReady)
+
+            // A and B are both signed in. The exact owner transition must still clear all of A's
+            // server-scoped state, and A's still-true local history cannot be relabelled as B's.
+            sessions.save(ownerB)
+
+            assertEquals(2, api.calls)
+            assertFalse(viewModel.state.value.loaded)
+            assertFalse(viewModel.state.value.messagingProtocolReady)
+            assertFalse(viewModel.state.value.secureMessagingLocalHistoryReady)
+            assertTrue(viewModel.state.value.communicationAccess == null)
+            assertTrue(viewModel.state.value.financialAccess == null)
+
+            chatRepository.localHistoryOwner.value = ownerB.fence()
+            assertTrue(viewModel.state.value.secureMessagingLocalHistoryReady)
+
+            api.completeReplacementRequest()
+            assertTrue(viewModel.state.value.loaded)
+        }
+
+    @Test
+    fun `local history requires the complete session fence`() = runTest {
+        val sessionA = testSession(
+            accountId = "account-a",
+            sessionId = "shared-session",
+            cacheScopeId = "scope-a",
+        )
+        val sessionB = sessionA.copy(cacheScopeId = "scope-b")
+        val sessions = MutableTestSessionStore(sessionA)
+        val chatRepository = FakeChatRepository(
+            initiallyReady = false,
+            initiallyLocalHistoryReady = true,
+            initiallyLocalHistoryOwner = sessionA.fence(),
+        )
+        val viewModel = AppCapabilitiesViewModel(
+            api = OfflineCapabilitiesApi.proxy,
+            apiCalls = ApiCallExecutor(
+                Moshi.Builder().add(KotlinJsonAdapterFactory()).build(),
+            ),
+            chatRepository = chatRepository,
+            pushMessagingTransport = FakePushMessagingTransport,
+            networkSource = FakeNetworkSource(),
+            sessions = sessions,
+        )
+
+        assertTrue(viewModel.state.value.secureMessagingLocalHistoryReady)
+
+        sessions.save(sessionB)
+
+        assertFalse(viewModel.state.value.secureMessagingLocalHistoryReady)
+        chatRepository.localHistoryOwner.value = sessionB.fence()
+        assertTrue(viewModel.state.value.secureMessagingLocalHistoryReady)
+    }
+
+    @Test
+    fun `constructor replacement cannot retain the previous owners offline flags`() = runTest {
+        val ownerA = testSession(accountId = "account-a").copy(
+            cachedCapabilities = CachedSessionCapabilities(
+                messaging = true,
+                calls = true,
+                messagingGroups = true,
+            ),
+        )
+        val ownerB = ownerA.copy(
+            accountId = "account-b",
+            cachedCapabilities = null,
+        )
+        val sessions = ReplacingDuringInitialReadSessionStore(ownerA, ownerB)
+        val viewModel = AppCapabilitiesViewModel(
+            api = OfflineCapabilitiesApi.proxy,
+            apiCalls = ApiCallExecutor(
+                Moshi.Builder().add(KotlinJsonAdapterFactory()).build(),
+            ),
+            chatRepository = FakeChatRepository(
+                initiallyReady = false,
+                initiallyLocalHistoryReady = true,
+                initiallyLocalHistoryOwner = ownerA.fence(),
+            ),
+            pushMessagingTransport = FakePushMessagingTransport,
+            networkSource = FakeNetworkSource(),
+            sessions = sessions,
+        )
+
+        assertEquals(ownerB.fence(), sessions.current()?.fence())
+        assertTrue(viewModel.state.value.loadFailed)
+        assertFalse(viewModel.state.value.messagingEntryVisible)
+        assertFalse(viewModel.state.value.routeUsable(com.kit.wallet.navigation.Dest.CALLS))
+        assertFalse(viewModel.state.value.secureMessagingLocalHistoryReady)
+    }
+
+    @Test
+    fun `successful authenticated discovery durably replaces retained read flags`() = runTest {
+        val sessions = MutableTestSessionStore(testSession(accountId = "account-1"))
+        AppCapabilitiesViewModel(
+            api = RolloutCapabilitiesApi().proxy,
+            apiCalls = ApiCallExecutor(
+                Moshi.Builder().add(KotlinJsonAdapterFactory()).build(),
+            ),
+            chatRepository = FakeChatRepository(),
+            pushMessagingTransport = FakePushMessagingTransport,
+            networkSource = FakeNetworkSource(),
+            sessions = sessions,
+        )
+
+        assertEquals(
+            CachedSessionCapabilities(messaging = true),
+            sessions.current()?.cachedCapabilities,
+        )
+    }
+
+    @Test
     fun `foreground loop refreshes immediately and periodically until lifecycle cancellation`() =
         runTest {
             val api = RolloutCapabilitiesApi()
@@ -140,6 +343,7 @@ class AppCapabilitiesViewModelTest {
                 chatRepository = FakeChatRepository(),
                 pushMessagingTransport = FakePushMessagingTransport,
                 networkSource = FakeNetworkSource(),
+                sessions = MutableTestSessionStore(null),
             )
             assertEquals(1, api.calls)
 
@@ -231,8 +435,79 @@ class AppCapabilitiesViewModelTest {
         } as KitWalletApi
     }
 
-    private class FakeChatRepository(initiallyReady: Boolean = true) : ChatRepository {
+    private class ReplacementCapabilitiesApi {
+        var calls: Int = 0
+            private set
+
+        private lateinit var replacementContinuation: Continuation<ApiEnvelope<CapabilitiesDto>>
+
+        val proxy: KitWalletApi = Proxy.newProxyInstance(
+            KitWalletApi::class.java.classLoader,
+            arrayOf(KitWalletApi::class.java),
+        ) { instance, method, arguments ->
+            when (method.name) {
+                "capabilities" -> capabilities(arguments.orEmpty())
+                "toString" -> "ReplacementCapabilitiesApi"
+                "hashCode" -> System.identityHashCode(instance)
+                "equals" -> instance === arguments?.firstOrNull()
+                else -> error("Unexpected API call: ${method.name}")
+            }
+        } as KitWalletApi
+
+        fun completeReplacementRequest() {
+            replacementContinuation.resume(envelope(enabled = false))
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        private fun capabilities(arguments: Array<out Any?>): Any = when (++calls) {
+            1 -> envelope(enabled = true)
+            2 -> {
+                replacementContinuation =
+                    arguments.last() as Continuation<ApiEnvelope<CapabilitiesDto>>
+                COROUTINE_SUSPENDED
+            }
+            else -> error("Unexpected capabilities request")
+        }
+    }
+
+    private class ReplacingDuringInitialReadSessionStore(
+        private val initialRead: SessionTokens,
+        replacement: SessionTokens,
+        private val delegate: MutableTestSessionStore = MutableTestSessionStore(replacement),
+    ) : SessionStore by delegate {
+        private var initialReadPending = true
+
+        override fun current(): SessionTokens? = if (initialReadPending) {
+            initialReadPending = false
+            initialRead
+        } else {
+            delegate.current()
+        }
+    }
+
+    private object OfflineCapabilitiesApi {
+        val proxy: KitWalletApi = Proxy.newProxyInstance(
+            KitWalletApi::class.java.classLoader,
+            arrayOf(KitWalletApi::class.java),
+        ) { instance, method, arguments ->
+            when (method.name) {
+                "capabilities" -> throw IOException("offline")
+                "toString" -> "OfflineCapabilitiesApi"
+                "hashCode" -> System.identityHashCode(instance)
+                "equals" -> instance === arguments?.firstOrNull()
+                else -> error("Unexpected API call: ${method.name}")
+            }
+        } as KitWalletApi
+    }
+
+    private class FakeChatRepository(
+        initiallyReady: Boolean = true,
+        initiallyLocalHistoryReady: Boolean = initiallyReady,
+        initiallyLocalHistoryOwner: SessionFence? = null,
+    ) : ChatRepository {
         override val readiness = MutableStateFlow(initiallyReady)
+        override val localHistoryReady = MutableStateFlow(initiallyLocalHistoryReady)
+        override val localHistoryOwner = MutableStateFlow(initiallyLocalHistoryOwner)
         override val chats: StateFlow<List<ChatPreview>> = MutableStateFlow(emptyList())
 
         override fun chat(chatId: String): ChatPreview? = null

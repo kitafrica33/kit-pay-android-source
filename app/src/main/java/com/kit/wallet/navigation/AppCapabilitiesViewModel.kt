@@ -6,6 +6,7 @@ import com.kit.wallet.data.messaging.SecureMessagingContract
 import com.kit.wallet.data.notifications.PushMessagingTransport
 import com.kit.wallet.data.remote.ApiCallExecutor
 import com.kit.wallet.data.remote.KitWalletApi
+import com.kit.wallet.data.remote.MESSAGING_GROUPS_FEATURE
 import com.kit.wallet.data.remote.SessionCommunicationAccessDto
 import com.kit.wallet.data.remote.SessionFinancialAccessDto
 import com.kit.wallet.data.realtime.KitNetworkEvent
@@ -15,6 +16,9 @@ import com.kit.wallet.data.remote.groupPaymentRequestsAvailable
 import com.kit.wallet.data.remote.scheduledChatPaymentsAvailable
 import com.kit.wallet.data.remote.scheduledGroupPaymentsAvailable
 import com.kit.wallet.data.repository.ChatRepository
+import com.kit.wallet.data.session.CachedSessionCapabilities
+import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.support.NegotiatedSupportProtocol
 import com.kit.wallet.data.support.SupportContract
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -25,6 +29,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -35,17 +41,21 @@ data class AppCapabilities(
     val loaded: Boolean = false,
     val loadFailed: Boolean = false,
     /**
-     * The last answer the server actually gave, kept across a *transport* failure only.
+     * The last answer the server actually gave, kept while a refresh is pending or fails.
      *
      * There is a real difference between "the server says messaging is off for you" and "we could
      * not ask" — and the app used to treat them identically, so losing the network took the
      * Messages tab off the bottom bar and bounced anyone reading a chat back to Home. Discovery
      * stays fail-closed for everything that acts ([enabled]); this exists so the surfaces that
      * merely *show* what is already on the device can keep showing it. Cleared at a session
-     * boundary, where another account's view must never survive.
+     * boundary, where another account's view must never survive. The three read-only flags that
+     * consume this state are also retained inside the encrypted exact-session credential, so this
+     * guarantee survives process death instead of holding only for one ViewModel instance.
      */
     val retainedFeatures: Map<String, Boolean> = emptyMap(),
     val secureMessagingClientReady: Boolean = false,
+    /** Exact process-local proof that this session's encrypted history has been opened. */
+    val secureMessagingLocalHistoryReady: Boolean = false,
     val messagingProtocolReady: Boolean = false,
     val messagingProtocolVersion: String? = null,
     val messagingProtocolSuite: String? = null,
@@ -83,7 +93,8 @@ data class AppCapabilities(
      * so a feature the server has genuinely turned off disappears on the next successful poll.
      */
     fun lastKnownEnabled(feature: String): Boolean =
-        enabled(feature) || (loadFailed && retainedFeatures[feature] == true)
+        enabled(feature) ||
+            ((!loaded || loadFailed) && retainedFeatures[feature] == true)
 
     /**
      * Whether the user should be able to discover the messaging surface. The entry remains
@@ -93,7 +104,8 @@ data class AppCapabilities(
      * on this device and remain readable with no server at all.
      */
     val messagingEntryVisible: Boolean
-        get() = lastKnownEnabled(KitFeature.MESSAGING)
+        get() = lastKnownEnabled(KitFeature.MESSAGING) ||
+            ((!loaded || loadFailed) && secureMessagingLocalHistoryReady)
 
     val messagingServerCompatible: Boolean
         get() = enabled(KitFeature.MESSAGING) &&
@@ -230,13 +242,23 @@ data class AppCapabilities(
 class AppCapabilitiesViewModel @Inject constructor(
     private val api: KitWalletApi,
     private val apiCalls: ApiCallExecutor,
-    chatRepository: ChatRepository,
+    private val chatRepository: ChatRepository,
     pushMessagingTransport: PushMessagingTransport,
     networkSource: KitNetworkSource,
+    private val sessions: SessionStore,
 ) : ViewModel() {
+    private val initialSessionState = sessions.current().let { session ->
+        InitialSessionState(
+            owner = session?.fence(),
+            retainedFeatures = session.retainedDisplayFeatures(),
+        )
+    }
     private val mutableState = MutableStateFlow(
         AppCapabilities(
+            retainedFeatures = initialSessionState.retainedFeatures,
             secureMessagingClientReady = chatRepository.readiness.value,
+            secureMessagingLocalHistoryReady = initialSessionState.owner != null &&
+                chatRepository.localHistoryOwner.value == initialSessionState.owner,
             pushMessagingConfigured = pushMessagingTransport.configured,
         ),
     )
@@ -244,8 +266,22 @@ class AppCapabilitiesViewModel @Inject constructor(
     private var refreshJob: Job? = null
     private var refreshGeneration: Long = 0
     private var observedSecureMessagingClientReady = chatRepository.readiness.value
+    private var observedSessionOwner = initialSessionState.owner
 
     init {
+        viewModelScope.launch {
+            sessions.session
+                .map { it?.fence() }
+                .distinctUntilChanged()
+                .collectLatest { owner ->
+                    if (owner == observedSessionOwner) return@collectLatest
+                    observedSessionOwner = owner
+                    // Authentication is an exact-owner boundary, not a signed-in Boolean. An
+                    // A-to-B replacement must synchronously fence A's protocol/access snapshot
+                    // even though both sessions are authenticated.
+                    startRefresh(cancelInFlight = true, invalidateSnapshot = true)
+                }
+        }
         viewModelScope.launch {
             chatRepository.readiness.collectLatest { ready ->
                 val becameReady = ready && !observedSecureMessagingClientReady
@@ -255,6 +291,19 @@ class AppCapabilitiesViewModel @Inject constructor(
                     // Local activation has just passed its own fresh server capability check.
                     // Replace any older UI discovery response from before a readiness rollout.
                     startRefresh(cancelInFlight = true, invalidateSnapshot = false)
+                }
+            }
+        }
+        viewModelScope.launch {
+            // This local activation is owner-fenced by the secure-messaging lifecycle and needs
+            // no network response. It also upgrades code-56 sessions, whose encrypted protocol
+            // binding predates the durable capability snapshot, without exposing send authority.
+            chatRepository.localHistoryOwner.collectLatest { owner ->
+                mutableState.update {
+                    it.copy(
+                        secureMessagingLocalHistoryReady =
+                            owner != null && owner == sessions.current()?.fence(),
+                    )
                 }
             }
         }
@@ -293,14 +342,6 @@ class AppCapabilitiesViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Authentication changes alter the response of the optional-auth capabilities endpoint.
-     * Fence and cancel discovery from the previous session before loading the new session's view.
-     */
-    fun onSessionChanged() {
-        startRefresh(cancelInFlight = true, invalidateSnapshot = true)
-    }
-
     private fun startRefresh(cancelInFlight: Boolean, invalidateSnapshot: Boolean) {
         if (!cancelInFlight && refreshJob?.isActive == true) return
 
@@ -315,13 +356,14 @@ class AppCapabilitiesViewModel @Inject constructor(
             mutableState.update {
                 it.copy(
                     features = emptyMap(),
-                    retainedFeatures = emptyMap(),
+                    retainedFeatures = sessions.current().retainedDisplayFeatures(),
                     loaded = false,
                     loadFailed = false,
                     messagingProtocolReady = false,
                     messagingProtocolVersion = null,
                     messagingProtocolSuite = null,
                     messagingProtocolPostQuantum = null,
+                    secureMessagingLocalHistoryReady = localHistoryBelongsToCurrentSession(),
                     biometricTokensAvailable = false,
                     groupPaymentRequestsReady = false,
                     scheduledChatPaymentsReady = false,
@@ -332,13 +374,33 @@ class AppCapabilitiesViewModel @Inject constructor(
                 )
             }
         }
+        val expectedOwner = sessions.current()?.fence()
         refreshJob = viewModelScope.launch {
             try {
                 val response = apiCalls.execute { api.capabilities() }
-                if (generation != refreshGeneration) return@launch
+                if (!refreshStillOwned(generation, expectedOwner)) return@launch
                 val features = response.features
                     .orEmpty()
                     .mapValues { (_, enabled) -> enabled == true }
+                if (expectedOwner != null) {
+                    val persisted = try {
+                        sessions.updateCachedCapabilities(
+                            expectedOwner,
+                            features.toCachedSessionCapabilities(),
+                        )
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        // Discovery remains useful in this process if the encrypted credential
+                        // cannot be rewritten. A later successful refresh will retry durability.
+                        null
+                    }
+                    if (persisted == false || !refreshStillOwned(generation, expectedOwner)) {
+                        return@launch
+                    }
+                } else if (!refreshStillOwned(generation, expectedOwner)) {
+                    return@launch
+                }
                 val messagingProtocol = response.protocols?.messaging
                 val biometricTokens = response.authentication?.get("biometric_tokens") == true
                 mutableState.update {
@@ -364,7 +426,7 @@ class AppCapabilitiesViewModel @Inject constructor(
                 // Structured cancellation must not be converted into a completed failed load.
                 throw cancelled
             } catch (_: Exception) {
-                if (generation != refreshGeneration) return@launch
+                if (!refreshStillOwned(generation, expectedOwner)) return@launch
                 // Capability discovery is fail-closed: unavailable services stay hidden until
                 // a later successful refresh. `retainedFeatures` is deliberately left alone —
                 // it is not consulted by `enabled`, only by the display-only surfaces that would
@@ -390,4 +452,35 @@ class AppCapabilitiesViewModel @Inject constructor(
             }
         }
     }
+
+    private fun refreshStillOwned(
+        generation: Long,
+        expectedOwner: SessionFence?,
+    ): Boolean = generation == refreshGeneration &&
+        sessions.current()?.fence() == expectedOwner
+
+    private fun localHistoryBelongsToCurrentSession(): Boolean {
+        val owner = sessions.current()?.fence() ?: return false
+        return chatRepository.localHistoryOwner.value == owner
+    }
+
+    private data class InitialSessionState(
+        val owner: SessionFence?,
+        val retainedFeatures: Map<String, Boolean>,
+    )
 }
+
+private fun com.kit.wallet.data.session.SessionTokens?.retainedDisplayFeatures(): Map<String, Boolean> =
+    this?.cachedCapabilities?.let { cached ->
+        mapOf(
+            KitFeature.MESSAGING to cached.messaging,
+            KitFeature.CALLS to cached.calls,
+            MESSAGING_GROUPS_FEATURE to cached.messagingGroups,
+        )
+    }.orEmpty()
+
+private fun Map<String, Boolean>.toCachedSessionCapabilities() = CachedSessionCapabilities(
+    messaging = get(KitFeature.MESSAGING) == true,
+    calls = get(KitFeature.CALLS) == true,
+    messagingGroups = get(MESSAGING_GROUPS_FEATURE) == true,
+)

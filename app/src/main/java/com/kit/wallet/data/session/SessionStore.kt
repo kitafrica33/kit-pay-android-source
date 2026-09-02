@@ -37,6 +37,22 @@ data class CachedSessionAssurance(
     val financialReadOnly: Boolean = false,
 )
 
+/**
+ * Last server-confirmed flags for surfaces whose contents already live on this device.
+ *
+ * This deliberately contains only display/read-only capability facts. It is stored inside the
+ * encrypted session credential, so a fresh process can keep local chat and call history visible
+ * while capability discovery is pending or offline without retaining any permission to create,
+ * mutate, or transmit data. The enclosing [SessionTokens] is the owner fence: logout or account
+ * replacement removes the snapshot with the credential.
+ */
+@JsonClass(generateAdapter = false)
+data class CachedSessionCapabilities(
+    val messaging: Boolean = false,
+    val calls: Boolean = false,
+    val messagingGroups: Boolean = false,
+)
+
 data class SessionTokens(
     val accessToken: String,
     val refreshToken: String,
@@ -50,6 +66,7 @@ data class SessionTokens(
     val cacheScopeId: String = sessionId,
     val profileSetupState: ProfileSetupState = ProfileSetupState.UNKNOWN,
     val cachedAssurance: CachedSessionAssurance? = null,
+    val cachedCapabilities: CachedSessionCapabilities? = null,
     val messagingResetProof: SecureMessagingResetProofFence? = null,
     /** Device-local replay proof for recovering one committed refresh whose response was lost. */
     val refreshReplayNonce: String = UUID.randomUUID().toString(),
@@ -205,6 +222,10 @@ interface SessionStore {
                 } else {
                     refreshedCredentials.cachedAssurance
                 },
+                // Capability refresh owns this metadata. A concurrent token refresh must carry
+                // the newest exact-session snapshot forward rather than replace it with the
+                // default-null value of freshly decoded server credentials.
+                cachedCapabilities = latest.cachedCapabilities,
                 messagingResetProof = latest.messagingResetProof,
             ),
         )
@@ -224,6 +245,17 @@ interface SessionStore {
         val current = current() ?: return false
         if (snapshot.fence != expected || current.fence() != expected) return false
         return saveIfUnchanged(snapshot, current.copy(cachedAssurance = assurance))
+    }
+
+    /** Updates read-only capability retention only while the same encrypted owner is current. */
+    suspend fun updateCachedCapabilities(
+        expected: SessionFence,
+        capabilities: CachedSessionCapabilities,
+    ): Boolean {
+        val snapshot = snapshot()
+        val current = current() ?: return false
+        if (snapshot.fence != expected || current.fence() != expected) return false
+        return saveIfUnchanged(snapshot, current.copy(cachedCapabilities = capabilities))
     }
 
     /**

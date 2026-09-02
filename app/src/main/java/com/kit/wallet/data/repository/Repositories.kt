@@ -464,6 +464,17 @@ interface ChatRepository {
         get() = readiness
 
     /**
+     * Exact authenticated owner of [localHistoryReady], or null when no owner-fenced local
+     * projection is published.
+     *
+     * Consumers that combine local-history availability with session-scoped state must use this
+     * fence rather than sampling [localHistoryReady] beside the current login. Those two Boolean
+     * snapshots can otherwise straddle an authenticated account replacement.
+     */
+    val localHistoryOwner: StateFlow<SessionFence?>
+        get() = NO_LOCAL_HISTORY_OWNER
+
+    /**
      * Whether the authenticated account may correct a message it has already sent.
      *
      * Fail closed by default, and false whenever the server has not advertised the feature for
@@ -831,6 +842,8 @@ interface ChatRepository {
 
     suspend fun clearComposerDraft(chatId: String) = Unit
 }
+
+private val NO_LOCAL_HISTORY_OWNER = MutableStateFlow<SessionFence?>(null)
 
 interface CallRepository {
     val calls: StateFlow<List<CallEntry>>

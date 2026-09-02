@@ -8,6 +8,7 @@ import com.kit.wallet.data.remote.KitWalletApi
 import com.kit.wallet.data.remote.SecureMessagingTransportValidator
 import com.kit.wallet.data.session.SecureMessagingResetProofFence
 import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
 import java.io.IOException
@@ -137,103 +138,223 @@ internal class SecureMessagingAuthBindingResolver @Inject constructor(
     private val api: KitWalletApi,
     private val apiCalls: ApiCallExecutor,
     private val deviceIdentity: DeviceIdentityProvider,
+    private val persistence: SecureMessagingAuthBindingPersistence,
 ) {
+    internal constructor(
+        sessions: SessionStore,
+        api: KitWalletApi,
+        apiCalls: ApiCallExecutor,
+        deviceIdentity: DeviceIdentityProvider,
+    ) : this(
+        sessions,
+        api,
+        apiCalls,
+        deviceIdentity,
+        NoOpSecureMessagingAuthBindingPersistence,
+    )
+
     suspend fun resolve(expectedSessionEpoch: String? = null): SecureMessagingSessionBinding {
-        val sessionEpoch = currentSessionEpoch()
-        if (expectedSessionEpoch != null && expectedSessionEpoch != sessionEpoch) {
+        val owner = currentOwner()
+        if (expectedSessionEpoch != null && expectedSessionEpoch != owner.sessionId) {
             throw SecureMessagingAuthenticationEpochChangedException(
                 "Authentication epoch changed before resolving secure messaging",
             )
         }
-        return resolveCurrent(sessionEpoch) { assertCurrent(sessionEpoch) }
+        return resolveCurrent(owner)
     }
 
     suspend fun resolve(expectedSession: SessionFence): SecureMessagingSessionBinding {
         assertCurrent(expectedSession)
-        return resolveCurrent(expectedSession.sessionId) { assertCurrent(expectedSession) }
+        return resolveCurrent(expectedSession)
+    }
+
+    /**
+     * Resolves only encrypted metadata already owned by [expectedSession].
+     *
+     * This path deliberately cannot fall through to profile/device APIs. It exists so process
+     * restoration can issue local-history read authority while the device has no connectivity;
+     * the ordinary [resolve] path remains responsible for live discovery when no reusable record
+     * exists.
+     */
+    suspend fun resolvePersisted(
+        expectedSession: SessionFence,
+    ): SecureMessagingSessionBinding? {
+        assertCurrent(expectedSession)
+        reusableBinding(expectedSession)?.let { cached ->
+            assertCurrent(expectedSession)
+            return cached
+        }
+        return bindingGate.withLock {
+            reusableBinding(expectedSession)?.let { cached ->
+                assertCurrent(expectedSession)
+                return@withLock cached
+            }
+            val installationId = deviceIdentity.registration().installationId
+            val persisted = readPersistedBinding(expectedSession, installationId)
+            assertCurrent(expectedSession)
+            check(deviceIdentity.registration().installationId == installationId) {
+                "Secure-messaging installation identity changed"
+            }
+            persisted?.binding?.also { binding ->
+                cachedBinding = CachedBinding(expectedSession, binding)
+            }
+        }
     }
 
     /**
      * The authenticated profile and the current server device are both stable for the lifetime of
-     * one authentication epoch, so they are resolved once per epoch instead of on every
-     * [SecureMessagingSyncEngine.synchronize] call. The cache is keyed on the epoch itself and on
-     * the installation identity, which are the only two facts that can invalidate a binding; a
-     * server response can never invalidate it, so a hostile server cannot force a re-resolve.
+     * one exact local owner, so they are resolved once instead of on every
+     * [SecureMessagingSyncEngine.synchronize] call. Both the memory and encrypted caches are keyed
+     * by the complete owner fence and installation identity. A server response can never evict the
+     * binding, so a hostile server cannot force a different local owner to adopt it.
      */
     private suspend fun resolveCurrent(
-        sessionEpoch: String,
-        assertOwner: () -> Unit,
+        owner: SessionFence,
     ): SecureMessagingSessionBinding {
-        reusableBinding(sessionEpoch)?.let { cached ->
-            assertOwner()
+        reusableBinding(owner)?.let { cached ->
+            assertCurrent(owner)
             return cached
         }
         // Collapse a concurrent stampede onto one resolve; the loser re-reads the cache.
         return bindingGate.withLock {
-            reusableBinding(sessionEpoch)?.let { cached ->
-                assertOwner()
+            reusableBinding(owner)?.let { cached ->
+                assertCurrent(owner)
                 return@withLock cached
             }
-            resolveUncached(sessionEpoch, assertOwner).also { cachedBinding = it }
+            val installationId = deviceIdentity.registration().installationId
+            val persisted = readPersistedBinding(owner, installationId)
+            assertCurrent(owner)
+            check(deviceIdentity.registration().installationId == installationId) {
+                "Secure-messaging installation identity changed"
+            }
+            val binding = persisted?.binding ?: resolveUncached(owner)
+            binding.also { cachedBinding = CachedBinding(owner, it) }
         }
     }
 
-    private fun reusableBinding(sessionEpoch: String): SecureMessagingSessionBinding? =
-        cachedBinding?.takeIf { cached ->
-            cached.sessionEpoch == sessionEpoch &&
-                cached.installationId == deviceIdentity.registration().installationId
-        }
+    private fun reusableBinding(owner: SessionFence): SecureMessagingSessionBinding? =
+        cachedBinding?.takeIf { cached -> cached.owner == owner }
+            ?.binding
+            ?.takeIf { binding -> reusableFor(owner, binding) }
 
     private suspend fun resolveUncached(
-        sessionEpoch: String,
-        assertOwner: () -> Unit,
+        owner: SessionFence,
     ): SecureMessagingSessionBinding {
         val profile = apiCalls.execute { api.profile() }
-        assertOwner()
+        assertCurrent(owner)
         require(UUID_PATTERN.matches(profile.id)) { "Invalid authenticated profile ID" }
 
         val device = SecureMessagingTransportValidator.requireCurrentServerDevice(
             apiCalls.execute { api.devices() },
         )
-        assertOwner()
+        assertCurrent(owner)
         val installationId = deviceIdentity.registration().installationId
         val binding = SecureMessagingSessionBinding(
-            sessionEpoch = sessionEpoch,
+            sessionEpoch = owner.sessionId,
             userId = profile.id,
             serverDeviceId = device.id,
             installationId = installationId,
         )
-        assertOwner()
-        check(deviceIdentity.registration().installationId == binding.installationId) {
-            "Secure-messaging installation identity changed"
-        }
+        assertCurrent(owner)
+        check(reusableFor(owner, binding)) { "Secure-messaging binding owner changed" }
         return binding
     }
+
+    /**
+     * Descriptive bootstrap metadata cannot itself authorize messaging. If its at-rest key is
+     * permanently gone, or a migration-fenced legacy store cannot be read, treat that metadata as
+     * absent. The live profile/device path can then establish the normal lifecycle generation,
+     * whose first real state access routes the proved loss through the existing fenced recovery.
+     */
+    private suspend fun readPersistedBinding(
+        owner: SessionFence,
+        installationId: String,
+    ): PersistedSecureMessagingAuthBinding? = try {
+        withExactOwner(owner) {
+            persistence.read(owner, installationId)
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        if (!isUnreadableSecureMessagingBindingMetadata(error)) throw error
+        assertCurrent(owner)
+        null
+    }
+
+    private data class CachedBinding(
+        val owner: SessionFence,
+        val binding: SecureMessagingSessionBinding,
+    )
 
     private val bindingGate = Mutex()
 
     @Volatile
-    private var cachedBinding: SecureMessagingSessionBinding? = null
+    private var cachedBinding: CachedBinding? = null
 
     fun assertCurrent(binding: SecureMessagingSessionBinding) {
-        assertCurrent(binding.sessionEpoch)
-        check(deviceIdentity.registration().installationId == binding.installationId) {
-            "Secure-messaging installation identity changed"
+        val owner = currentOwner()
+        if (cachedBinding != CachedBinding(owner, binding) || !reusableFor(owner, binding)) {
+            throw SecureMessagingAuthenticationEpochChangedException(
+                "Authentication owner changed while resolving secure messaging",
+            )
         }
     }
 
-    fun currentSessionEpoch(): String = sessions.current()?.sessionId?.also {
-        require(it.isNotBlank()) { "Authenticated session omitted its epoch" }
+    /** Persists only a binding that has completed the coordinator's live READY validation. */
+    suspend fun persistActivated(
+        expectedOwner: SessionFence,
+        binding: SecureMessagingSessionBinding,
+    ) {
+        assertCurrent(expectedOwner)
+        assertCurrent(binding)
+        try {
+            withExactOwner(expectedOwner) {
+                persistence.persist(expectedOwner, binding)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // Descriptive bootstrap metadata is an optimization. Keep the now-live activation and
+            // retry on the next sync, but never hide an owner or installation replacement.
+            assertCurrent(expectedOwner)
+            assertCurrent(binding)
+            return
+        }
+        assertCurrent(expectedOwner)
+        assertCurrent(binding)
+    }
+
+    fun currentSessionEpoch(): String = currentOwner().sessionId
+
+    private fun currentOwner(): SessionFence = sessions.current()?.fence()?.also {
+        require(it.sessionId.isNotBlank()) { "Authenticated session omitted its epoch" }
     } ?: throw SecureMessagingAuthenticationEpochChangedException(
         "Secure messaging requires an authenticated session",
     )
 
-    private fun assertCurrent(expectedSessionEpoch: String) {
-        if (sessions.current()?.sessionId != expectedSessionEpoch) {
-            throw SecureMessagingAuthenticationEpochChangedException(
-                "Authentication epoch changed while resolving secure messaging",
-            )
+    private fun reusableFor(
+        owner: SessionFence,
+        binding: SecureMessagingSessionBinding,
+    ): Boolean = binding.sessionEpoch == owner.sessionId &&
+        binding.installationId == deviceIdentity.registration().installationId &&
+        (owner.accountId == null || owner.accountId == binding.userId)
+
+    private suspend fun <T> withExactOwner(
+        expectedOwner: SessionFence,
+        operation: suspend () -> T,
+    ): T = try {
+        sessions.withCurrentSession(expectedOwner) { current ->
+            check(current.fence() == expectedOwner) {
+                "Secure-messaging session owner changed"
+            }
+            operation()
         }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (invalidated: SessionInvalidatedException) {
+        throw SecureMessagingAuthenticationEpochChangedException(
+            "Authentication changed while resolving secure messaging",
+        ).also { it.initCause(invalidated) }
     }
 
     private fun assertCurrent(expectedSession: SessionFence) {
@@ -250,6 +371,11 @@ internal class SecureMessagingAuthBindingResolver @Inject constructor(
         )
     }
 }
+
+private fun isUnreadableSecureMessagingBindingMetadata(error: Throwable): Boolean =
+    isPermanentlyMissingSecureMessagingRecordKey(error) ||
+        generateSequence(error) { it.cause }
+            .any { it is SecureMessagingLegacyStateUnreadableException }
 
 /** WorkManager-facing engine that can bootstrap a fresh process before a registry exists. */
 @Singleton
@@ -394,16 +520,13 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                     continue
                 }
                 assertExpectedSynchronizationCurrent(expected)
-                val binding = if (expectedSession == null) {
-                    bindingResolver.resolve(sessionEpoch)
-                } else {
-                    bindingResolver.resolve(expectedSession)
-                }
+                val binding = bindingResolver.resolve(sessionTarget)
                 bindingResolver.assertCurrent(binding)
                 assertExpectedAuthenticatedSession(expectedSession)
                 assertExpectedSynchronizationCurrent(expected)
+                prepareActivationForCurrentSession(sessionTarget, binding)
                 val active = try {
-                    activation.ensureActivated(binding)
+                    activation.advancePreparedActivation(sessionTarget, binding)
                 } catch (required: SecureMessagingReauthenticationRequiredException) {
                     assertExpectedRecoveryCurrent(expected, required.activationFence)
                     pendingEnrollmentRecovery = PendingEnrollmentRecovery.RemoteReset(
@@ -437,6 +560,9 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
                     "Secure-messaging activation returned another authentication epoch"
                 }
                 bindingResolver.assertCurrent(binding)
+                assertExpectedAuthenticatedSession(expectedSession)
+                assertActiveForExpectedSynchronization(expected, active.fence)
+                bindingResolver.persistActivated(sessionTarget, binding)
                 assertExpectedAuthenticatedSession(expectedSession)
                 assertActiveForExpectedSynchronization(expected, active.fence)
                 try {
@@ -532,6 +658,40 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
             throw SecureMessagingAuthenticationEpochChangedException(
                 "Authentication changed during exact-session secure messaging recovery",
             )
+        }
+    }
+
+    /**
+     * Creates the lifecycle generation while the exact authentication owner is locked against
+     * replacement. Network advancement happens only after releasing that lock, and is forbidden
+     * from recreating the attempt if erasure wins in between.
+     */
+    private suspend fun prepareActivationForCurrentSession(
+        owner: SessionFence,
+        binding: SecureMessagingSessionBinding,
+    ) {
+        while (true) {
+            try {
+                val prepared = sessions.withCurrentSession(owner) { current ->
+                    check(current.fence() == owner) {
+                        "Secure-messaging session owner changed"
+                    }
+                    if (!sessionLifecycle.stateAvailable.value) {
+                        throw SecureMessagingStateNotReadyException(
+                            "Secure messaging state closed before activation preparation",
+                        )
+                    }
+                    activation.prepareActivationIfIdle(owner, binding)
+                }
+                if (prepared != null) return
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (invalidated: SessionInvalidatedException) {
+                throw SecureMessagingAuthenticationEpochChangedException(
+                    "Authentication changed before secure messaging activation",
+                ).also { it.initCause(invalidated) }
+            }
+            delay(ACTIVATION_PREPARATION_RETRY_DELAY_MILLIS)
         }
     }
 
@@ -895,5 +1055,6 @@ class RealSecureMessagingSyncEngine @Inject internal constructor(
     private companion object {
         const val MAX_INTERNAL_RECORD_KEY_RETRIES = 3
         const val INTERNAL_RECORD_KEY_RETRY_DELAY_MILLIS = 5_000L
+        const val ACTIVATION_PREPARATION_RETRY_DELAY_MILLIS = 25L
     }
 }

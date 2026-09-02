@@ -5,15 +5,29 @@ import androidx.room.Room
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.SdkSuppress
 import androidx.test.platform.app.InstrumentationRegistry
+import com.kit.wallet.data.auth.DeviceIdentityProvider
 import com.kit.wallet.data.local.KitWalletDatabase
 import com.kit.wallet.data.messaging.AndroidKeystoreMessagingRecordCipher
 import com.kit.wallet.data.messaging.EncryptedMessagingRecord
+import com.kit.wallet.data.messaging.RemoteSecureMessagingTransport
 import com.kit.wallet.data.messaging.RoomSecureMessagingStateStore
+import com.kit.wallet.data.messaging.SecureMessagingActivationCoordinator
+import com.kit.wallet.data.messaging.SecureMessagingActiveSessionRegistry
+import com.kit.wallet.data.messaging.SecureMessagingAuthBindingResolver
+import com.kit.wallet.data.messaging.SecureMessagingAuthBindingStore
+import com.kit.wallet.data.messaging.SecureMessagingInitialSyncActivation
+import com.kit.wallet.data.messaging.SecureMessagingKeyActivation
 import com.kit.wallet.data.messaging.SecureMessagingLifecycleGuard
+import com.kit.wallet.data.messaging.SecureMessagingLocalHistoryBootstrapper
 import com.kit.wallet.data.messaging.SecureMessagingRecordCipher
+import com.kit.wallet.data.messaging.SecureMessagingRuntimeStage
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
 import com.kit.wallet.data.messaging.SecureMessagingSessionLifecycle
 import com.kit.wallet.data.messaging.SecureMessagingStateEraser
+import com.kit.wallet.data.remote.ApiCallExecutor
+import com.kit.wallet.data.remote.DeviceRegistrationDto
+import com.kit.wallet.data.remote.KitWalletApi
+import com.kit.wallet.data.remote.SecureMessagingWireApi
 import com.kit.wallet.data.session.KeystoreSessionStore
 import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionTokens
@@ -21,8 +35,11 @@ import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import dagger.Lazy
+import java.io.IOException
+import java.lang.reflect.Proxy
 import java.security.KeyStore
 import kotlin.coroutines.CoroutineContext
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
@@ -48,6 +65,82 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 @SdkSuppress(minSdkVersion = 28, maxSdkVersion = 28)
 class SecureMessagingResetCrashFenceAndroid9Test {
+    @Test
+    fun restored_keystore_session_opens_local_history_without_a_network_worker() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val databaseName = "kit-offline-local-history-bootstrap.db"
+        cleanPersistentState(context, databaseName)
+
+        var environment: TestEnvironment? = null
+        try {
+            createEnvironment(context, databaseName).also { first ->
+                environment = first
+                first.sessions.save(SESSION)
+                SecureMessagingAuthBindingStore(first.stateStore).persist(
+                    SESSION.fence(),
+                    MESSAGING_BINDING,
+                )
+                first.close()
+                environment = null
+            }
+
+            val restored = createEnvironment(context, databaseName)
+            environment = restored
+            val networkCalls = AtomicInteger(0)
+            val api = unavailableApi(KitWalletApi::class.java, networkCalls)
+            val wireApi = unavailableApi(SecureMessagingWireApi::class.java, networkCalls)
+            val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+            val resolver = SecureMessagingAuthBindingResolver(
+                sessions = restored.sessions,
+                api = api,
+                apiCalls = ApiCallExecutor(moshi),
+                deviceIdentity = object : DeviceIdentityProvider {
+                    override fun registration() = DeviceRegistrationDto(
+                        installationId = MESSAGING_BINDING.installationId,
+                        name = "Android 9 test phone",
+                        appVersion = "1",
+                        osVersion = "28",
+                        model = "instrumented",
+                    )
+                },
+                persistence = SecureMessagingAuthBindingStore(restored.stateStore),
+            )
+            val registry = SecureMessagingActiveSessionRegistry(restored.guard)
+            val coordinator = SecureMessagingActivationCoordinator(
+                transport = RemoteSecureMessagingTransport(
+                    api,
+                    wireApi,
+                    ApiCallExecutor(moshi),
+                ),
+                lifecycle = restored.guard,
+                sessions = registry,
+                keyActivation = SecureMessagingKeyActivation { },
+                initialSyncActivation = SecureMessagingInitialSyncActivation { },
+            )
+            SecureMessagingLocalHistoryBootstrapper(
+                sessions = restored.sessions,
+                sessionLifecycle = restored.lifecycle,
+                bindingResolver = resolver,
+                activation = coordinator,
+                applicationScope = restored.scope,
+            ).start()
+
+            // Runs the real KeystoreSessionStore constructor's restore job and the same singleton
+            // bootstrap started by KitApplication. Every API throws as if the device were in
+            // airplane mode, so any accidental remote dependency fails this test immediately.
+            restored.dispatcher.runAll()
+
+            assertEquals(SESSION, restored.sessions.current())
+            assertEquals(SecureMessagingRuntimeStage.ACTIVATING, restored.guard.snapshot().stage)
+            assertEquals(SESSION.fence(), restored.guard.localReadActivation.value?.owner)
+            assertEquals(0, networkCalls.get())
+            assertNull(registry.currentOrNull())
+        } finally {
+            environment?.close()
+            cleanPersistentState(context, databaseName)
+        }
+    }
+
     @Test
     fun ten_login_logout_cycles_keep_secure_messaging_reopenable_without_sms() = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -404,6 +497,15 @@ class SecureMessagingResetCrashFenceAndroid9Test {
         fun clear() {
             synchronized(queued) { queued.clear() }
         }
+
+        fun runAll() {
+            while (true) {
+                val next = synchronized(queued) {
+                    if (queued.isEmpty()) null else queued.removeAt(0)
+                } ?: return
+                next.run()
+            }
+        }
     }
 
     private class TestEnvironment(
@@ -413,8 +515,8 @@ class SecureMessagingResetCrashFenceAndroid9Test {
         val lifecycle: SecureMessagingSessionLifecycle,
         val sessions: KeystoreSessionStore,
         val crashController: CrashController,
-        private val scope: CoroutineScope,
-        private val dispatcher: PausedDispatcher,
+        val scope: CoroutineScope,
+        val dispatcher: PausedDispatcher,
     ) {
         fun close() {
             scope.cancel()
@@ -422,6 +524,20 @@ class SecureMessagingResetCrashFenceAndroid9Test {
             database.close()
         }
     }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> unavailableApi(type: Class<T>, calls: AtomicInteger): T =
+        Proxy.newProxyInstance(type.classLoader, arrayOf(type)) { instance, method, arguments ->
+            when (method.name) {
+                "toString" -> "Unavailable${type.simpleName}"
+                "hashCode" -> System.identityHashCode(instance)
+                "equals" -> instance === arguments?.firstOrNull()
+                else -> {
+                    calls.incrementAndGet()
+                    throw IOException("airplane mode")
+                }
+            }
+        } as T
 
     private companion object {
         const val ANDROID_KEYSTORE = "AndroidKeyStore"

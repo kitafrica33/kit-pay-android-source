@@ -7,6 +7,7 @@ import coil.ImageLoader
 import coil.ImageLoaderFactory
 import com.kit.wallet.data.backup.MessageBackupService
 import com.kit.wallet.data.media.ProfileAvatarImages
+import com.kit.wallet.data.messaging.SecureMessagingLocalHistoryBootstrapper
 import com.kit.wallet.data.notifications.PushMessagingTransport
 import com.kit.wallet.data.notifications.PushTokenCoordinator
 import com.kit.wallet.data.realtime.KitRealtimeCoordinator
@@ -28,6 +29,8 @@ class KitApplication : Application(), Configuration.Provider, ImageLoaderFactory
     @Inject internal lateinit var foregroundWalletRefresh:
         dagger.Lazy<ForegroundWalletRefreshCoordinator>
     @Inject lateinit var messageBackups: dagger.Lazy<MessageBackupService>
+    @Inject internal lateinit var messagingLocalHistory:
+        dagger.Lazy<SecureMessagingLocalHistoryBootstrapper>
 
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()
@@ -42,6 +45,9 @@ class KitApplication : Application(), Configuration.Provider, ImageLoaderFactory
 
     override fun onCreate() {
         super.onCreate()
+        // Local encrypted history is restored independently of WorkManager's connected-network
+        // constraint. The bootstrapper itself waits for the exact session-owned state gate.
+        messagingLocalHistory.get().start()
         pushMessagingTransport.get().initialize()
         telecomBridge.get().registerPhoneAccount()
         walletRefreshScheduler.get().schedule()

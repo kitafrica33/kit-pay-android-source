@@ -1,5 +1,6 @@
 package com.kit.wallet.data.messaging
 
+import com.kit.wallet.data.session.SessionFence
 import com.squareup.moshi.JsonReader
 import com.squareup.moshi.JsonWriter
 import java.nio.ByteBuffer
@@ -64,10 +65,13 @@ data class SecureMessagingSessionBinding(
  */
 sealed interface SecureMessagingActivationCapability {
     val binding: SecureMessagingSessionBinding
+    /** Exact authenticated owner that created this activation, when issued by a session flow. */
+    val owner: SessionFence?
 }
 
 private class IssuedSecureMessagingActivationCapability(
     override val binding: SecureMessagingSessionBinding,
+    override val owner: SessionFence?,
     private val validator: (Boolean) -> Unit,
     private val quarantiner: (SecureMessagingQuarantineReason) -> Unit,
 ) : SecureMessagingActivationCapability {
@@ -1667,7 +1671,15 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
 
     fun snapshot(): SecureMessagingRuntimeSnapshot = synchronized(lock) { current.copy() }
 
-    fun beginSession(binding: SecureMessagingSessionBinding): SecureMessagingSessionFence {
+    fun beginSession(
+        binding: SecureMessagingSessionBinding,
+        owner: SessionFence? = null,
+    ): SecureMessagingSessionFence {
+        require(
+            owner == null ||
+                owner.sessionId == binding.sessionEpoch &&
+                (owner.accountId == null || owner.accountId == binding.userId),
+        ) { "Secure messaging activation does not belong to its authenticated owner" }
         val result = synchronized(lock) {
             check(current.stage == SecureMessagingRuntimeStage.NO_SESSION) {
                 "Secure messaging must erase the previous epoch before activation"
@@ -1676,6 +1688,7 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
             val fence = SecureMessagingSessionFence(binding, activationIdentity)
             val capability = IssuedSecureMessagingActivationCapability(
                 binding = binding,
+                owner = owner,
                 validator = { readyRequired ->
                     synchronized(lock) {
                         assertCurrentIdentityLocked(activationIdentity, binding, readyRequired)
