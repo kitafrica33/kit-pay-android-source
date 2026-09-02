@@ -1,6 +1,7 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.auth.AuthRepository
+import com.kit.wallet.data.messaging.MediaPipelineDiagnosticJournal
 import com.kit.wallet.data.repository.ProfileEmailChallenge
 import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.feature.home.StarterMilestones
@@ -58,6 +59,7 @@ class SettingsEmailChallengeViewModelTest {
                 ioDispatcher = Dispatchers.Unconfined,
             ),
             clock,
+            mediaDiagnostics = testMediaDiagnostics(),
         )
         viewModel.beginEmailFlow(null)
 
@@ -161,3 +163,9 @@ class SettingsEmailChallengeViewModelTest {
         }
     } as AuthRepository
 }
+
+private fun testMediaDiagnostics() = MediaPipelineDiagnosticJournal(
+    readPersisted = { null },
+    writePersisted = { true },
+    clearPersisted = { true },
+)

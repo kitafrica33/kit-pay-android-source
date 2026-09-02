@@ -172,6 +172,7 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.stateIn
@@ -521,6 +522,12 @@ internal interface SecureMessagingChatRuntime {
         publication: () -> Unit,
     ): Boolean
 
+    /** Atomically publishes display-only state for the exact current local-read activation. */
+    fun publishLocalIfCurrent(
+        activation: SecureMessagingActivationCapability,
+        publication: () -> Unit,
+    ): Boolean
+
     /** Routes only proved key loss or migration-fenced unreadable state through local recovery. */
     suspend fun recoverPermanentlyUnavailableState(error: Throwable): Boolean = false
 
@@ -813,6 +820,11 @@ internal class DefaultSecureMessagingChatRuntime @Inject constructor(
         }
         return sessions.publishIfCurrent(expected, publication)
     }
+
+    override fun publishLocalIfCurrent(
+        activation: SecureMessagingActivationCapability,
+        publication: () -> Unit,
+    ): Boolean = lifecycle.runIfCurrent(activation, publication)
 
     private fun requireCurrent(
         session: SecureMessagingChatSession,
@@ -2363,6 +2375,8 @@ class EncryptedChatRepository @Inject internal constructor(
      */
     private var publishedLocalActivation: SecureMessagingActivationCapability? = null
     private val localHistoryMutex = Mutex()
+    /** Wakes the local projection after a retained ready-session view reaches its grace deadline. */
+    private val localHistoryRefreshRevision = MutableStateFlow(0L)
 
     /** A memory-only bubble used only while selected bytes enter retained local storage. */
     private data class StagingMedia(
@@ -2515,32 +2529,65 @@ class EncryptedChatRepository @Inject internal constructor(
             //
             // It yields the screen to the exchange path below as soon as that path publishes:
             // the ready baseline is authoritative, this is the interim view of the same data.
-            combine(
-                runtime.localHistoryActivations,
-                mutableReadiness,
-                runtime.projectionChanges,
-                contacts.contacts,
-                combine(
-                    immediateSends?.items ?: MutableStateFlow(emptyList()),
-                    stagingMedia,
-                ) { pending, staging -> pending to staging },
-            ) { activation, ready, _, contactList, _ ->
-                Triple(activation, ready, contactList)
-            }.conflate().collect { (activation, ready, contactList) ->
-                localHistoryMutex.withLock {
-                    // Compared by identity rather than waiting for an intervening null: StateFlow
-                    // conflation could otherwise carry one activation's chats into the next.
-                    if (publishedLocalActivation !== activation) discardLocalHistoryPublication()
-                    if (activation == null || ready) return@withLock
-                    try {
-                        publishLocalHistory(activation, contactList)
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        // Unreadable local state is not an error the user can act on. Leave the
-                        // screen as it is; the next projection change or activation retries.
-                    }
+            // Only an activation/readiness boundary may cancel an in-flight local read or its
+            // retry delay. Projection/contact/queue changes are ordinary refresh triggers: they
+            // are conflated while a retry is running and handled sequentially afterward, so noisy
+            // sync ticks cannot reset backoff or starve one read forever.
+            var observedLocalActivation: SecureMessagingActivationCapability? = null
+            combine(runtime.localHistoryActivations, mutableReadiness) { _, _ ->
+                // A StateFlow value may have advanced again after the emission that woke combine.
+                // Normalize both inputs to their authoritative snapshots before collectLatest:
+                // otherwise a delayed obsolete activation can cancel the replacement's collector
+                // and leave its local view permanently stale until another lifecycle transition.
+                runtime.localHistoryActivations.value to mutableReadiness.value
+            }.distinctUntilChanged { previous, next ->
+                previous.first === next.first && previous.second == next.second
+            }.collectLatest { (activation, ready) ->
+                val activationWasWithdrawn =
+                    activation == null && observedLocalActivation != null
+                observedLocalActivation = activation
+                // Compared by identity rather than waiting for an intervening null: StateFlow
+                // conflation could otherwise carry one activation's chats into the next.
+                val samePublishedActivation = synchronized(publicationLock) {
+                    publishedLocalActivation === activation
                 }
+                // An observed non-null -> null transition is an authority withdrawal, never a
+                // same-activation lifecycle blip. It clears READY and local plaintext immediately.
+                // Grace is available only while a non-null capability still proves the owner.
+                if (activationWasWithdrawn || activation != null && !samePublishedActivation) {
+                    discardLocalHistoryPublication(activation)
+                }
+                if (activation == null || ready) return@collectLatest
+
+                // `combine` subscribes to every StateFlow before producing its first snapshot.
+                // That ordering matters: the former onStart read ran before these subscriptions,
+                // then drop(1) discarded the only current-value evidence of a queue/projection
+                // change made during that read. Keeping the producers collected while the
+                // sequential recovery loop is busy leaves one newest snapshot in `conflate`, so
+                // a concurrent write always earns a follow-up read without cancelling the current
+                // attempt or resetting its retry/cooldown state.
+                combine(
+                    runtime.projectionChanges,
+                    contacts.contacts,
+                    immediateSends?.items ?: flowOf(emptyList()),
+                    stagingMedia,
+                    localHistoryRefreshRevision,
+                ) { _, localContacts, _, _, _ -> localContacts }
+                    .conflate()
+                    .collect { localContacts ->
+                        localHistoryMutex.withLock {
+                            if (
+                                runtime.localHistoryActivations.value !== activation ||
+                                mutableReadiness.value
+                            ) {
+                                return@withLock
+                            }
+                            publishLocalHistoryWithRecovery(
+                                activation,
+                                localContacts,
+                            )
+                        }
+                    }
             }
         }
         scope.launch {
@@ -2556,10 +2603,10 @@ class EncryptedChatRepository @Inject internal constructor(
                 .collectLatest { session ->
                     if (session == null) {
                         // Lifecycle blips (key revalidation, roster resync) retain the registry
-                        // for a moment; keep the last published chats visible instead of
-                        // blanking the app. A real sign-out never returns, so the retained
-                        // plaintext is erased after a short grace that a returning session
-                        // cancels via collectLatest.
+                        // for a moment only while the same account still has a non-null local-read
+                        // capability. Its last published chats remain visible during that bounded
+                        // revalidation grace. Logout/quarantine withdraws the local capability and
+                        // the local-history collector above erases plaintext immediately.
                         synchronized(publicationLock) {
                             mutableReadiness.value = false
                             // The chats stay on screen through a lifecycle blip, but the edit
@@ -2568,7 +2615,19 @@ class EncryptedChatRepository @Inject internal constructor(
                             mutableMediaAlbumsAvailable.value = false
                         }
                         delay(SIGNED_OUT_CLEAR_GRACE_MILLIS)
-                        clearPublishedStateIfCurrent(null)
+                        val localActivation = runtime.localHistoryActivations.value
+                        val cleared = if (localActivation == null) {
+                            clearPublishedStateIfCurrent(null)
+                        } else {
+                            clearRetainedReadyPublicationIfCurrent()
+                        }
+                        if (cleared && localActivation != null) {
+                            // Readiness was already false before the grace delay, so clearing the
+                            // retained ready projection does not itself emit an input observed by
+                            // the local-history collector. Wake it explicitly to replace the
+                            // cleared view from the still-authorized encrypted local store.
+                            localHistoryRefreshRevision.update { revision -> revision + 1L }
+                        }
                         return@collectLatest
                     }
                     val signals = merge(
@@ -2627,10 +2686,12 @@ class EncryptedChatRepository @Inject internal constructor(
         ) {
             // Nothing has ever synced on this device. Say so by publishing an empty-but-ready
             // list rather than leaving the screen in a permanent loading state.
-            synchronized(publicationLock) {
-                if (mutableReadiness.value || publishedSession != null) return
-                publishedLocalActivation = activation
-                mutableLocalHistoryReady.value = true
+            runtime.publishLocalIfCurrent(activation) {
+                synchronized(publicationLock) {
+                    if (mutableReadiness.value || publishedSession != null) return@synchronized
+                    publishedLocalActivation = activation
+                    mutableLocalHistoryReady.value = true
+                }
             }
             return
         }
@@ -2651,33 +2712,122 @@ class EncryptedChatRepository @Inject internal constructor(
             pendingIntents = pending,
             stagingMedia = staging,
         )
-        val committed = synchronized(publicationLock) {
-            // The exchange path may have published while this was being built. Its baseline is
-            // authoritative and must never be replaced by the interim local view.
-            if (mutableReadiness.value || publishedSession != null) {
-                false
-            } else {
-                // The local view's owner comes from the activation's own crypto binding — the
-                // account whose encrypted store these messages were read from — not from the
-                // session signed in at commit time, which an account switch may have replaced.
-                commitPublicationBodyLocked(publication, activation.binding.userId)
-                publishedLocalActivation = activation
-                mutableLocalHistoryReady.value = true
-                true
+        var committed = false
+        runtime.publishLocalIfCurrent(activation) {
+            synchronized(publicationLock) {
+                // The exchange path may have published while this was being built. Its baseline is
+                // authoritative and must never be replaced by the interim local view.
+                if (!mutableReadiness.value && publishedSession == null) {
+                    // The local view's owner comes from the activation's own crypto binding — the
+                    // account whose encrypted store these messages were read from — not from the
+                    // session signed in at commit time, which an account switch may have replaced.
+                    commitPublicationBodyLocked(publication, activation.binding.userId)
+                    publishedLocalActivation = activation
+                    mutableLocalHistoryReady.value = true
+                    committed = true
+                }
             }
         }
         if (committed) rememberPublicationPhotos(activation.binding.sessionEpoch, publication)
     }
 
-    /** Takes the local view off screen, but never a ready session's publication. */
-    private fun discardLocalHistoryPublication() = synchronized(publicationLock) {
-        if (publishedSession != null) {
+    /**
+     * Recovers a transient provider/Keystore/local-I/O failure without waiting for an unrelated
+     * contact, projection or lifecycle emission. The retry child is cancelled by collectLatest
+     * as soon as its activation/readiness input changes; the final publication is independently
+     * fenced by [SecureMessagingChatRuntime.publishLocalIfCurrent].
+     */
+    private suspend fun publishLocalHistoryWithRecovery(
+        activation: SecureMessagingActivationCapability,
+        localContacts: List<Contact>,
+    ) {
+        var failedAttempts = 0
+        var cooldownMillis = LOCAL_HISTORY_REFRESH_COOLDOWN_MILLIS
+        while (
+            runtime.localHistoryActivations.value === activation &&
+            !mutableReadiness.value
+        ) {
+            try {
+                publishLocalHistory(activation, localContacts)
+                return
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                debugLocalHistoryFailure(error)
+                if (
+                    runtime.localHistoryActivations.value !== activation ||
+                    mutableReadiness.value ||
+                    !isRetryableLocalHistoryFailure(error)
+                ) {
+                    return
+                }
+                failedAttempts++
+                val retryDelay = if (failedAttempts < LOCAL_HISTORY_REFRESH_ATTEMPTS) {
+                    LOCAL_HISTORY_REFRESH_RETRY_DELAY_MILLIS
+                } else {
+                    failedAttempts = 0
+                    cooldownMillis.also {
+                        cooldownMillis = (cooldownMillis * 2)
+                            .coerceAtMost(MAX_LOCAL_HISTORY_REFRESH_COOLDOWN_MILLIS)
+                    }
+                }
+                delay(retryDelay)
+            }
+        }
+    }
+
+    private fun isRetryableLocalHistoryFailure(error: Throwable): Boolean {
+        if (isRecoverableSecureMessagingStateLoss(error)) return false
+        return isRetryableSecureMessagingStateFailure(error) ||
+            error is IOException ||
+            error is SecureMessagingStateConflictException
+    }
+
+    /**
+     * Takes an obsolete local view off screen and never carries a ready projection across owners.
+     *
+     * A same-account activation may retain its last ready projection through a short transport
+     * revalidation. A missing or different-owner activation cannot: that is logout/account
+     * replacement, so retaining the plaintext would expose the previous account in a warm process.
+     */
+    private fun discardLocalHistoryPublication(
+        nextActivation: SecureMessagingActivationCapability?,
+    ) {
+        if (nextActivation == null) {
+            synchronized(publicationLock) {
+                // A collectLatest child can already be obsolete before its first suspension.
+                // Recheck the source while holding the publication lock so a delayed null event
+                // cannot erase the next account's projection.
+                if (runtime.localHistoryActivations.value != null) return
+                discardLocalHistoryPublicationLocked(nextActivation)
+            }
+            return
+        }
+        // The lifecycle lock remains held through this non-suspending callback. A replacement or
+        // quarantine therefore makes stale cleanup a no-op instead of letting activation A erase
+        // a projection that activation B has already made visible.
+        runtime.publishLocalIfCurrent(nextActivation) {
+            synchronized(publicationLock) {
+                discardLocalHistoryPublicationLocked(nextActivation)
+            }
+        }
+    }
+
+    /** Called only while [publicationLock] and the applicable activation fence are held. */
+    private fun discardLocalHistoryPublicationLocked(
+        nextActivation: SecureMessagingActivationCapability?,
+    ) {
+        val readyOwner = publishedSession?.ownerAccountId
+        val nextOwner = nextActivation?.binding?.userId
+        val canRetainReadyPublication = publishedSession != null &&
+            !readyOwner.isNullOrBlank() && readyOwner == nextOwner
+        if (canRetainReadyPublication) {
             // A ready session already replaced the interim view. Nothing to take down, and
             // withdrawing readiness here would be a lie about what is on screen.
             publishedLocalActivation = null
-            return@synchronized
+            return
         }
-        val owned = publishedLocalActivation != null
+        val owned = publishedLocalActivation != null || publishedSession != null
         publishedLocalActivation = null
         mutableLocalHistoryReady.value = false
         if (owned) clearPublishedStateLocked(owner = null)
@@ -3573,9 +3723,12 @@ class EncryptedChatRepository @Inject internal constructor(
         val id = idempotentClientMessageId ?: UUID.randomUUID().toString()
         val createdAt = clock.instant().toEpochMilli()
         mediaPipelineProfiler?.begin(
-            id,
-            normalizedMediaType,
-            source.originatedAtNanos,
+            mediaId = id,
+            mediaType = normalizedMediaType,
+            originatedAtNanos = source.originatedAtNanos,
+            declaredByteCount = source.declaredByteCount,
+            durationMillis = source.durationMillis,
+            ownerScopeId = owner.cacheScopeId,
         )
         val cache = secureMediaCache
         if (cache == null) {
@@ -3596,7 +3749,11 @@ class EncryptedChatRepository @Inject internal constructor(
                     replyToMessageId = replyTarget,
                 )
             }
-            mediaPipelineProfiler?.mark(id, MediaPipelineMilestone.LOCAL_PROJECTION_READY)
+            mediaPipelineProfiler?.mark(
+                id,
+                MediaPipelineMilestone.LOCAL_PROJECTION_READY,
+                owner.cacheScopeId,
+            )
             try {
                 immediateSendAcceptanceMutex(chatId).withLock {
                     requireCurrentMediaOwner(owner, chatId)
@@ -3618,7 +3775,7 @@ class EncryptedChatRepository @Inject internal constructor(
                             queue.rearmForOwner(owner, existing.id)
                         }
                         immediateSendScheduler?.schedule()
-                        mediaPipelineProfiler?.forget(id)
+                        mediaPipelineProfiler?.forget(id, owner.cacheScopeId)
                         return
                     }
                     val material = spool.stage(id, source)
@@ -3651,7 +3808,7 @@ class EncryptedChatRepository @Inject internal constructor(
                 immediateSendScheduler?.schedule()
             } catch (error: Throwable) {
                 spool.discard(id)
-                mediaPipelineProfiler?.forget(id)
+                mediaPipelineProfiler?.forget(id, owner.cacheScopeId)
                 throw error
             } finally {
                 stagingMedia.update { current -> current.filterNot { it.id == id } }
@@ -3687,7 +3844,7 @@ class EncryptedChatRepository @Inject internal constructor(
                         queue.rearmForOwner(owner, existing.id)
                     }
                     immediateSendScheduler?.schedule()
-                    mediaPipelineProfiler?.forget(id)
+                    mediaPipelineProfiler?.forget(id, owner.cacheScopeId)
                     return
                 }
                 val candidate = ImmediateSendIntent(
@@ -3734,9 +3891,17 @@ class EncryptedChatRepository @Inject internal constructor(
                     throw error
                 }
             }
-            mediaPipelineProfiler?.mark(id, MediaPipelineMilestone.LOCAL_PROJECTION_READY)
+            mediaPipelineProfiler?.mark(
+                id,
+                MediaPipelineMilestone.LOCAL_PROJECTION_READY,
+                owner.cacheScopeId,
+            )
             if (activeLocalMediaOriginals[id] != null) {
-                mediaPipelineProfiler?.mark(id, MediaPipelineMilestone.LOCAL_PLAYABLE)
+                mediaPipelineProfiler?.mark(
+                    id,
+                    MediaPipelineMilestone.LOCAL_PLAYABLE,
+                    owner.cacheScopeId,
+                )
             }
             immediateSendScheduler?.schedule()
 
@@ -3786,7 +3951,11 @@ class EncryptedChatRepository @Inject internal constructor(
                         durationMillis = durationMillis,
                     ),
                 )
-                mediaPipelineProfiler?.mark(id, MediaPipelineMilestone.LOCAL_PLAYABLE)
+                mediaPipelineProfiler?.mark(
+                    id,
+                    MediaPipelineMilestone.LOCAL_PLAYABLE,
+                    owner.cacheScopeId,
+                )
                 val current = queue.findForOwner(owner, id)
                 if (current?.state == ImmediateSendState.IMPORTING) {
                     val preparing = current.copy(
@@ -3821,7 +3990,7 @@ class EncryptedChatRepository @Inject internal constructor(
                     }
                     runCatching { markImmediateMediaFailure(owner, current, permanent = true) }
                     runCatching { cache.releaseRetention(cacheKey) }
-                    mediaPipelineProfiler?.forget(id)
+                    mediaPipelineProfiler?.forget(id, owner.cacheScopeId)
                 }
             }
             throw error
@@ -4054,9 +4223,12 @@ class EncryptedChatRepository @Inject internal constructor(
                 },
             ).also {
                 mediaPipelineProfiler?.begin(
-                    it.attachmentId,
-                    mediaType,
-                    attachments[index].source.originatedAtNanos,
+                    mediaId = it.attachmentId,
+                    mediaType = mediaType,
+                    originatedAtNanos = attachments[index].source.originatedAtNanos,
+                    declaredByteCount = attachments[index].source.declaredByteCount,
+                    durationMillis = attachments[index].source.durationMillis,
+                    ownerScopeId = owner.cacheScopeId,
                 )
             }
         }
@@ -4083,6 +4255,7 @@ class EncryptedChatRepository @Inject internal constructor(
                 mediaPipelineProfiler?.mark(
                     it.attachmentId,
                     MediaPipelineMilestone.LOCAL_PROJECTION_READY,
+                    owner.cacheScopeId,
                 )
             }
             try {
@@ -4105,7 +4278,10 @@ class EncryptedChatRepository @Inject internal constructor(
                         }
                         immediateSendScheduler?.schedule()
                         importItems.forEach {
-                            mediaPipelineProfiler?.forget(it.attachmentId)
+                            mediaPipelineProfiler?.forget(
+                                it.attachmentId,
+                                owner.cacheScopeId,
+                            )
                         }
                         return
                     }
@@ -4147,7 +4323,9 @@ class EncryptedChatRepository @Inject internal constructor(
                 immediateSendScheduler?.schedule()
             } catch (error: Throwable) {
                 stagedIds.forEach { spool.discard(it) }
-                importItems.forEach { mediaPipelineProfiler?.forget(it.attachmentId) }
+                importItems.forEach {
+                    mediaPipelineProfiler?.forget(it.attachmentId, owner.cacheScopeId)
+                }
                 throw error
             } finally {
                 stagingMedia.update { current -> current.filterNot { it.id == id } }
@@ -4179,7 +4357,9 @@ class EncryptedChatRepository @Inject internal constructor(
                         queue.rearmForOwner(owner, existing.id)
                     }
                     immediateSendScheduler?.schedule()
-                    importItems.forEach { mediaPipelineProfiler?.forget(it.attachmentId) }
+                    importItems.forEach {
+                        mediaPipelineProfiler?.forget(it.attachmentId, owner.cacheScopeId)
+                    }
                     return
                 }
                 val candidate = ImmediateSendIntent(
@@ -4241,11 +4421,13 @@ class EncryptedChatRepository @Inject internal constructor(
                 mediaPipelineProfiler?.mark(
                     it.attachmentId,
                     MediaPipelineMilestone.LOCAL_PROJECTION_READY,
+                    owner.cacheScopeId,
                 )
                 if (activeLocalMediaOriginals[it.attachmentId] != null) {
                     mediaPipelineProfiler?.mark(
                         it.attachmentId,
                         MediaPipelineMilestone.LOCAL_PLAYABLE,
+                        owner.cacheScopeId,
                     )
                 }
             }
@@ -4304,6 +4486,7 @@ class EncryptedChatRepository @Inject internal constructor(
                     mediaPipelineProfiler?.mark(
                         item.attachmentId,
                         MediaPipelineMilestone.LOCAL_PLAYABLE,
+                        owner.cacheScopeId,
                     )
                     local
                 }
@@ -4350,7 +4533,9 @@ class EncryptedChatRepository @Inject internal constructor(
                     cacheKeys.values.forEach { cacheKey ->
                         runCatching { cache.releaseRetention(cacheKey) }
                     }
-                    importItems.forEach { mediaPipelineProfiler?.forget(it.attachmentId) }
+                    importItems.forEach {
+                        mediaPipelineProfiler?.forget(it.attachmentId, owner.cacheScopeId)
+                    }
                 }
             }
             throw error
@@ -5237,7 +5422,11 @@ class EncryptedChatRepository @Inject internal constructor(
                 }
                 val encryptedAt = maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli())
                 localMediaLibrary?.markEncrypted(owner, intent.id, encryptedAt)
-                mediaPipelineProfiler?.mark(intent.id, MediaPipelineMilestone.ENCRYPTED)
+                mediaPipelineProfiler?.mark(
+                    intent.id,
+                    MediaPipelineMilestone.ENCRYPTED,
+                    owner.cacheScopeId,
+                )
                 intent.copy(
                     state = ImmediateSendState.WAITING,
                     mediaPlaintextBytes = material.plaintextBytes,
@@ -5282,6 +5471,7 @@ class EncryptedChatRepository @Inject internal constructor(
                         mediaPipelineProfiler?.mark(
                             item.attachmentId,
                             MediaPipelineMilestone.ENCRYPTED,
+                            owner.cacheScopeId,
                         )
                         stagedIds += item.attachmentId
                         item.copy(
@@ -5435,7 +5625,11 @@ class EncryptedChatRepository @Inject internal constructor(
             storageKey,
             maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
         )
-        mediaPipelineProfiler?.mark(intent.id, MediaPipelineMilestone.UPLOADED)
+        mediaPipelineProfiler?.mark(
+            intent.id,
+            MediaPipelineMilestone.UPLOADED,
+            owner.cacheScopeId,
+        )
         return descriptor
     }
 
@@ -5499,7 +5693,11 @@ class EncryptedChatRepository @Inject internal constructor(
             storageKey,
             maxOf(intent.createdAtEpochMillis, clock.instant().toEpochMilli()),
         )
-        mediaPipelineProfiler?.mark(item.attachmentId, MediaPipelineMilestone.UPLOADED)
+        mediaPipelineProfiler?.mark(
+            item.attachmentId,
+            MediaPipelineMilestone.UPLOADED,
+            owner.cacheScopeId,
+        )
         return storageKey
     }
 
@@ -6906,6 +7104,20 @@ class EncryptedChatRepository @Inject internal constructor(
         synchronized(publicationLock) { clearPublishedStateLocked(session) }
     }
 
+    /** Clears only the ready projection retained during a transport grace period. */
+    private fun clearRetainedReadyPublicationIfCurrent(): Boolean {
+        var cleared = false
+        runtime.publishIfCurrent(null) {
+            synchronized(publicationLock) {
+                if (publishedSession != null) {
+                    clearPublishedStateLocked(owner = null)
+                    cleared = true
+                }
+            }
+        }
+        return cleared
+    }
+
     private fun clearPublishedStateIfOwnedBy(
         session: SecureMessagingChatSession,
     ): Boolean = synchronized(publicationLock) {
@@ -6943,6 +7155,10 @@ class EncryptedChatRepository @Inject internal constructor(
         const val BASELINE_REFRESH_RETRY_DELAY_MILLIS = 5_000L
         const val BASELINE_REFRESH_COOLDOWN_MILLIS = 30_000L
         const val MAX_BASELINE_REFRESH_COOLDOWN_MILLIS = 5 * 60_000L
+        const val LOCAL_HISTORY_REFRESH_ATTEMPTS = 4
+        const val LOCAL_HISTORY_REFRESH_RETRY_DELAY_MILLIS = 5_000L
+        const val LOCAL_HISTORY_REFRESH_COOLDOWN_MILLIS = 30_000L
+        const val MAX_LOCAL_HISTORY_REFRESH_COOLDOWN_MILLIS = 5 * 60_000L
         const val SIGNED_OUT_CLEAR_GRACE_MILLIS = 15_000L
         const val LOCAL_MEDIA_DESCRIPTOR_PREFIX = "KITLOCALMEDIA1:"
         const val MAX_CONCURRENT_MEDIA_HYDRATIONS = 2
@@ -6962,7 +7178,19 @@ private fun debugProjectionBaselineFailure(error: Throwable) {
     Log.w(PROJECTION_DIAGNOSTIC_TAG, "Projection baseline failure: $classes")
 }
 
+/** Debug-only exception classes: never account, conversation, message, or key material. */
+private fun debugLocalHistoryFailure(error: Throwable) {
+    if (!BuildConfig.DEBUG) return
+    val classes = generateSequence(error) { current ->
+        current.cause?.takeUnless { it === current }
+    }
+        .take(MAX_PROJECTION_DIAGNOSTIC_CAUSES)
+        .joinToString(" <- ") { it::class.java.simpleName }
+    Log.w(LOCAL_HISTORY_DIAGNOSTIC_TAG, "Local history publication failure: $classes")
+}
+
 private const val PROJECTION_DIAGNOSTIC_TAG = "KitMessagingBaseline"
+private const val LOCAL_HISTORY_DIAGNOSTIC_TAG = "KitMessagingLocalHistory"
 private const val MAX_PROJECTION_DIAGNOSTIC_CAUSES = 8
 private val CHAT_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
 

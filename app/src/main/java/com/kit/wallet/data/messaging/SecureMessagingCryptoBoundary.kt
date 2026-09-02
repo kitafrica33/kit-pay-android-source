@@ -1895,6 +1895,29 @@ class SecureMessagingLifecycleGuard @Inject constructor() {
         true
     }
 
+    /**
+     * Runs one non-suspending local-history publication while [capability] is still the exact
+     * activation allowed to read the encrypted store.
+     *
+     * Unlike [runIfCurrentAndReady], this is intentionally valid during activation: drawing the
+     * already-encrypted local transcript must not wait for network setup. Holding the lifecycle
+     * lock through [publication] closes the account-switch/quarantine race between the final
+     * local read and making its plaintext projection observable.
+     */
+    internal fun runIfCurrent(
+        capability: SecureMessagingActivationCapability,
+        publication: () -> Unit,
+    ): Boolean = synchronized(lock) {
+        if (
+            currentCapability !== capability ||
+            current.stage in LOCAL_READ_WITHDRAWN_STAGES
+        ) {
+            return@synchronized false
+        }
+        publication()
+        true
+    }
+
     private fun transition(
         fence: SecureMessagingSessionFence,
         from: Set<SecureMessagingRuntimeStage>,

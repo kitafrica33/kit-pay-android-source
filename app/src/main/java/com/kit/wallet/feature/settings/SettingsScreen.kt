@@ -1,6 +1,7 @@
 package com.kit.wallet.feature.settings
 
 import android.content.Intent
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
@@ -86,6 +87,7 @@ import com.kit.wallet.data.repository.BlockedCommunicationUser
 import com.kit.wallet.feature.legal.OpenSourceLicenceDialog
 import com.kit.wallet.feature.legal.isTrustedKitReleaseSourceUrl
 import com.kit.wallet.feature.legal.openSourceLicencePresentation
+import com.kit.wallet.feature.wallet.launchTextShare
 import com.kit.wallet.navigation.AppCapabilities
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.VerifiedAccountName
@@ -150,7 +152,6 @@ fun SettingsScreen(
         incomingCallNotificationAccess(context)
     }
     val callAlertPlan = incomingCallAlertPlan(callAlertAccess)
-
     LaunchedEffect(logoutError) {
         if (!logoutError.isNullOrBlank()) showLogoutError = true
     }
@@ -392,6 +393,25 @@ fun SettingsScreen(
             }
         },
         onOpenSourceLicence = { showOpenSourceLicence = true },
+        onExportMediaDiagnostics = {
+            launchTextShare(
+                context = context,
+                chooserTitle = "Share media performance report",
+                text = viewModel.mediaDiagnosticsReport(),
+            )
+        },
+        onClearMediaDiagnostics = {
+            val cleared = viewModel.clearMediaDiagnostics()
+            Toast.makeText(
+                context,
+                if (cleared) {
+                    "Media performance measurements cleared."
+                } else {
+                    "Media performance measurements could not be cleared."
+                },
+                Toast.LENGTH_SHORT,
+            ).show()
+        },
         onDeleteAccount = {
             if (capabilities.enabled(KitFeature.ACCOUNT_DELETION)) {
                 showDeletionDialog = true
@@ -442,6 +462,8 @@ private fun SettingsContent(
     onReferrals: () -> Unit,
     onPrivacyPolicy: () -> Unit,
     onOpenSourceLicence: () -> Unit,
+    onExportMediaDiagnostics: () -> Unit,
+    onClearMediaDiagnostics: () -> Unit,
     onDeleteAccount: () -> Unit,
     onLogout: () -> Unit,
 ) {
@@ -582,6 +604,22 @@ private fun SettingsContent(
                         )
                     }
                 }
+            }
+        }
+        item {
+            SettingsGroup {
+                SettingsRow(
+                    Icons.Rounded.Description,
+                    "Media performance report",
+                    "Export bounded, privacy-safe media timing measurements",
+                    onClick = onExportMediaDiagnostics,
+                )
+                SettingsRow(
+                    Icons.Rounded.Refresh,
+                    "Clear media measurements",
+                    "Remove all locally retained media timing measurements",
+                    onClick = onClearMediaDiagnostics,
+                )
             }
         }
         item {
@@ -1376,6 +1414,8 @@ private fun SettingsPreview() {
             onReferrals = {},
             onPrivacyPolicy = {},
             onOpenSourceLicence = {},
+            onExportMediaDiagnostics = {},
+            onClearMediaDiagnostics = {},
             onDeleteAccount = {},
             onLogout = {},
         )

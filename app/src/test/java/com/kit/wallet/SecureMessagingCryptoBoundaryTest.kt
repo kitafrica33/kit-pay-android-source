@@ -109,6 +109,37 @@ class SecureMessagingCryptoBoundaryTest {
     }
 
     @Test
+    fun `local publication fence works before ready and rejects a withdrawn activation`() {
+        val active = activation()
+        var publications = 0
+
+        assertTrue(active.lifecycle.runIfCurrent(active.capability) { publications++ })
+        assertEquals(1, publications)
+
+        active.lifecycle.beginErasure()
+
+        assertFalse(active.lifecycle.runIfCurrent(active.capability) { publications++ })
+        assertEquals(1, publications)
+        active.lifecycle.finishErasure()
+    }
+
+    @Test
+    fun `local publication fence rejects an old capability after replacement activation`() {
+        val active = activation()
+        active.lifecycle.beginErasure()
+        active.lifecycle.finishErasure()
+        val replacementFence = active.lifecycle.beginSession(BINDING.copy())
+        val replacement = active.lifecycle.activationCapability(replacementFence)
+        var oldPublications = 0
+        var replacementPublications = 0
+
+        assertFalse(active.lifecycle.runIfCurrent(active.capability) { oldPublications++ })
+        assertTrue(active.lifecycle.runIfCurrent(replacement) { replacementPublications++ })
+        assertEquals(0, oldPublications)
+        assertEquals(1, replacementPublications)
+    }
+
+    @Test
     fun `encryption uses one exact roster plan before lookup and rejects an equivalent second plan`() = runTest {
         val active = activation()
         val roster = validatedRoster()

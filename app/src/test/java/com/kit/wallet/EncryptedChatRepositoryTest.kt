@@ -96,11 +96,14 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
@@ -137,13 +140,14 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
-    fun `readiness and plaintext projections clear when the active session ends`() = runTest {
+    fun `withdrawing activation immediately clears ready plaintext`() = runTest {
         val runtime = FakeRuntime(epoch = null).apply {
             conversations += conversation(CONVERSATION_ONE, "Grace")
             projected += message("out:one", CONVERSATION_ONE, "hello", fromMe = true)
         }
         val repository = repository(runtime)
 
+        runtime.localHistoryActivations.value = localActivation()
         runtime.activate("session-one")
         runCurrent()
 
@@ -151,19 +155,16 @@ class EncryptedChatRepositoryTest {
         assertEquals(listOf(CONVERSATION_ONE), repository.chats.value.map { it.id })
         assertEquals("hello", repository.conversation(CONVERSATION_ONE).value.single().text)
 
-        runtime.activate(null)
+        // Withdraw the local-read authority while the ready session is still published. The null
+        // capability itself must clear READY/plaintext; this cannot depend on the session collector
+        // reaching its delayed signed-out cleanup.
+        runtime.localHistoryActivations.value = null
         runCurrent()
 
-        // A lifecycle blip keeps the last publication visible (readiness only drops), so the
-        // open chat never blanks; a real sign-out erases the plaintext after the short grace.
+        // Logout/quarantine withdrew the read capability as well as exchange readiness. No grace
+        // applies: keeping either READY or local plaintext here would cross an authority boundary.
         assertFalse(repository.readiness.value)
-        assertEquals(listOf(CONVERSATION_ONE), repository.chats.value.map { it.id })
-        assertEquals("hello", repository.conversation(CONVERSATION_ONE).value.single().text)
-
-        advanceTimeBy(16_000L)
-        runCurrent()
-
-        assertFalse(repository.readiness.value)
+        assertFalse(repository.localHistoryReady.value)
         assertTrue(repository.chats.value.isEmpty())
         assertTrue(repository.conversation(CONVERSATION_ONE).value.isEmpty())
     }
@@ -247,6 +248,242 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `transient local history failure retries without an external signal`() = runTest {
+        val runtime = FakeRuntime(epoch = null, localHistoryFailures = 1).apply {
+            cachedConversations += conversation(CONVERSATION_ONE, "Grace")
+            localProjected += message("in:one", CONVERSATION_ONE, "from disk", fromMe = false)
+        }
+        val repository = repository(runtime)
+
+        runtime.localHistoryActivations.value = localActivation()
+        runCurrent()
+
+        assertEquals(1, runtime.cachedRosterReads)
+        assertFalse(repository.localHistoryReady.value)
+        advanceTimeBy(4_999L)
+        runCurrent()
+        assertEquals(1, runtime.cachedRosterReads)
+
+        advanceTimeBy(1L)
+        runCurrent()
+
+        assertEquals(2, runtime.cachedRosterReads)
+        assertTrue(repository.localHistoryReady.value)
+        assertEquals("from disk", repository.conversation(CONVERSATION_ONE).value.single().text)
+    }
+
+    @Test
+    fun `same activation churn cannot cancel or reset local history backoff`() = runTest {
+        val runtime = FakeRuntime(epoch = null, localHistoryFailures = Int.MAX_VALUE)
+        repository(runtime)
+
+        runtime.localHistoryActivations.value = localActivation()
+        runCurrent()
+        assertEquals(1, runtime.cachedRosterReads)
+
+        repeat(20) { runtime.projectionChanges.value += 1L }
+        runCurrent()
+        assertEquals("ordinary refresh signals bypassed backoff", 1, runtime.cachedRosterReads)
+
+        advanceTimeBy(4_999L)
+        runCurrent()
+        assertEquals(1, runtime.cachedRosterReads)
+        advanceTimeBy(1L)
+        runCurrent()
+        assertEquals(2, runtime.cachedRosterReads)
+    }
+
+    @Test
+    fun `initial local read catches projection and contact changes made after its snapshot`() =
+        runTest {
+            val releaseProjectionRead = CompletableDeferred<Unit>()
+            val contacts = MutableStateFlow<List<Contact>>(emptyList())
+            val runtime = FakeRuntime(
+                epoch = null,
+                localProjectionGate = releaseProjectionRead,
+            ).apply {
+                cachedConversations += conversation(CONVERSATION_ONE, "Server Grace")
+                localProjected +=
+                    message("in:one", CONVERSATION_ONE, "before", fromMe = false)
+            }
+            val repository = repository(runtime, contactState = contacts)
+
+            runtime.localHistoryActivations.value = localActivation()
+            runtime.localProjectionSnapshotRead.await()
+
+            // The first page and contact argument have already been captured. Both changes occur
+            // in the old onStart/drop(1) blind window and therefore require a follow-up rebuild.
+            runtime.localProjected[0] =
+                message("in:one", CONVERSATION_ONE, "after", fromMe = false)
+            runtime.projectionChanges.value += 1L
+            contacts.value = listOf(
+                Contact(
+                    id = USER_ONE,
+                    name = "Saved Grace",
+                    phone = "+256700000001",
+                    savedInDevice = true,
+                ),
+            )
+            releaseProjectionRead.complete(Unit)
+            runCurrent()
+
+            assertEquals("concurrent changes did not earn one catch-up read", 2, runtime.cachedRosterReads)
+            assertEquals("Saved Grace", repository.chats.value.single().name)
+            assertEquals("after", repository.conversation(CONVERSATION_ONE).value.single().text)
+        }
+
+    @Test
+    fun `stale activation cleanup cannot erase the replacement accounts local projection`() =
+        runTest {
+            val first = localActivation(USER_TWO)
+            val replacement = localActivation(USER_THREE)
+            val runtime = FakeRuntime(epoch = null).apply {
+                cachedConversations += conversation(CONVERSATION_ONE, "First account")
+                localProjected +=
+                    message("in:first", CONVERSATION_ONE, "first account", fromMe = false)
+            }
+            val repository = repository(runtime)
+
+            runtime.localHistoryActivations.value = first
+            runCurrent()
+            assertEquals(
+                "first account",
+                repository.conversation(CONVERSATION_ONE).value.single().text,
+            )
+
+            runtime.cachedConversations.clear()
+            runtime.cachedConversations += conversation(CONVERSATION_TWO, "Replacement account")
+            runtime.localProjected.clear()
+            runtime.localProjected +=
+                message("in:replacement", CONVERSATION_TWO, "replacement account", fromMe = false)
+            runtime.localHistoryActivations.value = replacement
+            runCurrent()
+            assertEquals(listOf(CONVERSATION_TWO), repository.chats.value.map { it.id })
+
+            // Model a collectLatest delivery that was already queued when A was replaced. The
+            // StateFlow's authority is B, but its collector receives the stale A event once.
+            runtime.localHistoryActivations.emitWithoutBecomingCurrent(first)
+            runCurrent()
+
+            assertTrue(repository.localHistoryReady.value)
+            assertEquals(listOf(CONVERSATION_TWO), repository.chats.value.map { it.id })
+            assertEquals(
+                "replacement account",
+                repository.conversation(CONVERSATION_TWO).value.single().text,
+            )
+
+            runtime.localProjected[0] =
+                message("in:replacement", CONVERSATION_TWO, "replacement refreshed", fromMe = false)
+            runtime.projectionChanges.value += 1L
+            runCurrent()
+
+            assertEquals(
+                "replacement refreshed",
+                repository.conversation(CONVERSATION_TWO).value.single().text,
+            )
+        }
+
+    @Test
+    fun `outbox and projection changes during local retry are coalesced after backoff`() = runTest {
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "local-epoch"),
+        )
+        val queue = ImmediateSendIntentStore(TestSecureMessagingStateStore(), authentication)
+        val runtime = FakeRuntime(epoch = null, localHistoryFailures = 1).apply {
+            cachedConversations += conversation(CONVERSATION_ONE, "Grace")
+            localHistoryActivations.value = localActivation()
+        }
+        val repository = repository(
+            runtime = runtime,
+            authenticationSessions = authentication,
+            immediateSends = queue,
+        )
+
+        runCurrent()
+        assertEquals(1, runtime.cachedRosterReads)
+
+        queue.enqueue(
+            textIntent(
+                id = OUTBOX_ID_ONE,
+                conversationId = CONVERSATION_ONE,
+                text = "queued while retrying",
+                createdAtEpochMillis = Instant.parse("2026-07-20T12:00:01Z").toEpochMilli(),
+            ),
+        )
+        runtime.localProjected +=
+            message("in:one", CONVERSATION_ONE, "arrived while retrying", fromMe = false)
+        runtime.projectionChanges.value += 1L
+        runCurrent()
+
+        // Neither signal may cancel the in-flight recovery or bypass its five-second backoff.
+        assertEquals(1, runtime.cachedRosterReads)
+        advanceTimeBy(4_999L)
+        runCurrent()
+        assertEquals(1, runtime.cachedRosterReads)
+
+        advanceTimeBy(1L)
+        runCurrent()
+
+        // Attempt two succeeds with the latest stores. The coalesced concurrent signal then earns
+        // exactly one follow-up read, proving it was observed rather than lost during recovery.
+        assertEquals(3, runtime.cachedRosterReads)
+        assertEquals(
+            listOf("arrived while retrying", "queued while retrying"),
+            repository.conversation(CONVERSATION_ONE).value.map { it.text },
+        )
+    }
+
+    @Test
+    fun `same activation projection signal refreshes an already published local view`() = runTest {
+        val runtime = FakeRuntime(epoch = null).apply {
+            cachedConversations += conversation(CONVERSATION_ONE, "Grace")
+            localProjected += message("in:one", CONVERSATION_ONE, "before", fromMe = false)
+        }
+        val repository = repository(runtime)
+        runtime.localHistoryActivations.value = localActivation()
+        runCurrent()
+        assertEquals("before", repository.conversation(CONVERSATION_ONE).value.single().text)
+
+        runtime.localProjected[0] =
+            message("in:one", CONVERSATION_ONE, "after", fromMe = false)
+        runtime.projectionChanges.value += 1L
+        runCurrent()
+
+        assertEquals(2, runtime.cachedRosterReads)
+        assertEquals("after", repository.conversation(CONVERSATION_ONE).value.single().text)
+    }
+
+    @Test
+    fun `replacing activation cancels its local history retry and publishes only replacement owner`() =
+        runTest {
+            val runtime = FakeRuntime(epoch = null, localHistoryFailures = 1).apply {
+                cachedConversations += conversation(CONVERSATION_ONE, "Grace")
+                localProjected +=
+                    message("out:one", CONVERSATION_ONE, "from disk", fromMe = true)
+            }
+            val repository = repository(runtime)
+            val first = localActivation(USER_ONE)
+            val replacement = localActivation(USER_TWO)
+
+            runtime.localHistoryActivations.value = first
+            runCurrent()
+            assertEquals(1, runtime.cachedRosterReads)
+            assertFalse(repository.localHistoryReady.value)
+
+            runtime.localHistoryActivations.value = replacement
+            runCurrent()
+
+            assertEquals(2, runtime.cachedRosterReads)
+            assertTrue(repository.localHistoryReady.value)
+            assertEquals(USER_TWO, repository.sentMessageEvidence.value.ownerAccountId)
+
+            advanceTimeBy(5_000L)
+            runCurrent()
+            assertEquals("cancelled activation retried", 2, runtime.cachedRosterReads)
+            assertEquals(USER_TWO, repository.sentMessageEvidence.value.ownerAccountId)
+        }
+
+    @Test
     fun `withdrawing the activation takes the local view down with it`() = runTest {
         val runtime = FakeRuntime(epoch = null).apply {
             cachedConversations += conversation(CONVERSATION_ONE, "Grace")
@@ -265,6 +502,73 @@ class EncryptedChatRepositoryTest {
         assertTrue(repository.chats.value.isEmpty())
         assertTrue(repository.conversation(CONVERSATION_ONE).value.isEmpty())
     }
+
+    @Test
+    fun `local history replaces a retained ready projection when its grace expires`() = runTest {
+        val runtime = FakeRuntime(epoch = null).apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+            projected += message("out:ready", CONVERSATION_ONE, "ready copy", fromMe = true)
+            cachedConversations += conversation(CONVERSATION_ONE, "Grace")
+            localProjected += message("in:local", CONVERSATION_ONE, "local copy", fromMe = false)
+        }
+        val repository = repository(runtime)
+        runtime.activate("session-one", ownerAccountId = USER_TWO)
+        runCurrent()
+        assertTrue(repository.readiness.value)
+        assertEquals("ready copy", repository.conversation(CONVERSATION_ONE).value.single().text)
+
+        runtime.localHistoryActivations.value = localActivation(USER_TWO)
+        runtime.activate(null)
+        runCurrent()
+
+        assertFalse(repository.readiness.value)
+        assertEquals("ready copy", repository.conversation(CONVERSATION_ONE).value.single().text)
+
+        advanceTimeBy(15_000L)
+        runCurrent()
+
+        assertFalse(repository.readiness.value)
+        assertTrue(repository.localHistoryReady.value)
+        assertEquals("local copy", repository.conversation(CONVERSATION_ONE).value.single().text)
+    }
+
+    @Test
+    fun `replacement account activation never retains the previous owners ready projection`() =
+        runTest {
+            val runtime = FakeRuntime(epoch = null).apply {
+                conversations += conversation(CONVERSATION_ONE, "Previous owner")
+                projected +=
+                    message("out:previous", CONVERSATION_ONE, "previous account", fromMe = true)
+                cachedConversations += conversation(CONVERSATION_TWO, "Replacement owner")
+                localProjected +=
+                    message("in:replacement", CONVERSATION_TWO, "replacement account", fromMe = false)
+            }
+            val repository = repository(runtime)
+            runtime.activate("session-one", ownerAccountId = USER_TWO)
+            runCurrent()
+            assertEquals("previous account", repository.conversation(CONVERSATION_ONE).value.single().text)
+
+            runtime.activate(null)
+            runtime.localHistoryActivations.value = localActivation(USER_THREE)
+            runCurrent()
+
+            assertEquals(listOf(CONVERSATION_TWO), repository.chats.value.map { it.id })
+            assertTrue(repository.conversation(CONVERSATION_ONE).value.isEmpty())
+            assertEquals(
+                "replacement account",
+                repository.conversation(CONVERSATION_TWO).value.single().text,
+            )
+            assertEquals(USER_THREE, repository.sentMessageEvidence.value.ownerAccountId)
+
+            // The old ready session's grace task must not erase the replacement's local view.
+            advanceTimeBy(15_000L)
+            runCurrent()
+            assertEquals(listOf(CONVERSATION_TWO), repository.chats.value.map { it.id })
+            assertEquals(
+                "replacement account",
+                repository.conversation(CONVERSATION_TWO).value.single().text,
+            )
+        }
 
     @Test
     fun `published chats survive a same-identity lifecycle blip without an empty emission`() =
@@ -5098,6 +5402,38 @@ class EncryptedChatRepositoryTest {
         PRE_DURABLE_FAILURE,
     }
 
+    /**
+     * StateFlow test double whose authoritative [value] can differ from one queued delivery.
+     *
+     * Real StateFlow collectors can be cancelled after an emission was selected but before their
+     * non-suspending callback runs. This seam makes that boundary deterministic without sleeps or
+     * threads: [emitWithoutBecomingCurrent] delivers the already-selected value while [value]
+     * continues to identify the replacement activation.
+     */
+    @OptIn(ExperimentalForInheritanceCoroutinesApi::class)
+    private class TestStateFlow<T>(initial: T) : StateFlow<T> {
+        private val current = MutableStateFlow(initial)
+        private val queued = MutableSharedFlow<T>(extraBufferCapacity = 1)
+
+        override var value: T
+            get() = current.value
+            set(value) {
+                current.value = value
+            }
+
+        override val replayCache: List<T>
+            get() = current.replayCache
+
+        fun emitWithoutBecomingCurrent(value: T) {
+            check(queued.tryEmit(value))
+        }
+
+        override suspend fun collect(collector: FlowCollector<T>): Nothing {
+            merge(current, queued).collect(collector)
+            error("A StateFlow collection cannot complete")
+        }
+    }
+
     private class FakeRuntime(
         epoch: String? = "session-one",
         private val sendScenario: SendScenario = SendScenario.NORMAL,
@@ -5111,6 +5447,8 @@ class EncryptedChatRepositoryTest {
         private val afterDurablyCommitted: (String) -> Throwable? = { null },
         /** What the server said about this account's message-correction capability. */
         private val messageEditsEnabled: Boolean = false,
+        localHistoryFailures: Int = 0,
+        private val localProjectionGate: CompletableDeferred<Unit>? = null,
     ) : SecureMessagingChatRuntime {
         private val authorityLock = Any()
         private val initialSession = epoch?.let(::newSession)
@@ -5120,6 +5458,7 @@ class EncryptedChatRepositoryTest {
         private val sessionBaselineGates =
             mutableMapOf<SecureMessagingChatSession, CompletableDeferred<Unit>>()
         private var remainingBaselineFailures = baselineFailures
+        private var remainingLocalHistoryFailures = localHistoryFailures
         private var remainingPermanentRecoveryFailures = permanentRecoveryFailures
         override val activeSession = MutableStateFlow(initialSession)
         override val projectionChanges = MutableStateFlow(0L)
@@ -5127,7 +5466,7 @@ class EncryptedChatRepositoryTest {
             MutableSharedFlow<SecureMessagingChatSession>(extraBufferCapacity = 1)
         override val baselineRetrySessions = mutableBaselineRetrySessions
         override val localHistoryActivations =
-            MutableStateFlow<SecureMessagingActivationCapability?>(null)
+            TestStateFlow<SecureMessagingActivationCapability?>(null)
         val conversations = mutableListOf<AuthenticatedConversation>()
         val projected = mutableListOf<AuthenticatedProjectedText>()
 
@@ -5135,6 +5474,7 @@ class EncryptedChatRepositoryTest {
         val cachedConversations = mutableListOf<AuthenticatedConversation>()
         val localProjected = mutableListOf<AuthenticatedProjectedText>()
         val localPageRequests = mutableListOf<String?>()
+        val localProjectionSnapshotRead = CompletableDeferred<Unit>()
         var cachedRosterReads = 0
             private set
         val createdPeers = mutableListOf<String>()
@@ -5169,8 +5509,9 @@ class EncryptedChatRepositoryTest {
         fun activate(
             epoch: String?,
             sessionBaselineGate: CompletableDeferred<Unit>? = null,
+            ownerAccountId: String? = USER_TWO,
         ) {
-            val activated = epoch?.let(::newSession)
+            val activated = epoch?.let { newSession(it, ownerAccountId) }
             synchronized(authorityLock) {
                 if (activated != null && sessionBaselineGate != null) {
                     sessionBaselineGates[activated] = sessionBaselineGate
@@ -5184,7 +5525,13 @@ class EncryptedChatRepositoryTest {
         fun blipSameIdentity() {
             synchronized(authorityLock) {
                 val current = checkNotNull(authoritativeSession)
-                val rewrapped = SecureMessagingChatSession(current.sessionEpoch, current.identity)
+                val rewrapped = SecureMessagingChatSession(
+                    sessionEpoch = current.sessionEpoch,
+                    identity = current.identity,
+                    messageEditsEnabled = current.messageEditsEnabled,
+                    mediaAlbumsEnabled = current.mediaAlbumsEnabled,
+                    ownerAccountId = current.ownerAccountId,
+                )
                 activeSession.value = null
                 authoritativeSession = rewrapped
                 activeSession.value = rewrapped
@@ -5234,6 +5581,15 @@ class EncryptedChatRepositoryTest {
             if (authoritativeSession !== session) return@synchronized false
             publication()
             authoritativeSession === session
+        }
+
+        override fun publishLocalIfCurrent(
+            activation: SecureMessagingActivationCapability,
+            publication: () -> Unit,
+        ): Boolean = synchronized(authorityLock) {
+            if (localHistoryActivations.value !== activation) return@synchronized false
+            publication()
+            localHistoryActivations.value === activation
         }
 
         fun completeSuccessfulSync(session: SecureMessagingChatSession) {
@@ -5364,6 +5720,10 @@ class EncryptedChatRepositoryTest {
             activation: SecureMessagingActivationCapability,
         ): List<AuthenticatedConversation> {
             cachedRosterReads += 1
+            if (remainingLocalHistoryFailures > 0) {
+                remainingLocalHistoryFailures--
+                throw IOException("local history temporarily unavailable")
+            }
             return cachedConversations.toList()
         }
 
@@ -5376,6 +5736,12 @@ class EncryptedChatRepositoryTest {
             val remaining = localProjected.sortedBy { it.recordKey }
                 .filter { afterRecordKey == null || it.recordKey > afterRecordKey }
             val page = remaining.take(limit)
+            if (afterRecordKey == null && localProjectionGate != null) {
+                // Snapshot first, then pause. Tests can now reproduce a store/contact/outbox
+                // mutation in the exact read-to-publication window that used to be unsubscribed.
+                localProjectionSnapshotRead.complete(Unit)
+                localProjectionGate.await()
+            }
             return AuthenticatedProjectionPage(
                 messages = page,
                 nextAfterRecordKey = page.lastOrNull()?.recordKey
@@ -5682,8 +6048,13 @@ class EncryptedChatRepositoryTest {
             return committed
         }
 
-        private fun newSession(epoch: String) =
-            SecureMessagingChatSession(epoch, Any(), messageEditsEnabled)
+        private fun newSession(epoch: String, ownerAccountId: String? = USER_TWO) =
+            SecureMessagingChatSession(
+                sessionEpoch = epoch,
+                identity = Any(),
+                messageEditsEnabled = messageEditsEnabled,
+                ownerAccountId = ownerAccountId,
+            )
     }
 
     private companion object {

@@ -2,6 +2,7 @@ package com.kit.wallet.feature.settings
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.kit.wallet.data.messaging.MediaPipelineDiagnosticJournal
 import com.kit.wallet.data.repository.ProfileEmailChallenge
 import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.data.session.SessionStore
@@ -48,6 +49,7 @@ class SettingsViewModel @Inject constructor(
     private val sessions: SessionStore,
     private val milestones: StarterMilestones,
     private val clock: Clock,
+    private val mediaDiagnostics: MediaPipelineDiagnosticJournal,
 ) : ViewModel() {
     val profile = userRepo.profile
 
@@ -63,6 +65,10 @@ class SettingsViewModel @Inject constructor(
     init {
         refreshProfile()
     }
+
+    fun mediaDiagnosticsReport(): String = mediaDiagnostics.exportReport()
+
+    fun clearMediaDiagnostics(): Boolean = mediaDiagnostics.clear()
 
     /**
      * Re-reads the profile from the server.

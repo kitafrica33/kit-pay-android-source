@@ -2,6 +2,7 @@ package com.kit.wallet
 
 import com.kit.wallet.data.auth.AccountDeletionPreflight
 import com.kit.wallet.data.auth.AuthRepository
+import com.kit.wallet.data.messaging.MediaPipelineDiagnosticJournal
 import com.kit.wallet.data.repository.ProfileEmailChallenge
 import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.feature.home.StarterMilestone
@@ -109,6 +110,7 @@ class SettingsAccountDeletionViewModelTest {
         MutableTestSessionStore(testSession("account-a")),
         milestones,
         Clock.systemUTC(),
+        mediaDiagnostics = deletionTestMediaDiagnostics(),
     )
 
     /** Answers the deletion preflight and scripted request results; everything else errors. */
@@ -158,6 +160,12 @@ class SettingsAccountDeletionViewModelTest {
             error("Unused")
     }
 }
+
+private fun deletionTestMediaDiagnostics() = MediaPipelineDiagnosticJournal(
+    readPersisted = { null },
+    writePersisted = { true },
+    clearPersisted = { true },
+)
 
 @Suppress("UNCHECKED_CAST")
 private fun unusedAuthRepository(): AuthRepository = Proxy.newProxyInstance(

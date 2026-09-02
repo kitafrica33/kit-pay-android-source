@@ -12,6 +12,9 @@ import com.kit.wallet.data.auth.challengeLifetimeMillis
 import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
 import com.kit.wallet.data.messaging.AccountMessageArchivePurgeNotDurableException
 import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
+import com.kit.wallet.data.messaging.MediaPipelineDiagnosticJournal
+import com.kit.wallet.data.messaging.MediaPipelineMeasurement
+import com.kit.wallet.data.messaging.MediaPipelineMilestone
 import com.kit.wallet.data.messaging.SecureMessagingSessionBinding
 import com.kit.wallet.data.messaging.SecureMessagingSessionFence
 import com.kit.wallet.data.messaging.SecureMessagingRecordKeyPermanentlyMissingException
@@ -50,6 +53,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotNull
@@ -110,6 +114,73 @@ class RemoteAuthRepositoryTest {
     }
 
     @Test
+    fun `fresh authenticated owner clears retained media performance evidence`() = runTest {
+        server.enqueue(jsonResponse(AUTHENTICATED_JSON))
+        val diagnostics = RecordingMediaDiagnostics()
+        val repository = repository(
+            sessions = FakeSessionStore(),
+            refresh = FakeRefreshTrigger(),
+            mediaDiagnostics = diagnostics.journal,
+        )
+
+        repository.loginWithEmail("amina@example.test", "secret")
+
+        assertEquals(1, diagnostics.clearCalls)
+        assertNull(diagnostics.persisted)
+    }
+
+    @Test
+    fun `failed diagnostic deletion cannot expose the replaced owners measurements`() = runTest {
+        server.enqueue(jsonResponse(AUTHENTICATED_JSON))
+        val oldSession = TEST_SESSION.copy(
+            sessionId = "old-session",
+            accountId = "11111111-1111-4111-8111-111111111111",
+        )
+        val sessions = FakeSessionStore().apply { save(oldSession) }
+        var persisted: String? = null
+        var clearCalls = 0
+        val diagnostics = MediaPipelineDiagnosticJournal(
+            readPersisted = { persisted },
+            writePersisted = {
+                persisted = it
+                true
+            },
+            clearPersisted = {
+                clearCalls++
+                false
+            },
+            currentOwnerScopeId = { sessions.current()?.cacheScopeId },
+        )
+        diagnostics.record(
+            mediaKind = "video",
+            measurement = MediaPipelineMeasurement(
+                milestone = MediaPipelineMilestone.UPLOADED,
+                elapsedMillis = 12,
+                declaredByteCount = 24_000,
+                durationMillis = 10_000,
+            ),
+            ownerScopeId = oldSession.cacheScopeId,
+        )
+        assertTrue(
+            diagnostics.exportReport(versionName = "test", versionCode = 1, androidApi = 35)
+                .contains("video,uploaded"),
+        )
+        val repository = repository(
+            sessions = sessions,
+            refresh = FakeRefreshTrigger(),
+            mediaDiagnostics = diagnostics,
+        )
+
+        repository.loginWithEmail("amina@example.test", "secret")
+
+        assertEquals(1, clearCalls)
+        assertFalse(
+            diagnostics.exportReport(versionName = "test", versionCode = 1, androidApi = 35)
+                .contains("video,uploaded"),
+        )
+    }
+
+    @Test
     fun `authenticated login snapshots old history before saving a replacement session`() =
         runTest {
             server.enqueue(jsonResponse(AUTHENTICATED_JSON))
@@ -120,10 +191,12 @@ class RemoteAuthRepositoryTest {
             )
             val sessions = FakeSessionStore(replacementEvents = events).apply { save(oldSession) }
             val history = FakeMessageHistoryRetention(snapshotEvents = events)
+            val diagnostics = RecordingMediaDiagnostics()
             val repository = repository(
                 sessions = sessions,
                 refresh = FakeRefreshTrigger(),
                 messageHistory = history,
+                mediaDiagnostics = diagnostics.journal,
             )
 
             repository.loginWithEmail("amina@example.test", "secret")
@@ -131,6 +204,8 @@ class RemoteAuthRepositoryTest {
             assertEquals(listOf("snapshot", "save-replacement"), events)
             assertEquals(listOf(oldSession.fence()), history.snapshotTargets)
             assertEquals("session-uuid", sessions.current()?.sessionId)
+            assertEquals(1, diagnostics.clearCalls)
+            assertNull(diagnostics.persisted)
         }
 
     @Test
@@ -538,7 +613,12 @@ class RemoteAuthRepositoryTest {
         )
         server.enqueue(jsonResponse(LOGOUT_JSON))
         val sessions = FakeSessionStore().apply { save(TEST_SESSION) }
-        val repository = repository(sessions, FakeRefreshTrigger())
+        val diagnostics = RecordingMediaDiagnostics()
+        val repository = repository(
+            sessions,
+            FakeRefreshTrigger(),
+            mediaDiagnostics = diagnostics.journal,
+        )
 
         repository.logout(allDevices = true)
 
@@ -547,6 +627,8 @@ class RemoteAuthRepositoryTest {
         assertEquals("/api/kit-wallet/v1/auth/logout", logout.path)
         assertTrue(logout.body.readUtf8().contains("\"all_devices\":true"))
         assertNull(sessions.current())
+        assertEquals(1, diagnostics.clearCalls)
+        assertNull(diagnostics.persisted)
     }
 
     @Test
@@ -1144,6 +1226,7 @@ class RemoteAuthRepositoryTest {
         walletSync: WalletSyncRepository = FakeWalletSync(),
         messageHistory: AccountMessageHistoryRetention = NoOpAccountMessageHistoryRetention,
         biometricKeys: BiometricKeyLifecycle? = null,
+        mediaDiagnostics: MediaPipelineDiagnosticJournal = RecordingMediaDiagnostics().journal,
     ) = RemoteAuthRepository(
         api = api,
         apiCalls = apiCalls,
@@ -1164,7 +1247,25 @@ class RemoteAuthRepositoryTest {
         messageHistory = messageHistory,
         applicationScope = backgroundScope,
         biometricSigningKey = biometricKeys,
+        mediaDiagnostics = mediaDiagnostics,
     )
+
+    private class RecordingMediaDiagnostics {
+        var persisted: String? = "video|UPLOADED|12|24000|10000"
+        var clearCalls = 0
+        val journal = MediaPipelineDiagnosticJournal(
+            readPersisted = { persisted },
+            writePersisted = {
+                persisted = it
+                true
+            },
+            clearPersisted = {
+                clearCalls++
+                persisted = null
+                true
+            },
+        )
+    }
 
     private class RecordingBiometricKeys : BiometricKeyLifecycle {
         val removed = mutableListOf<String>()

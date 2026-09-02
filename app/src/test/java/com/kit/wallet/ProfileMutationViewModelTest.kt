@@ -1,6 +1,7 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.auth.AuthRepository
+import com.kit.wallet.data.messaging.MediaPipelineDiagnosticJournal
 import com.kit.wallet.data.repository.ProfileEmailChallenge
 import com.kit.wallet.data.repository.UserRepository
 import com.kit.wallet.feature.home.StarterMilestones
@@ -45,6 +46,7 @@ class ProfileMutationViewModelTest {
                 ioDispatcher = Dispatchers.Unconfined,
             ),
             Clock.systemUTC(),
+            mediaDiagnostics = profileTestMediaDiagnostics(),
         )
 
         viewModel.attachAvatar(byteArrayOf(1, 2, 3))
@@ -109,3 +111,9 @@ class ProfileMutationViewModelTest {
         }
     } as AuthRepository
 }
+
+private fun profileTestMediaDiagnostics() = MediaPipelineDiagnosticJournal(
+    readPersisted = { null },
+    writePersisted = { true },
+    clearPersisted = { true },
+)

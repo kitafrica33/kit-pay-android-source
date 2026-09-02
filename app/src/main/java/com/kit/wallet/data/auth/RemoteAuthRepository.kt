@@ -2,6 +2,7 @@ package com.kit.wallet.data.auth
 
 import com.kit.wallet.data.notifications.PushTokenCoordinator
 import com.kit.wallet.data.messaging.SecureMediaCache
+import com.kit.wallet.data.messaging.MediaPipelineDiagnosticJournal
 import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
 import com.kit.wallet.data.messaging.AccountMessageArchivePurgeNotDurableException
 import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
@@ -69,6 +70,7 @@ class RemoteAuthRepository @Inject constructor(
     private val walletRefreshTrigger: WalletRefreshTrigger,
     private val pushTokens: PushTokenCoordinator,
     private val paymentAuthorizer: PaymentAuthorizer,
+    private val mediaDiagnostics: MediaPipelineDiagnosticJournal,
     private val messageHistory: AccountMessageHistoryRetention =
         NoOpAccountMessageHistoryRetention,
     @ApplicationScope applicationScope: CoroutineScope,
@@ -228,7 +230,10 @@ class RemoteAuthRepository @Inject constructor(
                 localSessionCleared = true,
                 remoteRevocation = RemoteRevocationState.ALREADY_REVOKED,
                 retryRecommended = false,
-            )
+            ).also {
+                // No authenticated owner remains. Remove any report left by an interrupted logout.
+                mediaDiagnostics.clear()
+            }
         var historyCleanupFailed = false
         if (allDevices) {
             // Persist both independent crash fences before remote revocation. A restart can then
@@ -596,6 +601,9 @@ class RemoteAuthRepository @Inject constructor(
         }
 
         if (targetCleared) {
+            // Retire queued samples as well as persisted evidence. If durable deletion fails, the
+            // journal's owner-generation digest still makes these rows unreadable to a successor.
+            mediaDiagnostics.clear()
             try {
                 // This is owner-conditional, so a newer account may claim/populate its cache while
                 // the remote logout is finishing without having its projections erased here.
@@ -651,6 +659,8 @@ class RemoteAuthRepository @Inject constructor(
             sessionFailure?.let { throw it }
             return false
         }
+
+        mediaDiagnostics.clear()
 
         try {
             walletSync.clearCachedUserData(expected.cacheScopeId)
@@ -751,6 +761,12 @@ class RemoteAuthRepository @Inject constructor(
             )
             if (!sessionAdopted) {
                 throw SessionInvalidatedException()
+            }
+            if (previousFence?.accountId != authenticatedUser.id) {
+                // A fresh/different owner begins a fresh performance-evidence journal. This runs
+                // only after the exact expected session snapshot was replaced successfully; the
+                // journal also filters any bytes a failed preference deletion leaves on disk.
+                mediaDiagnostics.clear()
             }
             walletRefreshTrigger.refreshNow()
             return AuthOutcome.Authenticated(
