@@ -2221,17 +2221,17 @@ class EncryptedChatRepository @Inject internal constructor(
         }
     }
 
-    // Drafts are a best-effort convenience riding the encrypted messaging state store; they are
-    // erased with that state on logout and must never fail or gate any messaging operation.
+    // Draft reads remain best-effort presentation. Writes surface local-store failures to the
+    // conversation-scoped retry queue; they still never gate any messaging operation.
     override suspend fun composerDraft(chatId: String): String? =
         runCatching { composerDrafts?.read(chatId) }.getOrNull()
 
     override suspend fun saveComposerDraft(chatId: String, text: String) {
-        runCatching { composerDrafts?.save(chatId, text) }
+        composerDrafts?.save(chatId, text)
     }
 
     override suspend fun clearComposerDraft(chatId: String) {
-        runCatching { composerDrafts?.clear(chatId) }
+        composerDrafts?.clear(chatId)
     }
 
     // A message-ready transport is necessary but not sufficient for UI readiness. Keep this gate

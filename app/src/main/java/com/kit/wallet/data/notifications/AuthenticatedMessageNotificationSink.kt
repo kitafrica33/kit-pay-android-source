@@ -31,8 +31,9 @@ import javax.inject.Singleton
 internal class AuthenticatedMessageNotificationSink @Inject constructor(
     @param:ApplicationContext private val context: Context,
     private val authorizer: SecureMessageNavigationAuthorizer,
+    private val notificationLedger: SecureMessageNotificationLedger,
 ) : SecureMessagingIncomingNotificationSink {
-    private val publicationLock = Any()
+    private val publicationLock = SECURE_MESSAGE_NOTIFICATION_MUTATION_LOCK
 
     init {
         // Upgrade cleanup cannot reconstruct a conversation identity from code 22's message-only
@@ -40,7 +41,20 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
         // package slots before the first code 23 message or incoming call arrives.
         synchronized(publicationLock) {
             val manager = context.getSystemService(NotificationManager::class.java)
-            cancelLegacyNotifications(manager, manager.activeNotifications.toList())
+            runCatching { manager.activeNotifications.toList() }.getOrNull()?.let { active ->
+                notificationLedger.clear()
+                cancelLegacyNotifications(manager, active)
+                active.filter { status ->
+                    status.id == SECURE_MESSAGE_NOTIFICATION_ID &&
+                        status.tag?.startsWith(SECURE_MESSAGE_CONVERSATION_TAG_PREFIX) == true
+                }.forEach { status ->
+                    val tag = checkNotNull(status.tag)
+                    status.notification.extras
+                        .getString(EXTRA_SECURE_MESSAGE_DIGEST)
+                        ?.takeIf(SECURE_MESSAGE_DIGEST_PATTERN::matches)
+                        ?.let { digest -> notificationLedger.record(tag, digest) }
+                }
+            }
         }
     }
 
@@ -97,6 +111,7 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
         )
         quotaPlan.tagsToCancel.forEach { tag ->
             manager.cancel(tag, SECURE_MESSAGE_NOTIFICATION_ID)
+            notificationLedger.remove(tag)
         }
         // A recovered history item must never replace a newer active preview for this direct
         // conversation. Returning normally also lets the durable publisher mark it handled.
@@ -104,7 +119,7 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
 
         manager.createNotificationChannel(
             NotificationChannel(
-                CHANNEL_ID,
+                SECURE_MESSAGE_NOTIFICATION_CHANNEL_ID,
                 "Secure messages",
                 NotificationManager.IMPORTANCE_HIGH,
             ).apply {
@@ -158,6 +173,7 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
                     sourceMessageId = notification.messageId,
                     sessionEpoch = notification.sessionEpoch,
                 ),
+                sourceMessageDigest = messageDigest,
                 notificationTag = notificationTag,
                 notificationId = NOTIFICATION_ID,
             ).setData(
@@ -182,13 +198,16 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
             .setAllowGeneratedReplies(false)
             .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
             .build()
-        val publicVersion = NotificationCompat.Builder(context, CHANNEL_ID)
+        val publicVersion = NotificationCompat.Builder(
+            context,
+            SECURE_MESSAGE_NOTIFICATION_CHANNEL_ID,
+        )
             .setSmallIcon(R.drawable.ic_kit_mark)
             .setContentTitle(context.getString(R.string.app_name))
             .setContentText(PUBLIC_COPY)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .build()
-        val built = NotificationCompat.Builder(context, CHANNEL_ID)
+        val built = NotificationCompat.Builder(context, SECURE_MESSAGE_NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_kit_mark)
             .setContentTitle(presentation.sender)
             .setContentText(presentation.preview)
@@ -217,11 +236,21 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
             .build()
         // A stable per-conversation tag preserves only the latest sender/preview and keeps direct
         // reply/tap routing attached to the exact notification currently visible to the user.
-        manager.notify(
-            notificationTag,
-            SECURE_MESSAGE_NOTIFICATION_ID,
-            built,
-        )
+        // Persist the replacement identity first. A crash in the tiny interval before notify can
+        // only make an old Reply action fail closed; it can never let that action overwrite the
+        // newer message described by the ledger.
+        val previousDigest = notificationLedger.currentDigest(notificationTag)
+        notificationLedger.record(notificationTag, messageDigest)
+        try {
+            manager.notify(
+                notificationTag,
+                SECURE_MESSAGE_NOTIFICATION_ID,
+                built,
+            )
+        } catch (error: RuntimeException) {
+            notificationLedger.restore(notificationTag, previousDigest)
+            throw error
+        }
     }
 
     private fun cancelLegacyNotifications(
@@ -236,6 +265,8 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
 
     override fun cancelAll() = synchronized(publicationLock) {
         authorizer.revokeAll()
+        // Revoke reply fallback identity even if an OEM's active-notification query fails.
+        notificationLedger.clear()
         val manager = context.getSystemService(NotificationManager::class.java)
         manager.activeNotifications
             .filter { notification ->
@@ -249,13 +280,13 @@ internal class AuthenticatedMessageNotificationSink @Inject constructor(
                             ) == true
                         )
             }
-            .forEach { notification -> manager.cancel(notification.tag, notification.id) }
+            .forEach { notification ->
+                manager.cancel(notification.tag, notification.id)
+                notification.tag?.let(notificationLedger::remove)
+            }
     }
 
     private companion object {
-        // Notification-channel sound/vibration is immutable once created, so bumping the id is
-        // required for the explicit alert settings to take effect on upgrades.
-        const val CHANNEL_ID = "kit_secure_messages_v2"
         const val NOTIFICATION_ID = SECURE_MESSAGE_NOTIFICATION_ID
         const val PUBLIC_COPY = "New secure message"
     }

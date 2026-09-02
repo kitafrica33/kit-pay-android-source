@@ -797,7 +797,7 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 val sender = checkNotNull(payment.senderUserId).lowercase()
                 val scheduledRecipients = exact.recipients.map { it.userId.lowercase() }
                 val paymentRecipients = payment.recipients.mapNotNull { it.userId?.lowercase() }
-                check(sender in memberIds && payment.id.lowercase() == resultId &&
+                check(payment.id.lowercase() == resultId &&
                     payment.conversationId == event.conversationId &&
                     payment.splitMode == exact.splitMode && payment.audience == exact.audience &&
                     payment.currencyCode == exact.currency.code &&
@@ -808,11 +808,16 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     payment.pendingCount + payment.acceptedCount + payment.returnedCount ==
                     payment.recipientCount && paymentRecipients.size == payment.recipientCount &&
                     paymentRecipients.toSet() == scheduledRecipients.toSet() &&
-                    scheduledRecipients.toSet().all { it in memberIds } &&
                     (exact.splitMode != "even" ||
                         ScheduleContract.minor(exact.totalAmount!!, payment.currencyScale) ==
                         payment.totalAmountMinor)
                 ) { "Scheduled group result did not match its reviewed schedule" }
+                // The exact schedule and payment can remain readable after one of their historical
+                // participants leaves an otherwise-current group. Current membership cannot
+                // authenticate a name or announcement for that departed participant, but retrying
+                // the same settled facts can never change the roster. Consume the wake without a
+                // local projection so one old payment cannot pin every conversation's sync cursor.
+                if (sender !in memberIds || scheduledRecipients.any { it !in memberIds }) return
                 val descriptor = checkNotNull(
                     KitGroupPaymentMessage.announcing(payment, scheduledRecipients),
                 ) { "Scheduled group result could not be projected" }

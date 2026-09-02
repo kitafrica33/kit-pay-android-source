@@ -3,6 +3,7 @@ package com.kit.wallet
 import com.kit.wallet.data.notifications.CallLifecycleEvent
 import com.kit.wallet.data.notifications.CallLifecycleEventBus
 import com.kit.wallet.data.notifications.CallLifecycleKind
+import com.kit.wallet.data.notifications.endsRingingSurface
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
@@ -72,6 +73,22 @@ class CallLifecycleEventBusTest {
         assertTrue(events.getValue(CallLifecycleKind.MISSED))
         assertFalse(
             CallLifecycleEvent(callId, CallLifecycleKind.DECLINED, state = "ringing").terminal,
+        )
+    }
+
+    @Test
+    fun `only answered or terminal lifecycle events remove a ringing surface`() {
+        assertTrue(
+            CallLifecycleEvent(callId, CallLifecycleKind.ANSWERED, state = "active")
+                .endsRingingSurface(),
+        )
+        assertTrue(
+            CallLifecycleEvent(callId, CallLifecycleKind.DECLINED, state = "declined")
+                .endsRingingSurface(),
+        )
+        assertFalse(
+            CallLifecycleEvent(callId, CallLifecycleKind.DECLINED, state = "ringing")
+                .endsRingingSurface(),
         )
     }
 }

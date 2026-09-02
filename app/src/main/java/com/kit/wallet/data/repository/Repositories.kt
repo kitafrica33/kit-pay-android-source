@@ -3,6 +3,7 @@ package com.kit.wallet.data.repository
 import com.kit.wallet.data.messaging.SecureMediaAlbumSource
 import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.data.messaging.SecureMediaSource
+import com.kit.wallet.data.notifications.callRingWindowMillis
 import com.kit.wallet.ui.model.Beneficiary
 import com.kit.wallet.ui.model.BillProvider
 import com.kit.wallet.ui.model.BankInstitution
@@ -454,10 +455,10 @@ interface ChatRepository {
      * Whether [chats] and [conversation] reflect this device's own encrypted store.
      *
      * True long before [readiness] and independent of the network: it means the local database has
-     * been read and what is on screen is real. [readiness] additionally means a message may be
-     * sent. Screens render on this one and gate send actions on the other, which is why a chat
-     * list, its previews and its transcripts survive a cold start, an offline launch and a failed
-     * or still-running secure-session setup.
+     * been read and what is on screen is real. [readiness] additionally means queued messages may
+     * be exchanged immediately. Screens render and durably accept sends on this one, which is why
+     * a chat list, its previews, its transcripts and its outbox survive a cold start, an offline
+     * launch and a failed or still-running secure-session setup.
      */
     val localHistoryReady: StateFlow<Boolean>
         get() = readiness
@@ -881,17 +882,19 @@ data class IncomingCallDetails(
     val direction: String,
     val state: String,
     val ringExpiresAt: String?,
+    val serverTime: String? = null,
 )
 
-fun IncomingCallDetails.requireAnswerable(now: Instant = Instant.now()): IncomingCallDetails {
+fun IncomingCallDetails.requireAnswerable(): IncomingCallDetails {
     require(direction.equals("incoming", ignoreCase = true)) {
         "This call is not an incoming call for the current account"
     }
     require(state.lowercase() in setOf("ringing", "active")) {
         "This incoming call is no longer available"
     }
-    val expiry = ringExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
-    require(expiry?.isAfter(now) == true) { "This incoming call has expired" }
+    require(callRingWindowMillis(ringExpiresAt, serverTime) != null) {
+        "This incoming call has expired"
+    }
     return this
 }
 
@@ -910,6 +913,8 @@ data class CallConnection(
     val room: String,
     /** Server-authoritative end of the ringing window; null only for legacy responses. */
     val ringExpiresAt: String? = null,
+    /** Server clock paired with [ringExpiresAt], distinct from the answer-age response stamp. */
+    val ringServerTime: String? = null,
     /** Server-authoritative instant the call became active; null until someone answers. */
     val answeredAt: String? = null,
     /** The server's own clock when it built this response, to age [answeredAt] against. */

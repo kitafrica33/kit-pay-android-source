@@ -1,10 +1,9 @@
 package com.kit.wallet.data.notifications
 
 import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.time.BootSessionIdProvider
+import com.kit.wallet.data.time.ElapsedRealtimeClock
 import java.security.SecureRandom
-import java.time.Clock
-import java.time.Duration
-import java.time.Instant
 import java.util.Base64
 import java.util.UUID
 import javax.inject.Inject
@@ -29,11 +28,13 @@ internal data class AuthorizedIncomingCallLaunch(
     val callId: String,
     val purpose: IncomingCallLaunchPurpose,
     val session: SessionFence,
-    val ringExpiresAt: Instant,
-    val expiresAt: Instant,
+    val ringLease: CallRingLease,
 ) {
     val acceptRequested: Boolean
         get() = purpose == IncomingCallLaunchPurpose.ANSWER
+
+    val ringExpiresAt: String
+        get() = ringLease.sourceRingExpiresAt
 }
 
 /**
@@ -44,15 +45,15 @@ internal data class AuthorizedIncomingCallLaunch(
  */
 @Singleton
 internal class IncomingCallLaunchAuthorizer @Inject constructor(
-    private val clock: Clock,
+    private val elapsedRealtimeClock: ElapsedRealtimeClock,
+    private val bootSessionIdProvider: BootSessionIdProvider,
 ) {
     private data class Grant(
         val callId: String,
         val purpose: IncomingCallLaunchPurpose,
         val session: SessionFence,
-        val issuedAt: Instant,
-        val ringExpiresAt: Instant,
-        val expiresAt: Instant,
+        val issuedAtElapsedRealtimeMillis: Long,
+        val ringLease: CallRingLease,
     )
 
     private val lock = Any()
@@ -63,19 +64,16 @@ internal class IncomingCallLaunchAuthorizer @Inject constructor(
         callId: String,
         purpose: IncomingCallLaunchPurpose,
         session: SessionFence,
-        ringExpiresAt: String?,
+        ringLease: CallRingLease,
     ): String? {
         val canonicalCallId = canonicalIncomingCallId(callId) ?: return null
         if (!session.isUsableCallFence()) return null
-        val now = clock.instant()
-        val serverExpiry = ringExpiresAt
-            ?.let { runCatching { Instant.parse(it) }.getOrNull() }
-            ?: return null
-        if (!serverExpiry.isAfter(now)) return null
-        val boundedExpiry = minOf(serverExpiry, now.plus(MAX_GRANT_LIFETIME))
+        val now = elapsedRealtimeClock.millis()
+        val bootId = bootSessionIdProvider.currentBootId()
+        if (ringLease.remainingMillis(now, bootId) == null) return null
 
         return synchronized(lock) {
-            purgeExpiredLocked(now)
+            purgeExpiredLocked(now, bootId)
             while (grants.size >= MAX_ACTIVE_GRANTS) {
                 grants.remove(grants.keys.first())
             }
@@ -92,9 +90,8 @@ internal class IncomingCallLaunchAuthorizer @Inject constructor(
                 callId = canonicalCallId,
                 purpose = purpose,
                 session = session,
-                issuedAt = now,
-                ringExpiresAt = serverExpiry,
-                expiresAt = boundedExpiry,
+                issuedAtElapsedRealtimeMillis = now,
+                ringLease = ringLease,
             )
             token
         }
@@ -103,14 +100,15 @@ internal class IncomingCallLaunchAuthorizer @Inject constructor(
     /** Consumes the named grant before checking it so a failed attempt cannot be replayed. */
     fun consume(token: String?, currentSession: SessionFence?): AuthorizedIncomingCallLaunch? {
         if (token == null || !TOKEN_PATTERN.matches(token)) return null
-        val now = clock.instant()
+        val now = elapsedRealtimeClock.millis()
+        val bootId = bootSessionIdProvider.currentBootId()
         return synchronized(lock) {
             val grant = grants.remove(token) ?: return@synchronized null
             if (
                 currentSession == null ||
                 currentSession != grant.session ||
-                now.isBefore(grant.issuedAt) ||
-                !now.isBefore(grant.expiresAt)
+                now < grant.issuedAtElapsedRealtimeMillis ||
+                grant.ringLease.remainingMillis(now, bootId) == null
             ) {
                 null
             } else {
@@ -118,8 +116,7 @@ internal class IncomingCallLaunchAuthorizer @Inject constructor(
                     callId = grant.callId,
                     purpose = grant.purpose,
                     session = grant.session,
-                    ringExpiresAt = grant.ringExpiresAt,
-                    expiresAt = grant.expiresAt,
+                    ringLease = grant.ringLease,
                 )
             }
         }
@@ -129,9 +126,13 @@ internal class IncomingCallLaunchAuthorizer @Inject constructor(
         grants.clear()
     }
 
-    private fun purgeExpiredLocked(now: Instant) {
+    private fun purgeExpiredLocked(nowElapsedRealtimeMillis: Long, currentBootSessionId: Long?) {
         grants.entries.removeAll { (_, grant) ->
-            now.isBefore(grant.issuedAt) || !now.isBefore(grant.expiresAt)
+            nowElapsedRealtimeMillis < grant.issuedAtElapsedRealtimeMillis ||
+                grant.ringLease.remainingMillis(
+                    nowElapsedRealtimeMillis,
+                    currentBootSessionId,
+                ) == null
         }
     }
 
@@ -143,7 +144,6 @@ internal class IncomingCallLaunchAuthorizer @Inject constructor(
             canonicalIncomingCallId(accountId) != null
 
     private companion object {
-        val MAX_GRANT_LIFETIME: Duration = Duration.ofMinutes(1)
         const val TOKEN_BYTES = 32
         const val MAX_ACTIVE_GRANTS = 16
         const val MAX_FENCE_COMPONENT_LENGTH = 256

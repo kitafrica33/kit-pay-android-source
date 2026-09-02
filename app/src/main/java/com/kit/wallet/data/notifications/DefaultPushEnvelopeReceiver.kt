@@ -14,17 +14,17 @@ import com.kit.wallet.MainActivity
 import com.kit.wallet.R
 import com.kit.wallet.feature.calls.KitTelecomBridge
 import com.kit.wallet.feature.calls.KitTelecomDisconnect
+import com.kit.wallet.data.realtime.KitForegroundSource
 import com.kit.wallet.data.repository.MobileMoneyRepository
+import com.kit.wallet.data.time.BootSessionIdProvider
+import com.kit.wallet.data.time.ElapsedRealtimeClock
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import dagger.hilt.android.qualifiers.ApplicationContext
-import java.time.Clock
-import java.time.Duration
-import java.time.Instant
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
-class DefaultPushEnvelopeReceiver @Inject constructor(
+class DefaultPushEnvelopeReceiver @Inject internal constructor(
     @param:ApplicationContext private val context: Context,
     private val callEvents: CallLifecycleEventBus,
     private val activeCallState: ActiveCallStateHolder,
@@ -32,9 +32,11 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
     private val replayLedger: IncomingCallReplayLedger,
     private val telecom: KitTelecomBridge,
     private val ringDeadlines: CallRingDeadlineCoordinator,
+    private val foregroundSource: KitForegroundSource,
     private val messagingSync: SecureMessagingSyncScheduler,
     private val mobileMoney: MobileMoneyRepository,
-    private val clock: Clock,
+    private val elapsedRealtimeClock: ElapsedRealtimeClock,
+    private val bootSessionIdProvider: BootSessionIdProvider,
 ) : PushEnvelopeReceiver {
     override fun receive(envelope: PushEnvelope) {
         val messagingData = envelope.data
@@ -55,16 +57,21 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         if (lifecycleEvent != null) {
             // Persist the tombstone before removing any local surface. A crash between these two
             // operations can only leave an old banner behind; it can never admit a late ring.
-            if (lifecycleEvent.kind == CallLifecycleKind.ANSWERED || lifecycleEvent.terminal) {
-                replayLedger.retire(lifecycleEvent.callId)
-            }
-            if (lifecycleEvent.kind == CallLifecycleKind.ANSWERED || lifecycleEvent.terminal) {
+            if (lifecycleEvent.endsRingingSurface()) {
+                replayLedger.retire(
+                    lifecycleEvent.callId,
+                    lifecycleEvent.ringingRetirementDisposition(),
+                )
+                incomingCallRelay.retire(lifecycleEvent.callId)
                 ringDeadlines.cancel(lifecycleEvent.callId)
             }
             callEvents.publish(envelope.data)
-            manager.cancel(callTag(lifecycleEvent.callId), CALL_NOTIFICATION_ID)
+            if (lifecycleEvent.endsRingingSurface()) {
+                manager.cancel(callTag(lifecycleEvent.callId), CALL_NOTIFICATION_ID)
+            }
             when (lifecycleEvent.kind) {
-                CallLifecycleKind.ANSWERED -> telecom.markConnecting(lifecycleEvent.callId)
+                CallLifecycleKind.ANSWERED ->
+                    telecom.finishRingingAsAnsweredElsewhere(lifecycleEvent.callId)
                 CallLifecycleKind.DECLINED -> if (lifecycleEvent.terminal) {
                     telecom.finish(lifecycleEvent.callId, KitTelecomDisconnect.REJECTED)
                 }
@@ -307,14 +314,17 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         phone: String?,
     ) {
         val expiresAt = call.ringExpiresAt ?: return
-        val timeoutMillis = runCatching {
-            Duration.between(Instant.now(clock), Instant.parse(expiresAt)).toMillis()
-        }.getOrNull()?.coerceAtMost(MAX_RING_TIMEOUT_MILLIS) ?: return
-        if (timeoutMillis <= 0) return
-
         val activeCallId = activeCallState.activeCallId.value
         if (activeCallId == call.callId) return
-        if (!replayLedger.admitRing(call.callId, expiresAt)) return
+        val ringLease = replayLedger.admitRing(
+            callId = call.callId,
+            ringExpiresAt = expiresAt,
+            serverTime = call.serverTime,
+        ) ?: return
+        val timeoutMillis = ringLease.remainingMillis(
+            elapsedRealtimeClock.millis(),
+            bootSessionIdProvider.currentBootId(),
+        ) ?: return
         val deliveryPlan = incomingCallDeliveryPlan(activeCallId, call.callId)
 
         // Telecom tracking is common to both surfaces so call-waiting calls participate in audio
@@ -339,7 +349,8 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
             )
             // Schedule after every local surface exists. An already-elapsed deadline can now
             // remove the banner as well as Telecom instead of firing just before the relay.
-            ringDeadlines.schedule(call.callId, expiresAt)
+            ringDeadlines.schedule(call.callId, ringLease)
+            reconcileIncomingCallPublication(call.callId, expiresAt)
             return
         }
 
@@ -433,11 +444,53 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         if (alertPlan.showSettingsAction) {
             notification.addAction(0, "Enable call alerts", callAlertSettingsIntent(access))
         }
+        if (
+            shouldRelayBlockedIncomingCallInForeground(
+                alertMode = alertPlan.mode,
+                foregrounded = foregroundSource.foregrounded.value,
+                surface = deliveryPlan.notificationSurface,
+            )
+        ) {
+            runCatching {
+                context.startActivity(
+                    IncomingCallRelayActivity.intent(
+                        context = context,
+                        callId = call.callId,
+                        purpose = IncomingCallLaunchPurpose.OPEN,
+                        ringExpiresAt = expiresAt,
+                    ).addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                    ),
+                )
+            }
+        }
         val published = runCatching {
             manager.notify(callTag(call.callId), CALL_NOTIFICATION_ID, notification.build())
         }.isSuccess
         IncomingCallDiagnostics.notificationPublished(alertPlan.mode, published)
-        ringDeadlines.schedule(call.callId, expiresAt)
+        ringDeadlines.schedule(call.callId, ringLease)
+        reconcileIncomingCallPublication(call.callId, expiresAt)
+    }
+
+    /**
+     * Closes the admit/publish race with a concurrent answer, decline or terminal push.
+     *
+     * If terminal retirement committed before this final ledger read, remove anything this
+     * delivery just recreated. Natural expiry stays owned by the armed deadline so it publishes a
+     * missed lifecycle; retirement that commits afterward removes the surfaces on its own path.
+     */
+    private fun reconcileIncomingCallPublication(callId: String, ringExpiresAt: String) {
+        reconcilePublishedIncomingCall(
+            callId = callId,
+            authorization = {
+                replayLedger.publicationAuthorization(callId, ringExpiresAt)
+            },
+            retireSurfaces = ringDeadlines::retire,
+            finishRinging = { retiredCallId, disposition ->
+                telecom.finishRinging(retiredCallId, disposition.telecomDisconnect())
+            },
+        )
     }
 
     private fun callAlertSettingsIntent(access: IncomingCallNotificationAccess): PendingIntent {
@@ -511,9 +564,46 @@ class DefaultPushEnvelopeReceiver @Inject constructor(
         // once created, so a new id is required for the ringtone settings to apply on upgrades.
         const val CALL_NOTIFICATION_ID = 4_101
         const val CALL_ALERT_SETTINGS_REQUEST_CODE = 4_102
-        const val MAX_RING_TIMEOUT_MILLIS = 60_000L
         const val ACTION_RETURN_TO_ACTIVE_CALL = "com.kit.wallet.action.RETURN_TO_ACTIVE_CALL"
 
         fun callTag(callId: String) = "kit_call:$callId"
     }
 }
+
+/** Final authorization fence for surfaces created after an earlier successful ring admission. */
+internal fun reconcilePublishedIncomingCall(
+    callId: String,
+    authorization: () -> IncomingCallPublicationAuthorization,
+    retireSurfaces: (String, IncomingCallRetirementDisposition) -> Unit,
+    finishRinging: (String, IncomingCallRetirementDisposition) -> Unit,
+): Boolean {
+    return when (val result = authorization()) {
+        IncomingCallPublicationAuthorization.Authorized -> true
+        IncomingCallPublicationAuthorization.Expired -> false
+        is IncomingCallPublicationAuthorization.Retired -> {
+            retireSurfaces(callId, result.disposition)
+            finishRinging(callId, result.disposition)
+            false
+        }
+    }
+}
+
+internal fun CallLifecycleEvent.ringingRetirementDisposition(): IncomingCallRetirementDisposition =
+    when (kind) {
+        CallLifecycleKind.ANSWERED -> IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE
+        CallLifecycleKind.DECLINED -> IncomingCallRetirementDisposition.REJECTED
+        CallLifecycleKind.ENDED -> IncomingCallRetirementDisposition.REMOTE
+        CallLifecycleKind.MISSED -> IncomingCallRetirementDisposition.MISSED
+    }
+
+private fun IncomingCallRetirementDisposition.telecomDisconnect(): KitTelecomDisconnect =
+    when (this) {
+        IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE ->
+            KitTelecomDisconnect.ANSWERED_ELSEWHERE
+        IncomingCallRetirementDisposition.REJECTED -> KitTelecomDisconnect.REJECTED
+        IncomingCallRetirementDisposition.REMOTE -> KitTelecomDisconnect.REMOTE
+        IncomingCallRetirementDisposition.MISSED -> KitTelecomDisconnect.MISSED
+        IncomingCallRetirementDisposition.LOCAL -> KitTelecomDisconnect.LOCAL
+        IncomingCallRetirementDisposition.ERROR -> KitTelecomDisconnect.ERROR
+        IncomingCallRetirementDisposition.UNKNOWN -> KitTelecomDisconnect.ANSWERED_ELSEWHERE
+    }

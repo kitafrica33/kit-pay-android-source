@@ -775,6 +775,7 @@ class RemoteCallRepository @Inject constructor(
                 direction = call.direction,
                 state = call.state,
                 ringExpiresAt = call.ringExpiresAt,
+                serverTime = call.serverTime,
             ).requireAnswerable()
         }
     }
@@ -894,6 +895,7 @@ class RemoteCallRepository @Inject constructor(
             token = rtc.token,
             room = rtc.room,
             ringExpiresAt = call.ringExpiresAt,
+            ringServerTime = call.serverTime,
             answeredAt = call.answeredAt,
             serverTime = serverTime,
             conversationId = call.conversationId?.trim()?.takeIf(String::isNotEmpty),

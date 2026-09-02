@@ -1,13 +1,11 @@
 package com.kit.wallet
 
+import com.kit.wallet.data.notifications.CallRingLease
 import com.kit.wallet.data.notifications.IncomingCallLaunchAuthorizer
 import com.kit.wallet.data.notifications.IncomingCallLaunchPurpose
 import com.kit.wallet.data.session.SessionFence
-import java.time.Clock
-import java.time.Duration
-import java.time.Instant
-import java.time.ZoneId
-import java.time.ZoneOffset
+import com.kit.wallet.data.time.BootSessionIdProvider
+import com.kit.wallet.data.time.ElapsedRealtimeClock
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -15,19 +13,29 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class IncomingCallLaunchAuthorizationTest {
-    private val clock = MutableClock(Instant.parse("2026-08-28T12:00:00Z"))
-    private val authorizer = IncomingCallLaunchAuthorizer(clock)
+    private var elapsedRealtimeMillis = 10_000L
+    private var bootId: Long? = 7L
+    private val authorizer = IncomingCallLaunchAuthorizer(
+        ElapsedRealtimeClock { elapsedRealtimeMillis },
+        BootSessionIdProvider { bootId },
+    )
     private val session = SessionFence("session-a", "cache-a", ACCOUNT_ID)
 
     @Test
-    fun `valid open and answer grants preserve only their bound call and purpose`() {
-        val open = authorizer.issue(CALL_ID, IncomingCallLaunchPurpose.OPEN, session, RING_EXPIRY)
-        val answer = authorizer.issue(OTHER_CALL_ID, IncomingCallLaunchPurpose.ANSWER, session, RING_EXPIRY)
+    fun `valid open and answer grants preserve only their bound call purpose and lease`() {
+        val open = authorizer.issue(CALL_ID, IncomingCallLaunchPurpose.OPEN, session, lease())
+        val answer = authorizer.issue(
+            OTHER_CALL_ID,
+            IncomingCallLaunchPurpose.ANSWER,
+            session,
+            lease(),
+        )
 
         val opened = authorizer.consume(open, session)
         val answered = authorizer.consume(answer, session)
 
         assertEquals(CALL_ID, opened?.callId)
+        assertEquals(lease(), opened?.ringLease)
         assertFalse(requireNotNull(opened).acceptRequested)
         assertEquals(OTHER_CALL_ID, answered?.callId)
         assertTrue(requireNotNull(answered).acceptRequested)
@@ -35,49 +43,48 @@ class IncomingCallLaunchAuthorizationTest {
 
     @Test
     fun `grant is one time and a wrong session consumes it fail closed`() {
-        val token = authorizer.issue(CALL_ID, IncomingCallLaunchPurpose.OPEN, session, RING_EXPIRY)
+        val token = authorizer.issue(CALL_ID, IncomingCallLaunchPurpose.OPEN, session, lease())
         assertNull(authorizer.consume(token, SessionFence("session-b", "cache-a", ACCOUNT_ID)))
         assertNull(authorizer.consume(token, session))
 
-        val oneTime = authorizer.issue(CALL_ID, IncomingCallLaunchPurpose.OPEN, session, RING_EXPIRY)
+        val oneTime = authorizer.issue(CALL_ID, IncomingCallLaunchPurpose.OPEN, session, lease())
         assertEquals(CALL_ID, authorizer.consume(oneTime, session)?.callId)
         assertNull(authorizer.consume(oneTime, session))
     }
 
     @Test
-    fun `expired malformed wrong call and invalid ring grants fail closed`() {
-        val expired = authorizer.issue(CALL_ID, IncomingCallLaunchPurpose.OPEN, session, RING_EXPIRY)
-        clock.advance(Duration.ofSeconds(61))
+    fun `expired rebooted rewound and malformed grants fail closed`() {
+        val expired = authorizer.issue(CALL_ID, IncomingCallLaunchPurpose.OPEN, session, lease())
+        elapsedRealtimeMillis = 70_000L
         assertNull(authorizer.consume(expired, session))
+
+        elapsedRealtimeMillis = 10_000L
+        val rebooted = authorizer.issue(CALL_ID, IncomingCallLaunchPurpose.OPEN, session, lease())
+        bootId = 8L
+        assertNull(authorizer.consume(rebooted, session))
+
+        bootId = 7L
+        val rewound = authorizer.issue(CALL_ID, IncomingCallLaunchPurpose.OPEN, session, lease())
+        elapsedRealtimeMillis = 9_000L
+        assertNull(authorizer.consume(rewound, session))
         assertNull(authorizer.consume("A".repeat(43), session))
-        assertNull(authorizer.issue("not-a-call", IncomingCallLaunchPurpose.OPEN, session, RING_EXPIRY))
+        assertNull(authorizer.issue("not-a-call", IncomingCallLaunchPurpose.OPEN, session, lease()))
         assertNull(
             authorizer.issue(
                 "00000000-0000-0000-8000-000000000000",
                 IncomingCallLaunchPurpose.OPEN,
                 session,
-                RING_EXPIRY,
-            ),
-        )
-        assertNull(
-            authorizer.issue(
-                CALL_ID,
-                IncomingCallLaunchPurpose.OPEN,
-                session,
-                "2026-08-28T11:59:59Z",
+                lease(),
             ),
         )
     }
 
-    private class MutableClock(
-        private var current: Instant,
-        private val zone: ZoneId = ZoneOffset.UTC,
-    ) : Clock() {
-        override fun getZone(): ZoneId = zone
-        override fun withZone(zone: ZoneId): Clock = MutableClock(current, zone)
-        override fun instant(): Instant = current
-        fun advance(duration: Duration) { current = current.plus(duration) }
-    }
+    private fun lease() = CallRingLease(
+        sourceRingExpiresAt = RING_EXPIRY,
+        bootSessionId = 7L,
+        receivedElapsedRealtimeMillis = 10_000L,
+        deadlineElapsedRealtimeMillis = 70_000L,
+    )
 
     private companion object {
         const val CALL_ID = "11111111-1111-4111-8111-111111111111"

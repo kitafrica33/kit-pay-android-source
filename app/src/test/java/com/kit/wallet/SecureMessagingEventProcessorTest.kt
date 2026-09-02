@@ -74,6 +74,7 @@ import com.kit.wallet.data.messaging.SecureMessagingTextContentBinding
 import com.kit.wallet.data.messaging.encodeSecureMessagingTextContent
 import com.kit.wallet.data.messaging.requireSecureMessagingSyncResumePosition
 import com.kit.wallet.data.repository.DefaultSecureMessagingChatRuntime
+import com.kit.wallet.data.repository.GroupPaymentRepository
 import com.kit.wallet.data.repository.PaymentAuthorizer
 import com.kit.wallet.data.repository.SecureMessagingPendingPredecessorException
 import com.kit.wallet.data.repository.ServerScheduledPaymentRepository
@@ -259,6 +260,7 @@ class SecureMessagingEventProcessorTest {
         assertTrue(preCommitCallbacks.isEmpty())
         assertTrue(projections.readPage(limit = 10).messages().isEmpty())
 
+        val requestsAfterBlockedSend = server.requestCount + 2
         enqueueRoster(roster)
         server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
         val committedClientId = CompletableDeferred<String>()
@@ -275,6 +277,11 @@ class SecureMessagingEventProcessorTest {
 
         val callbackId = withContext(Dispatchers.Default.limitedParallelism(1)) {
             withTimeout(5_000L) { committedClientId.await() }
+        }
+        withContext(Dispatchers.IO) {
+            while (server.requestCount < requestsAfterBlockedSend) {
+                assertNotNull(server.takeRequest(5L, TimeUnit.SECONDS))
+            }
         }
         val pending = projections.readPage(limit = 10).messages().single()
         assertEquals(stableClientId, callbackId)
@@ -2145,6 +2152,40 @@ class SecureMessagingEventProcessorTest {
     }
 
     @Test
+    fun `completed group event with a departed recipient cannot stall other conversations`() =
+        runTest {
+            val (session, _, _) = openSyncingSession()
+            val stateStore = TestSecureMessagingStateStore()
+            val systemEvents = ConversationSystemEventStore(stateStore)
+            val processor = processor(
+                stateStore = stateStore,
+                crypto = PersistingDecryptionEngine(stateStore),
+                systemEvents = systemEvents,
+                scheduledPayments = scheduledPaymentRepository(),
+                groupPayments = groupPaymentRepository(),
+            )
+            enqueueSync(
+                listOf(scheduledGroupCompletedEvent()),
+                "departed_group_recipient_cursor",
+            )
+            server.enqueue(
+                jsonResponse(GROUP_CONVERSATIONS.replace(PEER_USER_ID, STRANGER_USER_ID)),
+            )
+            server.enqueue(jsonResponse(COMPLETED_SCHEDULED_GROUP_PAYMENT))
+            server.enqueue(jsonResponse(COMPLETED_GROUP_PAYMENT))
+
+            processor.synchronize(session)
+
+            val cursor = checkNotNull(SecureMessagingSyncCursorStore(stateStore).load())
+            assertEquals(
+                "departed_group_recipient_cursor" to 10L,
+                requireSecureMessagingSyncResumePosition(cursor.position),
+            )
+            systemEvents.load(listOf(CONVERSATION_ID))
+            assertTrue(systemEvents.events.value[CONVERSATION_ID].orEmpty().isEmpty())
+        }
+
+    @Test
     fun `completed direct event cannot swap creator into recipient role`() = runTest {
         assertSwappedCompletedDirectionRejected(
             COMPLETED_SCHEDULED_DIRECT_PAYMENT_CREATOR,
@@ -3959,6 +4000,16 @@ class SecureMessagingEventProcessorTest {
         },
     )
 
+    private fun groupPaymentRepository() = GroupPaymentRepository(
+        api = api,
+        apiCalls = apiCalls,
+        paymentAuthorizer = PaymentAuthorizer(api, apiCalls),
+        walletSync = object : WalletSyncRepository {
+            override suspend fun refresh() = WalletSyncResult(0, 0, false)
+            override suspend fun clearCachedUserData(ownerScopeId: String?) = Unit
+        },
+    )
+
     private suspend fun openSyncingSession(): Triple<
         RemoteSecureMessagingTransport.Session,
         SecureMessagingLifecycleGuard,
@@ -4028,6 +4079,7 @@ class SecureMessagingEventProcessorTest {
             com.kit.wallet.data.messaging.NoOpWalletRefreshTrigger,
         systemEvents: ConversationSystemEventStore? = null,
         scheduledPayments: ServerScheduledPaymentRepository? = null,
+        groupPayments: GroupPaymentRepository? = null,
     ) = SecureMessagingEventProcessor(
         crypto,
         projections,
@@ -4038,6 +4090,7 @@ class SecureMessagingEventProcessorTest {
         walletRefresh,
         systemEvents,
         scheduledPayments,
+        groupPayments,
     )
 
     private fun projectionStore(stateStore: SecureMessagingStateStore) =
@@ -5420,6 +5473,27 @@ class SecureMessagingEventProcessorTest {
             "message":"Provider did not answer"},"scheduled_for":"$TIMESTAMP",
             "queued_at":null,"started_at":null,"completed_at":"$TIMESTAMP",
             "cancelled_at":null,"created_at":"$TIMESTAMP"}}
+        """
+        const val COMPLETED_SCHEDULED_GROUP_PAYMENT = """
+            {"ok":true,"data":{"id":"$SCHEDULED_PAYMENT_ID",
+            "type":"scheduled_group_payment","conversation_id":"$CONVERSATION_ID",
+            "status":"completed","source_wallet_id":"$SOURCE_WALLET_ID",
+            "split_mode":"even","audience":"all","total_amount":"2500.00",
+            "currency":{"code":"UGX","scale":"2"},"note":null,"recipient_count":1,
+            "recipients":[{"user_id":"$PEER_USER_ID","name":"Peer","amount":"2500.00"}],
+            "group_payment_id":"$GROUP_PAYMENT_ID","failure":null,
+            "scheduled_for":"$TIMESTAMP","queued_at":null,"started_at":null,
+            "completed_at":"$TIMESTAMP","cancelled_at":null,"created_at":"$TIMESTAMP"}}
+        """
+        const val COMPLETED_GROUP_PAYMENT = """
+            {"ok":true,"data":{"id":"$GROUP_PAYMENT_ID",
+            "conversation_id":"$CONVERSATION_ID","split_mode":"even","audience":"all",
+            "currency":{"code":"UGX","scale":"2"},"recipient_count":1,
+            "total_amount":"2500.00","note":null,
+            "sender":{"id":"$CURRENT_USER_ID","name":"Current User"},"status":"settled",
+            "pending_count":0,"accepted_count":1,"returned_count":0,
+            "can_reverse_unclaimed":false,"recipients":[{"user_id":"$PEER_USER_ID",
+            "name":"Peer","status":"accepted","amount":"2500.00"}]}}
         """
         const val FAILED_SCHEDULED_DIRECT_PAYMENT = """
             {"ok":true,"data":{"id":"$SCHEDULED_PAYMENT_ID","type":"scheduled_payment",

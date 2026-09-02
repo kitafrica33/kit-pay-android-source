@@ -104,17 +104,73 @@ class IncomingCallSecurityContractTest {
             .substringAfter("A successful answer response ends the incoming ringing window")
             .substringBefore("mutableState.value = mutableState.value.copy")
 
-        assertTrue(acceptedResponse.contains("closeRingWindow(session.callId)"))
+        assertTrue(acceptedResponse.contains("closeRingWindow("))
+        assertTrue(acceptedResponse.contains("session.callId"))
+        assertTrue(acceptedResponse.contains("IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE"))
 
         val termination = source
             .substringAfter("private fun terminate(reason: String)")
             .substringBefore("private fun markConnected")
-        assertTrue(termination.contains("closeRingWindow(telecomCallId)"))
+        assertTrue(
+            termination.contains(
+                "closeRingWindow(telecomCallId, disconnect.ringRetirementDisposition())",
+            ),
+        )
 
         val ringWindow = source
-            .substringAfter("private fun closeRingWindow(callId: String?)")
-            .substringBefore("\n}\n\nprivate const val OUTGOING_CALL_LAUNCH_CLAIMED")
-        assertTrue(ringWindow.contains("ringDeadlines.retire(canonicalIncomingId)"))
+            .substringAfter("private fun closeRingWindow(")
+            .substringBefore("\n}\n\nprivate fun KitTelecomDisconnect")
+        assertTrue(ringWindow.contains("ringDeadlines.retire(canonicalIncomingId, disposition)"))
+    }
+
+    @Test
+    fun `answer attempt claims Telecom and retires notification before network acceptance`() {
+        val source = source(
+            repositoryRoot(),
+            "app/src/main/java/com/kit/wallet/feature/calls/ActiveCallViewModel.kt",
+        )
+        val accept = source
+            .substringAfter("fun accept(requestedVideo: Boolean)")
+            .substringBefore("private fun connect(requestedVideo: Boolean)")
+
+        assertTrue(accept.contains("telecom.markAnswering(incomingCallId)"))
+        assertTrue(accept.contains("closeRingWindow("))
+        assertTrue(accept.contains("incomingCallId"))
+        assertTrue(
+            accept.indexOf("telecom.markAnswering(incomingCallId)") <
+                accept.indexOf("closeRingWindow("),
+        )
+        assertTrue(
+            accept.indexOf("closeRingWindow(") <
+                accept.indexOf("connect(requestedVideo)"),
+        )
+
+        val main = source(
+            root = repositoryRoot(),
+            path = "app/src/main/java/com/kit/wallet/MainActivity.kt",
+        )
+        val trustedLaunch = main
+            .substringAfter("if (launch.acceptRequested)")
+            .substringBefore("installAuthorizedIncomingCall")
+        assertTrue(trustedLaunch.contains("claimAuthorizedIncomingCallAnswer"))
+    }
+
+    @Test
+    fun `incoming ring lifetime never consults the device wall clock`() {
+        val root = repositoryRoot()
+        val sources = listOf(
+            "app/src/main/java/com/kit/wallet/MainActivity.kt",
+            "app/src/main/java/com/kit/wallet/IncomingCallRelayActivity.kt",
+            "app/src/main/java/com/kit/wallet/data/notifications/CallRingDeadlineCoordinator.kt",
+            "app/src/main/java/com/kit/wallet/data/notifications/DefaultPushEnvelopeReceiver.kt",
+            "app/src/main/java/com/kit/wallet/data/notifications/IncomingCallLaunchAuthorization.kt",
+            "app/src/main/java/com/kit/wallet/data/notifications/IncomingCallReplayLedger.kt",
+        ).joinToString("\n") { source(root, it) }
+
+        assertFalse(sources.contains("Instant.now"))
+        assertFalse(sources.contains("java.time.Clock"))
+        assertTrue(sources.contains("ElapsedRealtimeClock"))
+        assertTrue(sources.contains("BootSessionIdProvider"))
     }
 
     @Test
@@ -130,6 +186,9 @@ class IncomingCallSecurityContractTest {
         val systemAnswered = telecom
             .substringAfter("internal fun systemAnswered")
             .substringBefore("internal fun systemDeclined")
+        val markAnswering = telecom
+            .substringAfter("fun markAnswering")
+            .substringBefore("/** A sibling answer")
         val activeCall = source(
             root,
             "app/src/main/java/com/kit/wallet/feature/calls/ActiveCallViewModel.kt",
@@ -140,7 +199,8 @@ class IncomingCallSecurityContractTest {
 
         assertFalse(onAnswer.contains("setActive()"))
         assertTrue(onAnswer.contains("bridge.systemAnswered"))
-        assertTrue(systemAnswered.contains("TelecomCallState.ANSWERING"))
+        assertTrue(systemAnswered.contains("markAnswering(callId)"))
+        assertTrue(markAnswering.contains("TelecomCallState.ANSWERING"))
         assertTrue(telecom.contains("TelecomCallState.ANSWERING -> setInitializing()"))
         assertTrue(connected.contains("telecom::markActive"))
     }
@@ -160,6 +220,40 @@ class IncomingCallSecurityContractTest {
             incoming.indexOf("activeCallId == call.callId") <
                 incoming.indexOf("replayLedger.admitRing"),
         )
+    }
+
+    @Test
+    fun `every published ring is reconciled against retirement after its deadline is armed`() {
+        val receiver = source(
+            repositoryRoot(),
+            "app/src/main/java/com/kit/wallet/data/notifications/DefaultPushEnvelopeReceiver.kt",
+        )
+        val publication = receiver
+            .substringAfter("private fun showIncomingCall(")
+            .substringBefore("private fun reconcileIncomingCallPublication")
+        val callWaiting = publication
+            .substringAfter(
+                "if (deliveryPlan.notificationSurface == " +
+                    "IncomingCallNotificationSurface.CALL_WAITING)",
+            )
+            .substringBefore("val ringtoneUri")
+        val ordinary = publication.substringAfter("val published = runCatching")
+
+        listOf(callWaiting, ordinary).forEach { branch ->
+            assertTrue(branch.contains("ringDeadlines.schedule(call.callId, ringLease)"))
+            assertTrue(branch.contains("reconcileIncomingCallPublication(call.callId, expiresAt)"))
+            assertTrue(
+                branch.indexOf("ringDeadlines.schedule(call.callId, ringLease)") <
+                    branch.indexOf("reconcileIncomingCallPublication(call.callId, expiresAt)"),
+            )
+        }
+
+        val reconciliation = receiver
+            .substringAfter("private fun reconcileIncomingCallPublication")
+            .substringBefore("private fun callAlertSettingsIntent")
+        assertTrue(reconciliation.contains("replayLedger.publicationAuthorization"))
+        assertTrue(reconciliation.contains("ringDeadlines::retire"))
+        assertTrue(reconciliation.contains("telecom.finishRinging"))
     }
 
     private fun source(root: File, path: String): String = File(root, path).readText()

@@ -14,6 +14,8 @@ data class IncomingCallPayload(
     /** Caller's public user id, used to add them to an in-progress call (call-waiting merge). */
     val callerUserId: String? = null,
     val ringExpiresAt: String? = null,
+    /** Backend clock captured beside [ringExpiresAt]; the device wall clock is never trusted. */
+    val serverTime: String? = null,
     /** True when the notification's Answer action asked the app to accept immediately. */
     val acceptRequested: Boolean = false,
 ) {
@@ -38,6 +40,7 @@ data class IncomingCallPayload(
                 video = data["call_type"].equals("video", ignoreCase = true) ||
                     data["video"]?.toBooleanStrictOrNull() == true,
                 ringExpiresAt = data["ring_expires_at"],
+                serverTime = data["server_time"],
             )
         }
 
@@ -73,6 +76,7 @@ data class IncomingCallPayload(
             callerUserId: String? = null,
             video: Boolean,
             ringExpiresAt: String? = null,
+            serverTime: String? = null,
         ): IncomingCallPayload? {
             val normalizedCallId = normalizedCallId(callId) ?: return null
             val safeCaller = callerName.orEmpty()
@@ -86,6 +90,7 @@ data class IncomingCallPayload(
                 video = video,
                 callerUserId = normalizedUserId(callerUserId),
                 ringExpiresAt = ringExpiresAt?.trim()?.takeIf(String::isNotEmpty),
+                serverTime = serverTime?.trim()?.takeIf(String::isNotEmpty),
             )
         }
 

@@ -169,6 +169,30 @@ class KitTelecomBridge @Inject constructor(
         updateState(callId, TelecomCallState.DIALING)
     }
 
+    /** Claims a locally accepted incoming call before its backend answer can echo to this device. */
+    fun markAnswering(callId: String): Boolean =
+        calls.compareAndSetState(
+            callId = callId,
+            expected = TelecomCallState.RINGING,
+            state = TelecomCallState.ANSWERING,
+            applyToConnection = { connection, state -> connection.applyState(state) },
+        ) != null
+
+    /** A sibling answer dismisses only a still-offered incoming call on this device. */
+    fun finishRingingAsAnsweredElsewhere(callId: String) {
+        finishRinging(callId, KitTelecomDisconnect.ANSWERED_ELSEWHERE)
+    }
+
+    /** Applies a reconciled terminal disposition only while the incoming call is still offered. */
+    fun finishRinging(callId: String, disconnect: KitTelecomDisconnect) {
+        val tracked = calls.finishIfState(
+            callId = callId,
+            expected = TelecomCallState.RINGING,
+            disconnect = disconnect,
+        )
+        tracked?.connection?.complete(disconnect.cause)
+    }
+
     fun markActive(callId: String) {
         updateState(callId, TelecomCallState.ACTIVE)
     }
@@ -206,12 +230,7 @@ class KitTelecomBridge @Inject constructor(
         // Telecom's answer gesture is only a local intent. Keep the Connection in an explicit
         // pre-acceptance state until the authenticated backend accept and LiveKit connection
         // advance it; reporting ACTIVE here would claim live audio that does not yet exist.
-        calls.compareAndSetState(
-            callId = callId,
-            expected = TelecomCallState.RINGING,
-            state = TelecomCallState.ANSWERING,
-            applyToConnection = { connection, state -> connection.applyState(state) },
-        ) ?: return
+        if (!markAnswering(callId)) return
         val intent = IncomingCallRelayActivity.intent(
             context = context,
             callId = callId,

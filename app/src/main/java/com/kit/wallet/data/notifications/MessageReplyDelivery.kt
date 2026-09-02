@@ -16,6 +16,12 @@ internal data class MessageReplyRequest(
     val text: String,
 )
 
+internal enum class MessageReplyNotificationAction {
+    IGNORE,
+    CANCEL,
+    SHOW_FAILURE,
+}
+
 internal object MessageReplyPolicy {
     /** Leaves headroom inside Android's roughly ten-second asynchronous broadcast allowance. */
     const val DELIVERY_TIMEOUT_MILLIS = 8_000L
@@ -60,10 +66,45 @@ internal object MessageReplyPolicy {
         return deterministicUuid(seed)
     }
 
+    /**
+     * A reply completion may mutate only the exact source notification that supplied its action.
+     * A newer message in the same conversation reuses the tag/id, so comparing those alone would
+     * let a late reply cancel or overwrite the newer preview.
+     */
+    fun notificationAction(
+        delivered: Boolean,
+        expectedSourceMessageDigest: String?,
+        activeSourceMessageDigest: String?,
+    ): MessageReplyNotificationAction {
+        if (
+            expectedSourceMessageDigest == null ||
+            !SECURE_MESSAGE_DIGEST_PATTERN.matches(expectedSourceMessageDigest) ||
+            expectedSourceMessageDigest != activeSourceMessageDigest
+        ) {
+            return MessageReplyNotificationAction.IGNORE
+        }
+        return if (delivered) {
+            MessageReplyNotificationAction.CANCEL
+        } else {
+            MessageReplyNotificationAction.SHOW_FAILURE
+        }
+    }
+
     private const val MAX_SESSION_EPOCH_LENGTH = 256
     private val CANONICAL_UUID = Regex(
         "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     )
+}
+
+/** Falls back to the durable row owner only when Android refused the authoritative query. */
+internal fun replyNotificationSourceDigest(
+    activeQuerySucceeded: Boolean,
+    activeSourceMessageDigest: String?,
+    recordedSourceMessageDigest: String?,
+): String? = if (activeQuerySucceeded) {
+    activeSourceMessageDigest
+} else {
+    recordedSourceMessageDigest
 }
 
 /**

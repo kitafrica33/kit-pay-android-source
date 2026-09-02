@@ -1,5 +1,9 @@
 package com.kit.wallet.feature.calls
 
+import com.kit.wallet.claimAuthorizedIncomingCallAnswer
+import com.kit.wallet.data.notifications.IncomingCallPublicationAuthorization
+import com.kit.wallet.data.notifications.IncomingCallRetirementDisposition
+import com.kit.wallet.data.notifications.reconcilePublishedIncomingCall
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -46,6 +50,98 @@ class TerminalAwareTelecomCallRegistryTest {
         )
         assertEquals(TestState.ANSWERING, attached.liveCall?.state)
         assertEquals(listOf(TestState.ANSWERING), applied)
+    }
+
+    @Test
+    fun `conditional finish removes ringing without touching progressed calls`() {
+        val registry = registry()
+        registry.track("ringing", "incoming", TestState.RINGING)
+        registry.track("answering", "incoming", TestState.ANSWERING)
+        registry.track("active", "incoming", TestState.ACTIVE)
+
+        assertNotNull(registry.finishIfState("ringing", TestState.RINGING, "elsewhere"))
+        assertNull(registry.finishIfState("answering", TestState.RINGING, "elsewhere"))
+        assertNull(registry.finishIfState("active", TestState.RINGING, "elsewhere"))
+
+        assertEquals(
+            TestState.ANSWERING,
+            registry.attachConnection(
+                callId = "answering",
+                metadata = "incoming",
+                initialState = TestState.RINGING,
+                createConnection = { "answering-connection" },
+                prepareLiveConnection = { _, _ -> },
+            ).liveCall?.state,
+        )
+        assertEquals(
+            TestState.ACTIVE,
+            registry.attachConnection(
+                callId = "active",
+                metadata = "incoming",
+                initialState = TestState.RINGING,
+                createConnection = { "active-connection" },
+                prepareLiveConnection = { _, _ -> },
+            ).liveCall?.state,
+        )
+    }
+
+    @Test
+    fun `notification answer survives duplicate reconciliation and its own answered echo`() {
+        val registry = registry()
+        val callId = "locally-answered"
+        registry.track(callId, "incoming", TestState.RINGING)
+        var ringAuthorized = true
+
+        // The trusted notification boundary claims Telecom before it retires the ledger.
+        claimAuthorizedIncomingCallAnswer(
+            callId = callId,
+            markAnswering = {
+                registry.compareAndSetState(
+                    it,
+                    TestState.RINGING,
+                    TestState.ANSWERING,
+                ) { _, _ -> }
+            },
+            retireRing = { ringAuthorized = false },
+        )
+
+        // An admitted duplicate resumes after that retirement. Final reconciliation sees the
+        // tombstone, but its ringing-only cleanup cannot terminate this locally claimed call.
+        assertFalse(
+            reconcilePublishedIncomingCall(
+                callId = callId,
+                authorization = {
+                    if (ringAuthorized) {
+                        IncomingCallPublicationAuthorization.Authorized
+                    } else {
+                        IncomingCallPublicationAuthorization.Retired(
+                            IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE,
+                        )
+                    }
+                },
+                retireSurfaces = { _, _ -> },
+                finishRinging = { reconciledCallId, _ ->
+                    registry.finishIfState(
+                        reconciledCallId,
+                        TestState.RINGING,
+                        "answered-elsewhere",
+                    )
+                },
+            ),
+        )
+        assertNull(registry.finishIfState(callId, TestState.RINGING, "answered-elsewhere"))
+
+        // The backend echo takes the same conditional-finish path. A delayed Connection callback
+        // must still attach in ANSWERING rather than resolve against a terminal tombstone.
+        val attached = registry.attachConnection(
+            callId = callId,
+            metadata = "incoming",
+            initialState = TestState.RINGING,
+            createConnection = { "connection" },
+            prepareLiveConnection = { _, _ -> },
+        )
+        assertEquals(TestState.ANSWERING, attached.liveCall?.state)
+        assertNull(attached.terminalDisconnect)
     }
 
     @Test

@@ -28,6 +28,8 @@ class CallActionReceiver : BroadcastReceiver() {
 
     @Inject lateinit var replayLedger: IncomingCallReplayLedger
 
+    @Inject lateinit var incomingCallRelay: IncomingCallRelay
+
     @Inject @ApplicationScope lateinit var applicationScope: CoroutineScope
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -35,7 +37,15 @@ class CallActionReceiver : BroadcastReceiver() {
         val callId = IncomingCallPayload.callId(
             mapOf("call_id" to intent.getStringExtra(EXTRA_CALL_ID).orEmpty()),
         ) ?: return
-        replayLedger.retire(callId)
+        replayLedger.retire(
+            callId,
+            if (intent.action == ACTION_DECLINE) {
+                IncomingCallRetirementDisposition.REJECTED
+            } else {
+                IncomingCallRetirementDisposition.LOCAL
+            },
+        )
+        incomingCallRelay.retire(callId)
         ringDeadlines.cancel(callId)
         telecom.finish(
             callId,

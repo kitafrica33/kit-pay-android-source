@@ -103,6 +103,17 @@ internal class TerminalAwareTelecomCallRegistry<Metadata : Any, State : Any, Con
         return updated
     }
 
+    /** Terminates only the exact live source state, leaving every progressed call untouched. */
+    @Synchronized
+    fun finishIfState(
+        callId: String,
+        expected: State,
+        disconnect: Disconnect,
+    ): RegisteredTelecomCall<Metadata, State, Connection>? {
+        if (liveCalls[callId]?.state != expected) return null
+        return finish(callId, disconnect)
+    }
+
     /**
      * Atomically attaches and prepares a Telecom connection, or resolves it against a tombstone.
      * [prepareLiveConnection] runs while lifecycle mutation is excluded, so `finish` cannot

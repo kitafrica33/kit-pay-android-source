@@ -13,6 +13,9 @@ import com.kit.wallet.data.notifications.CallLifecycleEventBus
 import com.kit.wallet.data.notifications.CallLifecycleKind
 import com.kit.wallet.data.notifications.CallRingDeadlineCoordinator
 import com.kit.wallet.data.notifications.IncomingCallRelay
+import com.kit.wallet.data.notifications.IncomingCallRelayEvent
+import com.kit.wallet.data.notifications.IncomingCallRetirementDisposition
+import com.kit.wallet.data.notifications.callRingLease
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.remote.isKitConnectivityError
 import com.kit.wallet.data.repository.CallConnection
@@ -25,6 +28,8 @@ import com.kit.wallet.data.repository.canonicalCallUserId
 import com.kit.wallet.data.repository.initialCallPresentation
 import com.kit.wallet.data.repository.resolveCallPresentation
 import com.kit.wallet.data.repository.resolveRoomParticipant
+import com.kit.wallet.data.time.BootSessionIdProvider
+import com.kit.wallet.data.time.ElapsedRealtimeClock
 import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.AccountVerification
@@ -121,6 +126,42 @@ data class ActiveCallUiState(
 
     /** True once more than one other participant is on the call. */
     val isGroup: Boolean get() = remoteParticipants.size > 1
+}
+
+/** Applies the single ordered ring/retirement stream that owns the call-waiting banner. */
+internal fun applyIncomingCallRelayEvent(
+    state: ActiveCallUiState,
+    activeCallId: String?,
+    terminated: Boolean,
+    event: IncomingCallRelayEvent,
+): ActiveCallUiState = when (event) {
+    is IncomingCallRelayEvent.Ringing -> {
+        val incoming = event.call
+        if (
+            terminated ||
+            activeCallId == null ||
+            incoming.callId == activeCallId ||
+            state.waitingCall?.callId == incoming.callId
+        ) {
+            state
+        } else {
+            state.copy(
+                waitingCall = WaitingCall(
+                    callId = incoming.callId,
+                    name = incoming.callerName,
+                    video = incoming.video,
+                    callerUserId = incoming.callerUserId,
+                ),
+            )
+        }
+    }
+    is IncomingCallRelayEvent.Retired -> if (
+        event.callId.equals(state.waitingCall?.callId, ignoreCase = true)
+    ) {
+        state.copy(waitingCall = null, mergingWaitingCall = false)
+    } else {
+        state
+    }
 }
 
 internal fun offlineCallRetryDelayMillis(attempt: Int): Long =
@@ -266,6 +307,8 @@ class ActiveCallViewModel @Inject constructor(
     private val incomingCalls: IncomingCallRelay,
     private val telecom: KitTelecomBridge,
     private val ringDeadlines: CallRingDeadlineCoordinator,
+    private val elapsedRealtimeClock: ElapsedRealtimeClock,
+    private val bootSessionIdProvider: BootSessionIdProvider,
     @ApplicationScope private val applicationScope: CoroutineScope,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
@@ -391,23 +434,19 @@ class ActiveCallViewModel @Inject constructor(
         }
         // A second call ringing in while this one is connected becomes a call-waiting banner.
         viewModelScope.launch {
-            incomingCalls.events.collect { incoming ->
-                val currentCallId = connection?.callId
-                if (
-                    !terminated &&
-                    currentCallId != null &&
-                    incoming.callId != currentCallId &&
-                    mutableState.value.waitingCall?.callId != incoming.callId
-                ) {
-                    mutableState.value = mutableState.value.copy(
-                        waitingCall = WaitingCall(
-                            callId = incoming.callId,
-                            name = incoming.callerName,
-                            video = incoming.video,
-                            callerUserId = incoming.callerUserId,
-                        ),
-                    )
-                    applyContactPresentation(contacts.contacts.value)
+            incomingCalls.events.collect { event ->
+                val previous = mutableState.value
+                val updated = applyIncomingCallRelayEvent(
+                    state = previous,
+                    activeCallId = connection?.callId,
+                    terminated = terminated,
+                    event = event,
+                )
+                if (updated != previous) {
+                    mutableState.value = updated
+                    if (event is IncomingCallRelayEvent.Ringing) {
+                        applyContactPresentation(contacts.contacts.value)
+                    }
                 }
             }
         }
@@ -418,7 +457,7 @@ class ActiveCallViewModel @Inject constructor(
     fun declineWaitingCall() {
         val waiting = mutableState.value.waitingCall ?: return
         mutableState.value = mutableState.value.copy(waitingCall = null, mergingWaitingCall = false)
-        ringDeadlines.retire(waiting.callId)
+        ringDeadlines.retire(waiting.callId, IncomingCallRetirementDisposition.REJECTED)
         telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
         applicationScope.launch { runCatching { calls.decline(waiting.callId) } }
     }
@@ -436,7 +475,7 @@ class ActiveCallViewModel @Inject constructor(
                 waitingCall = null,
                 error = "This call can't be merged. Ask them to call back after this call.",
             )
-            ringDeadlines.retire(waiting.callId)
+            ringDeadlines.retire(waiting.callId, IncomingCallRetirementDisposition.REJECTED)
             telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
             applicationScope.launch { runCatching { calls.decline(waiting.callId) } }
             return
@@ -446,7 +485,7 @@ class ActiveCallViewModel @Inject constructor(
             try {
                 calls.invite(currentCallId, listOf(callerUserId))
                 runCatching { calls.decline(waiting.callId) }
-                ringDeadlines.retire(waiting.callId)
+                ringDeadlines.retire(waiting.callId, IncomingCallRetirementDisposition.REJECTED)
                 telecom.finish(waiting.callId, KitTelecomDisconnect.REJECTED)
                 mutableState.value = mutableState.value.copy(
                     waitingCall = null,
@@ -503,6 +542,16 @@ class ActiveCallViewModel @Inject constructor(
 
     fun accept(requestedVideo: Boolean) {
         if (incomingCallId == null || !mutableState.value.incomingVerified) return
+        // Claim the local Telecom offer synchronously, before POST /accept can emit its
+        // call.answered push back to this same device. The echo dismisses sibling rings only;
+        // ANSWERING keeps this device's Connection alive until the authenticated response.
+        telecom.markAnswering(incomingCallId)
+        // Answer is a terminal local decision for the ringing surface. Retire it before the
+        // network call so a failed or interrupted accept can never leave a zombie notification.
+        closeRingWindow(
+            incomingCallId,
+            IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE,
+        )
         connect(requestedVideo)
     }
 
@@ -573,14 +622,22 @@ class ActiveCallViewModel @Inject constructor(
                         alreadyAnswered = answeredCallId.equals(session.callId, ignoreCase = true),
                     )
                 ) {
-                    ringDeadlines.schedule(session.callId, session.ringExpiresAt)
+                    callRingLease(
+                        ringExpiresAt = session.ringExpiresAt,
+                        serverTime = session.ringServerTime,
+                        receivedElapsedRealtimeMillis = elapsedRealtimeClock.millis(),
+                        bootSessionId = bootSessionIdProvider.currentBootId(),
+                    )?.let { ringDeadlines.schedule(session.callId, it) }
                 } else {
                     // A successful answer response ends the incoming ringing window even if media
                     // connection takes longer than the original deadline — and so does an answer
                     // that overtook this response on the way here.
                     // Persist the answered tombstone before dropping an incoming ring deadline so
                     // an old immutable notification action cannot reopen this accepted call.
-                    closeRingWindow(session.callId)
+                    closeRingWindow(
+                        session.callId,
+                        IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE,
+                    )
                 }
                 mutableState.value = mutableState.value.copy(
                     name = session.name,
@@ -884,6 +941,12 @@ class ActiveCallViewModel @Inject constructor(
             try {
                 val incoming = calls.incoming(callId)
                 if (terminated) return@launch
+                val ringLease = callRingLease(
+                    ringExpiresAt = incoming.ringExpiresAt,
+                    serverTime = incoming.serverTime,
+                    receivedElapsedRealtimeMillis = elapsedRealtimeClock.millis(),
+                    bootSessionId = bootSessionIdProvider.currentBootId(),
+                ) ?: error("This incoming call has expired")
                 verifiedIncomingCall = incoming
                 mutableState.value = mutableState.value.copy(
                     name = incoming.name,
@@ -902,7 +965,7 @@ class ActiveCallViewModel @Inject constructor(
                     incoming.ringExpiresAt,
                 )
                 localTelecomTermination.resolveCallId(callId)
-                ringDeadlines.schedule(callId, incoming.ringExpiresAt)
+                ringDeadlines.schedule(callId, ringLease)
                 applyContactPresentation(contacts.contacts.value)
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -1012,24 +1075,18 @@ class ActiveCallViewModel @Inject constructor(
         val safeReason = reason.takeIf { it in setOf("completed", "cancelled", "network_error") }
             ?: "cancelled"
         val telecomCallId = connection?.callId ?: incomingCallId
-        closeRingWindow(telecomCallId)
+        val disconnect = when {
+            safeReason == "network_error" -> KitTelecomDisconnect.ERROR
+            connection == null && incomingCallId != null -> KitTelecomDisconnect.REJECTED
+            else -> KitTelecomDisconnect.LOCAL
+        }
+        closeRingWindow(telecomCallId, disconnect.ringRetirementDisposition())
         if (telecomCallId != null) {
-            val disconnect = when {
-                safeReason == "network_error" -> KitTelecomDisconnect.ERROR
-                connection == null && incomingCallId != null -> KitTelecomDisconnect.REJECTED
-                else -> KitTelecomDisconnect.LOCAL
-            }
             localTelecomTermination.terminate(disconnect)
         } else {
             // Outgoing POST /calls is still in flight. The deferred transition is delivered once
             // its response has been tracked with Telecom.
-            localTelecomTermination.terminate(
-                if (safeReason == "network_error") {
-                    KitTelecomDisconnect.ERROR
-                } else {
-                    KitTelecomDisconnect.LOCAL
-                },
-            )
+            localTelecomTermination.terminate(disconnect)
             outgoingClientCallId?.takeIf { outgoingAttemptSubmitted && !outgoingAttemptResolved }
                 ?.let { attemptId ->
                 applicationScope.launch { runCatching { calls.cancelAttempt(attemptId) } }
@@ -1080,7 +1137,10 @@ class ActiveCallViewModel @Inject constructor(
     }
 
     private fun markConnected() {
-        closeRingWindow(connection?.callId ?: incomingCallId)
+        closeRingWindow(
+            connection?.callId ?: incomingCallId,
+            IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE,
+        )
         mutableState.value = mutableState.value.copy(phase = CallPhase.CONNECTED)
         // Media is up, so the call is running whether or not anything authoritative has
         // reached us yet. Anchoring here is never earlier than the real answer, so a
@@ -1127,7 +1187,7 @@ class ActiveCallViewModel @Inject constructor(
         // while ids taken verbatim from REST responses keep whatever case the server used,
         // and the same call must never fail to match itself over that difference.
         if (event.callId.equals(mutableState.value.waitingCall?.callId, ignoreCase = true)) {
-            if (event.kind != CallLifecycleKind.ANSWERED) clearWaitingCall()
+            if (event.kind == CallLifecycleKind.ANSWERED || event.terminal) clearWaitingCall()
             return
         }
 
@@ -1159,7 +1219,10 @@ class ActiveCallViewModel @Inject constructor(
                 // armed — would expire mid-call, finish Telecom as MISSED, and tear down a
                 // call both sides are on. Cancelled under this screen's own id, the exact
                 // string the deadline was scheduled with.
-                closeRingWindow(connection?.callId ?: incomingCallId)
+                closeRingWindow(
+                    connection?.callId ?: incomingCallId,
+                    IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE,
+                )
                 // Applied on every answer signal, not only the one that moves the phase.
                 // The socket frame, the push and the accept response all carry the same
                 // instant, and taking each of them is what lets the earliest — and so the
@@ -1201,7 +1264,7 @@ class ActiveCallViewModel @Inject constructor(
             return
         }
         terminated = true
-        ringDeadlines.retire(callId)
+        ringDeadlines.retire(callId, disconnect.ringRetirementDisposition())
         telecom.finish(callId, disconnect)
         validationJob?.cancel()
         timerJob?.cancel()
@@ -1321,7 +1384,10 @@ class ActiveCallViewModel @Inject constructor(
             return
         }
         terminated = true
-        closeRingWindow(connection?.callId ?: incomingCallId)
+        closeRingWindow(
+            connection?.callId ?: incomingCallId,
+            IncomingCallRetirementDisposition.ERROR,
+        )
         timerJob?.cancel()
         timerJob = null
         room.disconnect()
@@ -1377,7 +1443,17 @@ class ActiveCallViewModel @Inject constructor(
         room.release()
         CallForegroundService.stop(context)
         activeCallState.setActiveCall(null)
-        closeRingWindow(connection?.callId ?: incomingCallId)
+        val closingDisposition = if (
+            connection == null &&
+            incomingCallId != null &&
+            mutableState.value.incomingVerified &&
+            mutableState.value.phase !in setOf(CallPhase.ENDING, CallPhase.ENDED)
+        ) {
+            IncomingCallRetirementDisposition.REJECTED
+        } else {
+            IncomingCallRetirementDisposition.LOCAL
+        }
+        closeRingWindow(connection?.callId ?: incomingCallId, closingDisposition)
         connection?.callId?.let { activeCallId ->
             telecom.finish(activeCallId, KitTelecomDisconnect.LOCAL)
             pendingTerminations.enqueue(
@@ -1409,16 +1485,31 @@ class ActiveCallViewModel @Inject constructor(
     }
 
     /** Retires an incoming identity; outgoing deadlines need only process-local cancellation. */
-    private fun closeRingWindow(callId: String?) {
+    private fun closeRingWindow(
+        callId: String?,
+        disposition: IncomingCallRetirementDisposition,
+    ) {
         val canonicalIncomingId = incomingCallId
         if (callId == null) return
         if (canonicalIncomingId != null && callId.equals(canonicalIncomingId, ignoreCase = true)) {
-            ringDeadlines.retire(canonicalIncomingId)
+            ringDeadlines.retire(canonicalIncomingId, disposition)
         } else {
             ringDeadlines.cancel(callId)
         }
     }
 }
+
+private fun KitTelecomDisconnect.ringRetirementDisposition():
+    IncomingCallRetirementDisposition =
+    when (this) {
+        KitTelecomDisconnect.ANSWERED_ELSEWHERE ->
+            IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE
+        KitTelecomDisconnect.REJECTED -> IncomingCallRetirementDisposition.REJECTED
+        KitTelecomDisconnect.REMOTE -> IncomingCallRetirementDisposition.REMOTE
+        KitTelecomDisconnect.MISSED -> IncomingCallRetirementDisposition.MISSED
+        KitTelecomDisconnect.LOCAL -> IncomingCallRetirementDisposition.LOCAL
+        KitTelecomDisconnect.ERROR -> IncomingCallRetirementDisposition.ERROR
+    }
 
 private const val OUTGOING_CALL_LAUNCH_CLAIMED = "kit.outgoing_call_launch_claimed"
 

@@ -21,6 +21,7 @@ class IncomingCallPayloadTest {
                 "initiator_name" to "  Grace & Amina  ",
                 "initiator_user_id" to "86d5c9b8-4c19-4f14-91a7-28c2500049d1",
                 "ring_expires_at" to "2026-07-17T18:00:00Z",
+                "server_time" to "2026-07-17T17:59:30Z",
             ),
         )
 
@@ -30,6 +31,7 @@ class IncomingCallPayloadTest {
         assertEquals("86d5c9b8-4c19-4f14-91a7-28c2500049d1", payload.callerUserId)
         assertTrue(payload.video)
         assertEquals("2026-07-17T18:00:00Z", payload.ringExpiresAt)
+        assertEquals("2026-07-17T17:59:30Z", payload.serverTime)
 
         val navigated = IncomingCallPayload.fromDeepLink(
             payload.deepLinkUri() + "&name=Spoofed%20Caller&video=true",

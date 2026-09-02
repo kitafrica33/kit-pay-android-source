@@ -72,6 +72,19 @@ internal fun incomingCallAlertPlan(access: IncomingCallNotificationAccess): Inco
     }
 }
 
+/**
+ * With notifications entirely disabled, a primary call still has an in-app surface while Kit Pay
+ * is already foregrounded. Call waiting has its own relay into the active call and must never
+ * construct a second call screen.
+ */
+internal fun shouldRelayBlockedIncomingCallInForeground(
+    alertMode: IncomingCallAlertMode,
+    foregrounded: Boolean,
+    surface: IncomingCallNotificationSurface,
+): Boolean = foregrounded &&
+    alertMode == IncomingCallAlertMode.BLOCKED &&
+    surface == IncomingCallNotificationSurface.FULL_SCREEN_RING
+
 /** Current user-controlled Android gates, safe to evaluate whenever a foreground screen resumes. */
 internal fun incomingCallNotificationAccess(context: Context): IncomingCallNotificationAccess {
     val manager = context.getSystemService(NotificationManager::class.java)

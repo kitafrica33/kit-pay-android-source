@@ -1279,14 +1279,14 @@ private fun KitNavHost(
                     navController.popBackStack()
                 }
             } else {
-                LaunchedEffect(callId, authorization.expiresAt) {
+                LaunchedEffect(callId, authorization.ringLease.deadlineElapsedRealtimeMillis) {
                     // MainActivity's opaque call cover remains above this destination until the
                     // route itself has crossed a complete draw boundary.
                     withFrameNanos { }
                     withFrameNanos { }
                     onAuthorizedIncomingCallSurfaceChanged(callId, true)
                 }
-                DisposableEffect(callId, authorization.expiresAt) {
+                DisposableEffect(callId, authorization.ringLease.deadlineElapsedRealtimeMillis) {
                     onDispose {
                         onAuthorizedIncomingCallSurfaceChanged(callId, false)
                     }

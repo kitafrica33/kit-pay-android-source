@@ -20,7 +20,15 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 internal enum class ImmediateSendDispatchOutcome { IDLE, COMMITTED, RETRY }
-internal enum class ImmediateMediaPreparationOutcome { IDLE, PREPARED, RETRY }
+internal enum class ImmediateMediaPreparationOutcome(
+    val progressed: Boolean,
+    val retryNeeded: Boolean,
+) {
+    IDLE(progressed = false, retryNeeded = false),
+    PROGRESSED(progressed = true, retryNeeded = false),
+    RETRY(progressed = false, retryNeeded = true),
+    PROGRESSED_RETRY(progressed = true, retryNeeded = true),
+}
 
 /** Promotes local plaintext intents to the existing encrypted companion outbox. */
 @Singleton
@@ -29,16 +37,18 @@ internal class ImmediateSendDispatcher @Inject constructor(
     private val mediaSpool: ImmediateMediaSpool,
     private val chats: EncryptedChatRepository,
 ) {
-    private val mutex = Mutex()
+    // Device-only preparation can spend seconds transcoding and encrypting large media. It must
+    // not own the network-dispatch lock while ready text in another conversation is waiting.
+    private val preparationMutex = Mutex()
+    private val dispatchMutex = Mutex()
 
     /**
      * Performs device-only encryption without requiring connectivity or a ready network runtime.
      *
-     * The unconstrained preparation worker calls this path. [dispatch] retains the same step as a
-     * crash/race fallback, but upload no longer has to be the operation that first makes local
-     * ciphertext durable.
+     * The unconstrained preparation worker exclusively owns this step. Network dispatch treats an
+     * unfinished row as a per-conversation ordering barrier and continues with other chats.
      */
-    suspend fun prepareLocalMedia(): ImmediateMediaPreparationOutcome = mutex.withLock {
+    suspend fun prepareLocalMedia(): ImmediateMediaPreparationOutcome = preparationMutex.withLock {
         val owner = store.loadForCurrentOwner()
             ?: return@withLock ImmediateMediaPreparationOutcome.IDLE
         val preparing = store.itemsForOwner(owner)
@@ -53,9 +63,14 @@ internal class ImmediateSendDispatcher @Inject constructor(
                 async { permit.withPermit { prepareOne(owner, intent) } }
             }.awaitAll()
         }
+        val progressed = results.any {
+            it == PrepareOneResult.PREPARED || it == PrepareOneResult.FAILED
+        }
+        val retryNeeded = results.any { it == PrepareOneResult.RETRY }
         when {
-            results.any { it == PrepareOneResult.RETRY } -> ImmediateMediaPreparationOutcome.RETRY
-            results.any { it == PrepareOneResult.PREPARED } -> ImmediateMediaPreparationOutcome.PREPARED
+            progressed && retryNeeded -> ImmediateMediaPreparationOutcome.PROGRESSED_RETRY
+            progressed -> ImmediateMediaPreparationOutcome.PROGRESSED
+            retryNeeded -> ImmediateMediaPreparationOutcome.RETRY
             else -> ImmediateMediaPreparationOutcome.IDLE
         }
     }
@@ -146,7 +161,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
         }
     }
 
-    suspend fun dispatch(): ImmediateSendDispatchOutcome = mutex.withLock {
+    suspend fun dispatch(): ImmediateSendDispatchOutcome = dispatchMutex.withLock {
         val owner = store.loadForCurrentOwner()
             ?: return@withLock ImmediateSendDispatchOutcome.IDLE
         val snapshot = store.itemsForOwner(owner)
@@ -159,9 +174,9 @@ internal class ImmediateSendDispatcher @Inject constructor(
         )
         if (snapshot.isEmpty()) return@withLock ImmediateSendDispatchOutcome.IDLE
 
-        // Uploading or encrypting one large attachment must not hold every other conversation
-        // behind it. Each worker still walks exactly one conversation in snapshot order, retaining
-        // strict per-chat FIFO, while the semaphore caps cross-chat CPU/network pressure.
+        // Uploading one large attachment must not hold every other conversation behind it. Each
+        // worker still walks exactly one conversation in snapshot order, retaining strict per-chat
+        // FIFO, while the semaphore caps cross-chat CPU/network pressure.
         val permit = Semaphore(MAX_CONCURRENT_CONVERSATIONS)
         val results = coroutineScope {
             snapshot.groupBy(ImmediateSendIntent::conversationId).values.map { conversation ->
@@ -233,6 +248,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
                     retryNeeded = true
                     break
                 }
+                DispatchOneResult.PENDING_PREPARATION -> break
                 DispatchOneResult.RETIRED -> Unit
                 DispatchOneResult.FAILED -> Unit
                 DispatchOneResult.RETRY_REQUIRED -> break
@@ -251,6 +267,7 @@ internal class ImmediateSendDispatcher @Inject constructor(
         /** Irrecoverable, and the record stays behind as its own visible failed bubble. */
         FAILED,
         RETRY,
+        PENDING_PREPARATION,
         RETRY_REQUIRED,
         GONE,
     }
@@ -261,24 +278,19 @@ internal class ImmediateSendDispatcher @Inject constructor(
     ): DispatchOneResult {
         var current = store.itemsForOwner(owner).firstOrNull { it.id == original.id }
             ?: return DispatchOneResult.GONE
-        if (current.state == ImmediateSendState.IMPORTING) {
+        if (
+            current.state == ImmediateSendState.IMPORTING ||
+            current.state == ImmediateSendState.PREPARING
+        ) {
             // The unconstrained local worker owns import reconciliation and encryption. Keeping
-            // this row at the per-conversation head preserves ordering while network work retries.
-            return DispatchOneResult.RETRY
+            // this row at the per-conversation head preserves ordering. This is not a network
+            // failure: successful preparation schedules a fresh sync, so this worker can finish
+            // without entering WorkManager's retry backoff.
+            return DispatchOneResult.PENDING_PREPARATION
         }
         var encryptedOutboxOwnsSend = false
         val failure = try {
-            if (current.state == ImmediateSendState.PREPARING) {
-                val prepared = chats.prepareImmediateMediaCiphertext(owner, current)
-                if (!store.replaceForOwner(owner, current, prepared)) {
-                    prepared.spoolIds().forEach { mediaSpool.discard(it) }
-                    return DispatchOneResult.GONE
-                }
-                current = prepared
-                // If the process dies after the queue replacement but before this release, the
-                // idempotent release below on the next WAITING dispatch completes the handoff.
-                runCatching { chats.releaseImmediateMediaRetention(owner, current) }
-            } else if (
+            if (
                 current.kind == ImmediateSendKind.MEDIA ||
                 current.kind == ImmediateSendKind.MEDIA_V2
             ) {
@@ -391,25 +403,6 @@ internal class ImmediateSendDispatcher @Inject constructor(
                 current.spoolIds().forEach { mediaSpool.discard(it) }
             }
             return DispatchOneResult.COMMITTED
-        }
-
-        if (current.state == ImmediateSendState.PREPARING) {
-            return if (failure.isTransientImmediateSendFailure()) {
-                runCatching { chats.markImmediateMediaFailure(owner, current, permanent = false) }
-                DispatchOneResult.RETRY
-            } else {
-                withContext(NonCancellable) {
-                    store.replaceForOwner(
-                        owner,
-                        current,
-                        current.copy(state = ImmediateSendState.FAILED),
-                    )
-                    current.spoolIds().forEach { mediaSpool.discard(it) }
-                    runCatching { chats.releaseImmediateMediaRetention(owner, current) }
-                    runCatching { chats.markImmediateMediaFailure(owner, current, permanent = true) }
-                }
-                DispatchOneResult.FAILED
-            }
         }
 
         if (

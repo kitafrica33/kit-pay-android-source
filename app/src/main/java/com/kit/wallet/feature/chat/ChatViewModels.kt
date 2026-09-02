@@ -103,6 +103,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -1049,6 +1050,11 @@ class ConversationViewModel @Inject internal constructor(
     // Encrypted composer draft restored once per conversation entry; consumed by the screen.
     private val mutableRestoredDraft = MutableStateFlow<String?>(null)
     val restoredDraft = mutableRestoredDraft.asStateFlow()
+    private data class PendingComposerDraftWrite(val revision: Long, val text: String)
+    private val pendingComposerDraftWrite =
+        MutableStateFlow<PendingComposerDraftWrite?>(null)
+    private val composerEditedSinceEntry = AtomicBoolean(false)
+    private var composerDraftRevision = 0L
 
     init {
         sessions?.let { sessionStore ->
@@ -1061,8 +1067,51 @@ class ConversationViewModel @Inject internal constructor(
         }
         if (chatId.isNotBlank()) {
             viewModelScope.launch {
-                mutableRestoredDraft.value =
-                    runCatching { chatRepo.composerDraft(chatId) }.getOrNull()
+                // The encrypted store is deliberately unavailable until this account's local
+                // history has been opened. Reading before that point looks exactly like "no
+                // draft" and permanently loses the only restoration attempt for this entry.
+                historyAvailable.first { it }
+                val restored = runCatching { chatRepo.composerDraft(chatId) }.getOrNull()
+                // A person can start typing (and can type, then clear) while the store opens.
+                // Never let the late disk read resurrect older text over that explicit choice.
+                if (!composerEditedSinceEntry.get()) {
+                    mutableRestoredDraft.value = restored
+                }
+            }
+            viewModelScope.launch {
+                combine(historyAvailable, pendingComposerDraftWrite) { ready, pending ->
+                    pending.takeIf { ready }
+                }.collect { pending ->
+                    pending ?: return@collect
+                    var retryDelayMillis = COMPOSER_DRAFT_RETRY_INITIAL_MILLIS
+                    while (
+                        historyAvailable.value &&
+                        pendingComposerDraftWrite.value == pending
+                    ) {
+                        val saved = try {
+                            if (pending.text.isBlank()) {
+                                chatRepo.clearComposerDraft(chatId)
+                            } else {
+                                chatRepo.saveComposerDraft(chatId, pending.text)
+                            }
+                            true
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (saved) {
+                            pendingComposerDraftWrite.compareAndSet(pending, null)
+                            break
+                        }
+                        // The latest text remains owned by this conversation-scoped ViewModel.
+                        // Retry autonomously while its encrypted store stays available, but cap
+                        // the interval so a persistent keystore failure neither spins nor grows.
+                        delay(retryDelayMillis)
+                        retryDelayMillis = (retryDelayMillis * 2)
+                            .coerceAtMost(COMPOSER_DRAFT_RETRY_MAX_MILLIS)
+                    }
+                }
             }
             scheduledSends?.let { queue ->
                 // Idempotent: the repository already re-reads the queue on every messaging
@@ -1095,6 +1144,7 @@ class ConversationViewModel @Inject internal constructor(
                             is MediaPreloadTarget.Single -> hydrateMedia(
                                 key = target.key,
                                 fallbackError = "The secure photo could not be opened",
+                                reportFailure = false,
                                 shouldStart = {
                                     isCurrentPreloadTarget(selectedChat.id, target)
                                 },
@@ -1110,6 +1160,7 @@ class ConversationViewModel @Inject internal constructor(
                             is MediaPreloadTarget.AlbumItem -> hydrateMedia(
                                 key = target.key,
                                 fallbackError = "The secure attachment could not be opened",
+                                reportFailure = false,
                                 shouldStart = {
                                     isCurrentPreloadTarget(selectedChat.id, target)
                                 },
@@ -1253,6 +1304,7 @@ class ConversationViewModel @Inject internal constructor(
     /** Every composer keystroke. The debounce, throttle and stop-on-switch all live downstream. */
     fun onComposerChanged(text: String) {
         if (chatId.isBlank()) return
+        composerEditedSinceEntry.set(true)
         typingSignaller.onComposerChanged(chatId, text)
     }
 
@@ -1461,7 +1513,10 @@ class ConversationViewModel @Inject internal constructor(
     /** Best-effort encrypted draft persistence; blank text clears the stored draft. */
     fun persistDraft(text: String) {
         if (chatId.isBlank()) return
-        viewModelScope.launch { chatRepo.saveComposerDraft(chatId, text) }
+        pendingComposerDraftWrite.value = PendingComposerDraftWrite(
+            revision = ++composerDraftRevision,
+            text = text,
+        )
     }
 
     private suspend fun attemptMarkConversationRead() {
@@ -1498,7 +1553,7 @@ class ConversationViewModel @Inject internal constructor(
                     // see "typing…" still attached to a message that has already reached them.
                     typingSignaller.onMessageCommitted(selectedChat.id)
                     // The message is durably owned by the outbox; its draft copy is obsolete.
-                    viewModelScope.launch { chatRepo.clearComposerDraft(selectedChat.id) }
+                    persistDraft("")
                 }
             }
             val failure = try {
@@ -3580,6 +3635,7 @@ class ConversationViewModel @Inject internal constructor(
     private suspend fun hydrateMedia(
         key: String,
         fallbackError: String,
+        reportFailure: Boolean = true,
         shouldStart: () -> Boolean = { true },
         open: suspend () -> SecureMediaFile,
     ) {
@@ -3605,6 +3661,7 @@ class ConversationViewModel @Inject internal constructor(
             // automatic one that succeeds once the import copy publishes. Released quietly, the
             // next projection pass or tap re-proves it against the queue's current truth.
         } catch (error: Exception) {
+            if (!reportFailure) return
             mutableMediaErrors.value = mutableMediaErrors.value +
                 (key to (error.message ?: fallbackError))
         } finally {
@@ -3739,6 +3796,8 @@ class ConversationViewModel @Inject internal constructor(
         // the bytes are bounded on disk by SecureMediaCache.
         const val MAX_OPEN_MEDIA_ENTRIES = 24
         const val MAX_MEDIA_PRELOAD_ENTRIES = 5
+        const val COMPOSER_DRAFT_RETRY_INITIAL_MILLIS = 100L
+        const val COMPOSER_DRAFT_RETRY_MAX_MILLIS = 5_000L
 
         // A poll re-reads one payment per request. Long-lived groups accumulate them, and the
         // cards a member can still act on are the recent ones; older announcements stay readable

@@ -3,6 +3,7 @@ package com.kit.wallet.data.notifications
 import com.kit.wallet.feature.calls.CallDurationAnchor
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -86,14 +87,27 @@ class ActiveCallStateHolder @Inject constructor() {
 
 /**
  * Delivers an incoming call to an already-active call screen so it can be shown as a call-waiting
- * banner. The push receiver publishes here only while the user is in a call.
+ * banner. Retirement travels on this same ordered stream so a concurrent duplicate ring cannot
+ * recreate the in-app banner after answer, decline or a terminal event removed it.
  */
+sealed interface IncomingCallRelayEvent {
+    data class Ringing(val call: IncomingCallPayload) : IncomingCallRelayEvent
+    data class Retired(val callId: String) : IncomingCallRelayEvent
+}
+
 @Singleton
 class IncomingCallRelay @Inject constructor() {
-    private val mutableEvents = MutableSharedFlow<IncomingCallPayload>(extraBufferCapacity = 8)
-    val events: SharedFlow<IncomingCallPayload> = mutableEvents.asSharedFlow()
+    private val mutableEvents = MutableSharedFlow<IncomingCallRelayEvent>(
+        extraBufferCapacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val events: SharedFlow<IncomingCallRelayEvent> = mutableEvents.asSharedFlow()
 
     fun publish(payload: IncomingCallPayload) {
-        mutableEvents.tryEmit(payload)
+        mutableEvents.tryEmit(IncomingCallRelayEvent.Ringing(payload))
+    }
+
+    fun retire(callId: String) {
+        mutableEvents.tryEmit(IncomingCallRelayEvent.Retired(callId))
     }
 }

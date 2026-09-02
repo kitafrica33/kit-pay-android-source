@@ -156,6 +156,29 @@ class ConversationViewModelTest {
     }
 
     @Test
+    fun `below realtime floor still durably queues composer text from local history`() = runTest {
+        val repository = FakeChatRepository(
+            initiallyReady = false,
+            localHistoryReady = true,
+            durablyCommitBeforeCompletion = true,
+        )
+        val viewModel = viewModel(repository)
+        var clearRequests = 0
+
+        assertFalse(viewModel.messagingAvailable.value)
+        assertTrue(viewModel.historyAvailable.value)
+
+        viewModel.send("queued below the realtime floor") { clearRequests++ }
+
+        assertEquals(
+            listOf(CHAT_ID to "queued below the realtime floor"),
+            repository.sent,
+        )
+        assertEquals(1, clearRequests)
+        assertEquals(null, viewModel.error.value)
+    }
+
+    @Test
     fun `concurrent identical send that fails cannot borrow the other durable commit`() = runTest {
         val failedAttemptRelease = CompletableDeferred<Unit>()
         val durableAttemptRelease = CompletableDeferred<Unit>()
@@ -575,6 +598,49 @@ class ConversationViewModelTest {
             viewModel.mediaFiles.value.keys,
         )
 
+        viewModel.setConversationVisible(false)
+        repository.deleteMediaScratch()
+    }
+
+    @Test
+    fun `automatic preload failures stay silent until the person opens the media`() = runTest {
+        val albumItem = MessageMediaItem("missing-item", "image/jpeg", 1)
+        val photo = Message(
+            id = "missing-photo",
+            text = "Photo",
+            time = "12:00",
+            fromMe = false,
+            kind = MessageKind.IMAGE,
+            mediaDescriptor = "missing-photo-descriptor",
+            mediaPlaintextBytes = 1,
+        )
+        val album = Message(
+            id = "missing-album",
+            text = "Album",
+            time = "12:01",
+            fromMe = false,
+            kind = MessageKind.MEDIA_ALBUM,
+            mediaDescriptor = "missing-album-descriptor",
+            mediaItems = listOf(albumItem),
+        )
+        val repository = FakeChatRepository()
+        val viewModel = viewModel(repository)
+        repository.messages.value = listOf(photo, album)
+
+        viewModel.setConversationVisible(true)
+        runCurrent()
+
+        assertTrue(viewModel.mediaErrors.value.isEmpty())
+        assertTrue(viewModel.mediaLoading.value.isEmpty())
+
+        viewModel.openMedia(photo)
+        viewModel.openAlbumItem(album, albumItem)
+        runCurrent()
+
+        assertEquals(
+            setOf(photo.id, albumItemMediaKey(album.id, albumItem.attachmentId)),
+            viewModel.mediaErrors.value.keys,
+        )
         viewModel.setConversationVisible(false)
         repository.deleteMediaScratch()
     }
@@ -1620,6 +1686,7 @@ class ConversationViewModelTest {
         private val readBlockUntil: CompletableDeferred<Unit>? = null,
         initiallyLoaded: Boolean = true,
         initiallyReady: Boolean = true,
+        localHistoryReady: Boolean = initiallyReady,
         private val mediaBlockUntil: CompletableDeferred<Unit>? = null,
         private val media: Map<String, ByteArray> = emptyMap(),
         private val albumMedia: Map<Pair<String, String>, ByteArray> = emptyMap(),
@@ -1639,6 +1706,7 @@ class ConversationViewModelTest {
 
         private val preview = ChatPreview(CHAT_ID, "Grace", "", "", peerUserId = PEER_USER_ID)
         override val readiness: StateFlow<Boolean> = MutableStateFlow(initiallyReady)
+        override val localHistoryReady: StateFlow<Boolean> = MutableStateFlow(localHistoryReady)
         private val mutableChats = MutableStateFlow(if (initiallyLoaded) listOf(preview) else emptyList())
         override val chats: StateFlow<List<ChatPreview>> = mutableChats
         val messages = MutableStateFlow<List<Message>>(emptyList())

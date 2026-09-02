@@ -384,8 +384,20 @@ internal class KitRealtimeCoordinator @Inject constructor(
         socketGeneration = Math.incrementExact(socketGeneration)
         val generation = socketGeneration
         activeSocketGeneration = generation
+        // Start the establishment deadline before open(): a transport that neither returns a
+        // callback nor throws must not leave the state machine in Connecting forever.
+        connectedAtMillis = clock.elapsedMillis()
         publish(KitRealtimeState.Connecting)
-        transport.open(current.socketUrl, socketListener(generation))
+        val opened = runCatching {
+            transport.open(current.socketUrl, socketListener(generation))
+        }.isSuccess
+        if (!opened && isCurrentSocket(generation)) {
+            // apply() is intentionally fault-isolated by the command loop. Recover here before
+            // that boundary so a synchronous transport failure becomes an ordinary bounded retry
+            // instead of being swallowed with the public state still stuck at Connecting.
+            teardown(clean = false)
+            enterBackoff(backoff.nextDelayMillis())
+        }
     }
 
     private fun requestAdvertisement() {
@@ -691,6 +703,7 @@ internal class KitRealtimeCoordinator @Inject constructor(
                 heartbeat(now)
             }
 
+            is KitRealtimeState.Connecting,
             is KitRealtimeState.Handshaking,
             is KitRealtimeState.Subscribing,
             -> if (now - connectedAtMillis >= HANDSHAKE_DEADLINE_MILLIS) {

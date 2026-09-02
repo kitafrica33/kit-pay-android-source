@@ -1073,6 +1073,8 @@ data class CallDto(
     @Json(name = "answered_at") val answeredAt: String? = null,
     @Json(name = "ended_at") val endedAt: String? = null,
     @Json(name = "ring_expires_at") val ringExpiresAt: String? = null,
+    /** Server clock paired with this call's ring expiry. Required by current call responses. */
+    @Json(name = "server_time") val serverTime: String? = null,
 )
 
 @JsonClass(generateAdapter = false)

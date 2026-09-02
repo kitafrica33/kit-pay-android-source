@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
 internal const val SECURE_MESSAGE_NOTIFICATION_ID = 4_201
+internal const val SECURE_MESSAGE_NOTIFICATION_CHANNEL_ID = "kit_secure_messages_v2"
 internal const val ANDROID_ACTIVE_NOTIFICATION_LIMIT = 50
 internal const val RESERVED_NON_MESSAGE_NOTIFICATION_SLOTS = 18
 internal const val MAX_ACTIVE_SECURE_MESSAGE_NOTIFICATIONS =
@@ -14,6 +15,10 @@ internal const val EXTRA_SECURE_MESSAGE_DIGEST = "kit_secure_message_digest"
 internal const val EXTRA_SECURE_MESSAGE_SENT_AT_EPOCH_SECOND =
     "kit_secure_message_sent_at_epoch_second"
 internal const val EXTRA_SECURE_MESSAGE_SENT_AT_NANO = "kit_secure_message_sent_at_nano"
+internal val SECURE_MESSAGE_DIGEST_PATTERN = Regex("^[0-9a-f]{64}$")
+
+/** Serializes read/compare/write mutations of the process's secure-message notifications. */
+internal val SECURE_MESSAGE_NOTIFICATION_MUTATION_LOCK = Any()
 
 /** Minimal platform-notification state needed for deterministic quota planning. */
 internal data class ActiveSecureMessageNotification(

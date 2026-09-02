@@ -8,6 +8,7 @@ import com.kit.wallet.data.notifications.PushEnvelope
 import com.kit.wallet.data.notifications.isVerifiedMessagingWake
 import com.kit.wallet.worker.SECURE_MESSAGING_WORK_POLICY
 import com.kit.wallet.worker.SecureMessagingSyncFailureDisposition
+import com.kit.wallet.worker.SecureMessagingSyncWorker
 import com.kit.wallet.worker.SecureMessagingWakeCoalescer
 import com.kit.wallet.worker.secureMessagingSyncFailureDisposition
 import com.kit.wallet.worker.scheduleAuthenticatedMessagingCatchUp
@@ -19,6 +20,15 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MessagingWakePayloadTest {
+    @Test
+    fun `expedited sync declares its pre Android 12 foreground notification`() {
+        assertTrue(
+            SecureMessagingSyncWorker::class.java.declaredMethods.any {
+                it.name == "getForegroundInfo"
+            },
+        )
+    }
+
     @Test
     fun `only the exact opaque messaging wake-up is recognized`() {
         val validPayload = mapOf(

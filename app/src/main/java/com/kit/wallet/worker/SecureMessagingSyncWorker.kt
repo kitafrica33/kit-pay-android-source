@@ -1,13 +1,18 @@
 package com.kit.wallet.worker
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
 import android.util.Log
 import androidx.annotation.VisibleForTesting
+import androidx.core.app.NotificationCompat
 import androidx.hilt.work.HiltWorker
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
+import androidx.work.ForegroundInfo
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
@@ -15,6 +20,7 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.kit.wallet.BuildConfig
+import com.kit.wallet.R
 import com.kit.wallet.data.messaging.SecureMessagingSyncEngine
 import com.kit.wallet.data.messaging.ImmediateSendDispatcher
 import com.kit.wallet.data.messaging.ImmediateSendDispatchOutcome
@@ -51,6 +57,37 @@ internal class SecureMessagingSyncWorker @AssistedInject constructor(
     private val pendingFinancialEvents: PendingFinancialEventCoordinator,
     private val financialCreationReceipts: FinancialCreationReceiptCoordinator,
 ) : CoroutineWorker(appContext, workerParameters) {
+    /** Required when WorkManager implements expedited work as a foreground service before S. */
+    override suspend fun getForegroundInfo(): ForegroundInfo {
+        val manager = applicationContext.getSystemService(NotificationManager::class.java)
+        manager?.createNotificationChannel(
+            NotificationChannel(
+                EXPEDITED_SYNC_CHANNEL_ID,
+                "Secure message delivery",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "Background delivery of end-to-end encrypted messages"
+                lockscreenVisibility = Notification.VISIBILITY_SECRET
+                setShowBadge(false)
+            },
+        )
+        val notification = NotificationCompat.Builder(
+            applicationContext,
+            EXPEDITED_SYNC_CHANNEL_ID,
+        )
+            .setSmallIcon(R.drawable.ic_kit_mark)
+            .setContentTitle(applicationContext.getString(R.string.app_name))
+            .setContentText("Checking for secure messages")
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setOngoing(true)
+            .build()
+        return ForegroundInfo(EXPEDITED_SYNC_NOTIFICATION_ID, notification)
+    }
+
     override suspend fun doWork(): Result {
         val urgent = inputData.getBoolean(URGENT_MESSAGING_WAKE_INPUT_KEY, false)
         // This run now covers every wake observed before it started. A wake arriving from this
@@ -92,16 +129,20 @@ internal class LocalMediaPreparationWorker @AssistedInject constructor(
     @Assisted workerParameters: WorkerParameters,
     private val sessions: SessionStore,
     private val immediateSends: ImmediateSendDispatcher,
+    private val syncScheduler: SecureMessagingSyncScheduler,
 ) : CoroutineWorker(appContext, workerParameters) {
     override suspend fun doWork(): Result {
         if (sessions.current() == null) return Result.success()
         return try {
-            when (immediateSends.prepareLocalMedia()) {
-                ImmediateMediaPreparationOutcome.RETRY -> Result.retry()
-                ImmediateMediaPreparationOutcome.IDLE,
-                ImmediateMediaPreparationOutcome.PREPARED,
-                -> Result.success()
+            val outcome = immediateSends.prepareLocalMedia()
+            if (outcome.progressed) {
+                // The network worker may already have observed a preparation barrier and
+                // completed. Whether that row became uploadable or terminally failed, give the
+                // conversation's newly unblocked tail an immediate pass. This remains necessary
+                // when a different attachment in the same preparation batch still needs retry.
+                syncScheduler.scheduleAfterMediaPreparationProgress()
             }
+            if (outcome.retryNeeded) Result.retry() else Result.success()
         } catch (error: Throwable) {
             debugSecureMessagingWorkerFailure(error)
             when (secureMessagingSyncFailureDisposition(error)) {
@@ -131,6 +172,8 @@ private fun debugSecureMessagingWorkerFailure(error: Throwable) {
 
 private const val WORKER_DIAGNOSTIC_TAG = "KitMessagingWorker"
 private const val MAX_WORKER_DIAGNOSTIC_CAUSES = 8
+private const val EXPEDITED_SYNC_CHANNEL_ID = "kit-secure-message-delivery"
+private const val EXPEDITED_SYNC_NOTIFICATION_ID = 4_104
 
 @Singleton
 class SecureMessagingSyncScheduler @Inject constructor(
@@ -161,6 +204,10 @@ class SecureMessagingSyncScheduler @Inject constructor(
     fun scheduleHistoryContinuation(delayMillis: Long) {
         require(delayMillis >= 0L)
         enqueueSync(initialDelayMillis = delayMillis, urgent = false)
+    }
+
+    internal fun scheduleAfterMediaPreparationProgress() {
+        enqueueSync(initialDelayMillis = 0L, urgent = false)
     }
 
     private fun enqueueLocalMediaPreparation() {

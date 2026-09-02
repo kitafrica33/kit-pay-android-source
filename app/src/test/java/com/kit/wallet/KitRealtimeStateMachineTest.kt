@@ -218,6 +218,22 @@ class KitRealtimeStateMachineTest {
     }
 
     @Test
+    fun `a synchronous socket open failure enters bounded backoff and can redial`() =
+        stateMachineTest { world ->
+            world.transport.openFailure = IllegalStateException("socket factory failed")
+
+            world.startSignedInAndForegrounded()
+
+            assertTrue("Expected Backoff, was ${world.state}", world.state is KitRealtimeState.Backoff)
+
+            world.transport.openFailure = null
+            world.retryFromBackoff()
+
+            assertEquals(SOCKET_URL, world.transport.openedUrl)
+            assertEquals(KitRealtimeState.Connecting, world.state)
+        }
+
+    @Test
     fun `a 4001 protocol error suspends rather than retrying forever`() = stateMachineTest { world ->
         world.goLive()
 
@@ -454,6 +470,19 @@ class KitRealtimeStateMachineTest {
 
         assertTrue(world.state is KitRealtimeState.Backoff)
     }
+
+    @Test
+    fun `a socket that never reports open is given up on after ten seconds`() =
+        stateMachineTest { world ->
+            world.startSignedInAndForegrounded()
+            assertEquals(KitRealtimeState.Connecting, world.state)
+
+            world.clock.now += 10_000L
+            world.tick()
+
+            assertTrue(world.state is KitRealtimeState.Backoff)
+            assertEquals(1, world.transport.cancels)
+        }
 
     @Test
     fun `losing the network backs off without spending an attempt`() = stateMachineTest { world ->
@@ -712,11 +741,12 @@ class KitRealtimeStateMachineTest {
     // --- the advertisement ------------------------------------------------------
 
     @Test
-    fun `no advertised block means no socket and the poller keeps the conversation`() =
+    fun `below realtime floor omits the socket block and REST polling keeps the conversation`() =
         stateMachineTest(advertise = false) { world ->
             world.startSignedInAndForegrounded()
 
-            // The server-side kill switch: no block, or one this build does not speak.
+            // A server below this client's realtime floor omits protocols.realtime. That is a
+            // compatibility signal, not a messaging gate: durable sends and REST remain usable.
             assertNull(world.transport.openedUrl)
             assertTrue(world.state is KitRealtimeState.Backoff)
             assertEquals(
@@ -1080,6 +1110,7 @@ class KitRealtimeStateMachineTest {
      */
     private class FakeTransport : KitRealtimeTransport {
         var openedUrl: String? = null
+        var openFailure: Throwable? = null
         val sent = mutableListOf<String>()
         var cleanCloses: Int = 0
             private set
@@ -1089,6 +1120,7 @@ class KitRealtimeStateMachineTest {
         private var listener: KitRealtimeTransport.Listener? = null
 
         override fun open(url: String, listener: KitRealtimeTransport.Listener) {
+            openFailure?.let { throw it }
             openedUrl = url
             this.listener = listener
         }

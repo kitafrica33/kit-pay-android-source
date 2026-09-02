@@ -18,7 +18,9 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
@@ -50,6 +52,66 @@ class ConversationDraftLifecycleTest {
 
         viewModel.persistDraft("half a thought, finished")
         assertEquals(listOf("half a thought, finished"), chats.savedDrafts)
+    }
+
+    @Test
+    fun `restore waits for encrypted history and buffered writes keep only the latest edit`() =
+        runTest {
+            val chats = DraftRecordingChatRepository(
+                storedDraft = "older device draft",
+                initiallyHistoryReady = false,
+            )
+            val viewModel = viewModel(chats)
+
+            assertEquals(0, chats.draftReads)
+            viewModel.onComposerChanged("new")
+            viewModel.persistDraft("new")
+            viewModel.onComposerChanged("newest")
+            viewModel.persistDraft("newest")
+            runCurrent()
+
+            assertEquals(emptyList<String>(), chats.savedDrafts)
+            assertNull(viewModel.restoredDraft.value)
+
+            chats.setHistoryReady()
+            runCurrent()
+
+            assertEquals(1, chats.draftReads)
+            assertNull(viewModel.restoredDraft.value)
+            assertEquals(listOf("newest"), chats.savedDrafts)
+        }
+
+    @Test
+    fun `typing then clearing before history opens cannot resurrect an older draft`() = runTest {
+        val chats = DraftRecordingChatRepository(
+            storedDraft = "do not resurrect",
+            initiallyHistoryReady = false,
+        )
+        val viewModel = viewModel(chats)
+
+        viewModel.onComposerChanged("temporary")
+        viewModel.onComposerChanged("")
+        viewModel.persistDraft("")
+        chats.setHistoryReady()
+        runCurrent()
+
+        assertNull(viewModel.restoredDraft.value)
+        assertEquals(listOf(CHAT_ID), chats.clearedDrafts)
+    }
+
+    @Test
+    fun `transient encrypted draft write failures retry without another edit`() = runTest {
+        val chats = DraftRecordingChatRepository(
+            storedDraft = null,
+            draftWriteFailures = 2,
+        )
+        val viewModel = viewModel(chats)
+
+        viewModel.persistDraft("survives a transient keystore failure")
+        advanceUntilIdle()
+
+        assertEquals(3, chats.draftSaveAttempts)
+        assertEquals(listOf("survives a transient keystore failure"), chats.savedDrafts)
     }
 
     @Test
@@ -88,13 +150,23 @@ class ConversationDraftLifecycleTest {
     private class DraftRecordingChatRepository(
         private val storedDraft: String?,
         private val failSends: Boolean = false,
+        initiallyHistoryReady: Boolean = true,
+        private var draftWriteFailures: Int = 0,
     ) : ChatRepository {
         private val preview = ChatPreview(CHAT_ID, "Grace", "", "")
         override val readiness: StateFlow<Boolean> = MutableStateFlow(true)
+        private val mutableHistoryReady = MutableStateFlow(initiallyHistoryReady)
+        override val localHistoryReady: StateFlow<Boolean> = mutableHistoryReady
         override val chats: StateFlow<List<ChatPreview>> = MutableStateFlow(listOf(preview))
         val savedDrafts = mutableListOf<String>()
         val clearedDrafts = mutableListOf<String>()
         val sentMessages = mutableListOf<String>()
+        var draftReads = 0
+        var draftSaveAttempts = 0
+
+        fun setHistoryReady() {
+            mutableHistoryReady.value = true
+        }
 
         override fun chat(chatId: String): ChatPreview? = preview.takeIf { it.id == chatId }
 
@@ -114,9 +186,17 @@ class ConversationDraftLifecycleTest {
             onDurablyCommitted("client-${sentMessages.size}")
         }
 
-        override suspend fun composerDraft(chatId: String): String? = storedDraft
+        override suspend fun composerDraft(chatId: String): String? {
+            draftReads++
+            return storedDraft
+        }
 
         override suspend fun saveComposerDraft(chatId: String, text: String) {
+            draftSaveAttempts++
+            if (draftWriteFailures > 0) {
+                draftWriteFailures--
+                throw java.io.IOException("temporary encrypted-store failure")
+            }
             savedDrafts += text
         }
 

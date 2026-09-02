@@ -1663,13 +1663,16 @@ class EncryptedChatRepositoryTest {
                 )
                 assertTrue(local.file.readBytes().contentEquals(bytes))
 
-                val dispatch = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
-                    ImmediateSendDispatcher(queue, spool, repository).dispatch()
+                val dispatcher = ImmediateSendDispatcher(queue, spool, repository)
+                val preparation = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
+                    dispatcher.prepareLocalMedia()
                 }
                 encryptionStarted.await()
                 assertEquals(ImmediateSendState.PREPARING, queue.items.value.single().state)
                 releaseEncryption.complete(Unit)
-                assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatch.await())
+                assertEquals(ImmediateMediaPreparationOutcome.PROGRESSED, preparation.await())
+                assertEquals(ImmediateSendState.WAITING, queue.items.value.single().state)
+                assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatcher.dispatch())
                 runCurrent()
                 val promotedDescriptor = runtime.sendAttempts.single().second
                 spoolDirectory.listFiles().orEmpty().forEach(File::delete)
@@ -1758,6 +1761,10 @@ class EncryptedChatRepositoryTest {
                 )
                 val dispatcher = ImmediateSendDispatcher(queue, spool, repository)
 
+                assertEquals(
+                    ImmediateMediaPreparationOutcome.PROGRESSED,
+                    dispatcher.prepareLocalMedia(),
+                )
                 assertEquals(ImmediateSendDispatchOutcome.RETRY, dispatcher.dispatch())
                 assertEquals(queued.id, queue.items.value.single().id)
                 assertTrue(runtime.sendAttempts.isEmpty())
@@ -1926,14 +1933,16 @@ class EncryptedChatRepositoryTest {
                 )
                 runCurrent()
 
-                assertEquals(
-                    ImmediateSendDispatchOutcome.COMMITTED,
-                    ImmediateSendDispatcher(
-                        restartedQueue,
-                        restartedSpool,
-                        restartedRepository,
-                    ).dispatch(),
+                val dispatcher = ImmediateSendDispatcher(
+                    restartedQueue,
+                    restartedSpool,
+                    restartedRepository,
                 )
+                assertEquals(
+                    ImmediateMediaPreparationOutcome.PROGRESSED,
+                    dispatcher.prepareLocalMedia(),
+                )
+                assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatcher.dispatch())
                 assertTrue(restartedQueue.items.value.isEmpty())
                 assertEquals(listOf(preparing.id), runtime.idempotentClientIds)
             } finally {
@@ -2050,7 +2059,7 @@ class EncryptedChatRepositoryTest {
                 )
 
                 releaseProcessor.complete(Unit)
-                assertEquals(ImmediateMediaPreparationOutcome.PREPARED, preparation.await())
+                assertEquals(ImmediateMediaPreparationOutcome.PROGRESSED, preparation.await())
                 val waiting = restartedQueue.items.value.single()
                 assertEquals(ImmediateSendState.WAITING, waiting.state)
                 assertEquals(rawOriginal.size, waiting.mediaOriginalPlaintextBytes)
@@ -2199,7 +2208,7 @@ class EncryptedChatRepositoryTest {
                 ).file.readBytes().contentEquals(originalBytes),
             )
             releaseProcessor.complete(Unit)
-            assertEquals(ImmediateMediaPreparationOutcome.PREPARED, preparation.await())
+            assertEquals(ImmediateMediaPreparationOutcome.PROGRESSED, preparation.await())
             val waiting = restartedQueue.items.value.single()
             assertEquals(ImmediateSendState.WAITING, waiting.state)
             assertEquals(originalBytes.size, waiting.mediaOriginalPlaintextBytes)
@@ -2270,7 +2279,7 @@ class EncryptedChatRepositoryTest {
             runCurrent()
 
             assertEquals(
-                ImmediateMediaPreparationOutcome.PREPARED,
+                ImmediateMediaPreparationOutcome.PROGRESSED,
                 ImmediateSendDispatcher(
                     restartedQueue,
                     ImmediateMediaSpool(spoolDirectory),
@@ -2423,7 +2432,7 @@ class EncryptedChatRepositoryTest {
                 // The poisoned row becomes its own visible terminal failure; the sibling behind
                 // it still completes instead of being cancelled by a crashing worker.
                 assertEquals(
-                    ImmediateMediaPreparationOutcome.PREPARED,
+                    ImmediateMediaPreparationOutcome.PROGRESSED,
                     ImmediateSendDispatcher(
                         restartedQueue,
                         ImmediateMediaSpool(spoolDirectory),
@@ -2569,20 +2578,29 @@ class EncryptedChatRepositoryTest {
                     localMediaLibrary = LocalMediaLibrary(disk, authentication),
                 )
                 runCurrent()
+                repository.sendMessage(CONVERSATION_ONE, "text after failed album")
+                val dispatcher = ImmediateSendDispatcher(
+                    restartedQueue,
+                    ImmediateMediaSpool(spoolDirectory),
+                    repository,
+                )
 
                 // KITMEDIA2 §7: never a partial album. One unsendable original fails the whole
-                // record in front of the person, without an exception in the shared worker.
+                // record in front of the person, without an exception in the shared worker. The
+                // progress result also wakes network dispatch so the text behind it is not left
+                // waiting after this terminal preparation barrier disappears.
                 assertEquals(
-                    ImmediateMediaPreparationOutcome.IDLE,
-                    ImmediateSendDispatcher(
-                        restartedQueue,
-                        ImmediateMediaSpool(spoolDirectory),
-                        repository,
-                    ).prepareLocalMedia(),
+                    ImmediateMediaPreparationOutcome.PROGRESSED,
+                    dispatcher.prepareLocalMedia(),
                 )
-                assertEquals(ImmediateSendState.FAILED, restartedQueue.items.value.single().state)
+                assertEquals(
+                    ImmediateSendState.FAILED,
+                    restartedQueue.items.value.first { it.id == albumId }.state,
+                )
+                assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatcher.dispatch())
+                assertEquals(listOf("text after failed album"), runtime.sendAttempts.map { it.second })
                 runCurrent()
-                val visible = repository.conversation(CONVERSATION_ONE).value.single()
+                val visible = repository.conversation(CONVERSATION_ONE).value.first { it.id == albumId }
                 assertEquals(DeliveryState.FAILED, visible.state)
             } finally {
                 smallBytes.fill(0)
@@ -2659,7 +2677,7 @@ class EncryptedChatRepositoryTest {
                 // The refused reconciliation becomes the row's own visible terminal failure
                 // instead of an exception that would crash and endlessly retry the worker.
                 assertEquals(
-                    ImmediateMediaPreparationOutcome.IDLE,
+                    ImmediateMediaPreparationOutcome.PROGRESSED,
                     ImmediateSendDispatcher(
                         restartedQueue,
                         ImmediateMediaSpool(spoolDirectory),
@@ -2718,15 +2736,18 @@ class EncryptedChatRepositoryTest {
             assertEquals("second text", queued.last().text)
             assertTrue(queued.first().createdAtEpochMillis < queued.last().createdAtEpochMillis)
 
-            val dispatch = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
-                ImmediateSendDispatcher(queue, spool, repository).dispatch()
+            val dispatcher = ImmediateSendDispatcher(queue, spool, repository)
+            val preparation = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
+                dispatcher.prepareLocalMedia()
             }
             encryptionStarted.await()
             runCurrent()
+            assertEquals(ImmediateSendDispatchOutcome.IDLE, dispatcher.dispatch())
             assertTrue(runtime.sendAttempts.isEmpty())
 
             releaseEncryption.complete(Unit)
-            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatch.await())
+            assertEquals(ImmediateMediaPreparationOutcome.PROGRESSED, preparation.await())
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatcher.dispatch())
             assertTrue(KitMediaMessage.parse(runtime.sendAttempts.first().second) != null)
             assertEquals("second text", runtime.sendAttempts.last().second)
             assertTrue(queue.items.value.isEmpty())
@@ -2778,21 +2799,24 @@ class EncryptedChatRepositoryTest {
                 repository.sendMessage(CONVERSATION_ONE, "same chat waits")
                 repository.sendMessage(CONVERSATION_TWO, "other chat is instant")
 
-                val dispatch = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
-                    ImmediateSendDispatcher(queue, spool, repository).dispatch()
+                val dispatcher = ImmediateSendDispatcher(queue, spool, repository)
+                val preparation = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
+                    dispatcher.prepareLocalMedia()
                 }
                 encryptionStarted.await()
                 runCurrent()
 
                 // Chat one's media is still encrypting. Chat two has nevertheless reached the
                 // encrypted outbox, while chat one's later text remains behind its media.
+                assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatcher.dispatch())
                 assertEquals(
                     listOf("other chat is instant"),
                     runtime.sendAttempts.map { it.second },
                 )
 
                 releaseEncryption.complete(Unit)
-                assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatch.await())
+                assertEquals(ImmediateMediaPreparationOutcome.PROGRESSED, preparation.await())
+                assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatcher.dispatch())
                 val attempts = runtime.sendAttempts.map { it.second }
                 val mediaIndex = attempts.indexOfFirst { KitMediaMessage.parse(it) != null }
                 val laterTextIndex = attempts.indexOf("same chat waits")
@@ -2959,6 +2983,67 @@ class EncryptedChatRepositoryTest {
             assertEquals(ImmediateSendDispatchOutcome.COMMITTED, outcome)
             assertTrue(restartedQueue.items.value.isEmpty())
             assertEquals(1, runtime.projected.count { it.clientMessageId == intent.id })
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `durably accepted text resumes after process death before promotion`() = runTest {
+        val disk = TestSecureMessagingStateStore()
+        val authentication = MutableTestSessionStore(
+            testSession(USER_TWO, sessionId = "session-one"),
+        )
+        val firstQueue = ImmediateSendIntentStore(disk, authentication)
+        val firstRuntime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+        }
+        val firstRepository = repository(
+            firstRuntime,
+            authenticationSessions = authentication,
+            immediateSends = firstQueue,
+        )
+        runCurrent()
+        var committedId: String? = null
+
+        firstRepository.sendMessage(CONVERSATION_ONE, "survives before promotion") {
+            committedId = it
+        }
+
+        val durableId = checkNotNull(committedId)
+        assertEquals(listOf(durableId), firstQueue.items.value.map(ImmediateSendIntent::id))
+        assertTrue(firstRuntime.sendAttempts.isEmpty())
+
+        // A new repository reloads the encrypted queue from its early local activation. The
+        // production active-session + pending-queue collector schedules this same dispatcher.
+        val restartedQueue = ImmediateSendIntentStore(disk, authentication)
+        val restartedRuntime = FakeRuntime().apply {
+            conversations += conversation(CONVERSATION_ONE, "Grace")
+            localHistoryActivations.value = localActivation()
+        }
+        val restartedRepository = repository(
+            restartedRuntime,
+            authenticationSessions = authentication,
+            immediateSends = restartedQueue,
+        )
+        runCurrent()
+
+        assertEquals(listOf(durableId), restartedQueue.items.value.map(ImmediateSendIntent::id))
+        val directory = Files.createTempDirectory("kit-immediate-text-restart-test").toFile()
+        try {
+            val outcome = ImmediateSendDispatcher(
+                restartedQueue,
+                ImmediateMediaSpool(directory),
+                restartedRepository,
+            ).dispatch()
+
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, outcome)
+            assertTrue(restartedQueue.items.value.isEmpty())
+            assertEquals(
+                listOf("survives before promotion"),
+                restartedRuntime.sendAttempts.map { it.second },
+            )
+            assertEquals(listOf(durableId), restartedRuntime.idempotentClientIds)
         } finally {
             directory.deleteRecursively()
         }
@@ -3910,12 +3995,14 @@ class EncryptedChatRepositoryTest {
             }
             assertEquals(listOf("first photo bytes", "second photo bytes"), opened)
 
-            val dispatch = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
-                ImmediateSendDispatcher(queue, spool, repository).dispatch()
+            val dispatcher = ImmediateSendDispatcher(queue, spool, repository)
+            val preparation = backgroundScope.async(UnconfinedTestDispatcher(testScheduler)) {
+                dispatcher.prepareLocalMedia()
             }
             encryptionStarted.await()
             releaseEncryption.complete(Unit)
-            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatch.await())
+            assertEquals(ImmediateMediaPreparationOutcome.PROGRESSED, preparation.await())
+            assertEquals(ImmediateSendDispatchOutcome.COMMITTED, dispatcher.dispatch())
             runCurrent()
             assertTrue(queue.items.value.isEmpty())
         } finally {

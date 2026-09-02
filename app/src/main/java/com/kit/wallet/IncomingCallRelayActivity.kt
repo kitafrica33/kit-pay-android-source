@@ -31,16 +31,16 @@ class IncomingCallRelayActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val request = intent.takeRelayRequest()
         val token = request?.let { trusted ->
-            val serverExpiry = runCatching {
-                java.time.Instant.parse(trusted.ringExpiresAt)
-            }.getOrNull() ?: return@let null
-            if (!replayLedger.authorizesLaunch(trusted.callId, serverExpiry)) return@let null
+            val ringLease = replayLedger.authorizedLease(
+                trusted.callId,
+                trusted.ringExpiresAt,
+            ) ?: return@let null
             sessions.current()?.fence()?.let { fence ->
                 authorizer.issue(
                     callId = trusted.callId,
                     purpose = trusted.purpose,
                     session = fence,
-                    ringExpiresAt = trusted.ringExpiresAt,
+                    ringLease = ringLease,
                 )
             }
         }

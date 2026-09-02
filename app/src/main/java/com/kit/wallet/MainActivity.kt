@@ -52,10 +52,13 @@ import com.kit.wallet.data.messaging.isRetryableSecureMessagingStateFailure
 import com.kit.wallet.data.notifications.ActiveCallReturnLink
 import com.kit.wallet.data.notifications.ACTION_OPEN_AUTHORIZED_INCOMING_CALL
 import com.kit.wallet.data.notifications.AuthorizedIncomingCallLaunch
+import com.kit.wallet.data.notifications.CallRingLease
+import com.kit.wallet.data.notifications.CallRingDeadlineCoordinator
 import com.kit.wallet.data.notifications.EXTRA_INCOMING_CALL_AUTHORIZATION
 import com.kit.wallet.data.notifications.IncomingCallLaunchAuthorizer
 import com.kit.wallet.data.notifications.IncomingCallLaunchPurpose
 import com.kit.wallet.data.notifications.IncomingCallReplayLedger
+import com.kit.wallet.data.notifications.IncomingCallRetirementDisposition
 import com.kit.wallet.data.notifications.MobileMoneySettlementLink
 import com.kit.wallet.data.notifications.PaymentClaimAlert
 import com.kit.wallet.data.notifications.PaymentClaimLink
@@ -64,6 +67,9 @@ import com.kit.wallet.data.notifications.canonicalIncomingCallId
 import com.kit.wallet.data.remote.KitWalletApiException
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.data.time.BootSessionIdProvider
+import com.kit.wallet.data.time.ElapsedRealtimeClock
+import com.kit.wallet.feature.calls.KitTelecomBridge
 import com.kit.wallet.feature.chat.ChatMediaScratch
 import com.kit.wallet.feature.chat.ACTION_OPEN_TEXT_SHARE
 import com.kit.wallet.feature.chat.EXTRA_TEXT_SHARE_TOKEN
@@ -78,8 +84,6 @@ import com.kit.wallet.worker.SecureMessagingSyncScheduler
 import com.kit.wallet.worker.scheduleAuthenticatedMessagingCatchUp
 import dagger.hilt.android.AndroidEntryPoint
 import java.io.IOException
-import java.time.Duration
-import java.time.Instant
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -102,6 +106,10 @@ class MainActivity : FragmentActivity() {
     @Inject lateinit var secureMessageAuthorizer: SecureMessageNavigationAuthorizer
     @Inject internal lateinit var incomingCallAuthorizer: IncomingCallLaunchAuthorizer
     @Inject lateinit var incomingCallReplayLedger: IncomingCallReplayLedger
+    @Inject lateinit var ringDeadlines: CallRingDeadlineCoordinator
+    @Inject lateinit var telecom: KitTelecomBridge
+    @Inject lateinit var elapsedRealtimeClock: ElapsedRealtimeClock
+    @Inject lateinit var bootSessionIdProvider: BootSessionIdProvider
     @Inject lateinit var pushTokens: PushTokenCoordinator
     private val foregroundStartMutex = Mutex()
     private var foregroundStartJob: Job? = null
@@ -126,13 +134,18 @@ class MainActivity : FragmentActivity() {
         savedInstanceState
             ?.restoreAuthorizedIncomingCall(
                 currentSession = sessions.current()?.fence(),
-                now = Instant.now(),
+                nowElapsedRealtimeMillis = elapsedRealtimeClock.millis(),
+                currentBootSessionId = bootSessionIdProvider.currentBootId(),
             )
-            ?.takeIf { restored ->
-                incomingCallReplayLedger.authorizesLaunch(
+            ?.let { restored ->
+                incomingCallReplayLedger.authorizedLease(
                     restored.launch.callId,
                     restored.launch.ringExpiresAt,
-                )
+                )?.let { authoritativeLease ->
+                    restored.copy(
+                        launch = restored.launch.copy(ringLease = authoritativeLease),
+                    )
+                }
             }
             ?.let { restored ->
                 installAuthorizedIncomingCall(restored.launch, restored.pendingNavigation)
@@ -328,10 +341,26 @@ class MainActivity : FragmentActivity() {
         intent?.takeAuthorizedIncomingCallLaunch(
             authorizer = incomingCallAuthorizer,
             currentSession = sessions.current()?.fence(),
-        )?.takeIf { launch ->
-            incomingCallReplayLedger.authorizesLaunch(launch.callId, launch.ringExpiresAt)
+        )?.let { launch ->
+            incomingCallReplayLedger.authorizedLease(
+                launch.callId,
+                launch.ringExpiresAt,
+            )?.let { authoritativeLease ->
+                launch.copy(ringLease = authoritativeLease)
+            }
         }?.let { launch ->
-            if (launch.acceptRequested) incomingCallReplayLedger.retire(launch.callId)
+            if (launch.acceptRequested) {
+                claimAuthorizedIncomingCallAnswer(
+                    callId = launch.callId,
+                    markAnswering = { telecom.markAnswering(it) },
+                    retireRing = {
+                        ringDeadlines.retire(
+                            it,
+                            IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE,
+                        )
+                    },
+                )
+            }
             installAuthorizedIncomingCall(launch, pendingNavigation = true)
         }
         intent?.takeAuthorizedSecureMessageRoute(
@@ -350,11 +379,13 @@ class MainActivity : FragmentActivity() {
         authorizedIncomingCallLease = launch
         pendingAuthorizedIncomingCall = launch.takeIf { pendingNavigation }
         setIncomingCallKeyguardVisibility(false)
+        if (!launch.acceptRequested) ringDeadlines.schedule(launch.callId, launch.ringLease)
         incomingCallLeaseExpiryJob?.cancel()
         incomingCallLeaseExpiryJob = lifecycleScope.launch {
-            val remaining = runCatching {
-                Duration.between(Instant.now(), launch.expiresAt).toMillis()
-            }.getOrDefault(0L)
+            val remaining = launch.ringLease.remainingMillis(
+                elapsedRealtimeClock.millis(),
+                bootSessionIdProvider.currentBootId(),
+            ) ?: 0L
             if (remaining > 0L) delay(remaining)
             clearAuthorizedIncomingCall(launch.callId)
         }
@@ -885,12 +916,23 @@ private val CALL_PAYLOAD_KEYS = listOf(
     "initiator_name",
     "initiator_user_id",
     "ring_expires_at",
+    "server_time",
 )
 
 private val CLAIM_HINT_KEYS = listOf(
     PaymentClaimAlert.EXTRA_CONVERSATION_HINT,
     PaymentClaimAlert.EXTRA_GROUP_PAYMENT_HINT,
 )
+
+/** A trusted notification Answer owns Telecom before retiring the shared ringing lease. */
+internal fun claimAuthorizedIncomingCallAnswer(
+    callId: String,
+    markAnswering: (String) -> Unit,
+    retireRing: (String) -> Unit,
+) {
+    markAnswering(callId)
+    retireRing(callId)
+}
 
 private const val STATE_PENDING_DEEP_LINK = "kit.pending_deep_link"
 private const val KYC_STATUS_DEEP_LINK = "kitwallet://kyc/status"
@@ -900,8 +942,10 @@ private const val STATE_CALL_PURPOSE = "kit.incoming_call.purpose"
 private const val STATE_CALL_SESSION_ID = "kit.incoming_call.session_id"
 private const val STATE_CALL_CACHE_SCOPE = "kit.incoming_call.cache_scope"
 private const val STATE_CALL_ACCOUNT_ID = "kit.incoming_call.account_id"
-private const val STATE_CALL_EXPIRES_AT = "kit.incoming_call.expires_at"
 private const val STATE_CALL_RING_EXPIRES_AT = "kit.incoming_call.ring_expires_at"
+private const val STATE_CALL_RING_BOOT_ID = "kit.incoming_call.ring_boot_id"
+private const val STATE_CALL_RING_RECEIVED_ELAPSED = "kit.incoming_call.ring_received_elapsed"
+private const val STATE_CALL_RING_DEADLINE_ELAPSED = "kit.incoming_call.ring_deadline_elapsed"
 private const val STATE_CALL_PENDING_NAVIGATION = "kit.incoming_call.pending_navigation"
 
 private data class RestoredIncomingCallLaunch(
@@ -918,14 +962,23 @@ private fun Bundle.saveAuthorizedIncomingCall(
     putString(STATE_CALL_SESSION_ID, launch.session.sessionId)
     putString(STATE_CALL_CACHE_SCOPE, launch.session.cacheScopeId)
     putString(STATE_CALL_ACCOUNT_ID, launch.session.accountId)
-    putString(STATE_CALL_EXPIRES_AT, launch.expiresAt.toString())
-    putString(STATE_CALL_RING_EXPIRES_AT, launch.ringExpiresAt.toString())
+    putString(STATE_CALL_RING_EXPIRES_AT, launch.ringLease.sourceRingExpiresAt)
+    putLong(STATE_CALL_RING_BOOT_ID, launch.ringLease.bootSessionId)
+    putLong(
+        STATE_CALL_RING_RECEIVED_ELAPSED,
+        launch.ringLease.receivedElapsedRealtimeMillis,
+    )
+    putLong(
+        STATE_CALL_RING_DEADLINE_ELAPSED,
+        launch.ringLease.deadlineElapsedRealtimeMillis,
+    )
     putBoolean(STATE_CALL_PENDING_NAVIGATION, pendingNavigation)
 }
 
 private fun Bundle.restoreAuthorizedIncomingCall(
     currentSession: SessionFence?,
-    now: Instant,
+    nowElapsedRealtimeMillis: Long,
+    currentBootSessionId: Long?,
 ): RestoredIncomingCallLaunch? {
     val callId = canonicalIncomingCallId(getString(STATE_CALL_ID)) ?: return null
     val purpose = runCatching {
@@ -937,21 +990,22 @@ private fun Bundle.restoreAuthorizedIncomingCall(
         accountId = getString(STATE_CALL_ACCOUNT_ID),
     )
     if (currentSession == null || currentSession != expectedSession) return null
-    val expiresAt = getString(STATE_CALL_EXPIRES_AT)
-        ?.let { runCatching { Instant.parse(it) }.getOrNull() }
-        ?: return null
-    if (!expiresAt.isAfter(now) || expiresAt.isAfter(now.plus(Duration.ofMinutes(1)))) return null
-    val ringExpiresAt = getString(STATE_CALL_RING_EXPIRES_AT)
-        ?.let { runCatching { Instant.parse(it) }.getOrNull() }
-        ?.takeIf { it.isAfter(now) }
-        ?: return null
+    val ringExpiresAt = getString(STATE_CALL_RING_EXPIRES_AT) ?: return null
+    val ringLease = CallRingLease(
+        sourceRingExpiresAt = ringExpiresAt,
+        bootSessionId = getLong(STATE_CALL_RING_BOOT_ID, -1L),
+        receivedElapsedRealtimeMillis = getLong(STATE_CALL_RING_RECEIVED_ELAPSED, -1L),
+        deadlineElapsedRealtimeMillis = getLong(STATE_CALL_RING_DEADLINE_ELAPSED, -1L),
+    )
+    if (ringLease.remainingMillis(nowElapsedRealtimeMillis, currentBootSessionId) == null) {
+        return null
+    }
     return RestoredIncomingCallLaunch(
         launch = AuthorizedIncomingCallLaunch(
             callId,
             purpose,
             expectedSession,
-            ringExpiresAt,
-            expiresAt,
+            ringLease,
         ),
         pendingNavigation = getBoolean(STATE_CALL_PENDING_NAVIGATION, false),
     )

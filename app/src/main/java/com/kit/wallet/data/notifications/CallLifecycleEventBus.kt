@@ -80,6 +80,10 @@ data class CallLifecycleEvent(
     }
 }
 
+/** Whether this event closes the shared ringing window on every recipient device. */
+internal fun CallLifecycleEvent.endsRingingSurface(): Boolean =
+    kind == CallLifecycleKind.ANSWERED || terminal
+
 /** Process-local bridge from push delivery to any matching foreground call screen. */
 @Singleton
 class CallLifecycleEventBus @Inject constructor() {

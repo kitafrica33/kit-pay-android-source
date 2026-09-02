@@ -65,6 +65,8 @@ class RemoteCallRepositoryTest {
         assertEquals(RECIPIENT_PHONE, second.phone)
         assertEquals("2026-07-23T00:00:45Z", first.ringExpiresAt)
         assertEquals("2026-07-23T00:00:45Z", second.ringExpiresAt)
+        assertEquals(SERVER_TIME, first.ringServerTime)
+        assertEquals(SERVER_TIME, second.ringServerTime)
         assertEquals(2, api.clientCallIds.distinct().size)
     }
 
@@ -131,6 +133,7 @@ class RemoteCallRepositoryTest {
         assertEquals(INCOMING_CALL_ID, connection.callId)
         assertEquals(ANSWERED_AT, connection.answeredAt)
         assertEquals(SERVER_TIME, connection.serverTime)
+        assertEquals(SERVER_TIME, connection.ringServerTime)
     }
 
     @Test
@@ -324,6 +327,7 @@ class RemoteCallRepositoryTest {
                 startedAt = "2026-07-23T00:00:00Z",
                 answeredAt = ANSWERED_AT,
                 ringExpiresAt = "2026-07-23T00:00:45Z",
+                serverTime = SERVER_TIME,
             ),
             rtc = RtcCredentialsDto(
                 provider = "livekit",
@@ -346,6 +350,7 @@ class RemoteCallRepositoryTest {
                 state = "ringing",
                 startedAt = "2026-07-23T00:00:00Z",
                 ringExpiresAt = "2026-07-23T00:00:45Z",
+                serverTime = SERVER_TIME,
             ),
             rtc = RtcCredentialsDto(
                 provider = "livekit",

@@ -1,6 +1,10 @@
 package com.kit.wallet
 
 import com.kit.wallet.data.notifications.MessageReplyPolicy
+import com.kit.wallet.data.notifications.MessageReplyNotificationAction
+import com.kit.wallet.data.notifications.MESSAGE_REPLY_NOT_CONFIRMED_COPY
+import com.kit.wallet.data.notifications.secureMessageIdentifierDigest
+import com.kit.wallet.data.notifications.replyNotificationSourceDigest
 import com.kit.wallet.data.notifications.deliverMessageReply
 import com.kit.wallet.data.session.SessionFence
 import java.io.IOException
@@ -182,6 +186,54 @@ class MessageReplyDeliveryTest {
         assertEquals(first, UUID.fromString(first).toString())
         assertNotEquals(SOURCE_MESSAGE_ID, first)
     }
+
+    @Test
+    fun `reply completion mutates only the exact source notification`() {
+        val sourceDigest = messageReplyDigest(SOURCE_MESSAGE_ID)
+        val newerDigest = messageReplyDigest(OTHER_SOURCE_MESSAGE_ID)
+
+        assertEquals(
+            MessageReplyNotificationAction.CANCEL,
+            MessageReplyPolicy.notificationAction(true, sourceDigest, sourceDigest),
+        )
+        assertEquals(
+            MessageReplyNotificationAction.SHOW_FAILURE,
+            MessageReplyPolicy.notificationAction(false, sourceDigest, sourceDigest),
+        )
+        assertEquals(
+            MessageReplyNotificationAction.IGNORE,
+            MessageReplyPolicy.notificationAction(true, sourceDigest, newerDigest),
+        )
+        assertEquals(
+            MessageReplyNotificationAction.IGNORE,
+            MessageReplyPolicy.notificationAction(false, sourceDigest, newerDigest),
+        )
+        assertEquals(
+            MessageReplyNotificationAction.IGNORE,
+            MessageReplyPolicy.notificationAction(false, "not-a-digest", "not-a-digest"),
+        )
+    }
+
+    @Test
+    fun `reply failure copy is generic and never contains typed text`() {
+        assertEquals(
+            "Reply not confirmed. Tap Reply to try again.",
+            MESSAGE_REPLY_NOT_CONFIRMED_COPY,
+        )
+        assertFalse(MESSAGE_REPLY_NOT_CONFIRMED_COPY.contains(REQUEST.text))
+    }
+
+    @Test
+    fun `notification identity falls back to durable ledger only when platform query fails`() {
+        val active = messageReplyDigest(SOURCE_MESSAGE_ID)
+        val recorded = messageReplyDigest(OTHER_SOURCE_MESSAGE_ID)
+
+        assertEquals(active, replyNotificationSourceDigest(true, active, recorded))
+        assertNull(replyNotificationSourceDigest(true, null, recorded))
+        assertEquals(recorded, replyNotificationSourceDigest(false, active, recorded))
+    }
+
+    private fun messageReplyDigest(messageId: String) = secureMessageIdentifierDigest(messageId)
 
     private companion object {
         const val CONVERSATION_ID = "10000000-0000-4000-8000-000000000001"
