@@ -805,10 +805,25 @@ object SecureMessagingTransportValidator {
         currentEnrollmentEpoch: Long?,
     ): ValidatedMessagingSyncEvent {
         val type = required(event.type, "messaging sync event type")
-        requireTransport(type in SYNC_EVENT_TYPES, "messaging sync event type")
+        requireTransport(
+            type.length <= MAX_SYNC_EVENT_TYPE_LENGTH && SYNC_EVENT_TYPE.matches(type),
+            "messaging sync event type",
+        )
         val conversationId = required(event.conversationId, "messaging sync conversation ID")
         requireUuid(conversationId, "messaging sync conversation ID")
         val occurredAt = requireEventTimestamp(event.occurredAt, "messaging sync event time")
+
+        // A syntactically valid type added by a newer server has no authority in this build. Keep
+        // only its inert stream coordinates so the processor can consume it deterministically and
+        // durably advance past it; every known type below retains its closed-world validation.
+        if (type !in SYNC_EVENT_TYPES) {
+            return ValidatedMessagingSyncEvent.Unsupported(
+                eventId = eventId,
+                type = type,
+                conversationId = conversationId,
+                occurredAt = occurredAt,
+            )
+        }
 
         return when (type) {
             MESSAGE_CREATED_EVENT -> validateMessageEvent(
@@ -1420,6 +1435,7 @@ object SecureMessagingTransportValidator {
     private const val MAX_SERVER_DEVICES = 1_000
     private const val MAX_CONVERSATIONS = 10_000
     private const val MAX_SYNC_PAGE_SIZE = 100
+    private const val MAX_SYNC_EVENT_TYPE_LENGTH = 128
     private const val MAX_HISTORY_PAGE_SIZE = 50
     private const val MAX_CURSOR_LENGTH = 2_048
     private const val DIRECT_MEMBER_COUNT = 2
@@ -1444,6 +1460,7 @@ object SecureMessagingTransportValidator {
     private val UTC_TIMESTAMP = Regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
     private val MESSAGE_TIMESTAMP =
         Regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{6})?Z$")
+    private val SYNC_EVENT_TYPE = Regex("^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$")
     private val CONVERSATION_TYPES = setOf("direct", "group", "community", "channel")
 
     /** The subset of [CONVERSATION_TYPES] the pairwise wire protocol can actually carry. */
@@ -1586,6 +1603,14 @@ sealed interface ValidatedMessagingSyncEvent {
     val eventId: Long
     val conversationId: String
     val occurredAt: Instant
+
+    /** A well-formed event type this client does not implement and must consume without effect. */
+    data class Unsupported(
+        override val eventId: Long,
+        val type: String,
+        override val conversationId: String,
+        override val occurredAt: Instant,
+    ) : ValidatedMessagingSyncEvent
 
     data class IncomingMessage(
         override val eventId: Long,

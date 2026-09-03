@@ -770,10 +770,13 @@ interface KitWalletApi {
     @retrofit2.http.PUT("api/kit-wallet/v1/devices/current/push-token")
     suspend fun registerPushToken(
         @Body request: RegisterPushTokenRequest,
+        @Tag expectedOwner: SessionFence,
     ): ApiEnvelope<PushTokenStatusDto>
 
     @DELETE("api/kit-wallet/v1/devices/current/push-token")
-    suspend fun unregisterPushToken(): ApiEnvelope<PushTokenStatusDto>
+    suspend fun unregisterPushToken(
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<PushTokenStatusDto>
 
     // --- In-app support (docs/support-client.md). Every call is fenced to the session that
     // prepared it: ticket content is account-private and must never ride a successor session.

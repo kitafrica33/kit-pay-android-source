@@ -203,6 +203,16 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             val occurredAt: Instant,
         )
 
+        /** Inert capability for one validated stream row whose type this client does not know. */
+        class UnsupportedEvent internal constructor(
+            owner: Session,
+            issuanceIdentity: Any,
+            eventId: Long,
+            conversationId: String,
+            occurredAt: Instant,
+            val type: String,
+        ) : SyncEvent(owner, issuanceIdentity, eventId, conversationId, occurredAt)
+
         /** Opaque incoming ciphertext. Only [decryptionRequest] can unwrap it. */
         class IncomingEnvelope internal constructor(
             owner: Session,
@@ -2682,6 +2692,14 @@ class RemoteSecureMessagingTransport @Inject internal constructor(
             validated: ValidatedMessagingSyncEvent,
             identity: Any,
         ): SyncEvent = when (validated) {
+            is ValidatedMessagingSyncEvent.Unsupported -> UnsupportedEvent(
+                owner = this,
+                issuanceIdentity = identity,
+                eventId = validated.eventId,
+                conversationId = validated.conversationId,
+                occurredAt = validated.occurredAt,
+                type = validated.type,
+            )
             is ValidatedMessagingSyncEvent.IncomingMessage -> IncomingEnvelope(
                 owner = this,
                 issuanceIdentity = identity,

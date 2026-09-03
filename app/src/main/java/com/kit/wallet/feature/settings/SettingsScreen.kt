@@ -77,7 +77,6 @@ import com.kit.wallet.data.repository.KycVerificationState
 import com.kit.wallet.data.repository.kycVerificationStateOf
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.demo.DemoData
-import com.kit.wallet.data.notifications.IncomingCallAlertMode
 import com.kit.wallet.data.notifications.foregroundReadinessCopy
 import com.kit.wallet.data.notifications.incomingCallAlertPlan
 import com.kit.wallet.data.notifications.incomingCallAlertSettingsIntent
@@ -346,7 +345,7 @@ fun SettingsScreen(
         onShareDeviceContactsChanged = contactDiscoveryToggle.onCheckedChange,
         onIncomingCallsChanged = communicationViewModel::setIncomingCallsEnabled,
         callAlertReadiness = callAlertPlan.foregroundReadinessCopy(),
-        onCallAlertSettings = if (callAlertPlan.mode == IncomingCallAlertMode.FULL_SCREEN) {
+        onCallAlertSettings = if (!callAlertPlan.showSettingsAction) {
             null
         } else {
             {

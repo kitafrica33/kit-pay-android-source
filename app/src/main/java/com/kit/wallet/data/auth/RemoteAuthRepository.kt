@@ -263,7 +263,7 @@ class RemoteAuthRepository @Inject constructor(
             // The current device token must be removed while its Kit session can still authorize
             // the request. All-device logout then revokes the remaining sessions server-side.
             try {
-                pushTokens.unregisterBeforeLogout()
+                pushTokens.unregisterBeforeLogout(target)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {

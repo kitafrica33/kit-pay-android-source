@@ -27,6 +27,9 @@ internal object NoOpSecureMessagingHistoryContinuationScheduler :
     override fun schedule(delayMillis: Long) = Unit
 }
 
+/** A non-secret metadata hint contradicted a successful authoritative read and cannot recover. */
+private class DeterministicSyncEventPoisonException(message: String) : Exception(message)
+
 @VisibleForTesting
 internal data class SecureMessagingHistoryDrainResult(
     val workUnits: Int,
@@ -587,21 +590,27 @@ internal class SecureMessagingEventProcessor @Inject constructor(
 
     private suspend fun processEvents(state: SessionState) {
         while (state.eventIndex < state.events.size) {
-            when (val event = state.events[state.eventIndex]) {
-                is RemoteSecureMessagingTransport.Session.IncomingEnvelope ->
-                    processIncoming(state, event)
-                is RemoteSecureMessagingTransport.Session.OutboundEvent ->
-                    processOutbound(state, event)
-                is RemoteSecureMessagingTransport.Session.DeliveryReceiptEvent ->
-                    processDeliveryReceipt(state, event)
-                is RemoteSecureMessagingTransport.Session.ReadReceiptEvent ->
-                    processReadReceipt(state, event)
-                is RemoteSecureMessagingTransport.Session.RosterRefreshEvent ->
-                    processRosterRefresh(state, event)
-                is RemoteSecureMessagingTransport.Session.MetadataEvent ->
-                    processMetadata(state, event)
-                is RemoteSecureMessagingTransport.Session.FinancialMetadataEvent ->
-                    processFinancialMetadata(state, event)
+            try {
+                when (val event = state.events[state.eventIndex]) {
+                    is RemoteSecureMessagingTransport.Session.UnsupportedEvent -> Unit
+                    is RemoteSecureMessagingTransport.Session.IncomingEnvelope ->
+                        processIncoming(state, event)
+                    is RemoteSecureMessagingTransport.Session.OutboundEvent ->
+                        processOutbound(state, event)
+                    is RemoteSecureMessagingTransport.Session.DeliveryReceiptEvent ->
+                        processDeliveryReceipt(state, event)
+                    is RemoteSecureMessagingTransport.Session.ReadReceiptEvent ->
+                        processReadReceipt(state, event)
+                    is RemoteSecureMessagingTransport.Session.RosterRefreshEvent ->
+                        processRosterRefresh(state, event)
+                    is RemoteSecureMessagingTransport.Session.MetadataEvent ->
+                        processMetadata(state, event)
+                    is RemoteSecureMessagingTransport.Session.FinancialMetadataEvent ->
+                        processFinancialMetadata(state, event)
+                }
+            } catch (_: DeterministicSyncEventPoisonException) {
+                // A replay produces the same contradiction after the authoritative reads succeed.
+                // Consume only this explicitly classified hint so later ciphertext can progress.
             }
             state.eventIndex++
         }
@@ -678,40 +687,50 @@ internal class SecureMessagingEventProcessor @Inject constructor(
             val currency = checkNotNull(event.currency)
             val scale = checkNotNull(event.currencyScale)
             val scheduledFor = checkNotNull(event.scheduledFor)
-            check(exact.conversationId == event.conversationId &&
-                exact.knownStatus?.wire == action.wire &&
-                ScheduleContract.minor(exact.amount, scale) == amountMinor &&
-                exact.currency.code == currency && exact.currency.scale.toIntOrNull() == scale &&
-                Instant.parse(exact.scheduledFor) == scheduledFor && exact.note == event.note &&
-                exact.walletTransactionId == event.walletTransactionId
-            ) { "Scheduled-payment exact state did not match its event" }
+            requireDeterministicMetadata(
+                exact.conversationId == event.conversationId &&
+                    exact.knownStatus?.wire == action.wire &&
+                    ScheduleContract.minor(exact.amount, scale) == amountMinor &&
+                    exact.currency.code == currency && exact.currency.scale.toIntOrNull() == scale &&
+                    Instant.parse(exact.scheduledFor) == scheduledFor && exact.note == event.note &&
+                    exact.walletTransactionId == event.walletTransactionId,
+                "Scheduled-payment exact state did not match its event",
+            )
             if (exact.sourceWalletId != null) {
-                check(currentUserId == sender) {
-                    "A creator's scheduled-payment event changed its sender"
-                }
+                requireDeterministicMetadata(
+                    currentUserId == sender,
+                    "A creator's scheduled-payment event changed its sender",
+                )
             } else {
-                check(action == KitScheduledPaymentAction.COMPLETED && currentUserId == recipient) {
-                    "A recipient's scheduled-payment event changed its recipient"
-                }
+                requireDeterministicMetadata(
+                    action == KitScheduledPaymentAction.COMPLETED && currentUserId == recipient,
+                    "A recipient's scheduled-payment event changed its recipient",
+                )
             }
             when (action) {
-                KitScheduledPaymentAction.COMPLETED -> check(
+                KitScheduledPaymentAction.COMPLETED -> requireDeterministicMetadata(
                     exact.failure == null && exact.completedAt?.let(Instant::parse) == event.completedAt &&
                         exact.cancelledAt == null,
+                    "Scheduled-payment completion state did not match its event",
                 )
                 KitScheduledPaymentAction.FAILED -> {
-                    val failure = checkNotNull(exact.failure)
-                    check(
+                    val failure = requireDeterministicMetadata(
+                        exact.failure,
+                        "Scheduled-payment failure state was missing",
+                    )
+                    requireDeterministicMetadata(
                         failure.isStructurallyValid() && failure.code == event.failureCode &&
                             (event.failureMessage == null ||
                                 failure.message == event.failureMessage) &&
                             exact.completedAt?.let(Instant::parse) == event.completedAt &&
                             exact.cancelledAt == null,
+                        "Scheduled-payment failure state did not match its event",
                     )
                 }
-                KitScheduledPaymentAction.CANCELLED -> check(
+                KitScheduledPaymentAction.CANCELLED -> requireDeterministicMetadata(
                     exact.failure == null && exact.completedAt == null &&
                         exact.cancelledAt?.let(Instant::parse) == event.cancelledAt,
+                    "Scheduled-payment cancellation state did not match its event",
                 )
             }
             exact
@@ -726,31 +745,41 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 throw error
             }
             val action = event.type.substringAfterLast('.')
-            check(exact.conversationId == event.conversationId && exact.knownStatus?.wire == action &&
+            requireDeterministicMetadata(
+                exact.conversationId == event.conversationId && exact.knownStatus?.wire == action &&
                 Instant.parse(exact.scheduledFor) == event.scheduledFor &&
-                exact.groupPaymentId == event.groupPaymentId
-            ) { "Scheduled-group exact state did not match its event" }
+                    exact.groupPaymentId == event.groupPaymentId,
+                "Scheduled-group exact state did not match its event",
+            )
             when (exact.knownStatus) {
-                ScheduledPaymentStatus.COMPLETED -> check(
+                ScheduledPaymentStatus.COMPLETED -> requireDeterministicMetadata(
                     exact.failure == null && exact.completedAt?.let(Instant::parse) == event.completedAt &&
                         exact.cancelledAt == null,
+                    "Scheduled-group completion state did not match its event",
                 )
                 ScheduledPaymentStatus.FAILED -> {
-                    val failure = checkNotNull(exact.failure)
+                    val failure = requireDeterministicMetadata(
+                        exact.failure,
+                        "Scheduled-group failure state was missing",
+                    )
                     val legacyHint = event.failureCode == null && event.failureMessage == null
-                    check(
+                    requireDeterministicMetadata(
                         failure.isStructurallyValid() &&
                             (legacyHint || failure.code == event.failureCode &&
                                 failure.message == event.failureMessage) &&
                             exact.completedAt?.let(Instant::parse) == event.completedAt &&
                             exact.cancelledAt == null,
+                        "Scheduled-group failure state did not match its event",
                     )
                 }
-                ScheduledPaymentStatus.CANCELLED -> check(
+                ScheduledPaymentStatus.CANCELLED -> requireDeterministicMetadata(
                     exact.failure == null && exact.completedAt == null &&
                         exact.cancelledAt?.let(Instant::parse) == event.cancelledAt,
+                    "Scheduled-group cancellation state did not match its event",
                 )
-                else -> error("Scheduled-group exact state is not terminal")
+                else -> throw DeterministicSyncEventPoisonException(
+                    "Scheduled-group exact state is not terminal",
+                )
             }
             exact
         } else null
@@ -759,13 +788,17 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         // deleted. Consume its already-validated terminal hint without recreating local history.
         val visibleConversation = conversation ?: return
         val projection = if (directEvent) {
-            check(!visibleConversation.isGroup) { "A direct schedule event belongs to a group" }
+            requireDeterministicMetadata(
+                !visibleConversation.isGroup,
+                "A direct schedule event belongs to a group",
+            )
             val sender = checkNotNull(event.senderUserId)
             val recipient = checkNotNull(event.recipientUserId)
             val members = visibleConversation.members.map { it.userId.lowercase() }.toSet()
-            check(members == setOf(sender, recipient)) {
-                "A direct schedule event changed its participants"
-            }
+            requireDeterministicMetadata(
+                members == setOf(sender, recipient),
+                "A direct schedule event changed its participants",
+            )
             val exact = checkNotNull(exactDirect)
             val action = checkNotNull(directAction)
             val amountMinor = checkNotNull(event.amountMinor)
@@ -778,15 +811,19 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                     .trim().take(MAX_SCHEDULED_PAYMENT_REASON_LENGTH)
                 KitScheduledPaymentAction.CANCELLED -> "The scheduled payment was cancelled."
             }
-            val descriptor = checkNotNull(
+            val descriptor = requireDeterministicMetadata(
                 KitScheduledPaymentMessage.create(
                     action, event.paymentId, amountMinor, currency, scale, scheduledFor,
                     event.walletTransactionId, event.note, reason,
                 ),
-            ) { "A scheduled-payment projection is invalid" }
+                "A scheduled-payment projection is invalid",
+            )
             ScheduleProjection(descriptor.encode(), sender, descriptor.deterministicMessageId())
         } else {
-            check(visibleConversation.isGroup) { "A scheduled group event belongs to a direct chat" }
+            requireDeterministicMetadata(
+                visibleConversation.isGroup,
+                "A scheduled group event belongs to a direct chat",
+            )
             val exact = checkNotNull(exactGroup)
             if (exact.knownStatus == ScheduledPaymentStatus.COMPLETED) {
                 val resultId = checkNotNull(event.groupPaymentId)
@@ -797,33 +834,37 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 val sender = checkNotNull(payment.senderUserId).lowercase()
                 val scheduledRecipients = exact.recipients.map { it.userId.lowercase() }
                 val paymentRecipients = payment.recipients.mapNotNull { it.userId?.lowercase() }
-                check(payment.id.lowercase() == resultId &&
-                    payment.conversationId == event.conversationId &&
-                    payment.splitMode == exact.splitMode && payment.audience == exact.audience &&
-                    payment.currencyCode == exact.currency.code &&
-                    payment.currencyScale == exact.currency.scale.toIntOrNull() &&
-                    payment.recipientCount == exact.recipientCount && payment.note == exact.note &&
-                    payment.pendingCount >= 0 && payment.acceptedCount >= 0 &&
-                    payment.returnedCount >= 0 &&
-                    payment.pendingCount + payment.acceptedCount + payment.returnedCount ==
-                    payment.recipientCount && paymentRecipients.size == payment.recipientCount &&
-                    paymentRecipients.toSet() == scheduledRecipients.toSet() &&
-                    (exact.splitMode != "even" ||
-                        ScheduleContract.minor(exact.totalAmount!!, payment.currencyScale) ==
-                        payment.totalAmountMinor)
-                ) { "Scheduled group result did not match its reviewed schedule" }
+                requireDeterministicMetadata(
+                    payment.id.lowercase() == resultId &&
+                        payment.conversationId == event.conversationId &&
+                        payment.splitMode == exact.splitMode && payment.audience == exact.audience &&
+                        payment.currencyCode == exact.currency.code &&
+                        payment.currencyScale == exact.currency.scale.toIntOrNull() &&
+                        payment.recipientCount == exact.recipientCount && payment.note == exact.note &&
+                        payment.pendingCount >= 0 && payment.acceptedCount >= 0 &&
+                        payment.returnedCount >= 0 &&
+                        payment.pendingCount + payment.acceptedCount + payment.returnedCount ==
+                        payment.recipientCount && paymentRecipients.size == payment.recipientCount &&
+                        paymentRecipients.toSet() == scheduledRecipients.toSet() &&
+                        (exact.splitMode != "even" ||
+                            ScheduleContract.minor(exact.totalAmount!!, payment.currencyScale) ==
+                            payment.totalAmountMinor),
+                    "Scheduled group result did not match its reviewed schedule",
+                )
                 // The exact schedule and payment can remain readable after one of their historical
                 // participants leaves an otherwise-current group. Current membership cannot
                 // authenticate a name or announcement for that departed participant, but retrying
                 // the same settled facts can never change the roster. Consume the wake without a
                 // local projection so one old payment cannot pin every conversation's sync cursor.
                 if (sender !in memberIds || scheduledRecipients.any { it !in memberIds }) return
-                val descriptor = checkNotNull(
+                val descriptor = requireDeterministicMetadata(
                     KitGroupPaymentMessage.announcing(payment, scheduledRecipients),
-                ) { "Scheduled group result could not be projected" }
-                check(descriptor.matchesAuthoritativePayment(payment)) {
-                    "Scheduled group projection did not match exact state"
-                }
+                    "Scheduled group result could not be projected",
+                )
+                requireDeterministicMetadata(
+                    descriptor.matchesAuthoritativePayment(payment),
+                    "Scheduled group projection did not match exact state",
+                )
                 ScheduleProjection(
                     descriptor.encode(), sender,
                     deterministicUuid("scheduled-group-payment|${exact.id}|$resultId"),
@@ -832,11 +873,12 @@ internal class SecureMessagingEventProcessor @Inject constructor(
                 val outcome = if (exact.knownStatus == ScheduledPaymentStatus.FAILED) {
                     KitScheduledGroupPaymentOutcomeAction.FAILED
                 } else KitScheduledGroupPaymentOutcomeAction.CANCELLED
-                val descriptor = checkNotNull(
+                val descriptor = requireDeterministicMetadata(
                     KitScheduledGroupPaymentOutcomeMessage.create(
                         outcome, exact.id, Instant.parse(exact.scheduledFor),
                     ),
-                ) { "Scheduled group outcome could not be projected" }
+                    "Scheduled group outcome could not be projected",
+                )
                 ScheduleProjection(
                     descriptor.encode(), state.session.binding.userId,
                     descriptor.deterministicMessageId(),
@@ -863,6 +905,13 @@ internal class SecureMessagingEventProcessor @Inject constructor(
         val senderUserId: String,
         val messageId: String,
     )
+
+    private fun requireDeterministicMetadata(condition: Boolean, message: String) {
+        if (!condition) throw DeterministicSyncEventPoisonException(message)
+    }
+
+    private fun <T : Any> requireDeterministicMetadata(value: T?, message: String): T =
+        value ?: throw DeterministicSyncEventPoisonException(message)
 
     /**
      * A metadata event carries no ciphertext, so the only thing it can change is what the next

@@ -31,6 +31,8 @@ internal enum class IncomingCallAlertMode {
 internal data class IncomingCallAlertPlan(
     val mode: IncomingCallAlertMode,
     val showSettingsAction: Boolean,
+    /** Whether the user-controlled incoming-call channel can produce an audible alert. */
+    val channelHasSound: Boolean,
 ) {
     val useFullScreenIntent: Boolean get() = mode == IncomingCallAlertMode.FULL_SCREEN
 }
@@ -58,17 +60,33 @@ internal fun callAlertsBlocked(
 
 internal fun incomingCallAlertPlan(access: IncomingCallNotificationAccess): IncomingCallAlertPlan {
     if (!access.postNotificationsGranted || !access.appNotificationsEnabled) {
-        return IncomingCallAlertPlan(IncomingCallAlertMode.BLOCKED, showSettingsAction = true)
+        return IncomingCallAlertPlan(
+            IncomingCallAlertMode.BLOCKED,
+            showSettingsAction = true,
+            channelHasSound = access.channelHasSound,
+        )
     }
     if (
         access.channelImportance < NotificationManager.IMPORTANCE_HIGH
     ) {
-        return IncomingCallAlertPlan(IncomingCallAlertMode.PASSIVE, showSettingsAction = true)
+        return IncomingCallAlertPlan(
+            IncomingCallAlertMode.PASSIVE,
+            showSettingsAction = true,
+            channelHasSound = access.channelHasSound,
+        )
     }
     return if (access.fullScreenIntentAllowed) {
-        IncomingCallAlertPlan(IncomingCallAlertMode.FULL_SCREEN, showSettingsAction = false)
+        IncomingCallAlertPlan(
+            IncomingCallAlertMode.FULL_SCREEN,
+            showSettingsAction = !access.channelHasSound,
+            channelHasSound = access.channelHasSound,
+        )
     } else {
-        IncomingCallAlertPlan(IncomingCallAlertMode.HEADS_UP, showSettingsAction = true)
+        IncomingCallAlertPlan(
+            IncomingCallAlertMode.HEADS_UP,
+            showSettingsAction = true,
+            channelHasSound = access.channelHasSound,
+        )
     }
 }
 
@@ -115,6 +133,7 @@ internal fun incomingCallAlertSettingsIntent(
             access.postNotificationsGranted &&
             access.appNotificationsEnabled &&
             access.channelImportance >= NotificationManager.IMPORTANCE_HIGH &&
+            access.channelHasSound &&
             !access.fullScreenIntentAllowed
     return when {
         !access.postNotificationsGranted || !access.appNotificationsEnabled ->
@@ -130,15 +149,17 @@ internal fun incomingCallAlertSettingsIntent(
     }
 }
 
-internal fun IncomingCallAlertPlan.foregroundReadinessCopy(): String = when (mode) {
-    IncomingCallAlertMode.FULL_SCREEN ->
-        "Ready to ring and appear over the lock screen"
-    IncomingCallAlertMode.HEADS_UP ->
-        "Heads-up alerts only · allow full-screen call alerts"
-    IncomingCallAlertMode.PASSIVE ->
-        "Call alerts are quiet or minimized · review notification settings"
-    IncomingCallAlertMode.BLOCKED ->
+internal fun IncomingCallAlertPlan.foregroundReadinessCopy(): String = when {
+    mode == IncomingCallAlertMode.BLOCKED ->
         "Call notifications are off · incoming calls may be missed"
+    !channelHasSound ->
+        "Call alerts are silent · turn on sound in notification settings"
+    mode == IncomingCallAlertMode.FULL_SCREEN ->
+        "Ready to ring and appear over the lock screen"
+    mode == IncomingCallAlertMode.HEADS_UP ->
+        "Heads-up alerts only · allow full-screen call alerts"
+    else ->
+        "Call alerts are quiet or minimized · review notification settings"
 }
 
 internal const val INCOMING_CALLS_CHANNEL_ID = "kit_incoming_calls_v2"

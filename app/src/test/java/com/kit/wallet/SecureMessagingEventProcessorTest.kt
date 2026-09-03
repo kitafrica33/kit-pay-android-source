@@ -530,6 +530,39 @@ class SecureMessagingEventProcessorTest {
     }
 
     @Test
+    fun `unsupported event cannot wedge later ciphertext or its cursor`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val crypto = PersistingDecryptionEngine(stateStore)
+        val projections = projectionStore(stateStore)
+        val processor = processor(stateStore, crypto, projections)
+        val roster = authoritativeRoster()
+        val unsupported = MessagingSyncEventDto(
+            id = "10",
+            type = "reaction.created",
+            conversationId = CONVERSATION_ID,
+            occurredAt = TIMESTAMP,
+        )
+        enqueueSync(
+            events = listOf(unsupported, incomingEvent(roster, eventId = 11)),
+            nextCursor = "forward_event_cursor",
+        )
+        server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
+
+        processor.synchronize(session)
+
+        assertEquals(1, crypto.openedTransactions)
+        assertNotNull(projections.readInbound(INCOMING_MESSAGE_ID))
+        val persisted = checkNotNull(SecureMessagingSyncCursorStore(stateStore).load())
+        assertEquals(
+            "forward_event_cursor" to 11L,
+            requireSecureMessagingSyncResumePosition(persisted.position),
+        )
+    }
+
+    @Test
     fun `ciphertext history wrapper materializes only the donor authenticated original`() = runTest {
         val (session, _, _) = openSyncingSession()
         recordCurrentIdentity(session)
@@ -1987,29 +2020,71 @@ class SecureMessagingEventProcessorTest {
     }
 
     @Test
-    fun `inconsistent enriched group failure cannot advance cursor`() = runTest {
+    fun `inconsistent enriched group failure is quarantined and advances cursor`() = runTest {
         val (session, _, _) = openSyncingSession()
         val stateStore = TestSecureMessagingStateStore()
+        val crypto = PersistingDecryptionEngine(stateStore)
+        val projections = projectionStore(stateStore)
         val processor = processor(
             stateStore = stateStore,
-            crypto = PersistingDecryptionEngine(stateStore),
+            crypto = crypto,
+            projections = projections,
             scheduledPayments = scheduledPaymentRepository(),
         )
+        val roster = authoritativeRoster()
         enqueueSync(
             listOf(
                 scheduledGroupFailureEvent(
                     failureCode = "PROVIDER_UNAVAILABLE",
                     failureMessage = "A different failure",
                 ),
+                incomingEvent(roster, eventId = 11),
             ),
             "inconsistent_group_failure_cursor",
         )
         server.enqueue(jsonResponse(GROUP_CONVERSATIONS))
         server.enqueue(jsonResponse(FAILED_SCHEDULED_GROUP_PAYMENT))
+        enqueueRoster(roster)
+        enqueueDeliveryAcknowledgement()
 
-        val failure = runCatching { processor.synchronize(session) }.exceptionOrNull()
+        processor.synchronize(session)
 
-        assertTrue(failure is IllegalStateException)
+        assertEquals(1, crypto.openedTransactions)
+        assertNotNull(projections.readInbound(INCOMING_MESSAGE_ID))
+        val cursor = checkNotNull(SecureMessagingSyncCursorStore(stateStore).load())
+        assertEquals(
+            "inconsistent_group_failure_cursor" to 11L,
+            requireSecureMessagingSyncResumePosition(cursor.position),
+        )
+    }
+
+    @Test
+    fun `transient scheduled authority failure pins later ciphertext and cursor`() = runTest {
+        val (session, _, _) = openSyncingSession()
+        val stateStore = TestSecureMessagingStateStore()
+        val crypto = PersistingDecryptionEngine(stateStore)
+        val projections = projectionStore(stateStore)
+        val processor = processor(
+            stateStore = stateStore,
+            crypto = crypto,
+            projections = projections,
+            scheduledPayments = scheduledPaymentRepository(),
+        )
+        val roster = authoritativeRoster()
+        enqueueSync(
+            events = listOf(
+                scheduledGroupFailureEvent(),
+                incomingEvent(roster, eventId = 11),
+            ),
+            nextCursor = "transient_group_failure_cursor",
+        )
+        server.enqueue(jsonResponse(GROUP_CONVERSATIONS))
+        server.enqueue(apiErrorResponse(503, "TEMPORARY_FAILURE"))
+
+        assertTrue(runCatching { processor.synchronize(session) }.isFailure)
+
+        assertEquals(0, crypto.openedTransactions)
+        assertNull(projections.readInbound(INCOMING_MESSAGE_ID))
         assertNull(SecureMessagingSyncCursorStore(stateStore).load())
     }
 
@@ -2187,7 +2262,7 @@ class SecureMessagingEventProcessorTest {
 
     @Test
     fun `completed direct event cannot swap creator into recipient role`() = runTest {
-        assertSwappedCompletedDirectionRejected(
+        assertSwappedCompletedDirectionQuarantined(
             COMPLETED_SCHEDULED_DIRECT_PAYMENT_CREATOR,
             senderUserId = PEER_USER_ID,
             recipientUserId = CURRENT_USER_ID,
@@ -2196,7 +2271,7 @@ class SecureMessagingEventProcessorTest {
 
     @Test
     fun `completed direct event cannot swap recipient into sender role`() = runTest {
-        assertSwappedCompletedDirectionRejected(
+        assertSwappedCompletedDirectionQuarantined(
             COMPLETED_SCHEDULED_DIRECT_PAYMENT_RECIPIENT,
             senderUserId = CURRENT_USER_ID,
             recipientUserId = PEER_USER_ID,
@@ -2714,7 +2789,10 @@ class SecureMessagingEventProcessorTest {
         val (session, lifecycle, fence) = openSyncingSession()
         lifecycle.finishActivation(fence)
         val stateStore = TestSecureMessagingStateStore()
-        val processor = processor(stateStore, PersistingDecryptionEngine(stateStore))
+        val crypto = PersistingDecryptionEngine(stateStore)
+        val projections = projectionStore(stateStore)
+        val processor = processor(stateStore, crypto, projections)
+        val roster = authoritativeRoster()
         enqueueSync(
             events = listOf(
                 deviceLifecycleEvent(
@@ -2722,6 +2800,7 @@ class SecureMessagingEventProcessorTest {
                     userId = PEER.userId,
                     deviceId = PEER.serverDeviceId,
                 ).copy(data = null),
+                incomingEvent(roster, eventId = 11),
             ),
             nextCursor = "malformed_cursor",
         )
@@ -2734,6 +2813,9 @@ class SecureMessagingEventProcessorTest {
             (failure as SecureMessagingCryptographicFailureException).quarantineReason,
         )
         assertEquals(SecureMessagingRuntimeStage.QUARANTINED, lifecycle.snapshot().stage)
+        assertEquals(0, crypto.openedTransactions)
+        assertNull(projections.readInbound(INCOMING_MESSAGE_ID))
+        assertNull(SecureMessagingSyncCursorStore(stateStore).load())
         val requestCount = server.requestCount
         assertTrue(runCatching { processor.synchronize(session) }.isFailure)
         assertEquals(requestCount, server.requestCount)
@@ -3967,16 +4049,18 @@ class SecureMessagingEventProcessorTest {
         occurredAt = TIMESTAMP,
     )
 
-    private suspend fun assertSwappedCompletedDirectionRejected(
+    private suspend fun assertSwappedCompletedDirectionQuarantined(
         authority: String,
         senderUserId: String,
         recipientUserId: String,
     ) {
         val (session, _, _) = openSyncingSession()
         val stateStore = TestSecureMessagingStateStore()
+        val systemEvents = ConversationSystemEventStore(stateStore)
         val processor = processor(
             stateStore = stateStore,
             crypto = PersistingDecryptionEngine(stateStore),
+            systemEvents = systemEvents,
             scheduledPayments = scheduledPaymentRepository(),
         )
         enqueueSync(
@@ -3986,8 +4070,15 @@ class SecureMessagingEventProcessorTest {
         server.enqueue(jsonResponse(DIRECT_CONVERSATIONS))
         server.enqueue(jsonResponse(authority))
 
-        assertTrue(runCatching { processor.synchronize(session) }.isFailure)
-        assertNull(SecureMessagingSyncCursorStore(stateStore).load())
+        processor.synchronize(session)
+
+        val cursor = checkNotNull(SecureMessagingSyncCursorStore(stateStore).load())
+        assertEquals(
+            "swapped_direction_cursor" to 10L,
+            requireSecureMessagingSyncResumePosition(cursor.position),
+        )
+        systemEvents.load(listOf(CONVERSATION_ID))
+        assertTrue(systemEvents.events.value[CONVERSATION_ID].orEmpty().isEmpty())
     }
 
     private fun scheduledPaymentRepository() = ServerScheduledPaymentRepository(

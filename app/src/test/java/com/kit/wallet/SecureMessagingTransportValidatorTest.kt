@@ -403,6 +403,33 @@ class SecureMessagingTransportValidatorTest {
     }
 
     @Test
+    fun `sync page preserves unsupported event coordinates before a known event`() {
+        val unsupported = MessagingSyncEventDto(
+            id = "10",
+            type = "reaction.created",
+            conversationId = CONVERSATION_ID,
+            occurredAt = SENT_AT,
+        )
+        val validated = SecureMessagingTransportValidator.validateSyncPage(
+            response = MessagingSyncDto(
+                events = listOf(unsupported, outgoingMessageEvent(id = "11")),
+                page = CursorPageDto(nextCursor = "forward_cursor", hasMore = false, limit = 2),
+            ),
+            currentUserId = CURRENT_USER_ID,
+            currentDeviceId = CURRENT_DEVICE_ID,
+            requestedCursor = "old_cursor",
+            requestedLimit = 2,
+            previousEventId = 9,
+        )
+
+        val quarantined = validated.events[0] as ValidatedMessagingSyncEvent.Unsupported
+        assertEquals(10L, quarantined.eventId)
+        assertEquals("reaction.created", quarantined.type)
+        assertTrue(validated.events[1] is ValidatedMessagingSyncEvent.OutboundMessage)
+        assertEquals(11L, validated.lastEventId)
+    }
+
+    @Test
     fun `outbound projection accepts the server six digit message timestamp`() {
         val precise = "2026-07-19T12:02:00.123456Z"
         val eventTime = "2026-07-19T12:02:00.234567Z"
@@ -462,7 +489,6 @@ class SecureMessagingTransportValidatorTest {
             readReceiptEvent("12").copy(resourceId = OTHER_USER_ID),
             readReceiptEvent("12").copy(data = readReceiptEvent("12").data?.copy(userId = "bad")),
             readReceiptEvent("12").copy(occurredAt = SENT_AT),
-            readReceiptEvent(id = "12").copy(type = "reaction.changed"),
         ).forEach { unsupported ->
             assertRejected {
                 SecureMessagingTransportValidator.validateSyncPage(
@@ -1045,7 +1071,7 @@ class SecureMessagingTransportValidatorTest {
     }
 
     @Test
-    fun `sync rejects missing pagination nonmonotonic IDs unknown events and route substitution`() {
+    fun `sync rejects missing pagination nonmonotonic IDs malformed types and route substitution`() {
         val validEvent = incomingMessageEvent("10")
         val validPage = CursorPageDto(nextCursor = "next", hasMore = false, limit = 2)
         val malformed = listOf(
@@ -1069,7 +1095,7 @@ class SecureMessagingTransportValidatorTest {
                 page = validPage,
             ),
             MessagingSyncDto(
-                events = listOf(validEvent.copy(type = "future.unreviewed")),
+                events = listOf(validEvent.copy(type = "future unreviewed")),
                 page = validPage,
             ),
             MessagingSyncDto(
