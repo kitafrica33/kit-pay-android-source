@@ -10,6 +10,10 @@ import com.kit.wallet.data.messaging.KitPaymentAction
 import com.kit.wallet.data.messaging.KitPaymentMessage
 import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.data.messaging.SecureMediaSource
+import com.kit.wallet.data.messaging.SecureMediaAlbumSource
+import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.feature.chat.VoiceNoteRecorder
 import com.kit.wallet.data.messaging.SecureMessagingStateNotReadyException
 import com.kit.wallet.data.remote.KIT_NETWORK_UNAVAILABLE_MESSAGE
 import com.kit.wallet.data.remote.KitWalletApiException
@@ -41,6 +45,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
@@ -1016,7 +1021,7 @@ class ConversationViewModelTest {
     @Test
     fun `completed media send zeroizes picker plaintext`() = runTest {
         val repository = FakeChatRepository()
-        val viewModel = viewModel(repository)
+        val viewModel = viewModel(repository, sessions = MutableTestSessionStore(testSession(CURRENT_USER_ID)))
         val bytes = byteArrayOf(1, 2, 3, 4)
 
         viewModel.sendImage(bytes, "image/jpeg")
@@ -1024,6 +1029,7 @@ class ConversationViewModelTest {
         assertEquals(1, repository.sentImages.size)
         assertEquals(CHAT_ID, repository.sentImages.single().first)
         assertEquals("image/jpeg", repository.sentImages.single().second)
+        assertEquals(listOf(testSession(CURRENT_USER_ID).fence()), repository.mediaOwners)
         assertTrue(repository.sentImages.single().third.contentEquals(byteArrayOf(1, 2, 3, 4)))
         assertTrue(bytes.all { it == 0.toByte() })
     }
@@ -1031,7 +1037,7 @@ class ConversationViewModelTest {
     @Test
     fun `rejected media send zeroizes picker plaintext`() = runTest {
         val repository = FakeChatRepository(initiallyReady = false)
-        val viewModel = viewModel(repository)
+        val viewModel = viewModel(repository, sessions = MutableTestSessionStore(testSession(CURRENT_USER_ID)))
         val bytes = byteArrayOf(5, 6, 7, 8)
 
         viewModel.sendImage(bytes, "image/jpeg")
@@ -1043,7 +1049,7 @@ class ConversationViewModelTest {
     @Test
     fun `media send into a cleared scope still zeroizes picker plaintext`() = runTest {
         val repository = FakeChatRepository()
-        val viewModel = viewModel(repository)
+        val viewModel = viewModel(repository, sessions = MutableTestSessionStore(testSession(CURRENT_USER_ID)))
         viewModel.viewModelScope.cancel()
         val bytes = byteArrayOf(9, 10, 11, 12)
 
@@ -1052,6 +1058,53 @@ class ConversationViewModelTest {
 
         assertTrue(repository.sentImages.isEmpty())
         assertTrue(bytes.all { it == 0.toByte() })
+    }
+
+    @Test
+    fun `deferred media from a replaced group session is released without adoption`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val sessions = MutableTestSessionStore(testSession(CURRENT_USER_ID))
+        val repository = FakeChatRepository(isGroup = true)
+        val viewModel = viewModel(repository, sessions = sessions)
+        runCurrent()
+        val original = File.createTempFile("voice-handoff-", ".m4a").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+        val recording = VoiceNoteRecorder.Recording(listOf(original), 1_200L)
+        var opens = 0
+        var finished = 0
+        var sent = 0
+        val source = SecureMediaSource(declaredByteCount = original.length()) {
+            opens++
+            recording.source.open()
+        }
+        val bytes = byteArrayOf(4, 5, 6)
+        try {
+            // The UI accepted all three while A was active; their coroutine bodies have not run.
+            viewModel.sendMedia(source, "audio/mp4", onSent = { sent++ }, onFinished = {
+                recording.release()
+                finished++
+            })
+            viewModel.sendMediaAlbum(listOf(SecureMediaAlbumSource(source, "audio/mp4")),
+                onSent = { sent++ }, onFinished = { finished++ })
+            viewModel.sendMedia(bytes, "image/jpeg", onSent = { sent++ })
+            sessions.save(testSession(PEER_USER_ID))
+            runCurrent()
+            assertEquals(0, opens)
+            assertEquals(0, sent)
+            assertEquals(2, finished)
+            assertTrue(repository.mediaOwners.isEmpty())
+            assertTrue(repository.sentImages.isEmpty())
+            assertTrue(bytes.all { it == 0.toByte() })
+            assertFalse(original.exists())
+
+            // A result callback that arrives after replacement also cleans up synchronously.
+            viewModel.sendMedia(source, "audio/mp4", onFinished = { finished++ })
+            assertEquals(3, finished)
+            assertEquals(0, opens)
+        } finally {
+            viewModel.viewModelScope.cancel()
+            recording.release()
+            repository.deleteMediaScratch()
+        }
     }
 
     @Test
@@ -1525,7 +1578,7 @@ class ConversationViewModelTest {
     @Test
     fun `a photo can be the answer just as a sentence can`() = runTest {
         val repository = FakeChatRepository()
-        val viewModel = viewModel(repository)
+        val viewModel = viewModel(repository, sessions = MutableTestSessionStore(testSession(CURRENT_USER_ID)))
         val target = deliveredMessage("target-message", "what does it look like?")
 
         viewModel.beginReply(target)
@@ -1550,6 +1603,7 @@ class ConversationViewModelTest {
         wallet: WalletRepository = FakeWalletRepository(),
         realtime: KitConversationSignals = InertConversationSignals,
         typingSignaller: KitTypingSignals = RecordingTypingSignals(),
+        sessions: SessionStore? = null,
     ) = ConversationViewModel(
         chatRepo = repository,
         walletRepo = wallet,
@@ -1558,6 +1612,7 @@ class ConversationViewModelTest {
         messageSounds = NoOpMessageSoundPlayer,
         realtime = realtime,
         typingSignaller = typingSignaller,
+        sessions = sessions,
         savedStateHandle = SavedStateHandle(mapOf("chatId" to CHAT_ID)),
     )
 
@@ -1690,6 +1745,7 @@ class ConversationViewModelTest {
         private val mediaBlockUntil: CompletableDeferred<Unit>? = null,
         private val media: Map<String, ByteArray> = emptyMap(),
         private val albumMedia: Map<Pair<String, String>, ByteArray> = emptyMap(),
+        isGroup: Boolean = false,
     ) : ChatRepository {
         // Attachments are handed to the UI as files now, so the fake writes real ones into a
         // scratch directory the test tears down; nothing here can pass while production still
@@ -1704,7 +1760,7 @@ class ConversationViewModelTest {
             mediaDirectory.deleteRecursively()
         }
 
-        private val preview = ChatPreview(CHAT_ID, "Grace", "", "", peerUserId = PEER_USER_ID)
+        private val preview = ChatPreview(CHAT_ID, "Grace", "", "", peerUserId = PEER_USER_ID, isGroup = isGroup)
         override val readiness: StateFlow<Boolean> = MutableStateFlow(initiallyReady)
         override val localHistoryReady: StateFlow<Boolean> = MutableStateFlow(localHistoryReady)
         private val mutableChats = MutableStateFlow(if (initiallyLoaded) listOf(preview) else emptyList())
@@ -1713,6 +1769,7 @@ class ConversationViewModelTest {
         val sent = mutableListOf<Pair<String, String>>()
         val retried = mutableListOf<Triple<String, String, String>>()
         val sentImages = mutableListOf<Triple<String, String, ByteArray>>()
+        val mediaOwners = mutableListOf<SessionFence>()
         /** What each send in [sent] was answering, in the same order; null for a fresh remark. */
         val sentReplyTargets = mutableListOf<String?>()
         /** The same, for each send in [sentImages]. */
@@ -1772,6 +1829,29 @@ class ConversationViewModelTest {
             retried += Triple(chatId, clientMessageId, text)
             failure?.let { throw it }
             blockUntil?.await()
+        }
+
+        override suspend fun sendMediaMessageForOwner(
+            owner: SessionFence,
+            chatId: String,
+            source: SecureMediaSource,
+            mediaType: String,
+            caption: String?,
+            replyToMessageId: String?,
+        ) {
+            mediaOwners += owner
+            sendMediaMessage(chatId, source, mediaType, caption, replyToMessageId)
+        }
+
+        override suspend fun sendMediaAlbumMessageForOwner(
+            owner: SessionFence,
+            chatId: String,
+            attachments: List<SecureMediaAlbumSource>,
+            caption: String?,
+            replyToMessageId: String?,
+        ) {
+            mediaOwners += owner
+            attachments.forEach { sendMediaMessage(chatId, it.source, it.mediaType, caption, replyToMessageId) }
         }
 
         override suspend fun sendMediaMessage(

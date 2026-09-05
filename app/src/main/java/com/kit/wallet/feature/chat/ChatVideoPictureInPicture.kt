@@ -68,7 +68,11 @@ internal fun ChatVideoPictureInPictureEffect(isPlaying: Boolean) {
                 }
             }
             .build()
-        activity.setPictureInPictureParams(params)
+        // Feature advertisement does not guarantee the activity/window can enter PiP right now.
+        // A vendor or lifecycle rejection must leave ordinary playback available.
+        if (runCatching { activity.setPictureInPictureParams(params) }.isFailure) {
+            return@DisposableEffect onDispose { }
+        }
         // Below 12 there is no automatic hand-off, so the last moment before the app goes away is
         // the only moment the window can be asked for.
         val leaveHint = Runnable {

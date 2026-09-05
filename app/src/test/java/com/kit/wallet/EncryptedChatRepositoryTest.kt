@@ -1506,6 +1506,130 @@ class EncryptedChatRepositoryTest {
     }
 
     @Test
+    fun `owner pinned media rejects a retired login before importing single or album sources`() =
+        runTest {
+            val original = testSession(USER_TWO, sessionId = "session-one")
+            val authentication = MutableTestSessionStore(original)
+            val runtime = FakeRuntime().apply {
+                conversations += groupConversation(
+                    GROUP_ONE,
+                    "Shared group",
+                    listOf(USER_ONE to "Grace", USER_THREE to "Emma"),
+                )
+            }
+            val queue = ImmediateSendIntentStore(TestSecureMessagingStateStore(), authentication)
+            val directory = Files.createTempDirectory("kit-owner-pinned-media-rejection").toFile()
+            val spoolDirectory = File(directory, "spool")
+            val cacheDirectory = File(directory, "cache")
+            var sourceOpens = 0
+            fun source() = SecureMediaSource(declaredByteCount = 13) {
+                sourceOpens += 1
+                ByteArrayInputStream("private draft".toByteArray())
+            }
+            try {
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = queue,
+                    immediateMediaSpool = ImmediateMediaSpool(spoolDirectory),
+                    secureMediaCache = SecureMediaCache(cacheDirectory),
+                )
+                runCurrent()
+                val replacement = testSession(USER_THREE, sessionId = "session-two")
+                authentication.save(replacement)
+                runtime.conversations[0] = runtime.conversations.single().copy(viewerUserId = USER_THREE)
+                runtime.activate("session-two", ownerAccountId = USER_THREE)
+                runCurrent()
+                assertTrue(repository.chat(GROUP_ONE)?.isGroup == true)
+
+                val singleFailure = runCatching {
+                    repository.sendMediaMessageForOwner(
+                        original.fence(), GROUP_ONE, source(), "audio/mp4",
+                    )
+                }.exceptionOrNull()
+                assertTrue(singleFailure is SessionInvalidatedException)
+                // Both the normal album and its one-item fallback must retain A's owner.
+                for (count in listOf(1, 2)) {
+                    val albumFailure = runCatching {
+                        repository.sendMediaAlbumMessageForOwner(
+                            original.fence(),
+                            GROUP_ONE,
+                            List(count) { SecureMediaAlbumSource(source(), "image/jpeg") },
+                        )
+                    }.exceptionOrNull()
+                    assertTrue(albumFailure is SessionInvalidatedException)
+                }
+                runCurrent()
+                assertEquals(0, sourceOpens)
+                assertTrue(queue.items.value.isEmpty())
+                assertTrue(runtime.sendAttempts.isEmpty())
+                assertFalse(cacheDirectory.walkTopDown().any(File::isFile))
+                assertFalse(spoolDirectory.walkTopDown().any(File::isFile))
+            } finally {
+                directory.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `owner pinned media keeps shared group replies for single attachments and albums`() =
+        runTest {
+            val authentication = MutableTestSessionStore(
+                testSession(USER_TWO, sessionId = "session-one"),
+            )
+            val owner = checkNotNull(authentication.current()).fence()
+            val runtime = FakeRuntime().apply {
+                conversations += groupConversation(
+                    GROUP_ONE,
+                    "Shared group",
+                    listOf(USER_ONE to "Grace", USER_THREE to "Emma"),
+                )
+                projected += message(TARGET_MESSAGE_ID, GROUP_ONE, "Reply here", fromMe = false)
+            }
+            val queue = ImmediateSendIntentStore(TestSecureMessagingStateStore(), authentication)
+            val directory = Files.createTempDirectory("kit-owner-pinned-media-replies").toFile()
+            try {
+                val repository = repository(
+                    runtime,
+                    authenticationSessions = authentication,
+                    immediateSends = queue,
+                    immediateMediaSpool = ImmediateMediaSpool(File(directory, "spool")),
+                    secureMediaCache = SecureMediaCache(File(directory, "cache")),
+                )
+                runCurrent()
+                repository.sendMediaMessageForOwner(
+                    owner = owner,
+                    chatId = GROUP_ONE,
+                    source = SecureMediaSource.ofBytes("voice reply".toByteArray()),
+                    mediaType = "audio/mp4",
+                    caption = "Voice",
+                    replyToMessageId = TARGET_MESSAGE_ID,
+                )
+                for (count in listOf(1, 2)) {
+                    repository.sendMediaAlbumMessageForOwner(
+                        owner = owner,
+                        chatId = GROUP_ONE,
+                        attachments = albumSources(*Array(count) { "photo $it" }),
+                        caption = "Photos $count",
+                        replyToMessageId = TARGET_MESSAGE_ID,
+                    )
+                }
+                runCurrent()
+                val queued = queue.items.value
+                assertEquals(3, queued.size)
+                assertEquals(setOf("Voice", "Photos 1", "Photos 2"), queued.map { it.caption }.toSet())
+                assertTrue(queued.all { it.conversationId == GROUP_ONE })
+                assertTrue(queued.all { it.replyToMessageId == TARGET_MESSAGE_ID })
+                assertTrue(queued.all { it.state == ImmediateSendState.PREPARING })
+                assertEquals(2, queued.single { it.kind == ImmediateSendKind.MEDIA_V2 }.mediaItems.size)
+                assertEquals(owner, queue.currentOwnerFence())
+                assertTrue(File(directory, "cache").walkTopDown().any(File::isFile))
+                assertTrue(runtime.sendAttempts.isEmpty())
+            } finally {
+                directory.deleteRecursively()
+            }
+        }
+
+    @Test
     fun `notification reply is durable before hydration and replay is content bound`() = runTest {
         val disk = TestSecureMessagingStateStore()
         val authentication = MutableTestSessionStore(

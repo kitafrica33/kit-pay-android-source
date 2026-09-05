@@ -40,3 +40,55 @@ internal object CameraPull {
 
     data class CollapseResult(val revealPx: Float, val consumedY: Float)
 }
+
+/** One real finger gesture; cancellation, layout changes and release consume its eligibility. */
+internal class CameraPullGesture(private val maximumPx: Float, private val thresholdPx: Float) {
+    var revealPx: Float = 0f
+        private set
+    var active: Boolean = false
+        private set
+    private var hapticSent = false
+
+    val pastThreshold: Boolean get() = active && CameraPull.shouldOpen(revealPx, thresholdPx)
+
+    fun begin(atBottom: Boolean, enabled: Boolean) {
+        cancel()
+        active = atBottom && enabled
+        hapticSent = false
+    }
+
+    fun pull(availableY: Float, userInput: Boolean, atBottom: Boolean): Float {
+        if (!active || !userInput || !availableY.isFinite()) return 0f
+        if (!atBottom) {
+            cancel()
+            return 0f
+        }
+        val previous = revealPx
+        revealPx = CameraPull.pull(revealPx, availableY, maximumPx)
+        return previous - revealPx
+    }
+
+    fun collapse(availableY: Float): Float {
+        if (!active || !availableY.isFinite()) return 0f
+        val result = CameraPull.collapse(revealPx, availableY)
+        revealPx = result.revealPx
+        return result.consumedY
+    }
+
+    fun takeThresholdHaptic(): Boolean {
+        if (!pastThreshold || hapticSent) return false
+        hapticSent = true
+        return true
+    }
+
+    fun release(completed: Boolean): Boolean {
+        val open = completed && pastThreshold
+        cancel()
+        return open
+    }
+
+    fun cancel() {
+        active = false
+        revealPx = 0f
+    }
+}

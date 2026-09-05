@@ -4,7 +4,6 @@ import android.content.ContentValues
 import android.content.Intent
 import android.os.Build
 import android.provider.MediaStore
-import android.widget.VideoView
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -46,6 +45,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -61,7 +61,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.kit.wallet.data.messaging.SecureMediaFile
@@ -73,6 +72,8 @@ import com.kit.wallet.ui.model.MessageReaction
 import com.kit.wallet.ui.model.acceptsReactions
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** Media kinds the connected gallery can page through. */
@@ -123,6 +124,8 @@ internal fun ConversationMediaGallery(
         .coerceAtLeast(0)
     val pagerState = rememberPagerState(initialPage = initialPage) { mediaMessages.size }
     var actionNotice by remember { mutableStateOf<String?>(null) }
+    var saving by remember { mutableStateOf(false) }
+    val actionScope = rememberCoroutineScope()
     var paletteOpen by remember { mutableStateOf(false) }
     var pickerOpen by remember { mutableStateOf(false) }
     var reactorsOpen by remember { mutableStateOf(false) }
@@ -168,7 +171,11 @@ internal fun ConversationMediaGallery(
                     media != null && message.kind == MessageKind.IMAGE ->
                         ZoomableGalleryImage(messageId = message.id, media = media)
                     media != null && message.kind == MessageKind.VIDEO ->
-                        GalleryVideoPage(message = message, media = media)
+                        GalleryVideoPage(
+                            message = message,
+                            media = media,
+                            isActive = page == pagerState.currentPage,
+                        )
                     mediaErrors.containsKey(message.id) -> GalleryStatePage(
                         text = mediaErrors[message.id] ?: "This media could not be loaded",
                         actionLabel = "Tap to retry",
@@ -255,14 +262,28 @@ internal fun ConversationMediaGallery(
                     )
                 }
                 IconButton(
-                    enabled = currentMedia != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
+                    enabled = !saving && currentMedia != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
                     onClick = {
                         val message = current ?: return@IconButton
                         val media = currentMedia ?: return@IconButton
-                        actionNotice = runCatching {
-                            saveGalleryMedia(context, message, media.file)
-                            "Saved to your gallery"
-                        }.getOrElse { "This media could not be saved" }
+                        if (saving) return@IconButton
+                        saving = true
+                        actionScope.launch {
+                            try {
+                                withContext(Dispatchers.IO) {
+                                    chatMediaPlaybackLease(context, media).use { lease ->
+                                        saveGalleryMedia(context, message, lease.file)
+                                    }
+                                }
+                                actionNotice = "Saved to your gallery"
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                actionNotice = "This media could not be saved"
+                            } finally {
+                                saving = false
+                            }
+                        }
                     },
                 ) {
                     Icon(
@@ -395,8 +416,13 @@ internal fun ConversationMediaGallery(
 /** Pinch, pan and double-tap zoom for one decrypted photo, clamped to sensible bounds. */
 @Composable
 private fun ZoomableGalleryImage(messageId: String, media: SecureMediaFile) {
-    val bitmap by produceState<ImageBitmap?>(initialValue = null, messageId) {
-        value = withContext(Dispatchers.Default) { decodeBoundedSecureImage(media.file) }
+    val context = LocalContext.current
+    val bitmap by produceState<ImageBitmap?>(initialValue = null, messageId, media) {
+        value = withContext(Dispatchers.Default) {
+            runCatching {
+                chatMediaPlaybackLease(context, media).use { lease -> decodeBoundedSecureImage(lease.file) }
+            }.getOrNull()
+        }
     }
     var scale by remember(messageId) { mutableFloatStateOf(1f) }
     var offset by remember(messageId) { mutableStateOf(Offset.Zero) }
@@ -450,7 +476,7 @@ private fun ZoomableGalleryImage(messageId: String, media: SecureMediaFile) {
 
 /** Full-screen playback through a stable lease on the local copy, without a second large file. */
 @Composable
-private fun GalleryVideoPage(message: Message, media: SecureMediaFile) {
+private fun GalleryVideoPage(message: Message, media: SecureMediaFile, isActive: Boolean) {
     val context = LocalContext.current
     var playing by remember(message.id) { mutableStateOf(false) }
     var playbackLease by remember(message.id) {
@@ -461,12 +487,18 @@ private fun GalleryVideoPage(message: Message, media: SecureMediaFile) {
         val heldLease = playbackLease
         onDispose { heldLease?.close() }
     }
+    LaunchedEffect(isActive, media) {
+        if (!isActive) {
+            playing = false
+            playbackLease = null
+        }
+    }
     // A video the user started is theirs until it ends: leaving Kit Pay hands it to the system's
     // floating window instead of cutting it off, and the window goes when the video does.
-    ChatVideoPictureInPictureEffect(isPlaying = playing)
-    if (!playing) {
+    if (isActive) ChatVideoPictureInPictureEffect(isPlaying = playing)
+    if (!playing || !isActive) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            val poster by produceState<ImageBitmap?>(initialValue = null, message.id) {
+            val poster by produceState<ImageBitmap?>(initialValue = null, message.id, media) {
                 value = withContext(Dispatchers.Default) {
                     runCatching {
                         chatMediaPlaybackLease(context, media).use { lease ->
@@ -520,28 +552,18 @@ private fun GalleryVideoPage(message: Message, media: SecureMediaFile) {
         }
     } else {
         val lease = playbackLease ?: return
-        AndroidView(
-            factory = { viewContext ->
-                VideoView(viewContext).apply {
-                    setVideoPath(lease.file.absolutePath)
-                    setMediaController(android.widget.MediaController(viewContext).also {
-                        it.setAnchorView(this)
-                    })
-                    setOnPreparedListener { player -> player.start() }
-                    // The end of the video is the end of the floating window.
-                    setOnCompletionListener {
-                        playing = false
-                        playbackLease = null
-                    }
-                    setOnErrorListener { _, _, _ ->
-                        playing = false
-                        playbackLease = null
-                        false
-                    }
-                }
-            },
+        ChatVideoPlayer(
+            file = lease.file,
             modifier = Modifier.fillMaxSize(),
-            onRelease = { view -> view.stopPlayback() },
+            onCompleted = {
+                playing = false
+                playbackLease = null
+            },
+            onError = {
+                playbackFailed = true
+                playing = false
+                playbackLease = null
+            },
         )
     }
 }
@@ -597,7 +619,7 @@ private fun shareGalleryMedia(
 }
 
 /** Saves the decrypted media into the public gallery via MediaStore (API 29+ scoped storage). */
-private fun saveGalleryMedia(
+internal fun saveGalleryMedia(
     context: android.content.Context,
     message: Message,
     source: File,
@@ -617,15 +639,26 @@ private fun saveGalleryMedia(
             "KitPay-${message.id.take(8)}.${chatMediaFileExtension(mediaType)}",
         )
         put(MediaStore.MediaColumns.MIME_TYPE, mediaType)
-        put(MediaStore.MediaColumns.RELATIVE_PATH, "${android.os.Environment.DIRECTORY_PICTURES}/Kit Pay")
+        val directory = if (isVideo) android.os.Environment.DIRECTORY_MOVIES
+            else android.os.Environment.DIRECTORY_PICTURES
+        put(MediaStore.MediaColumns.RELATIVE_PATH, "$directory/Kit Pay")
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
     }
     val uri = checkNotNull(context.contentResolver.insert(collection, values)) {
         "The gallery did not accept this media"
     }
-    // Streamed, not written in one go: a saved video is as large as the wire now allows.
-    context.contentResolver.openOutputStream(uri)?.use { output ->
-        source.inputStream().use { input -> input.copyTo(output) }
-    } ?: error("The gallery entry could not be written")
+    var published = false
+    try {
+        context.contentResolver.openOutputStream(uri)?.use { output ->
+            source.inputStream().use { input -> input.copyTo(output) }
+        } ?: error("The gallery entry could not be written")
+        check(context.contentResolver.update(uri, ContentValues().apply {
+            put(MediaStore.MediaColumns.IS_PENDING, 0)
+        }, null, null) == 1) { "The gallery entry could not be published" }
+        published = true
+    } finally {
+        if (!published) runCatching { context.contentResolver.delete(uri, null, null) }
+    }
 }
 
 /** Cleans stale decrypted temp files left behind by interrupted viewers, on a best-effort basis. */

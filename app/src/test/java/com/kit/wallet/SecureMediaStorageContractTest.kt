@@ -69,16 +69,18 @@ class SecureMediaStorageContractTest {
         val gallery = source(
             "app/src/main/java/com/kit/wallet/feature/chat/MediaGalleryViewer.kt",
         )
+        val player = source("app/src/main/java/com/kit/wallet/feature/chat/ChatVideoPlayer.kt")
 
         assertTrue(bubbles.split("chatMediaPlaybackLease(context, media)").size - 1 >= 2)
         assertTrue(bubbles.contains("DisposableEffect(lease)"))
-        assertTrue(bubbles.contains("setVideoPath(lease.file.absolutePath)"))
+        assertTrue(bubbles.contains("file = lease.file"))
         assertTrue(bubbles.split("launchWithChatMediaUri(context, media)").size - 1 >= 2)
         assertFalse(bubbles.contains("playerFile = media.file"))
         assertFalse(bubbles.contains("viewerFile = media.file"))
 
         assertTrue(gallery.contains("chatMediaPlaybackLease(context, media)"))
-        assertTrue(gallery.contains("setVideoPath(lease.file.absolutePath)"))
+        assertTrue(gallery.contains("file = lease.file"))
+        assertTrue(player.contains("setVideoPath(file.absolutePath)"))
         assertTrue(gallery.contains("launchWithChatMediaUri(context, media)"))
         assertFalse(gallery.contains("setVideoPath(media.file.absolutePath)"))
     }

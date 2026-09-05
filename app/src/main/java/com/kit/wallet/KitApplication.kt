@@ -12,6 +12,9 @@ import com.kit.wallet.data.notifications.PushMessagingTransport
 import com.kit.wallet.data.notifications.PushTokenCoordinator
 import com.kit.wallet.data.realtime.KitRealtimeCoordinator
 import com.kit.wallet.feature.calls.KitTelecomBridge
+import com.kit.wallet.feature.chat.VoiceNotePlayer
+import com.kit.wallet.feature.chat.VoiceNoteDrafts
+import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.worker.ForegroundWalletRefreshCoordinator
 import com.kit.wallet.worker.WalletRefreshScheduler
 import dagger.hilt.android.HiltAndroidApp
@@ -25,6 +28,7 @@ class KitApplication : Application(), Configuration.Provider, ImageLoaderFactory
     @Inject lateinit var pushMessagingTransport: dagger.Lazy<PushMessagingTransport>
     @Inject lateinit var pushTokens: dagger.Lazy<PushTokenCoordinator>
     @Inject lateinit var telecomBridge: dagger.Lazy<KitTelecomBridge>
+    @Inject lateinit var sessions: dagger.Lazy<SessionStore>
     @Inject internal lateinit var realtime: dagger.Lazy<KitRealtimeCoordinator>
     @Inject internal lateinit var foregroundWalletRefresh:
         dagger.Lazy<ForegroundWalletRefreshCoordinator>
@@ -45,6 +49,8 @@ class KitApplication : Application(), Configuration.Provider, ImageLoaderFactory
 
     override fun onCreate() {
         super.onCreate()
+        VoiceNotePlayer.bindToSession(sessions.get().session)
+        VoiceNoteDrafts.bindToSession(sessions.get().session)
         // Local encrypted history is restored independently of WorkManager's connected-network
         // constraint. The bootstrapper itself waits for the exact session-owned state gate.
         messagingLocalHistory.get().start()

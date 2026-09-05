@@ -1,5 +1,7 @@
 package com.kit.wallet.feature.chat
 
+import com.kit.wallet.data.session.SessionFence
+
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -23,6 +25,7 @@ internal data class VoiceNotePlaybackContext(
      * the thread still says where it came from.
      */
     val conversationTitle: String = "",
+    val sessionOwner: SessionFence? = null,
 ) {
     /** What the floating bar puts on its first line: who is speaking, never the note itself. */
     val title: String get() = speaker.ifBlank { "Voice note" }
@@ -49,11 +52,13 @@ internal data class VoiceNoteChatContext(
     val conversationId: String = "",
     val conversationTitle: String = "",
     val displayName: (String) -> String = { "Kit Pay user" },
+    val sessionOwner: SessionFence? = null,
 ) {
     fun playbackContext(senderUserId: String?): VoiceNotePlaybackContext = VoiceNotePlaybackContext(
         conversationId = conversationId,
         speaker = displayName(senderUserId.orEmpty()),
         conversationTitle = conversationTitle,
+        sessionOwner = sessionOwner,
     )
 }
 

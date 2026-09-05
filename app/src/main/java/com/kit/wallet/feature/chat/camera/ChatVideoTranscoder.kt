@@ -6,9 +6,9 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import com.kit.wallet.data.media.MediaVideoRemuxPlan
 import com.kit.wallet.data.media.MediaVideoRemuxer
+import com.kit.wallet.data.media.decodeVideoFrame
 import java.io.ByteArrayOutputStream
 import java.io.File
-import kotlin.math.max
 
 internal const val MIN_CLIP_MILLIS = 500L
 
@@ -98,35 +98,19 @@ internal object ChatVideoTranscoder {
 
     /** Extracts a poster frame at [atMillis] as a JPEG, or null. */
     fun posterFrame(source: File, atMillis: Long, maxDimension: Int): ByteArray? {
-        val retriever = MediaMetadataRetriever()
-        var frame: Bitmap? = null
-        var scaled: Bitmap? = null
+        val frame = decodeVideoFrame(
+            source,
+            timeMicros = atMillis.coerceIn(0L, Long.MAX_VALUE / 1_000) * 1_000,
+            maxDimension = maxDimension,
+        ) ?: return null
         return try {
-            retriever.setDataSource(source.absolutePath)
-            val decoded = retriever.getFrameAtTime(atMillis * 1_000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                ?: return null
-            frame = decoded
-            val longest = max(decoded.width, decoded.height)
-            val poster = if (longest > maxDimension) {
-                val scale = maxDimension.toFloat() / longest
-                Bitmap.createScaledBitmap(
-                    decoded,
-                    max(1, (decoded.width * scale).toInt()),
-                    max(1, (decoded.height * scale).toInt()),
-                    true,
-                ).also { scaled = it }
-            } else {
-                decoded
-            }
             val output = ByteArrayOutputStream()
-            if (!poster.compress(Bitmap.CompressFormat.JPEG, 85, output)) return null
+            if (!frame.compress(Bitmap.CompressFormat.JPEG, 85, output)) return null
             output.toByteArray()
         } catch (_: Exception) {
             null
         } finally {
-            runCatching { retriever.release() }
-            runCatching { scaled?.recycle() }
-            runCatching { frame?.recycle() }
+            frame.recycle()
         }
     }
 

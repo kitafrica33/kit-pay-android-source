@@ -3645,6 +3645,23 @@ class EncryptedChatRepository @Inject internal constructor(
         idempotentClientMessageId = clientMessageId,
     )
 
+    override suspend fun sendMediaMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        source: SecureMediaSource,
+        mediaType: String,
+        caption: String?,
+        replyToMessageId: String?,
+    ) = sendMediaMessageInternal(
+        chatId = chatId,
+        source = source,
+        mediaType = mediaType,
+        caption = caption,
+        replyToMessageId = replyToMessageId,
+        expectedOwner = owner,
+        idempotentClientMessageId = null,
+    )
+
     private suspend fun sendMediaMessageInternal(
         chatId: String,
         source: SecureMediaSource,
@@ -4095,6 +4112,21 @@ class EncryptedChatRepository @Inject internal constructor(
         replyToMessageId = null,
         expectedOwner = owner,
         idempotentClientMessageId = clientMessageId,
+    )
+
+    override suspend fun sendMediaAlbumMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        attachments: List<SecureMediaAlbumSource>,
+        caption: String?,
+        replyToMessageId: String?,
+    ) = sendMediaAlbumMessageInternal(
+        chatId = chatId,
+        attachments = attachments,
+        caption = caption,
+        replyToMessageId = replyToMessageId,
+        expectedOwner = owner,
+        idempotentClientMessageId = null,
     )
 
     /**

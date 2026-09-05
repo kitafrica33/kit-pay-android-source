@@ -1,12 +1,52 @@
 package com.kit.wallet
 
 import com.kit.wallet.feature.chat.camera.CameraPull
+import com.kit.wallet.feature.chat.camera.CameraPullGesture
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ConversationCameraPullTest {
+    @Test
+    fun `only a gesture beginning at bottom may arm and programmatic deltas are ignored`() {
+        val gesture = CameraPullGesture(160f, 120f)
+        gesture.begin(atBottom = false, enabled = true)
+        assertEquals(0f, gesture.pull(-200f, userInput = true, atBottom = true), EPSILON)
+        assertFalse(gesture.release(completed = true))
+        gesture.begin(atBottom = true, enabled = true)
+        assertEquals(0f, gesture.pull(-200f, userInput = false, atBottom = true), EPSILON)
+        assertFalse(gesture.release(completed = true))
+    }
+
+    @Test
+    fun `camera opens only once after a completed eligible release`() {
+        val gesture = CameraPullGesture(160f, 120f)
+        gesture.begin(atBottom = true, enabled = true)
+        gesture.pull(-130f, userInput = true, atBottom = true)
+        assertTrue(gesture.takeThresholdHaptic())
+        assertFalse(gesture.takeThresholdHaptic())
+        assertTrue(gesture.release(completed = true))
+        assertFalse(gesture.release(completed = true))
+        assertEquals(0f, gesture.revealPx, EPSILON)
+    }
+
+    @Test
+    fun `cancelled or retracted pulls never launch and haptic occurs once per gesture`() {
+        val gesture = CameraPullGesture(160f, 120f)
+        gesture.begin(atBottom = true, enabled = true)
+        gesture.pull(-130f, userInput = true, atBottom = true)
+        assertTrue(gesture.takeThresholdHaptic())
+        gesture.collapse(20f)
+        assertFalse(gesture.pastThreshold)
+        gesture.pull(-20f, userInput = true, atBottom = true)
+        assertFalse(gesture.takeThresholdHaptic())
+        assertFalse(gesture.release(completed = false))
+        gesture.begin(atBottom = true, enabled = true)
+        gesture.pull(-130f, userInput = true, atBottom = true)
+        gesture.cancel() // viewport change, chat switch or lost gesture
+        assertFalse(gesture.release(completed = true))
+    }
 
     @Test
     fun `upward leftover delta grows the reveal`() {

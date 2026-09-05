@@ -2,7 +2,6 @@ package com.kit.wallet.feature.chat
 
 import android.content.ActivityNotFoundException
 import android.content.Intent
-import android.widget.VideoView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
@@ -59,7 +58,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.semantics.contentDescription
@@ -106,16 +104,16 @@ internal fun SecureVoiceNoteContent(
     val context = LocalContext.current
     val chatContext = LocalVoiceNoteChatContext.current
     val playback by VoiceNotePlayer.state.collectAsStateWithLifecycle()
-    val isCurrent = playback.isCurrent(msg.id)
+    val isCurrent = playback.isCurrent(msg.id) && playback.playing?.context?.sessionOwner == chatContext.sessionOwner
     val playing = isCurrent && !playback.isPaused
     val progress = if (isCurrent) playback.progress else 0f
     var playbackError by remember(msg.id) { mutableStateOf<String?>(null) }
 
     // The player is told where its own bubble is, so it knows whether anything on screen can still
     // stop it. Only the playing note's report is listened to, so a row scrolling by cannot lie.
-    DisposableEffect(msg.id) {
-        VoiceNotePlayer.noteSourceVisibility(true, msg.id)
-        onDispose { VoiceNotePlayer.noteSourceVisibility(false, msg.id) }
+    DisposableEffect(msg.id, chatContext.sessionOwner) {
+        VoiceNotePlayer.noteSourceVisibility(true, msg.id, chatContext.sessionOwner)
+        onDispose { VoiceNotePlayer.noteSourceVisibility(false, msg.id, chatContext.sessionOwner) }
     }
 
     val accent = LocalContentColor.current
@@ -345,14 +343,23 @@ internal fun SecureVideoContent(
         )
     }
     playerLease?.let { lease ->
-        SecureVideoPlayerDialog(lease = lease, onDismiss = {
-            playerLease = null
-        })
+        SecureVideoPlayerDialog(
+            lease = lease,
+            onDismiss = { playerLease = null },
+            onError = {
+                playbackError = "This video could not be played. Tap to retry."
+                playerLease = null
+            },
+        )
     }
 }
 
 @Composable
-private fun SecureVideoPlayerDialog(lease: SecureMediaLease, onDismiss: () -> Unit) {
+private fun SecureVideoPlayerDialog(
+    lease: SecureMediaLease,
+    onDismiss: () -> Unit,
+    onError: () -> Unit = onDismiss,
+) {
     DisposableEffect(lease) {
         onDispose { lease.close() }
     }
@@ -365,15 +372,11 @@ private fun SecureVideoPlayerDialog(lease: SecureMediaLease, onDismiss: () -> Un
                 .fillMaxSize()
                 .background(Color.Black),
         ) {
-            AndroidView(
-                factory = { viewContext ->
-                    VideoView(viewContext).apply {
-                        setVideoPath(lease.file.absolutePath)
-                        setOnPreparedListener { player -> player.start() }
-                    }
-                },
+            ChatVideoPlayer(
+                file = lease.file,
                 modifier = Modifier.fillMaxSize(),
-                onRelease = { view -> view.stopPlayback() },
+                onCompleted = onDismiss,
+                onError = onError,
             )
             IconButton(
                 onClick = onDismiss,
@@ -948,14 +951,14 @@ private fun MediaAlbumAudioRow(
     val loading = itemKey in mediaLoading
     val mediaError = mediaErrors[itemKey]
     val playback by VoiceNotePlayer.state.collectAsStateWithLifecycle()
-    val isCurrent = playback.isCurrent(itemKey)
+    val isCurrent = playback.isCurrent(itemKey) && playback.playing?.context?.sessionOwner == chatContext.sessionOwner
     val playing = isCurrent && !playback.isPaused
     val progress = if (isCurrent) playback.progress else 0f
     var playbackError by remember(itemKey) { mutableStateOf<String?>(null) }
 
-    DisposableEffect(itemKey) {
-        VoiceNotePlayer.noteSourceVisibility(true, itemKey)
-        onDispose { VoiceNotePlayer.noteSourceVisibility(false, itemKey) }
+    DisposableEffect(itemKey, chatContext.sessionOwner) {
+        VoiceNotePlayer.noteSourceVisibility(true, itemKey, chatContext.sessionOwner)
+        onDispose { VoiceNotePlayer.noteSourceVisibility(false, itemKey, chatContext.sessionOwner) }
     }
 
     val accent = LocalContentColor.current

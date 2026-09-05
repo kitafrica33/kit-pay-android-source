@@ -680,6 +680,16 @@ interface ChatRepository {
         error("This chat repository does not support secure media messages")
     }
 
+    /** Keeps a picker or recording owned by the login that opened its conversation. */
+    suspend fun sendMediaMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        source: SecureMediaSource,
+        mediaType: String,
+        caption: String? = null,
+        replyToMessageId: String? = null,
+    ): Unit = error("Owner-pinned secure media messaging is unavailable")
+
     /** Media equivalent of [sendIdempotentMessageForOwner]. */
     suspend fun sendIdempotentMediaMessageForOwner(
         owner: SessionFence,
@@ -704,6 +714,15 @@ interface ChatRepository {
         caption: String? = null,
         replyToMessageId: String? = null,
     ): Unit = error("This chat repository does not support media albums")
+
+    /** Owner-pinned album acceptance, including the chosen reply target. */
+    suspend fun sendMediaAlbumMessageForOwner(
+        owner: SessionFence,
+        chatId: String,
+        attachments: List<SecureMediaAlbumSource>,
+        caption: String? = null,
+        replyToMessageId: String? = null,
+    ): Unit = error("Owner-pinned media albums are unavailable")
 
     /** Album equivalent of [sendIdempotentMediaMessageForOwner]. */
     suspend fun sendIdempotentMediaAlbumMessageForOwner(

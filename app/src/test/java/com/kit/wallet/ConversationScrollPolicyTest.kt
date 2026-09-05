@@ -2,6 +2,7 @@ package com.kit.wallet
 
 import com.kit.wallet.feature.chat.ConversationScrollAction
 import com.kit.wallet.feature.chat.conversationScrollDecision
+import com.kit.wallet.feature.chat.isConversationNearBottom
 import com.kit.wallet.feature.chat.shouldRepinAfterGroupPaymentHydration
 import com.kit.wallet.feature.chat.shouldReleaseOpeningBottomAnchor
 import com.kit.wallet.ui.model.Message
@@ -10,6 +11,29 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class ConversationScrollPolicyTest {
+    @Test
+    fun `seeing the top of a tall final message does not mean the reader is at the bottom`() {
+        assertEquals(false, isConversationNearBottom(10, 8, 2000, 700, 80))
+        assertEquals(false, isConversationNearBottom(10, 9, 2000, 700, 80))
+        assertEquals(true, isConversationNearBottom(10, 9, 750, 700, 80))
+        assertEquals(true, isConversationNearBottom(10, 9, 700, 700, 80))
+        assertEquals(false, isConversationNearBottom(10, null, null, 700, 80))
+    }
+
+    @Test
+    fun `an outgoing delivery during focus navigation cannot override its target`() {
+        assertEquals(
+            ConversationScrollAction.KEEP_POSITION,
+            conversationScrollDecision(
+                previousMessageIds = setOf("old"),
+                messages = listOf(message("old"), message("sent", fromMe = true)),
+                nearBottom = true,
+                focusPending = true,
+                openingBottomAnchorActive = true,
+            ).action,
+        )
+    }
+
     @Test
     fun `first vertical user delta releases opening anchor before list consumption`() {
         assertEquals(true, shouldReleaseOpeningBottomAnchor(userInput = true, verticalDelta = -1f))

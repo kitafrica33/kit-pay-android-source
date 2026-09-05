@@ -5,11 +5,13 @@ import android.graphics.Bitmap
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
-import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import androidx.core.content.FileProvider
+import com.kit.wallet.data.media.decodeVideoFrame
+import com.kit.wallet.data.session.SessionTokens
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.messaging.SecureMediaFile
 import com.kit.wallet.data.messaging.SecureMediaLease
 import kotlinx.coroutines.CoroutineScope
@@ -23,12 +25,15 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileInputStream
+import java.util.UUID
 import kotlin.math.max
 
 /** The note the player is currently on, with everything the floating bar needs to name it. */
 internal data class VoiceNotePlayingNote(
     val id: String,
     val context: VoiceNotePlaybackContext,
+    /** Notification commands remain attached to this exact playback, even for the same note. */
+    val transportToken: String = UUID.randomUUID().toString(),
 )
 
 /** Everything the bubble, the floating bar and the notification each draw from. */
@@ -73,18 +78,23 @@ internal object VoiceNotePlayer {
     private var appContext: Context? = null
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
+    private var focusListener: AudioManager.OnAudioFocusChangeListener? = null
+    private var sessionBinding: VoiceNoteSessionBinding? = null
+    private var sessionJob: Job? = null
 
-    /**
-     * An interruption — a call, another app taking the output — leaves the note paused rather than
-     * silently "playing" into a stream it no longer owns.
-     */
-    private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
-        when (change) {
-            AudioManager.AUDIOFOCUS_LOSS -> stop()
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK,
-            -> pause()
-        }
+    /** App-scoped observation keeps paused/background notes fenced even without a visible UI. */
+    fun bindToSession(sessions: StateFlow<SessionTokens?>) {
+        stop()
+        sessionJob?.cancel()
+        val binding = VoiceNoteSessionBinding(sessions)
+        sessionBinding = binding
+        sessionJob = scope.launch { binding.watch(::stop) }
+    }
+
+    private fun requirePlaybackOwner(): Boolean {
+        if (sessionBinding?.ownsCurrentSession() == true) return true
+        stop()
+        return false
     }
 
     // MARK: Transport
@@ -99,12 +109,24 @@ internal object VoiceNotePlayer {
         file: File,
         playbackContext: VoiceNotePlaybackContext,
     ) {
+        if (sessionBinding?.matches(playbackContext.sessionOwner) != true) {
+            // A delayed click from A must not stop B's valid player. Only retire playback
+            // when the player itself no longer belongs to the live session.
+            if (mutableState.value.playing != null && sessionBinding?.ownsCurrentSession() != true) stop()
+            return
+        }
         appContext = context.applicationContext
-        if (mutableState.value.isCurrent(messageId) && player != null) {
+        val current = mutableState.value
+        if (
+            current.isCurrent(messageId) && player != null &&
+            current.playing?.context?.sessionOwner == playbackContext.sessionOwner &&
+            current.playing?.context?.conversationId == playbackContext.conversationId
+        ) {
             if (mutableState.value.isPaused) resume() else pause()
             return
         }
         stop()
+        if (sessionBinding?.claim(playbackContext.sessionOwner) != true) return
         // A live call owns the audio route; a voice note must never take it away.
         if (isCallInProgress()) return
         if (!requestAudioFocus()) return
@@ -119,12 +141,14 @@ internal object VoiceNotePlayer {
             created.setAudioAttributes(playbackAttributes())
             created.setDataSource(opened.fd)
             created.prepare()
-            created.setOnCompletionListener { stop() }
+            check(sessionBinding?.ownsCurrentSession() == true) { "The playback session changed" }
+            created.setOnCompletionListener { if (player === created) stop() }
             created.setOnErrorListener { _, _, _ ->
-                stop()
+                if (player === created) stop()
                 true
             }
             created.start()
+            check(sessionBinding?.ownsCurrentSession() == true) { "The playback session changed" }
         } catch (error: Exception) {
             runCatching { created.release() }
             runCatching { opened.close() }
@@ -146,6 +170,7 @@ internal object VoiceNotePlayer {
     }
 
     fun pause() {
+        if (!requirePlaybackOwner()) return
         val active = player ?: return
         if (!runCatching { active.isPlaying }.getOrDefault(false)) return
         runCatching { active.pause() }
@@ -156,11 +181,16 @@ internal object VoiceNotePlayer {
     }
 
     fun resume() {
+        if (!requirePlaybackOwner()) return
         val active = player ?: return
         if (mutableState.value.playing == null) return
         if (isCallInProgress()) return
         if (!requestAudioFocus()) return
-        runCatching { active.start() }
+        if (runCatching { active.start() }.isFailure) {
+            stop()
+            return
+        }
+        if (!requirePlaybackOwner()) return
         mutableState.value = mutableState.value.copy(isPaused = false)
         startProgressUpdates()
         VoiceNotePlaybackService.refresh(appContext, mutableState.value)
@@ -171,11 +201,16 @@ internal object VoiceNotePlayer {
         if (mutableState.value.isPaused) resume() else pause()
     }
 
+    fun acceptsNotificationCommand(token: String?): Boolean =
+        token != null && token == mutableState.value.playing?.transportToken &&
+            sessionBinding?.ownsCurrentSession() == true
+
     /**
      * Positions playback at [fraction] of the note. Used by both a tap inside the waveform and a
      * slide along it; scrubbing past either end simply rests at that end.
      */
     fun seekToFraction(fraction: Float) {
+        if (!requirePlaybackOwner()) return
         val active = player ?: return
         val duration = mutableState.value.durationMillis
         if (mutableState.value.playing == null) return
@@ -200,13 +235,17 @@ internal object VoiceNotePlayer {
     }
 
     fun stop() {
+        sessionBinding?.clear()
         progressJob?.cancel()
         progressJob = null
-        player?.let { active ->
+        val active = player
+        player = null
+        active?.let {
+            it.setOnCompletionListener(null)
+            it.setOnErrorListener(null)
             runCatching { active.stop() }
             runCatching { active.release() }
         }
-        player = null
         runCatching { source?.close() }
         source = null
         abandonAudioFocus()
@@ -220,8 +259,9 @@ internal object VoiceNotePlayer {
      * Reported by the bubble that owns a note as it enters and leaves the screen. A stale report
      * from another row can never move the bar, because only the playing note's own source is heard.
      */
-    fun noteSourceVisibility(visible: Boolean, messageId: String) {
+    fun noteSourceVisibility(visible: Boolean, messageId: String, owner: SessionFence?) {
         val current = mutableState.value
+        if (sessionBinding?.matches(owner) != true || current.playing?.context?.sessionOwner != owner) return
         if (!current.isCurrent(messageId) || current.isSourceOnScreen == visible) return
         mutableState.value = current.copy(isSourceOnScreen = visible)
     }
@@ -232,6 +272,7 @@ internal object VoiceNotePlayer {
         progressJob?.cancel()
         progressJob = scope.launch {
             while (true) {
+                if (!requirePlaybackOwner()) return@launch
                 val active = player ?: return@launch
                 // A call that starts mid-note takes the route; end the note rather than let it
                 // fight the call for the earpiece.
@@ -270,34 +311,55 @@ internal object VoiceNotePlayer {
         return mode == AudioManager.MODE_IN_CALL || mode == AudioManager.MODE_IN_COMMUNICATION
     }
 
+    /** Interruption callbacks belong to one focus request and cannot control its successor. */
     private fun requestAudioFocus(): Boolean {
         val manager = audioManager() ?: return true
+        val listener = focusListener ?: run {
+            lateinit var created: AudioManager.OnAudioFocusChangeListener
+            created = AudioManager.OnAudioFocusChangeListener { change ->
+                if (focusListener === created) {
+                    when (change) {
+                        AudioManager.AUDIOFOCUS_LOSS -> stop()
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK,
+                        -> pause()
+                    }
+                }
+            }
+            created.also { focusListener = it }
+        }
         val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val request = focusRequest ?: AudioFocusRequest
                 .Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(playbackAttributes())
-                .setOnAudioFocusChangeListener(focusListener)
+                .setOnAudioFocusChangeListener(listener)
                 .build()
                 .also { focusRequest = it }
             manager.requestAudioFocus(request)
         } else {
             @Suppress("DEPRECATION")
             manager.requestAudioFocus(
-                focusListener,
+                listener,
                 AudioManager.STREAM_MUSIC,
                 AudioManager.AUDIOFOCUS_GAIN,
             )
         }
-        return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        val granted = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        if (!granted) abandonAudioFocus()
+        return granted
     }
 
     private fun abandonAudioFocus() {
+        val request = focusRequest
+        val listener = focusListener
+        focusRequest = null
+        focusListener = null
         val manager = audioManager() ?: return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            focusRequest?.let { manager.abandonAudioFocusRequest(it) }
+            request?.let { manager.abandonAudioFocusRequest(it) }
         } else {
             @Suppress("DEPRECATION")
-            manager.abandonAudioFocus(focusListener)
+            listener?.let { manager.abandonAudioFocus(it) }
         }
     }
 
@@ -321,17 +383,7 @@ internal fun voiceNoteWaveformFractions(messageId: String): List<Float> {
  * The retriever reads the opened attachment where it already lies, so posting a thumbnail for a
  * 200 MB video costs one seek rather than a second copy of the video.
  */
-internal fun videoPosterFrame(file: File): Bitmap? {
-    val retriever = MediaMetadataRetriever()
-    return try {
-        retriever.setDataSource(file.absolutePath)
-        retriever.getFrameAtTime(100_000)
-    } catch (_: Exception) {
-        null
-    } finally {
-        runCatching { retriever.release() }
-    }
-}
+internal fun videoPosterFrame(file: File): Bitmap? = decodeVideoFrame(file, timeMicros = 100_000)
 
 /** Opens a stable no-copy pathname for in-app video playback. */
 internal fun chatMediaPlaybackLease(

@@ -31,6 +31,18 @@ internal fun shouldReleaseOpeningBottomAnchor(
     verticalDelta: Float,
 ): Boolean = userInput && verticalDelta != 0f
 
+/** A partly visible tall message is not the bottom just because it is one of the last rows. */
+internal fun isConversationNearBottom(
+    totalItems: Int,
+    lastVisibleIndex: Int?,
+    lastVisibleEnd: Int?,
+    viewportEnd: Int,
+    thresholdPixels: Int,
+): Boolean = totalItems == 0 || (
+    lastVisibleIndex == totalItems - 1 && lastVisibleEnd != null &&
+        lastVisibleEnd.toLong() - viewportEnd <= thresholdPixels.coerceAtLeast(0)
+    )
+
 /**
  * Whether a payment-card hydration may restore the bottom anchor after its height changes.
  *
@@ -64,16 +76,18 @@ internal fun conversationScrollDecision(
 ): ConversationScrollDecision {
     if (messages.isEmpty()) return ConversationScrollDecision(ConversationScrollAction.KEEP_POSITION)
     if (previousMessageIds == null) {
-        return if (focusPending) {
-            ConversationScrollDecision(ConversationScrollAction.KEEP_POSITION)
-        } else {
-            ConversationScrollDecision(ConversationScrollAction.JUMP_TO_NEWEST)
-        }
+        return ConversationScrollDecision(
+            if (focusPending) ConversationScrollAction.KEEP_POSITION
+            else ConversationScrollAction.JUMP_TO_NEWEST,
+        )
     }
 
     val added = messages.filterNot { it.id in previousMessageIds }
     if (added.isEmpty()) {
         return ConversationScrollDecision(ConversationScrollAction.KEEP_POSITION)
+    }
+    if (focusPending) {
+        return ConversationScrollDecision(ConversationScrollAction.KEEP_POSITION, added.size)
     }
     if (nearBottom || (openingBottomAnchorActive && !focusPending)) {
         return ConversationScrollDecision(ConversationScrollAction.FOLLOW_NEWEST)

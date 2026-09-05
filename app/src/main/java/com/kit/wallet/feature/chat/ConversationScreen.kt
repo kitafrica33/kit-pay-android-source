@@ -8,7 +8,6 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
@@ -115,12 +114,10 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
@@ -131,7 +128,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.Lifecycle
@@ -173,7 +169,6 @@ import com.kit.wallet.feature.calls.CallDurationAnchorPolicy
 import com.kit.wallet.feature.funding.TopUpSheet
 import com.kit.wallet.feature.funding.TopUpViewModel
 import com.kit.wallet.feature.wallet.runFinancialAction
-import com.kit.wallet.feature.chat.camera.CameraPull
 import com.kit.wallet.feature.chat.camera.KitChatCameraFlow
 import com.kit.wallet.feature.chat.camera.KitChatVideoEditorFlow
 import com.kit.wallet.feature.chat.camera.LibraryVideoDraft
@@ -185,6 +180,7 @@ import com.kit.wallet.ui.components.kitNameAccent
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.ChatMember
 import com.kit.wallet.ui.model.ChatPreview
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.ui.model.DeliveryState
 import com.kit.wallet.ui.model.GroupPaymentSummary
 import com.kit.wallet.ui.model.Message
@@ -634,6 +630,7 @@ fun ConversationScreen(
     }
     ConversationContent(
         chat = currentChat,
+        mediaPlaybackOwner = viewModel.mediaPlaybackOwner,
         messages = visibleMessages,
         onBack = onBack,
         onVoiceCall = onVoiceCall,
@@ -1099,6 +1096,7 @@ internal fun ConversationContent(
     onCancelRequest: (Message) -> Unit = {},
     claimableTransfersEnabled: Boolean = false,
     currentAccountId: String? = null,
+    mediaPlaybackOwner: SessionFence? = null,
     transferClaims: Map<String, TransferClaim> = emptyMap(),
     onAcceptTransfer: (Message) -> Unit = {},
     onRejectTransfer: (Message, String?) -> Unit = { _, _ -> },
@@ -1214,6 +1212,7 @@ internal fun ConversationContent(
     // restores it across rotation and process death and is erased with the messaging state.
     var composerState by remember { mutableStateOf(ConversationComposerState()) }
     var editState by remember { mutableStateOf(ConversationComposerState()) }
+    var voiceDraftActive by remember(chat.id) { mutableStateOf(false) }
     // Ticked rather than read once, so an "Edit" option leaves the menu when its fifteen minutes
     // run out instead of lingering until something else happens to redraw the thread.
     var editClock by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -1316,10 +1315,11 @@ internal fun ConversationContent(
     }
     // A voice note outlives the bubble that started it, and the floating bar still has to say who
     // is speaking and where — so the thread hands over everything only it can resolve, now.
-    val voiceNoteChatContext = remember(chat.id, chat.name, chat.isGroup, displayGroupMemberName) {
+    val voiceNoteChatContext = remember(chat.id, chat.name, chat.isGroup, displayGroupMemberName, mediaPlaybackOwner) {
         VoiceNoteChatContext(
             conversationId = chat.id,
             conversationTitle = chat.name,
+            sessionOwner = mediaPlaybackOwner,
             displayName = { userId ->
                 when {
                     userId.isBlank() -> "You"
@@ -1346,6 +1346,9 @@ internal fun ConversationContent(
     val conversationRows = remember(messages) { groupConversationRows(messages) }
     val conversationRowKeys = remember(conversationRows) { conversationRows.map(ConversationRow::key) }
     val messageIds = remember(messages) { messages.map(Message::id) }
+    val tailIndex = CONVERSATION_LEADING_ITEMS + conversationRows.size +
+        serverScheduledDirect.size + serverScheduledGroup.size +
+        (if (serverSchedulesHaveMore) 1 else 0) + (if (chat.typing) 1 else 0)
     val groupPaymentHydrationKey = remember(groupPayments) {
         // The live map is capped by the ViewModel. Keep the complete immutable values so any card
         // content change that can alter its measured height restarts the narrowly guarded effect.
@@ -1358,6 +1361,7 @@ internal fun ConversationContent(
     }
     var renderedMessageIds by remember(chat.id) { mutableStateOf<Set<String>?>(null) }
     var pendingNewMessages by remember(chat.id) { mutableStateOf(0) }
+    var readerWasNearBottom by remember(chat.id) { mutableStateOf(true) }
     val coroutineScopeForScroll = rememberCoroutineScope()
     // Tapping a quote takes the thread to what it quotes. A target that is not in the loaded
     // history does nothing at all, rather than scrolling somewhere arbitrary and calling it the
@@ -1367,20 +1371,29 @@ internal fun ConversationContent(
             candidate.messages.any { it.id == targetId }
         }
         if (row >= 0) {
+            openingBottomAnchorActive = false
+            readerWasNearBottom = false
             coroutineScopeForScroll.launch {
                 listState.animateScrollToItem(row + CONVERSATION_LEADING_ITEMS)
             }
         }
     }
-    // The list header adds two leading items (date + encryption notice) and a trailing spacer,
-    // so the newest message sits just above the final index.
-    val nearBottom by remember(listState) {
+    val nearBottomThreshold = with(LocalDensity.current) { 80.dp.roundToPx() }
+    val nearBottom by remember(listState, nearBottomThreshold) {
         derivedStateOf {
             val info = listState.layoutInfo
-            val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: 0
-            lastVisible >= info.totalItemsCount - 3
+            val lastVisible = info.visibleItemsInfo.lastOrNull()
+            isConversationNearBottom(
+                totalItems = info.totalItemsCount,
+                lastVisibleIndex = lastVisible?.index,
+                lastVisibleEnd = lastVisible?.let { it.offset + it.size },
+                viewportEnd = info.viewportEndOffset,
+                thresholdPixels = nearBottomThreshold,
+            )
         }
     }
+    // Decide against the viewport BEFORE the new projection was measured. Reading live layout
+    // after a batch arrives mistakes the newly added rows for an intentional scroll into history.
     LaunchedEffect(nearBottom) {
         if (nearBottom) pendingNewMessages = 0
     }
@@ -1399,6 +1412,12 @@ internal fun ConversationContent(
     }
     val currentRowMessageIds by rememberUpdatedState(rowMessageIds)
     val currentMessageIds by rememberUpdatedState(messageIds)
+    LaunchedEffect(chat.id) {
+        snapshotFlow { Triple(currentMessageIds.toSet(), renderedMessageIds, nearBottom) }
+            .collect { (current, rendered, atBottom) ->
+                if (current == rendered) readerWasNearBottom = atBottom
+            }
+    }
     var focusedMessageId by remember(chat.id) { mutableStateOf<String?>(null) }
     // Keyed on the thread, not the request: consuming the request must not cancel the collector
     // mid-jump. rememberUpdatedState feeds snapshotFlow because it only reacts to State reads.
@@ -1439,7 +1458,7 @@ internal fun ConversationContent(
             focusedMessageId = null
         }
     }
-    LaunchedEffect(chat.id, conversationRowKeys, messageIds, focusPending) {
+    LaunchedEffect(chat.id, conversationRowKeys, messageIds, focusPending, tailIndex) {
         if (messages.isEmpty()) {
             // Keep null for a brand-new conversation composition so its first hydrated rows take
             // the explicit jump path. A thread whose existing rows were removed is already
@@ -1448,12 +1467,12 @@ internal fun ConversationContent(
             pendingNewMessages = 0
             return@LaunchedEffect
         }
-        val bottomIndex = conversationRows.size + CONVERSATION_LEADING_ITEMS
+        val bottomIndex = tailIndex
         val decision =
             conversationScrollDecision(
                 renderedMessageIds,
                 messages,
-                nearBottom,
+                readerWasNearBottom,
                 focusPending,
                 openingBottomAnchorActive,
             )
@@ -1490,9 +1509,15 @@ internal fun ConversationContent(
         if (!openingBottomAnchorActive || focusPending) return@LaunchedEffect
         snapshotFlow {
             val info = listState.layoutInfo
-            info.totalItemsCount to info.visibleItemsInfo.sumOf { it.size }
-        }.distinctUntilChanged().collect { (count, _) ->
-            if (count > 0 && openingBottomAnchorActive && !focusPending) {
+            Triple(
+                info.totalItemsCount,
+                info.viewportEndOffset,
+                info.visibleItemsInfo.map { Triple(it.index, it.offset, it.size) },
+            )
+        }.distinctUntilChanged().collect { (count, _, _) ->
+            if (count > 0 && openingBottomAnchorActive && !focusPending &&
+                !listState.isScrollInProgress && listState.canScrollForward
+            ) {
                 listState.scrollToItem(count - 1)
             }
         }
@@ -1528,7 +1553,7 @@ internal fun ConversationContent(
     // is already at the bottom — the same rule a new message gets, for the same reason.
     LaunchedEffect(chat.id, chat.typing) {
         if (chat.typing && nearBottom) {
-            listState.animateScrollToItem(conversationRows.size + 3)
+            listState.animateScrollToItem(tailIndex)
         }
     }
 
@@ -1955,11 +1980,13 @@ internal fun ConversationContent(
                         composerState.submittedGeneration != null
                     },
                     voiceDraftKey = chat.id,
+                    voiceDraftOwner = mediaPlaybackOwner,
                     onAttachLibrary = onAttachLibrary,
                     onAttachCamera = onAttachCamera,
                     onAttachVideoNote = onAttachVideoNote,
                     onAttachDocument = onAttachDocument,
                     onSendVoiceNote = onSendVoiceNote,
+                    onVoiceDraftActiveChanged = { voiceDraftActive = it },
                     // A correction replaces words with words. Everything that would instead start
                     // a *new* message — an attachment, a voice note, a payment, a send-later — is
                     // withdrawn while the mode is open, so no gesture can quietly leave it.
@@ -2012,68 +2039,26 @@ internal fun ConversationContent(
             }
         },
     ) { padding ->
-        // Pull-beyond-latest: dragging up past the newest message reveals a camera panel behind
-        // the list, and releasing past the threshold opens the in-app camera (the TikTok feel).
         val density = LocalDensity.current
-        val cameraPullMaxPx = with(density) { CAMERA_PULL_MAX_REVEAL.toPx() }
-        val cameraPullThresholdPx = with(density) { CAMERA_PULL_OPEN_THRESHOLD.toPx() }
-        var cameraRevealPx by remember { mutableFloatStateOf(0f) }
-        val currentOnOpenCamera by rememberUpdatedState(onOpenCamera)
-        val cameraPullConnection = remember(mediaEnabled, cameraPullMaxPx, cameraPullThresholdPx) {
-            object : NestedScrollConnection {
-                override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                    val userInput = source == NestedScrollSource.UserInput
-                    if (shouldReleaseOpeningBottomAnchor(userInput, available.y)) {
-                        openingBottomAnchorActive = false
-                    }
-                    if (!mediaEnabled || !userInput) return Offset.Zero
-                    val result = CameraPull.collapse(cameraRevealPx, available.y)
-                    cameraRevealPx = result.revealPx
-                    return Offset(0f, result.consumedY)
-                }
-
-                override fun onPostScroll(
-                    consumed: Offset,
-                    available: Offset,
-                    source: NestedScrollSource,
-                ): Offset {
-                    if (!mediaEnabled || source != NestedScrollSource.UserInput) return Offset.Zero
-                    val next = CameraPull.pull(cameraRevealPx, available.y, cameraPullMaxPx)
-                    val used = next - cameraRevealPx
-                    cameraRevealPx = next
-                    return Offset(0f, -used)
-                }
-
-                /**
-                 * Where the release is decided, and the only place it is.
-                 *
-                 * A scroll container dispatches this from the end of its drag — one call, once the
-                 * finger is genuinely off the glass — which is the same signal pull-to-refresh
-                 * settles on. The gesture used to watch pointers on the surrounding box instead and
-                 * open from there; that never fired for a pull the list had taken over, so the panel
-                 * kept promising a camera that never arrived.
-                 */
-                override suspend fun onPreFling(available: Velocity): Velocity {
-                    if (!mediaEnabled || cameraRevealPx <= 0f) return Velocity.Zero
-                    val open = CameraPull.shouldOpen(cameraRevealPx, cameraPullThresholdPx)
-                    // Settle the panel first either way, so the reveal never stays stuck open.
-                    animate(cameraRevealPx, 0f) { value, _ -> cameraRevealPx = value }
-                    if (open) currentOnOpenCamera()
-                    // The reveal — not the list — absorbed the drag that built this velocity, so the
-                    // list must not fling on it and carry the thread away under the camera.
-                    return available
-                }
-            }
-        }
+        val cameraPull = rememberConversationCameraPull(
+            chatId = chat.id,
+            listState = listState,
+            enabled = mediaEnabled && messages.isNotEmpty() && !focusPending &&
+                editTarget == null && !voiceDraftActive && !conversationMenuOpen,
+            onUserScroll = { openingBottomAnchorActive = false },
+            onReachedBottom = { openingBottomAnchorActive = true },
+            onOpenCamera = onOpenCamera,
+        )
+        val cameraRevealPx = cameraPull.revealPx
         Box(
             Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .nestedScroll(cameraPullConnection),
+                .then(cameraPull.modifier),
         ) {
         if (cameraRevealPx > 0f) {
             CameraPeekPanel(
-                pastThreshold = CameraPull.shouldOpen(cameraRevealPx, cameraPullThresholdPx),
+                pastThreshold = cameraPull.pastThreshold,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
@@ -2084,6 +2069,7 @@ internal fun ConversationContent(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
+                .testTag("conversation-messages")
                 .offset { IntOffset(0, -cameraRevealPx.roundToInt()) }
                 .padding(horizontal = 14.dp),
         ) {
@@ -2517,7 +2503,9 @@ internal fun ConversationContent(
                     TypingBubble(label = groupTypingLabel(chat.typingNames))
                 }
             }
-            item(key = "conversation-tail") { Spacer(Modifier.height(8.dp)) }
+            item(key = "conversation-tail") {
+                Spacer(Modifier.height(8.dp).fillMaxWidth().testTag("conversation-tail"))
+            }
         }
         if (pendingNewMessages > 0) {
             Surface(
@@ -2528,8 +2516,9 @@ internal fun ConversationContent(
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 12.dp)
                     .clickable {
-                        val target = conversationRows.size + 2
+                        val target = tailIndex
                         pendingNewMessages = 0
+                        openingBottomAnchorActive = true
                         coroutineScopeForScroll.launch {
                             listState.animateScrollToItem(target)
                         }
@@ -4161,7 +4150,7 @@ private fun CameraPeekPanel(pastThreshold: Boolean, modifier: Modifier = Modifie
             )
             Spacer(Modifier.width(8.dp))
             Text(
-                if (pastThreshold) "Release to open the camera" else "Keep pulling for the camera",
+                if (pastThreshold) "Release to open camera" else "Pull further to open camera",
                 color = Color.White.copy(alpha = 0.85f),
                 style = MaterialTheme.typography.labelMedium,
             )
@@ -4169,8 +4158,6 @@ private fun CameraPeekPanel(pastThreshold: Boolean, modifier: Modifier = Modifie
     }
 }
 
-private val CAMERA_PULL_MAX_REVEAL = 160.dp
-private val CAMERA_PULL_OPEN_THRESHOLD = 110.dp
 
 private const val TYPING_DOTS = 3
 private const val TYPING_DOT_CYCLE_MILLIS = 600
@@ -4375,12 +4362,14 @@ private fun Composer(
     onSend: () -> Unit,
     /** Stable conversation identity the voice-note draft is preserved under. */
     voiceDraftKey: String = "",
+    voiceDraftOwner: SessionFence? = null,
     onAttachLibrary: () -> Unit = {},
     onAttachCamera: () -> Unit = {},
     onAttachVideoNote: () -> Unit = {},
     onAttachDocument: () -> Unit = {},
     onSendVoiceNote: (VoiceNoteRecorder.Recording) -> Unit = { it.release() },
     onVoiceNoteTooShort: () -> Unit = {},
+    onVoiceDraftActiveChanged: (Boolean) -> Unit = {},
     mediaEnabled: Boolean = false,
     onRequestPayment: () -> Unit = {},
     /** Whether asking for money is on offer. False while a correction is being written. */
@@ -4414,37 +4403,49 @@ private fun Composer(
     onScheduleSend: () -> Unit = {},
 ) {
     val context = LocalContext.current
-    // The recorder outlives this composable on purpose: a draft keyed to the conversation
-    // survives navigation, recomposition, and configuration changes, and leaves the
-    // registry only by being sent or explicitly discarded.
-    val recorder = remember(voiceDraftKey) { VoiceNoteDrafts.recorder(voiceDraftKey, context) }
-    var draftPhase by remember(voiceDraftKey) {
+    // Ordinary navigation preserves a draft for its exact session and conversation. Logout or
+    // account replacement revokes the recorder, including callbacks retained by the old UI.
+    val recorder = remember(voiceDraftKey, voiceDraftOwner) {
+        VoiceNoteDrafts.recorder(voiceDraftKey, voiceDraftOwner, context)
+    }
+    var draftPhase by remember(recorder) {
         mutableStateOf(
             if (recorder.hasDraft) VoiceNoteDraftPhase.PAUSED else VoiceNoteDraftPhase.IDLE,
         )
     }
+    LaunchedEffect(recorder, draftPhase) {
+        onVoiceDraftActiveChanged(draftPhase != VoiceNoteDraftPhase.IDLE)
+    }
     var attachMenuOpen by remember { mutableStateOf(false) }
     var sendMenuOpen by remember { mutableStateOf(false) }
-    var recordingElapsedMillis by remember(voiceDraftKey) {
+    var recordingElapsedMillis by remember(recorder) {
         mutableStateOf(recorder.elapsedMillis())
     }
     var recordingLevel by remember { mutableStateOf(0f) }
-    val preview = remember(voiceDraftKey) {
+    val preview = remember(recorder) {
         VoiceNoteDraftPreviewPlayer(
+            ownsCurrentSession = recorder::ownsCurrentSession,
             onFinished = {
                 draftPhase = VoiceNoteDraftPolicy.endPreview(draftPhase) ?: draftPhase
             },
         )
     }
+    // The grant belongs to the recorder that requested it, not whichever account is on screen
+    // when Android eventually returns the result.
+    var permissionRequester by remember { mutableStateOf<VoiceNoteRecorder?>(null) }
     val recordPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        if (granted && VoiceNoteDraftPolicy.startRecording(draftPhase) != null) {
+        val requested = permissionRequester
+        permissionRequester = null
+        if (granted && requested === recorder &&
+            VoiceNoteDraftPolicy.startRecording(draftPhase) != null
+        ) {
             runCatching { recorder.start() }
                 .onSuccess { draftPhase = VoiceNoteDraftPhase.RECORDING }
         }
     }
-    LaunchedEffect(draftPhase, voiceDraftKey) {
+    LaunchedEffect(draftPhase, recorder) {
         while (draftPhase == VoiceNoteDraftPhase.RECORDING) {
             recordingElapsedMillis = recorder.elapsedMillis()
             recordingLevel = recorder.level()
@@ -4462,14 +4463,20 @@ private fun Composer(
             delay(80)
         }
     }
-    DisposableEffect(voiceDraftKey) {
+    DisposableEffect(recorder) {
+        val removeInvalidationListener = recorder.observeInvalidation {
+            preview.stop()
+            draftPhase = VoiceNoteDraftPhase.IDLE
+        }
         onDispose {
             // An ordinary UI interruption pauses and preserves the draft — the microphone
             // must not keep running behind the user's back, but nothing they said is lost.
-            // Only the explicit discard, or Send, ever deletes it.
+            // Session retirement deliberately discards it through the application observer.
+            removeInvalidationListener()
             preview.stop()
             recorder.pause()
-            if (!recorder.hasDraft) VoiceNoteDrafts.release(voiceDraftKey)
+            if (!recorder.hasDraft) VoiceNoteDrafts.release(voiceDraftKey, voiceDraftOwner, recorder)
+            onVoiceDraftActiveChanged(false)
         }
     }
     Column(
@@ -4523,7 +4530,6 @@ private fun Composer(
                             // The one deliberate way a draft dies.
                             preview.stop()
                             recorder.cancel()
-                            VoiceNoteDrafts.release(voiceDraftKey)
                             draftPhase = VoiceNoteDraftPhase.IDLE
                         }) {
                             Icon(
@@ -4763,7 +4769,6 @@ private fun Composer(
                             // stitched, read back, and handed to the encrypted send path.
                             preview.stop()
                             val finished = recorder.finish()
-                            VoiceNoteDrafts.release(voiceDraftKey)
                             draftPhase = VoiceNoteDraftPhase.IDLE
                             if (finished != null) onSendVoiceNote(finished) else onVoiceNoteTooShort()
                         },
@@ -4784,7 +4789,10 @@ private fun Composer(
                             CircleShape,
                         )
                         .clickable(enabled = sendEnabled) {
-                            recordPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                            if (permissionRequester == null && recorder.ownsCurrentSession()) {
+                                permissionRequester = recorder
+                                recordPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                            }
                         },
                     contentAlignment = Alignment.Center,
                 ) {

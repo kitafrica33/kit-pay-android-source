@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.SystemClock
 import com.kit.wallet.data.messaging.KitChatMediaLimits
 import com.kit.wallet.data.messaging.SecureMediaSource
+import com.kit.wallet.data.session.SessionInvalidatedException
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -24,7 +25,10 @@ import kotlin.math.min
  * until they are read back at Send or explicitly discarded; nothing is encrypted or
  * uploaded before then.
  */
-internal class VoiceNoteRecorder(private val context: Context) {
+internal class VoiceNoteRecorder(
+    private val context: Context,
+    private val ownerIsCurrent: () -> Boolean,
+) {
     /**
      * Ownership of finalized recording segments transferred out of the recorder.
      *
@@ -75,28 +79,34 @@ internal class VoiceNoteRecorder(private val context: Context) {
     private var recorder: MediaRecorder? = null
     private var output: File? = null
     private var startedAtMillis: Long = 0
+    private var revoked = false
+    private val invalidationListeners = mutableSetOf<() -> Unit>()
 
-    val isRecording: Boolean get() = recorder != null
+    fun ownsCurrentSession(): Boolean = !revoked && ownerIsCurrent()
+
+    val isRecording: Boolean get() = ownsCurrentSession() && recorder != null
 
     /** Whether any capture exists at all — an active segment or finalized ones. */
-    val hasDraft: Boolean get() = recorder != null || segments.isNotEmpty()
+    val hasDraft: Boolean get() = ownsCurrentSession() && (recorder != null || segments.isNotEmpty())
 
     /** Whether at least one finalized, individually playable segment exists. */
-    val hasPlayableSegments: Boolean get() = segments.isNotEmpty()
+    val hasPlayableSegments: Boolean get() = ownsCurrentSession() && segments.isNotEmpty()
 
     /**
      * Total captured audio: every finalized segment plus the live one. Measured on the
      * monotonic clock, so a wall-clock step mid-recording cannot stretch or shrink it.
      */
-    fun elapsedMillis(): Long = finalizedMillis + activeMillis()
+    fun elapsedMillis(): Long = if (ownsCurrentSession()) finalizedMillis + activeMillis() else 0L
 
     /** Live input level in 0..1 for the recording wave; 0 when idle or paused. */
     fun level(): Float {
+        if (!ownsCurrentSession()) return 0f
         val amplitude = runCatching { recorder?.maxAmplitude ?: 0 }.getOrDefault(0)
         return min(1f, amplitude / 12_000f)
     }
 
     fun start() {
+        requireCurrentOwner()
         check(!hasDraft) { "A voice note is already being recorded" }
         beginSegment()
     }
@@ -107,6 +117,10 @@ internal class VoiceNoteRecorder(private val context: Context) {
      * milliseconds is not audio the user could miss. Idempotent when already paused.
      */
     fun pause() {
+        if (!ownsCurrentSession()) {
+            invalidate()
+            return
+        }
         val active = recorder ?: return
         val file = output
         val duration = activeMillis()
@@ -115,6 +129,11 @@ internal class VoiceNoteRecorder(private val context: Context) {
         // stop() throws if nothing was captured yet; that segment is dropped either way.
         val finalized = runCatching { active.stop() }.isSuccess
         runCatching { active.release() }
+        if (!ownsCurrentSession()) {
+            file?.delete()
+            invalidate()
+            return
+        }
         if (finalized && file != null && file.isFile && file.length() > 0) {
             segments += file
             finalizedMillis += duration
@@ -125,6 +144,7 @@ internal class VoiceNoteRecorder(private val context: Context) {
 
     /** Opens the next segment of a paused draft. */
     fun resume() {
+        requireCurrentOwner()
         check(recorder == null) { "A voice note is already being recorded" }
         beginSegment()
     }
@@ -133,14 +153,37 @@ internal class VoiceNoteRecorder(private val context: Context) {
      * The finalized segments, in capture order, for local listen-back while paused. The
      * files remain owned by this recorder: play them in place, never move or delete them.
      */
-    fun previewFiles(): List<File> = segments.toList()
+    fun previewFiles(): List<File> = if (ownsCurrentSession()) segments.toList() else emptyList()
+
+    /** Retiring a session also stops any composed listen-back player immediately. */
+    fun observeInvalidation(listener: () -> Unit): () -> Unit {
+        if (revoked) listener() else invalidationListeners += listener
+        return { invalidationListeners -= listener }
+    }
+
+    /** A retired recorder can never be revived by a late permission/result callback. */
+    fun invalidate() {
+        if (revoked) return
+        revoked = true
+        cancel()
+        invalidationListeners.toList().forEach { runCatching(it) }
+        invalidationListeners.clear()
+    }
 
     /**
      * Stops and transfers the finalized files without reading them into heap. The caller owns the
      * returned [Recording] until its local-first send completes and must invoke `release()` then.
      */
     fun finish(): Recording? {
+        if (!ownsCurrentSession()) {
+            invalidate()
+            return null
+        }
         pause()
+        if (!ownsCurrentSession()) {
+            invalidate()
+            return null
+        }
         val files = segments.toList()
         val duration = finalizedMillis
         segments.clear()
@@ -174,6 +217,13 @@ internal class VoiceNoteRecorder(private val context: Context) {
     private fun activeMillis(): Long =
         if (recorder == null) 0 else SystemClock.elapsedRealtime() - startedAtMillis
 
+    private fun requireCurrentOwner() {
+        if (!ownsCurrentSession()) {
+            invalidate()
+            throw SessionInvalidatedException()
+        }
+    }
+
     private fun beginSegment() {
         val file = File(context.cacheDir, "kit-voice-${UUID.randomUUID()}.m4a")
         val created = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -197,7 +247,9 @@ internal class VoiceNoteRecorder(private val context: Context) {
             )
             created.setOutputFile(file.absolutePath)
             created.prepare()
+            requireCurrentOwner()
             created.start()
+            requireCurrentOwner()
         } catch (error: Exception) {
             runCatching { created.release() }
             file.delete()

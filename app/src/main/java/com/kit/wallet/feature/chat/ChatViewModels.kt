@@ -62,6 +62,7 @@ import com.kit.wallet.data.repository.WalletSyncRepository
 import com.kit.wallet.data.repository.WalletSyncResult
 import com.kit.wallet.data.repository.canonicalTransferClaimReason
 import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.data.session.SessionInvalidatedException
 import com.kit.wallet.ui.model.CallDirection
 import com.kit.wallet.ui.model.CallEntry
 import com.kit.wallet.ui.model.ChatPreview
@@ -661,6 +662,12 @@ class ConversationViewModel @Inject internal constructor(
     /** Current authenticated public ID; used only to bind server claims to this direct chat. */
     val currentAccountId: String?
         get() = walletRepo.currentAccountId
+
+    /** Immutable owner: an old conversation cannot claim media for a replacement login. */
+    internal val mediaPlaybackOwner = sessions?.current()?.fence()
+
+    private fun ownsMediaSession(): Boolean =
+        mediaPlaybackOwner != null && sessions?.current()?.fence() == mediaPlaybackOwner
 
     /** This account's live call, if any, for the header actions, call-log rows and live banner. */
     internal val activeCallPresence: StateFlow<ActiveCallPresence?> = activeCallState.presence
@@ -3410,7 +3417,7 @@ class ConversationViewModel @Inject internal constructor(
         onFinished: () -> Unit = {},
     ) {
         val selectedChat = chat.value
-        if (selectedChat == null || !historyAvailable.value) {
+        if (selectedChat == null || !historyAvailable.value || !ownsMediaSession()) {
             mutableError.value = "Secure messaging is temporarily unavailable"
             onFinished()
             return
@@ -3430,7 +3437,9 @@ class ConversationViewModel @Inject internal constructor(
                         source.declaredByteCount,
                     )
                 }
-                chatRepo.sendMediaMessage(
+                if (!ownsMediaSession()) throw SessionInvalidatedException()
+                chatRepo.sendMediaMessageForOwner(
+                    owner = requireNotNull(mediaPlaybackOwner),
                     chatId = selectedChat.id,
                     source = source,
                     mediaType = mediaType,
@@ -3461,7 +3470,7 @@ class ConversationViewModel @Inject internal constructor(
         onFinished: () -> Unit = {},
     ) {
         val selectedChat = chat.value
-        if (selectedChat == null || !historyAvailable.value) {
+        if (selectedChat == null || !historyAvailable.value || !ownsMediaSession()) {
             mutableError.value = "Secure messaging is temporarily unavailable"
             onFinished()
             return
@@ -3484,7 +3493,9 @@ class ConversationViewModel @Inject internal constructor(
                         )
                     }
                 }
-                chatRepo.sendMediaAlbumMessage(
+                if (!ownsMediaSession()) throw SessionInvalidatedException()
+                chatRepo.sendMediaAlbumMessageForOwner(
+                    owner = requireNotNull(mediaPlaybackOwner),
                     chatId = selectedChat.id,
                     attachments = attachments,
                     caption = null,
@@ -3521,6 +3532,7 @@ class ConversationViewModel @Inject internal constructor(
         if (
             selectedChat == null ||
             !historyAvailable.value ||
+            !ownsMediaSession() ||
             bytes.isEmpty()
         ) {
             // Dropping a capture without a word would present a fake success (the camera has
@@ -3539,9 +3551,11 @@ class ConversationViewModel @Inject internal constructor(
                     mediaType.trim().lowercase(),
                     bytes.size.toLong(),
                 )
-                chatRepo.sendImageMessage(
+                if (!ownsMediaSession()) throw SessionInvalidatedException()
+                chatRepo.sendMediaMessageForOwner(
+                    owner = requireNotNull(mediaPlaybackOwner),
                     chatId = selectedChat.id,
-                    bytes = bytes,
+                    source = SecureMediaSource.ofBytes(bytes),
                     mediaType = mediaType,
                     caption = caption,
                     replyToMessageId = replyToMessageId,
