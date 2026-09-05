@@ -14,6 +14,14 @@ import retrofit2.http.Tag
 import okhttp3.RequestBody
 
 interface KitWalletApi {
+    @GET("api/kit-wallet/v1/notifications")
+    suspend fun notificationInbox(
+        @Query("cursor") cursor: String? = null,
+        @Query("limit") limit: Int = 100,
+        @Query("unread_only") unreadOnly: Boolean = true,
+        @Tag expectedOwner: SessionFence,
+    ): ApiEnvelope<com.kit.wallet.data.notifications.NotificationInboxPage>
+
     @GET("api/kit-wallet/v1/capabilities")
     suspend fun capabilities(): ApiEnvelope<CapabilitiesDto>
 

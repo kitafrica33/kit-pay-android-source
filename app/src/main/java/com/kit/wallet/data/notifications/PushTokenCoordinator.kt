@@ -90,14 +90,11 @@ class PushTokenCoordinator @Inject constructor(
                     // completing after this one. The mutation lock also preserves ordering when
                     // an intermediate handoff is itself cancelled before it finishes the join.
                     predecessor?.cancelAndJoin()
-                    registrationMutationLock.withLock {
-                        if (!isCurrent(attempt)) return@withLock
-                        registerWithRetry(
-                            expectedOwner = owner,
-                            tokenProvider = token,
-                            isCurrentGeneration = { isCurrent(attempt) },
-                        )
-                    }
+                    registerWithRetry(
+                        expectedOwner = owner,
+                        tokenProvider = token,
+                        isCurrentGeneration = { isCurrent(attempt) },
+                    )
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
@@ -160,7 +157,11 @@ class PushTokenCoordinator @Inject constructor(
         var retry = 0
         while (isCurrentGeneration()) {
             try {
-                registerIfEnabled(expectedOwner, tokenProvider, isCurrentGeneration)
+                // Only the bounded attempt owns the mutation lock. Sleeping retries must not
+                // block a durable recovery worker from trying the current Firebase token.
+                registrationMutationLock.withLock {
+                    registerIfEnabled(expectedOwner, tokenProvider, isCurrentGeneration)
+                }
                 return
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -173,6 +174,27 @@ class PushTokenCoordinator @Inject constructor(
                 // offline must eventually register without waiting for another token/session event.
                 delay(retryDelaysMillis[retry.coerceAtMost(retryDelaysMillis.lastIndex)])
                 retry = (retry + 1).coerceAtMost(retryDelaysMillis.lastIndex)
+            }
+        }
+    }
+
+    /** One durable-worker attempt, serialized with callbacks and fenced against token/logout races. */
+    internal suspend fun recoverLatestRegistration() {
+        if (!transport.configured) return
+        val owner = sessions.current()?.fence() ?: return
+        val (generation, predecessor) = synchronized(registrationLock) {
+            if (sessions.current()?.fence() != owner || registrationSuppressedOwner == owner) return
+            // A callback's retry closure can retain an earlier token. Retire that generation
+            // before rereading Firebase, otherwise its next retry could overwrite this recovery.
+            registrationAttempt = null
+            (++registrationGeneration to registrationJob).also { registrationJob = null }
+        }
+        predecessor?.cancelAndJoin()
+        registrationMutationLock.withLock {
+            registerIfEnabled(owner, transport::currentToken) {
+                sessions.current()?.fence() == owner && synchronized(registrationLock) {
+                    generation == registrationGeneration && registrationSuppressedOwner != owner
+                }
             }
         }
     }

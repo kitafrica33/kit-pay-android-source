@@ -302,6 +302,13 @@ internal fun KitApp(
             it.scheme == "kitwallet" && it.host == "kyc" && it.path == "/status"
         } == true
         when {
+            rawDeepLink == com.kit.wallet.data.notifications.CALL_HISTORY_NOTIFICATION_LINK -> {
+                if (!signedIn || !capabilities.loaded || capabilities.loadFailed) return@LaunchedEffect
+                onDeepLinkConsumed()
+                if (capabilities.enabled(KitFeature.CALLS)) {
+                    navController.navigate(Dest.CALLS) { launchSingleTop = true }
+                }
+            }
             callReturn != null -> {
                 // The ongoing-call notification tap. The call it names lives (or died) in this
                 // process regardless of what happens here, so this consumes immediately and

@@ -182,6 +182,72 @@ class PushTokenCoordinatorTest {
     }
 
     @Test
+    fun `durable recovery reads the current transport token and exposes transient failures`() = runTest {
+        val transport = FakePushMessagingTransport(token = "latest-from-firebase")
+        val coordinator = coordinator(FakeSessionStore.signedIn(), backgroundScope, transport)
+        server.enqueue(MockResponse().setResponseCode(503))
+        try {
+            coordinator.recoverLatestRegistration()
+            org.junit.Assert.fail("Expected retryable failure")
+        } catch (error: KitWalletApiException) {
+            assertTrue(error.isTransientPushRegistrationFailure())
+        }
+        server.enqueue(jsonResponse(capabilitiesJson(notifications = true)))
+        server.enqueue(jsonResponse(PUSH_REGISTERED_JSON))
+        coordinator.recoverLatestRegistration()
+        server.takeRequest()
+        server.takeRequest()
+        assertTrue(server.takeRequest().utf8Body().contains("latest-from-firebase"))
+        assertEquals(1, transport.tokenReads)
+    }
+
+    @Test
+    fun `durable recovery retires a callback retry that retained an older token`() = runBlocking {
+        val sessions = FakeSessionStore.signedIn()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val failed = CountDownLatch(1)
+        val appliedTokens = CopyOnWriteArrayList<String>()
+        val failedOnce = AtomicBoolean(false)
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.method == "PUT") {
+                    val token = request.pushToken()
+                    if (token == "older-callback-token" && failedOnce.compareAndSet(false, true)) {
+                        failed.countDown()
+                        return MockResponse().setResponseCode(503)
+                    }
+                    appliedTokens += token
+                    return jsonResponse(PUSH_REGISTERED_JSON)
+                }
+                return jsonResponse(capabilitiesJson(notifications = true))
+            }
+        }
+        val coordinator = coordinator(
+            sessions, scope, FakePushMessagingTransport(token = "latest-firebase-token"),
+        )
+        try {
+            val callback = checkNotNull(coordinator.tokenChanged("fcm", "older-callback-token"))
+            assertTrue(failed.await(5, TimeUnit.SECONDS))
+            withTimeout(10_000L) { coordinator.recoverLatestRegistration() }
+            assertTrue(callback.isCancelled)
+            assertEquals(listOf("latest-firebase-token"), appliedTokens)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `durable recovery cannot revive a token after logout suppression`() = runTest {
+        val sessions = FakeSessionStore.signedIn()
+        val coordinator = coordinator(sessions, backgroundScope)
+        server.enqueue(jsonResponse(PUSH_REMOVED_JSON))
+        coordinator.unregisterBeforeLogout(sessions.current()!!.fence())
+        coordinator.recoverLatestRegistration()
+        assertEquals(1, server.requestCount)
+        assertEquals("DELETE", server.takeRequest().method)
+    }
+
+    @Test
     fun `transient failures keep retrying after the initial backoff ladder`() = runTest {
         repeat(4) {
             server.enqueue(

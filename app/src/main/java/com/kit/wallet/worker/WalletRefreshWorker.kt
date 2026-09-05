@@ -24,14 +24,18 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 @HiltWorker
-class WalletRefreshWorker @AssistedInject constructor(
+class WalletRefreshWorker @AssistedInject internal constructor(
     @Assisted appContext: Context,
     @Assisted workerParameters: WorkerParameters,
     private val sessions: SessionStore,
     private val walletSync: WalletSyncRepository,
+    private val notificationRecovery: NotificationRecoveryScheduler,
 ) : CoroutineWorker(appContext, workerParameters) {
     override suspend fun doWork(): Result {
         if (sessions.current() == null) return Result.success()
+        // Reuse the existing maintenance wake for missed FCM/inbox/encrypted-message recovery.
+        // WorkManager defers this under Doze; this is eventual catch-up, not an exact alarm.
+        notificationRecovery.schedule()
         return try {
             walletSync.refresh()
             Result.success()

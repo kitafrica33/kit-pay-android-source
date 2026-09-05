@@ -20,6 +20,8 @@ data class PushEnvelope(
      * metadata and confirmed that the provider supplied no display-notification payload.
      */
     val opaqueWakeVerified: Boolean = false,
+    /** Supplied only by the authenticated inbox reader for ordering recovered display alerts. */
+    val occurredAtEpochMillis: Long? = null,
 ) {
     val priorityWasDowngraded: Boolean
         get() = originalPriority == PushDeliveryPriority.HIGH &&

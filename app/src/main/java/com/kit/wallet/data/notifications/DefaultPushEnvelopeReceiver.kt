@@ -1,6 +1,7 @@
 package com.kit.wallet.data.notifications
 
 import android.app.NotificationChannel
+import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
@@ -19,6 +20,14 @@ import com.kit.wallet.data.repository.MobileMoneyRepository
 import com.kit.wallet.data.time.BootSessionIdProvider
 import com.kit.wallet.data.time.ElapsedRealtimeClock
 import com.kit.wallet.worker.SecureMessagingSyncScheduler
+import com.kit.wallet.worker.NotificationRecoveryScheduler
+import com.kit.wallet.data.session.SessionFence
+import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.di.ApplicationScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -37,7 +46,11 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
     private val mobileMoney: MobileMoneyRepository,
     private val elapsedRealtimeClock: ElapsedRealtimeClock,
     private val bootSessionIdProvider: BootSessionIdProvider,
-) : PushEnvelopeReceiver {
+    private val sessions: SessionStore,
+    private val alertDelivery: NotificationAlertDelivery,
+    private val notificationRecovery: NotificationRecoveryScheduler,
+    @param:ApplicationScope private val scope: CoroutineScope,
+) : PushEnvelopeReceiver, NotificationInboxAlertSink {
     override fun receive(envelope: PushEnvelope) {
         val messagingData = envelope.data
         if (MessagingWakePayload.isCandidate(messagingData)) {
@@ -52,6 +65,26 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
             return
         }
 
+        val owner = sessions.current()?.fence()
+        if (!explicitPushRecipientMatches(envelope.data, owner)) return
+        if (envelope.data.containsKey("recipient_user_id")) {
+            // Explicitly owned lifecycle pushes must not retire another logged-in account's
+            // ring while credential replacement races this FCM callback.
+            scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                try {
+                    sessions.withCurrentSession(checkNotNull(owner)) { receiveNonMessaging(envelope) }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    notificationRecovery.schedule()
+                }
+            }
+        } else {
+            receiveNonMessaging(envelope)
+        }
+    }
+
+    private fun receiveNonMessaging(envelope: PushEnvelope) {
         val manager = context.getSystemService(NotificationManager::class.java)
         val lifecycleEvent = CallLifecycleEvent.fromData(envelope.data)
         if (lifecycleEvent != null) {
@@ -80,6 +113,7 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
                 CallLifecycleKind.MISSED ->
                     telecom.finish(lifecycleEvent.callId, KitTelecomDisconnect.MISSED)
             }
+            if (lifecycleEvent.kind == CallLifecycleKind.MISSED) enqueueAlert(envelope)
             return
         }
 
@@ -96,26 +130,93 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
             return
         }
 
-        if (MobileMoneySettlementAlert.isCandidate(envelope.data)) {
-            val settlement = MobileMoneySettlementAlert.fromData(envelope.data) ?: return
-            // The payload never writes status. It only wakes an authenticated exact-operation GET.
-            mobileMoney.reconcileSettlementHint(settlement.operationId)
-            showMobileMoneySettlement(manager, envelope, settlement)
+        enqueueAlert(envelope)
+    }
+
+    private fun enqueueAlert(envelope: PushEnvelope) {
+        val owner = sessions.current()?.fence() ?: return
+        if (!envelope.data.containsKey("recipient_user_id")) {
+            // An older display payload carries no proof of which login owns its private copy.
+            // Recover it through the authenticated inbox instead of attributing it to this login.
+            notificationRecovery.schedule()
             return
         }
+        // Start on FCM's existing execution window; a contended session lock may suspend. The
+        // durable inbox/maintenance path recovers if Android kills this process afterward.
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                recoverAlert(owner, envelope)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                notificationRecovery.schedule()
+            }
+        }
+    }
 
+    override suspend fun recoverAlert(owner: SessionFence, envelope: PushEnvelope): Boolean {
+        val data = envelope.data
+        if (MessagingWakePayload.isCandidate(data)) return true
+        if (!explicitPushRecipientMatches(data, owner)) return true
+        val missed = MissedCallAlert.fromData(data, owner)
+        if (data["type"]?.startsWith("call.") == true && missed == null) return true
+        val settlement = MobileMoneySettlementAlert.fromData(data)
+        if (MobileMoneySettlementAlert.isCandidate(data) && settlement == null) return true
         val claimAlert = PaymentClaimAlert.fromData(envelope.data)
-        if (claimAlert != null) {
-            showPaymentClaim(manager, envelope, claimAlert)
-            return
-        }
-
         val financialAlert = FinancialPaymentAlert.fromData(envelope.data)
-        if (financialAlert != null) {
-            showFinancialPayment(manager, envelope, financialAlert)
-            return
+        val notificationId = PaymentClaimAlert.canonicalUuid(data["notification_id"])
+        val identity = missed?.identity ?: notificationId?.let { "notification:$it" } ?: return true
+        if (missed == null && settlement == null && claimAlert == null && financialAlert == null &&
+            envelope.notification == null
+        ) return true
+        val payment = settlement != null || claimAlert != null || financialAlert != null
+        val channel = if (payment) PAYMENTS_CHANNEL_ID else ALERTS_CHANNEL_ID
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val tag = missed?.tag ?: settlement?.notificationTag ?: claimAlert?.notificationTag
+            ?: financialAlert?.notificationTag ?: checkNotNull(notificationId)
+        val occurredAt = envelope.occurredAtEpochMillis ?: System.currentTimeMillis()
+        var quota = RecoveredAlertQuotaPlan(true, emptyList())
+        return alertDelivery.deliver(
+            owner = owner,
+            identity = identity,
+            canDisplay = {
+                quota = planRecoveredAlertQuota(
+                    manager.activeNotifications.mapNotNull { status ->
+                        val activeTag = status.tag ?: return@mapNotNull null
+                        if (status.id != PAYMENT_NOTIFICATION_ID && status.id != MISSED_NOTIFICATION_ID &&
+                            !(status.id == 0 && PaymentClaimAlert.canonicalUuid(activeTag) != null)
+                        ) return@mapNotNull null
+                        ActiveRecoveredAlert(activeTag, status.id, status.notification.`when`)
+                    }, tag, occurredAt,
+                )
+                manager.areNotificationsEnabled() &&
+                    manager.getNotificationChannel(channel)?.importance != NotificationManager.IMPORTANCE_NONE &&
+                    quota.display
+            },
+            alreadyDisplayed = {
+                // Ordinary FCM display messages are rendered automatically while backgrounded.
+                // The backend uses their notification_id as tag, numeric id 0, matching below.
+                manager.activeNotifications.any {
+                    it.tag == tag && (!payment ||
+                        (envelope.occurredAtEpochMillis != null && it.notification.`when` >= occurredAt))
+                }
+            },
+            onAuthenticatedHint = {
+                settlement?.let { mobileMoney.reconcileSettlementHint(it.operationId) }
+            },
+        ) {
+            quota.cancel.forEach { manager.cancel(it.tag, it.id) }
+            when {
+                missed != null -> showMissedCall(manager, missed, occurredAt)
+                settlement != null -> showMobileMoneySettlement(manager, envelope, settlement)
+                claimAlert != null -> showPaymentClaim(manager, envelope, claimAlert)
+                financialAlert != null -> showFinancialPayment(manager, envelope, financialAlert)
+                else -> showGeneralAlert(manager, envelope, checkNotNull(notificationId))
+            }
         }
+    }
 
+    private fun showGeneralAlert(manager: NotificationManager, envelope: PushEnvelope, notificationId: String) {
         val notification = envelope.notification ?: return
         manager.createNotificationChannel(
             NotificationChannel(
@@ -126,18 +227,52 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
         )
         val openApp = PendingIntent.getActivity(
             context,
-            envelope.data["notification_id"]?.hashCode() ?: envelope.messageId?.hashCode() ?: 0,
+            notificationId.hashCode(),
             Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         manager.notify(
-            envelope.data["notification_id"]?.hashCode() ?: envelope.messageId?.hashCode() ?: 0,
+            notificationId,
+            0,
             NotificationCompat.Builder(context, ALERTS_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_kit_mark)
                 .setContentTitle(notification.title ?: context.getString(R.string.app_name))
                 .setContentText(notification.body.orEmpty())
+                .setWhen(envelope.occurredAtEpochMillis ?: System.currentTimeMillis())
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setOnlyAlertOnce(true)
                 .setAutoCancel(true)
                 .setContentIntent(openApp)
+                .build(),
+        )
+    }
+
+    private fun showMissedCall(manager: NotificationManager, alert: MissedCallAlert, occurredAt: Long) {
+        manager.createNotificationChannel(
+            NotificationChannel(ALERTS_CHANNEL_ID, "Kit Pay alerts", NotificationManager.IMPORTANCE_HIGH),
+        )
+        val open = PendingIntent.getActivity(
+            context,
+            alert.tag.hashCode(),
+            Intent(context, MainActivity::class.java)
+                .setAction(Intent.ACTION_VIEW)
+                .setData(Uri.parse(CALL_HISTORY_NOTIFICATION_LINK))
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        manager.notify(
+            alert.tag,
+            MISSED_NOTIFICATION_ID,
+            NotificationCompat.Builder(context, ALERTS_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_kit_mark)
+                .setContentTitle("Missed call")
+                .setContentText("Open Kit Pay to view your calls.")
+                .setWhen(occurredAt)
+                .setCategory(NotificationCompat.CATEGORY_MISSED_CALL)
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setOnlyAlertOnce(true)
+                .setAutoCancel(true)
+                .setContentIntent(open)
                 .build(),
         )
     }
@@ -171,6 +306,7 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
                 .setSmallIcon(R.drawable.ic_kit_mark)
                 .setContentTitle(envelope.notification?.title ?: context.getString(R.string.app_name))
                 .setContentText(envelope.notification?.body ?: "Open Kit Pay to view this payment.")
+                .setWhen(envelope.occurredAtEpochMillis ?: System.currentTimeMillis())
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
                 .setPublicVersion(
                     NotificationCompat.Builder(context, PAYMENTS_CHANNEL_ID)
@@ -230,6 +366,7 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
                         .build(),
                 )
                 .setOnlyAlertOnce(true)
+                .setWhen(envelope.occurredAtEpochMillis ?: System.currentTimeMillis())
                 .setAutoCancel(true)
                 .setContentIntent(open)
                 .build(),
@@ -304,6 +441,7 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
                 )
                 .setAutoCancel(true)
                 .setContentIntent(openClaim)
+                .setWhen(envelope.occurredAtEpochMillis ?: System.currentTimeMillis())
                 .build(),
         )
     }
@@ -466,7 +604,13 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
             }
         }
         val published = runCatching {
-            manager.notify(callTag(call.callId), CALL_NOTIFICATION_ID, notification.build())
+            val ringingNotification = notification.build().apply {
+                // NotificationManager owns sound/vibration even if the app process is killed.
+                // The channel, DND and system ringer policy still control audibility. The
+                // existing monotonic deadline + timeoutAfter bound this insistent alert.
+                flags = flags or Notification.FLAG_INSISTENT
+            }
+            manager.notify(callTag(call.callId), CALL_NOTIFICATION_ID, ringingNotification)
         }.isSuccess
         IncomingCallDiagnostics.notificationPublished(alertPlan.mode, published)
         ringDeadlines.schedule(call.callId, ringLease)
@@ -560,6 +704,7 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
         const val ALERTS_CHANNEL_ID = "kit_wallet_alerts"
         const val PAYMENTS_CHANNEL_ID = "kit_payments"
         const val PAYMENT_NOTIFICATION_ID = 4_201
+        const val MISSED_NOTIFICATION_ID = 4_105
         // Bumped from "kit_incoming_calls": notification-channel sound and vibration are immutable
         // once created, so a new id is required for the ringtone settings to apply on upgrades.
         const val CALL_NOTIFICATION_ID = 4_101

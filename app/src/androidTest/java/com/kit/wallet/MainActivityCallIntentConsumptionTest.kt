@@ -13,21 +13,18 @@ class MainActivityCallIntentConsumptionTest {
     private val callId = "550e8400-e29b-41d4-a716-446655440000"
 
     @Test
-    fun callDeepLinkIsConsumedExactlyOnce() {
+    fun untrustedIncomingCallDeepLinkIsRejectedAndRemoved() {
         val intent = Intent().setData(
             Uri.parse("kitwallet://call/incoming?call_id=$callId"),
         )
 
-        assertEquals(
-            "kitwallet://call/incoming?call_id=$callId",
-            intent.takeKitDeepLink(),
-        )
+        assertNull(intent.takeKitDeepLink())
         assertNull(intent.data)
         assertNull(intent.takeKitDeepLink())
     }
 
     @Test
-    fun providerCallExtrasAreRemovedAfterRouting() {
+    fun providerCallExtrasAreRemovedWithoutCreatingAnIncomingRoute() {
         val intent = Intent()
             .putExtra("type", "call.ringing")
             .putExtra("call_id", callId)
@@ -35,10 +32,7 @@ class MainActivityCallIntentConsumptionTest {
             .putExtra("initiator_name", "Florence")
             .putExtra("ring_expires_at", "2026-07-24T15:20:00Z")
 
-        assertEquals(
-            "kitwallet://call/incoming?call_id=$callId",
-            intent.takeKitDeepLink(),
-        )
+        assertNull(intent.takeKitDeepLink())
         assertNull(intent.getStringExtra("call_id"))
         assertNull(intent.takeKitDeepLink())
     }
@@ -53,17 +47,14 @@ class MainActivityCallIntentConsumptionTest {
             .putExtra("initiator_name", "Florence")
             .putExtra("ring_expires_at", "2026-07-24T15:20:00Z")
 
-        assertEquals(
-            "kitwallet://call/incoming?call_id=$callId",
-            intent.takeKitDeepLink(),
-        )
+        assertNull(intent.takeKitDeepLink())
         assertNull(intent.data)
         assertNull(intent.getStringExtra("call_id"))
         assertNull(intent.takeKitDeepLink())
     }
 
     @Test
-    fun acceptedCallUriIsCanonicalizedBeforeItCanBeSaved() {
+    fun externalAutoAnswerUriCannotBypassThePrivateCallAuthorizer() {
         val intent = Intent().setData(
             Uri.parse(
                 "kitwallet://call/incoming?call_id=$callId&accept=1&" +
@@ -71,10 +62,25 @@ class MainActivityCallIntentConsumptionTest {
             ),
         )
 
-        assertEquals(
-            "kitwallet://call/incoming?call_id=$callId&accept=1",
-            intent.takeKitDeepLink(),
-        )
+        assertNull(intent.takeKitDeepLink())
         assertNull(intent.data)
+    }
+
+    @Test
+    fun missedCallTapOpensOnlyHistoryAndIsConsumedExactlyOnce() {
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setData(Uri.parse("kitwallet://calls/history"))
+            .putExtra("call_id", callId)
+            .putExtra("type", "call.ringing")
+        assertEquals("kitwallet://calls/history", intent.takeKitDeepLink())
+        assertNull(intent.data)
+        assertNull(intent.getStringExtra("call_id"))
+        assertNull(intent.takeKitDeepLink())
+    }
+
+    @Test
+    fun historyRouteRejectsAnAttachedIncomingCallOrAnswerCommand() {
+        val intent = Intent().setData(Uri.parse("kitwallet://calls/history?call_id=$callId&accept=1"))
+        assertNull(intent.takeKitDeepLink())
     }
 }

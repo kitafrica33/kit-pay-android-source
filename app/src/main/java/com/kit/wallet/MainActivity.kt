@@ -884,6 +884,7 @@ internal fun Intent.takeKitDeepLink(): String? {
         val claimLink = PaymentClaimLink.fromDeepLink(raw)
         val mobileMoneySettlementLink = MobileMoneySettlementLink.fromDeepLink(raw)
         val canonicalRoute = when {
+            raw == com.kit.wallet.data.notifications.CALL_HISTORY_NOTIFICATION_LINK -> raw
             isKycReturn -> KYC_STATUS_DEEP_LINK
             // The ongoing-call notification: return to the call the app is already in.
             returnLink != null -> returnLink.deepLinkUri()

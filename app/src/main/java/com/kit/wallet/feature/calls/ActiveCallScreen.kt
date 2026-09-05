@@ -242,13 +242,8 @@ fun ActiveCallScreen(
             connectCall()
         }
     }
-    // Ring and vibrate for the callee only while the verified call is still ringing. Accepting,
-    // declining, connecting or any error immediately flips this off and disposes the ringer.
-    val ringing = state.incoming && state.phase == CallPhase.INCOMING
-    DisposableEffect(ringing) {
-        val ringer = if (ringing) CallRinger(context).also { it.start() } else null
-        onDispose { ringer?.stop() }
-    }
+    // The incoming notification owns ringtone/vibration through its bounded ringing lease.
+    // Starting a second UI ringtone doubles the audio and bypasses a muted notification channel.
     // Standard telephony progress sounds for the caller: ringback while the peer's device rings
     // and a short disconnect burst when an active or ringing call terminates.
     val tones = remember { CallTonePlayer() }

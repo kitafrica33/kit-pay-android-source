@@ -10,6 +10,7 @@ import com.kit.wallet.data.media.ProfileAvatarImages
 import com.kit.wallet.data.messaging.SecureMessagingLocalHistoryBootstrapper
 import com.kit.wallet.data.notifications.PushMessagingTransport
 import com.kit.wallet.data.notifications.PushTokenCoordinator
+import com.kit.wallet.data.notifications.NotificationRecoveryMonitor
 import com.kit.wallet.data.realtime.KitRealtimeCoordinator
 import com.kit.wallet.feature.calls.KitTelecomBridge
 import com.kit.wallet.feature.chat.VoiceNotePlayer
@@ -27,6 +28,7 @@ class KitApplication : Application(), Configuration.Provider, ImageLoaderFactory
     @Inject lateinit var walletRefreshScheduler: dagger.Lazy<WalletRefreshScheduler>
     @Inject lateinit var pushMessagingTransport: dagger.Lazy<PushMessagingTransport>
     @Inject lateinit var pushTokens: dagger.Lazy<PushTokenCoordinator>
+    @Inject internal lateinit var notificationRecovery: dagger.Lazy<NotificationRecoveryMonitor>
     @Inject lateinit var telecomBridge: dagger.Lazy<KitTelecomBridge>
     @Inject lateinit var sessions: dagger.Lazy<SessionStore>
     @Inject internal lateinit var realtime: dagger.Lazy<KitRealtimeCoordinator>
@@ -61,6 +63,7 @@ class KitApplication : Application(), Configuration.Provider, ImageLoaderFactory
         // backup schedule is re-booked here rather than only when the settings screen is opened.
         messageBackups.get().restoreSchedule()
         pushTokens.get().start()
+        notificationRecovery.get().start()
         // Registers the lifecycle and connectivity monitors and returns. No socket
         // is opened until the app is foregrounded, a session exists, and the server
         // actually advertises the transport.

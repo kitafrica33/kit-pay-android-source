@@ -9,6 +9,9 @@ import dagger.Module
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
 import javax.inject.Singleton
+import com.kit.wallet.data.notifications.NotificationInboxAlertSink
+import com.kit.wallet.data.notifications.NotificationRecoveryStore
+import com.kit.wallet.data.notifications.SqliteNotificationRecoveryStore
 
 @Module
 @InstallIn(SingletonComponent::class)
@@ -24,4 +27,10 @@ abstract class PushMessagingModule {
     abstract fun bindPushEnvelopeReceiver(
         implementation: DefaultPushEnvelopeReceiver,
     ): PushEnvelopeReceiver
+
+    @Binds
+    internal abstract fun bindInboxAlertSink(implementation: DefaultPushEnvelopeReceiver): NotificationInboxAlertSink
+
+    @Binds
+    internal abstract fun bindRecoveryStore(implementation: SqliteNotificationRecoveryStore): NotificationRecoveryStore
 }
