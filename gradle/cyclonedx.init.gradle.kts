@@ -77,6 +77,8 @@ rootProject {
     )
 
     appProject.tasks.withType(CyclonedxDirectTask::class.java).configureEach {
+        // Refresh evidence without --rerun-tasks invalidating compilation/tests in the same graph.
+        outputs.upToDateWhen { false }
         includeConfigs.set(listOf("releaseRuntimeClasspath"))
         skipConfigs.set(emptyList())
         includeBuildEnvironment.set(false)
@@ -98,6 +100,7 @@ rootProject {
     appProject.tasks.register("writeReleaseRuntimeCoordinates") {
         description = "Writes the exact releaseRuntimeClasspath module set for SBOM validation."
         outputs.file(coordinateOutput)
+        outputs.upToDateWhen { false }
         doLast {
             val runtime = appProject.configurations.getByName("releaseRuntimeClasspath")
             val coordinates = runtime.incoming.resolutionResult.allComponents

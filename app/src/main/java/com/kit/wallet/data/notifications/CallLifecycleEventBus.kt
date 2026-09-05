@@ -27,6 +27,8 @@ data class CallLifecycleEvent(
      */
     val answeredAt: String? = null,
     val serverTime: String? = null,
+    /** Process-local notification/Telecom intent; wire decoding can never populate this flag. */
+    val localEndRequested: Boolean = false,
 ) {
     val terminal: Boolean
         get() = when (kind) {

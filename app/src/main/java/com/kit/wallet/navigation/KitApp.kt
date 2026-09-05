@@ -16,15 +16,12 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.statusBars
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Call
@@ -96,6 +93,7 @@ import com.kit.wallet.feature.bills.AirtimeScreen
 import com.kit.wallet.feature.bills.BillPayScreen
 import com.kit.wallet.feature.bills.BillsScreen
 import com.kit.wallet.feature.calls.ActiveCallScreen
+import com.kit.wallet.feature.calls.ActiveCallMiniBar
 import com.kit.wallet.feature.calls.CallsScreen
 import com.kit.wallet.feature.chat.ChatsScreen
 import com.kit.wallet.feature.chat.ChatsViewModel
@@ -260,6 +258,7 @@ internal fun KitApp(
         isSourceOnScreen = voiceNotePlayback.isSourceOnScreen,
     )
     val activeCallPresence by chatsBadgeViewModel.activeCallPresence.collectAsStateWithLifecycle()
+    val callBarVisible = signedIn && activeCallPresence != null && currentRoute !in CALL_ROUTES
     // Returning to the live call is always a pop back to the call entry already on the stack —
     // never a navigate(): a fresh call route would scope a fresh ViewModel (whose later pop would
     // end the call) or hit the incoming route's answerable-only gate. Anything but an exact match
@@ -534,6 +533,9 @@ internal fun KitApp(
     }
 
     Scaffold(
+        // Child screens own their top bars and cutout insets. Only reserve the bottom navigation
+        // here; adding Scaffold's status inset as well would leave a second empty status-bar row.
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
             if (showBottomBar) {
                 NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
@@ -577,36 +579,37 @@ internal fun KitApp(
         // A voice note keeps playing after the bubble that started it is scrolled past, or the
         // thread is left entirely. Its only remaining control rides above every screen — the same
         // place a minimized call sits — until the note ends or the user dismisses it.
-        Column {
-            if (voiceNoteBarVisible) {
-                VoiceNoteMiniBar(
-                    Modifier.statusBarsPadding(),
-                    onOpenSource = { playing ->
-                        val conversationId = playing.context.conversationId
-                        // An album track's id is "messageId/attachmentId"; the thread lands on
-                        // the message. The request rides beside navigation because a single-top
-                        // navigate to the thread already on top re-delivers nothing.
-                        if (
-                            ConversationFocusRequests.request(
-                                conversationId = conversationId,
-                                messageId = playing.id.substringBefore('/'),
-                            )
-                        ) {
-                            navController.navigate(Dest.conversation(conversationId)) {
-                                launchSingleTop = true
-                            }
-                        }
-                    },
-                )
-                Spacer(Modifier.height(VoiceNoteMiniBarPolicy.CONTENT_GAP_DP.dp))
-            }
-            Box(
+        OngoingSessionLayout(
+            hasBars = callBarVisible || voiceNoteBarVisible,
+            bars = {
+                if (callBarVisible) activeCallPresence?.let { call ->
+                    ActiveCallMiniBar(call, onReturn = { returnToActiveCall(call.callId) })
+                }
                 if (voiceNoteBarVisible) {
-                    Modifier.consumeWindowInsets(WindowInsets.statusBars)
-                } else {
-                    Modifier
-                },
-            ) {
+                    VoiceNoteMiniBar(
+                        Modifier,
+                        onOpenSource = { playing ->
+                            val conversationId = playing.context.conversationId
+                            // An album track's id is "messageId/attachmentId"; the thread lands on
+                            // the message. The request rides beside navigation because a single-top
+                            // navigate to the thread already on top re-delivers nothing.
+                            if (
+                                ConversationFocusRequests.request(
+                                    conversationId = conversationId,
+                                    messageId = playing.id.substringBefore('/'),
+                                )
+                            ) {
+                                navController.navigate(Dest.conversation(conversationId)) {
+                                    launchSingleTop = true
+                                }
+                            }
+                        },
+                    )
+                    Spacer(Modifier.height(VoiceNoteMiniBarPolicy.CONTENT_GAP_DP.dp))
+                }
+            },
+        ) {
+            Box {
                 KitNavHost(
                     navController = navController,
                     startDestination = if (signedIn) Dest.HOME else Dest.ONBOARDING,
@@ -625,7 +628,9 @@ internal fun KitApp(
                     onAuthorizedIncomingCallSurfaceChanged =
                         onAuthorizedIncomingCallSurfaceChanged,
                     onReturnToActiveCall = returnToActiveCall,
-                    modifier = if (showBottomBar) Modifier.padding(innerPadding) else Modifier,
+                    modifier = if (showBottomBar) {
+                        Modifier.padding(innerPadding).consumeWindowInsets(innerPadding)
+                    } else Modifier,
                 )
             }
         }

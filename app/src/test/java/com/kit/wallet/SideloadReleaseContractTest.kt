@@ -10,7 +10,8 @@ class SideloadReleaseContractTest {
     fun `arm64 property is isolated from the ordinary Play bundle build`() {
         val root = repositoryRoot()
         val buildScript = File(root, "app/build.gradle.kts").readText()
-        val workflow = File(root, ".github/workflows/android-ci.yml").readText()
+        val workflow = File(root, ".github/workflows/android-publish.yml").readText()
+        val releaseBuilder = File(root, "fastlane/scripts/generate-release-sbom.sh").readText()
 
         assertTrue(buildScript.contains("gradleProperty(\"KIT_PAY_SIDELOAD_ABI\").orNull"))
         assertFalse(buildScript.contains("environmentVariable(\"KIT_PAY_SIDELOAD_ABI\")"))
@@ -20,7 +21,9 @@ class SideloadReleaseContractTest {
         assertTrue(buildScript.contains("artifactChannel.set(if (kitPaySideloadAbi == null)"))
         assertTrue(buildScript.contains("nativeAbis.set("))
 
-        val bundlePosition = workflow.indexOf(":app:bundleRelease --stacktrace")
+        assertTrue(releaseBuilder.contains(":app:bundleRelease"))
+        assertFalse(releaseBuilder.contains("KIT_PAY_SIDELOAD_ABI"))
+        val bundlePosition = workflow.indexOf("\"${'$'}release_dir\" \"${'$'}RUNNER_TEMP/public-source\" build-release")
         val sideloadPosition = workflow.indexOf("-PKIT_PAY_SIDELOAD_ABI=arm64-v8a")
         assertTrue(bundlePosition >= 0)
         assertTrue(sideloadPosition > bundlePosition)

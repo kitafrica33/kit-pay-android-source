@@ -34,6 +34,7 @@ import com.kit.wallet.di.ApplicationScope
 import com.kit.wallet.ui.model.Contact
 import com.kit.wallet.ui.model.AccountVerification
 import com.twilio.audioswitch.AudioDevice
+import com.twilio.audioswitch.AudioDeviceChangeListener
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.livekit.android.ConnectOptions
@@ -53,6 +54,7 @@ import java.util.UUID
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -78,11 +80,19 @@ enum class CallPhase {
     ERROR,
 }
 
+private data class ForegroundCallPresentation(
+    val callId: String,
+    val name: String,
+    val video: Boolean,
+    val camera: Boolean,
+)
+
 /** One other person on the call: their name, current video (camera or screen) and speaking state. */
 data class RemoteCallParticipant(
     val id: String,
     val name: String,
     val videoTrack: VideoTrack? = null,
+    val screenSharing: Boolean = false,
     val speaking: Boolean = false,
     /** Stable backend/LiveKit fallback used if a saved contact is renamed or removed. */
     val serverName: String? = name,
@@ -112,7 +122,10 @@ data class ActiveCallUiState(
     val phase: CallPhase = CallPhase.IDLE,
     val muted: Boolean = false,
     val cameraEnabled: Boolean = false,
+    val mediaChanging: Boolean = false,
     val speakerEnabled: Boolean = false,
+    val audioDevices: List<AudioDevice> = emptyList(),
+    val selectedAudioDevice: AudioDevice? = null,
     val screenSharing: Boolean = false,
     val durationSeconds: Long = 0,
     val remoteParticipants: List<RemoteCallParticipant> = emptyList(),
@@ -123,6 +136,9 @@ data class ActiveCallUiState(
 ) {
     /** The primary remote video, used by the one-to-one layout. */
     val remoteVideoTrack: VideoTrack? get() = remoteParticipants.firstOrNull { it.videoTrack != null }?.videoTrack
+
+    val remoteScreenShare: RemoteCallParticipant?
+        get() = remoteParticipants.firstOrNull { it.screenSharing && it.videoTrack != null }
 
     /** True once more than one other participant is on the call. */
     val isGroup: Boolean get() = remoteParticipants.size > 1
@@ -366,6 +382,8 @@ class ActiveCallViewModel @Inject constructor(
     private var verifiedIncomingCall: IncomingCallDetails? = null
     private var validationJob: Job? = null
     private var startJob: Job? = null
+    private val mediaOperations = CallMediaOperations()
+    private var foregroundCall: ForegroundCallPresentation? = null
     private var offlineStartRetryJob: Job? = null
     private var offlineStartRetryAttempt = 0
     private var outgoingAttemptSubmitted = false
@@ -389,6 +407,18 @@ class ActiveCallViewModel @Inject constructor(
         initialCallId = incomingCallId,
     )
     private var terminated = false
+    private val audioDeviceListener: AudioDeviceChangeListener = { devices, selected ->
+        // AudioSwitch dispatches from its audio thread, while call state belongs to Main.
+        viewModelScope.launch {
+            if (!terminated) {
+                mutableState.value = mutableState.value.copy(
+                    audioDevices = devices.toList(),
+                    selectedAudioDevice = selected,
+                    speakerEnabled = selected is AudioDevice.Speakerphone,
+                )
+            }
+        }
+    }
 
     /** Kit Pay contacts that can be added to the call, for the in-call "Add people" picker. */
     val callableContacts: StateFlow<List<Contact>> = contacts.contacts
@@ -396,6 +426,8 @@ class ActiveCallViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     init {
+        (room.audioHandler as? AudioSwitchHandler)
+            ?.registerAudioDeviceChangeListener(audioDeviceListener)
         viewModelScope.launch {
             contacts.contacts.collect(::applyContactPresentation)
         }
@@ -415,11 +447,28 @@ class ActiveCallViewModel @Inject constructor(
                     // and re-derives whether the call is showing video.
                     is RoomEvent.TrackSubscribed -> if (!terminated) syncRemoteParticipants()
                     is RoomEvent.TrackUnsubscribed -> if (!terminated) syncRemoteParticipants()
+                    is RoomEvent.TrackMuted,
+                    is RoomEvent.TrackUnmuted,
+                    is RoomEvent.TrackPublished,
+                    is RoomEvent.TrackUnpublished,
+                    -> if (!terminated) {
+                        syncRemoteParticipants()
+                        syncLocalMediaState()
+                    }
+                    is RoomEvent.ActiveSpeakersChanged -> if (!terminated) syncRemoteParticipants()
                     is RoomEvent.Reconnecting -> if (!terminated) {
                         mutableState.value = mutableState.value.copy(phase = CallPhase.RECONNECTING)
                     }
                     is RoomEvent.Reconnected -> if (!terminated) {
-                        mutableState.value = mutableState.value.copy(phase = CallPhase.CONNECTED)
+                        mutableState.value = mutableState.value.copy(
+                            phase = CallAnswerRouting.phaseAfterConnect(
+                                hasRemoteParticipants = room.remoteParticipants.isNotEmpty(),
+                                incoming = incomingCallId != null,
+                                alreadyAnswered = answeredCallId.equals(connection?.callId, ignoreCase = true),
+                            ),
+                        )
+                        syncRemoteParticipants()
+                        syncLocalMediaState()
                     }
                     is RoomEvent.FailedToConnect -> fail(event.error)
                     is RoomEvent.Disconnected -> if (!terminated) {
@@ -570,6 +619,8 @@ class ActiveCallViewModel @Inject constructor(
             // termination guard; an incoming retry always retains its original call id.
             localTelecomTermination = DeferredCallTermination(finish = telecom::finish)
         }
+        mediaOperations.open()
+        foregroundCall = null
         terminated = false
         // A retry places a new call, so nothing the previous attempt counted applies to it.
         durationAnchor = null
@@ -581,9 +632,11 @@ class ActiveCallViewModel @Inject constructor(
             mutableState.value = mutableState.value.copy(
                 video = requestedVideo,
                 cameraEnabled = requestedVideo,
-                speakerEnabled = requestedVideo,
                 phase = CallPhase.CONNECTING,
                 durationSeconds = 0,
+                muted = false,
+                screenSharing = false,
+                mediaChanging = false,
                 error = null,
             )
             try {
@@ -647,12 +700,9 @@ class ActiveCallViewModel @Inject constructor(
                     cameraEnabled = session.video,
                 )
                 applyContactPresentation(contacts.contacts.value)
-                CallForegroundService.start(
-                    context,
-                    mutableState.value.name,
-                    session.video,
-                    callId = session.callId,
-                )
+                updateForegroundCall()
+                configureAudioRouting(session.video)
+                (room.audioHandler as? AudioSwitchHandler)?.selectDevice(null)
                 room.connect(
                     url = session.url,
                     token = session.token,
@@ -666,15 +716,20 @@ class ActiveCallViewModel @Inject constructor(
                     room.disconnect()
                     return@launch
                 }
-                // Routing before the local tracks, because the handler only enumerates
-                // devices once connect() has started it, and the first remote audio must
-                // not arrive with the route still on its default.
-                selectSpeaker(session.video)
                 // Idempotent: the handshake above normally published these already. Kept so
                 // a server or SDK path that declined to publish during connect still ends up
                 // with two-way media rather than a silent call.
-                room.localParticipant.setMicrophoneEnabled(true)
-                if (session.video) room.localParticipant.setCameraEnabled(true)
+                val microphoneEnabled = room.localParticipant.setMicrophoneEnabled(true)
+                if (terminated) {
+                    room.disconnect()
+                    return@launch
+                }
+                check(microphoneEnabled) { "The microphone could not start" }
+                val cameraEnabled = session.video && room.localParticipant.setCameraEnabled(true)
+                if (terminated) {
+                    room.disconnect()
+                    return@launch
+                }
                 val localTrack = room.localParticipant
                     .getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
                 mutableState.value = mutableState.value.copy(
@@ -683,9 +738,14 @@ class ActiveCallViewModel @Inject constructor(
                         incoming = incomingCallId != null,
                         alreadyAnswered = answeredCallId.equals(session.callId, ignoreCase = true),
                     ),
+                    cameraEnabled = cameraEnabled,
                     localVideoTrack = localTrack,
+                    error = if (session.video && !cameraEnabled) {
+                        "The camera could not start. You can continue with audio or try again."
+                    } else null,
                 )
                 syncRemoteParticipants()
+                updateForegroundCall()
                 if (mutableState.value.phase == CallPhase.CONNECTED) {
                     markConnected()
                 }
@@ -744,106 +804,74 @@ class ActiveCallViewModel @Inject constructor(
     }
 
     fun toggleMute() {
-        val enabled = mutableState.value.muted
-        viewModelScope.launch {
-            runCatching { room.localParticipant.setMicrophoneEnabled(enabled) }
-                .onSuccess { mutableState.value = mutableState.value.copy(muted = !enabled) }
-                .onFailure(::fail)
+        val enable = mutableState.value.muted
+        changeMedia("The microphone could not be changed. Please try again.") {
+            room.localParticipant.setMicrophoneEnabled(enable)
         }
     }
 
     fun toggleCamera() {
-        val enabled = !mutableState.value.cameraEnabled
-        viewModelScope.launch {
-            runCatching { room.localParticipant.setCameraEnabled(enabled) }
-                .onSuccess {
-                    val track = room.localParticipant
-                        .getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
-                    mutableState.value = mutableState.value.copy(
-                        cameraEnabled = enabled,
-                        localVideoTrack = track,
-                    )
-                    syncRemoteParticipants()
-                }
-                .onFailure(::fail)
-        }
+        if (mutableState.value.cameraEnabled) switchToAudio() else switchToVideo()
     }
 
-    /**
-     * Upgrades the current voice call to video: publishes the camera and routes audio to the
-     * speaker. The peer's screen upgrades automatically when the video track arrives.
-     */
+    /** Publish the camera without disconnecting working audio if capture cannot start. */
     fun switchToVideo() {
-        if (mutableState.value.phase !in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)) return
-        viewModelScope.launch {
-            runCatching { room.localParticipant.setCameraEnabled(true) }
-                .onSuccess {
-                    val track = room.localParticipant
-                        .getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
-                    mutableState.value = mutableState.value.copy(
-                        video = true,
-                        cameraEnabled = true,
-                        localVideoTrack = track,
-                    )
-                    selectSpeaker(true)
-                    syncRemoteParticipants()
-                    publishPresence()
-                }
-                .onFailure(::fail)
+        changeMedia("The camera could not start. Check camera access and try again.") {
+            updateForegroundCall(camera = true)
+            room.localParticipant.setCameraEnabled(true)
         }
     }
 
-    /**
-     * Drops this side of the call back to voice: unpublishes the camera and returns audio to the
-     * earpiece. The remote video keeps rendering if the peer still has their camera on.
-     */
     fun switchToAudio() {
-        viewModelScope.launch {
-            runCatching { room.localParticipant.setCameraEnabled(false) }
-                .onSuccess {
-                    mutableState.value = mutableState.value.copy(
-                        cameraEnabled = false,
-                        localVideoTrack = null,
-                    )
-                    syncRemoteParticipants()
-                    if (mutableState.value.remoteVideoTrack == null && !mutableState.value.screenSharing) {
-                        selectSpeaker(false)
-                    }
-                }
-                .onFailure(::fail)
+        changeMedia("The camera could not be turned off. Please try again.") {
+            room.localParticipant.setCameraEnabled(false)
         }
     }
 
-    /**
-     * Starts sharing this device's screen into the call using the granted MediaProjection result.
-     * The screen track publishes as a video track that other participants render.
-     */
     fun startScreenShare(mediaProjectionData: Intent) {
-        if (mutableState.value.phase !in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)) return
-        viewModelScope.launch {
-            runCatching {
-                room.localParticipant.setScreenShareEnabled(
-                    true,
-                    ScreenCaptureParams(mediaProjectionData),
-                )
-            }
-                .onSuccess {
-                    mutableState.value = mutableState.value.copy(video = true, screenSharing = true)
-                    selectSpeaker(true)
-                    syncRemoteParticipants()
-                }
-                .onFailure(::fail)
+        changeMedia("Screen sharing could not start. Please try again.") {
+            room.localParticipant.setScreenShareEnabled(
+                true,
+                ScreenCaptureParams(mediaProjectionData, onStop = {
+                    // Read the current publication: a delayed stop from an old capture must not
+                    // clear a replacement share that has already started.
+                    viewModelScope.launch { syncLocalMediaState() }
+                }),
+            )
         }
     }
 
     fun stopScreenShare() {
-        viewModelScope.launch {
-            runCatching { room.localParticipant.setScreenShareEnabled(false) }
-                .onSuccess {
-                    mutableState.value = mutableState.value.copy(screenSharing = false)
-                    syncRemoteParticipants()
+        changeMedia("Screen sharing could not stop. Please try again.") {
+            room.localParticipant.setScreenShareEnabled(false)
+        }
+    }
+
+    private fun changeMedia(failureMessage: String, change: suspend () -> Boolean) {
+        if (terminated || mediaOperations.isActive ||
+            mutableState.value.phase !in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)
+        ) return
+        val callId = connection?.callId ?: return
+        mutableState.value = mutableState.value.copy(mediaChanging = true, error = null)
+        mediaOperations.launch(viewModelScope) { isCurrent ->
+            try {
+                val changed = change()
+                if (isCurrent() && !terminated && connection?.callId == callId) {
+                    if (!changed) mutableState.value = mutableState.value.copy(error = failureMessage)
+                    syncLocalMediaState()
                 }
-                .onFailure(::fail)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                if (isCurrent() && !terminated && connection?.callId == callId) {
+                    mutableState.value = mutableState.value.copy(error = failureMessage)
+                    syncLocalMediaState()
+                }
+            } finally {
+                if (isCurrent() && !terminated && connection?.callId == callId) {
+                    mutableState.value = mutableState.value.copy(mediaChanging = false)
+                }
+            }
         }
     }
 
@@ -866,10 +894,21 @@ class ActiveCallViewModel @Inject constructor(
         if (terminated) return
         val participants = room.remoteParticipants.values.map { participant ->
             val identity = participant.identity?.value
-            val video = participant.videoTrackPublications
-                .asSequence()
-                .mapNotNull { (_, track) -> track as? VideoTrack }
-                .firstOrNull()
+            val video = selectRemoteCallVideo(
+                participant.trackPublications.values
+                    .filter { it.kind == Track.Kind.VIDEO }
+                    .map { publication ->
+                        CallVideoPublication(
+                            track = publication.track as? VideoTrack,
+                            source = when (publication.source) {
+                                Track.Source.SCREEN_SHARE -> CallVideoSource.SCREEN_SHARE
+                                Track.Source.CAMERA -> CallVideoSource.CAMERA
+                                else -> CallVideoSource.OTHER
+                            },
+                            muted = publication.muted,
+                        )
+                    },
+            )
             val presentation = resolveRoomParticipant(
                 identity = identity,
                 serverName = participant.name,
@@ -879,7 +918,8 @@ class ActiveCallViewModel @Inject constructor(
             RemoteCallParticipant(
                 id = identity ?: participant.hashCode().toString(),
                 name = presentation.name,
-                videoTrack = video,
+                videoTrack = video?.track,
+                screenSharing = video?.source == CallVideoSource.SCREEN_SHARE,
                 speaking = participant.isSpeaking,
                 serverName = participant.name,
                 avatarUrl = presentation.avatarUrl,
@@ -889,14 +929,37 @@ class ActiveCallViewModel @Inject constructor(
         val showsVideo = mutableState.value.cameraEnabled ||
             mutableState.value.screenSharing ||
             participants.any { it.videoTrack != null }
+        if (showsVideo != mutableState.value.video) configureAudioRouting(showsVideo)
         mutableState.value = mutableState.value.copy(
             remoteParticipants = participants,
             video = showsVideo,
         )
         applyContactPresentation(contacts.contacts.value)
+        updateForegroundCall()
+    }
+
+    private fun syncLocalMediaState() {
+        if (terminated || mutableState.value.phase !in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)) {
+            return
+        }
+        val camera = room.localParticipant.getTrackPublication(Track.Source.CAMERA)
+        val screen = room.localParticipant.getTrackPublication(Track.Source.SCREEN_SHARE)
+        val microphone = room.localParticipant.getTrackPublication(Track.Source.MICROPHONE)
+        mutableState.value = mutableState.value.copy(
+            cameraEnabled = camera?.track != null && camera.muted == false,
+            localVideoTrack = camera?.track as? VideoTrack,
+            screenSharing = screen?.track != null && screen.muted == false,
+            muted = microphone?.muted ?: mutableState.value.muted,
+        )
+        syncRemoteParticipants()
+        updateForegroundCall()
+        publishPresence()
     }
 
     fun flipCamera() {
+        if (terminated || mediaOperations.isActive ||
+            mutableState.value.phase !in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)
+        ) return
         val track = room.localParticipant.getTrackPublication(Track.Source.CAMERA)
             ?.track as? LocalVideoTrack ?: return
         val next = when (track.options.position) {
@@ -908,7 +971,12 @@ class ActiveCallViewModel @Inject constructor(
     }
 
     fun toggleSpeaker() {
-        selectSpeaker(!mutableState.value.speakerEnabled)
+        val desired = if (mutableState.value.speakerEnabled) {
+            mutableState.value.audioDevices.firstOrNull { it is AudioDevice.Earpiece }
+        } else {
+            mutableState.value.audioDevices.firstOrNull { it is AudioDevice.Speakerphone }
+        }
+        selectAudioDevice(desired)
     }
 
     fun end(reason: String = "completed") {
@@ -1052,18 +1120,31 @@ class ActiveCallViewModel @Inject constructor(
         }
     }
 
-    private fun selectSpeaker(speaker: Boolean) {
+    private fun configureAudioRouting(video: Boolean) {
+        (room.audioHandler as? AudioSwitchHandler)?.preferredDeviceList =
+            callAudioDevicePreference(video)
+    }
+
+    private fun updateForegroundCall(camera: Boolean = mutableState.value.cameraEnabled) {
+        val session = connection ?: return
+        if (terminated) return
+        val presentation = ForegroundCallPresentation(
+            session.callId, mutableState.value.name, mutableState.value.video, camera,
+        )
+        if (presentation == foregroundCall) return
+        CallForegroundService.start(
+            context, presentation.name, presentation.video,
+            callId = presentation.callId, camera = presentation.camera,
+        )
+        foregroundCall = presentation
+    }
+
+    fun selectAudioDevice(device: AudioDevice?) {
+        if (terminated || device != null && device !in mutableState.value.audioDevices) return
         val handler = room.audioHandler as? AudioSwitchHandler ?: return
-        val selected = runCatching {
-            val device = if (speaker) {
-                handler.availableAudioDevices.firstOrNull { it is AudioDevice.Speakerphone }
-            } else {
-                handler.availableAudioDevices.firstOrNull { it is AudioDevice.Earpiece }
-            }
-            handler.selectDevice(device)
-            speaker
-        }.getOrDefault(false)
-        mutableState.value = mutableState.value.copy(speakerEnabled = selected)
+        // A deliberate selection is sticky in AudioSwitch; automatic mode follows device changes.
+        // The listener, rather than this request, acknowledges the route shown to the user.
+        handler.selectDevice(device)
     }
 
     private fun terminate(reason: String) {
@@ -1093,6 +1174,7 @@ class ActiveCallViewModel @Inject constructor(
             }
         }
         terminated = true
+        val retiringMedia = mediaOperations.retire()
         offlineStartRetryJob?.cancel()
         offlineStartRetryJob = null
         validationJob?.cancel()
@@ -1111,6 +1193,8 @@ class ActiveCallViewModel @Inject constructor(
         val connecting = startJob
         terminationJob = viewModelScope.launch {
             connecting?.join()
+            retiringMedia?.join()
+            room.disconnect()
             val activeCallId = connection?.callId
             if (activeCallId != null) {
                 pendingTerminations.enqueue(
@@ -1205,6 +1289,11 @@ class ActiveCallViewModel @Inject constructor(
     }
 
     private fun applyLifecycleEvent(event: CallLifecycleEvent) {
+        event.pendingLocalTermination()?.let { action ->
+            pendingTerminations.enqueue(action)
+            terminate(action.reason)
+            return
+        }
         when (event.kind) {
             CallLifecycleKind.ANSWERED -> {
                 // Recorded before the action is chosen, so a start response that is still
@@ -1264,6 +1353,7 @@ class ActiveCallViewModel @Inject constructor(
             return
         }
         terminated = true
+        val retiringMedia = mediaOperations.retire()
         ringDeadlines.retire(callId, disconnect.ringRetirementDisposition())
         telecom.finish(callId, disconnect)
         validationJob?.cancel()
@@ -1281,6 +1371,8 @@ class ActiveCallViewModel @Inject constructor(
         val connecting = startJob
         terminationJob = viewModelScope.launch {
             connecting?.join()
+            retiringMedia?.join()
+            room.disconnect()
             pendingTerminations.completed(callId)
             connection = null
             startJob = null
@@ -1358,14 +1450,8 @@ class ActiveCallViewModel @Inject constructor(
         }
     }
 
-    private suspend fun drainPendingTerminations(): Boolean {
-        pendingTerminations.snapshot().forEach { action ->
-            if (performBackendTermination(action)) {
-                pendingTerminations.completed(action.callId)
-            }
-        }
-        return pendingTerminations.isEmpty
-    }
+    private suspend fun drainPendingTerminations(): Boolean =
+        pendingTerminations.drain(::performBackendTermination)
 
     private suspend fun performBackendTermination(action: PendingCallTermination): Boolean =
         withTimeoutOrNull(3_000) {
@@ -1384,6 +1470,7 @@ class ActiveCallViewModel @Inject constructor(
             return
         }
         terminated = true
+        val retiringMedia = mediaOperations.retire()
         closeRingWindow(
             connection?.callId ?: incomingCallId,
             IncomingCallRetirementDisposition.ERROR,
@@ -1403,6 +1490,8 @@ class ActiveCallViewModel @Inject constructor(
         val connecting = startJob
         cleanupJob = viewModelScope.launch {
             connecting?.join()
+            retiringMedia?.join()
+            room.disconnect()
             val failedCallId = connection?.callId
             connection = null
             if (failedCallId != null) {
@@ -1439,8 +1528,17 @@ class ActiveCallViewModel @Inject constructor(
         timerJob?.cancel()
         timerJob = null
         terminated = true
+        (room.audioHandler as? AudioSwitchHandler)
+            ?.unregisterAudioDeviceChangeListener(audioDeviceListener)
+        val retiringMedia = mediaOperations.retire()
+        val connecting = startJob
         room.disconnect()
-        room.release()
+        applicationScope.launch(Dispatchers.Main.immediate) {
+            retiringMedia?.join()
+            connecting?.join()
+            room.disconnect()
+            room.release()
+        }
         CallForegroundService.stop(context)
         activeCallState.setActiveCall(null)
         val closingDisposition = if (

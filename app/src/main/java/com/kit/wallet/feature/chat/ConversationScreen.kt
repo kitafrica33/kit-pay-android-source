@@ -2547,17 +2547,6 @@ internal fun ConversationContent(
                 }
             }
         }
-        // This thread's own live call, floating over the top of the list the way the new-message
-        // chip floats over the bottom. Tapping it returns to the call; nothing here starts one.
-        liveCall?.let { call ->
-            LiveCallBanner(
-                call = call,
-                onReturn = { onReturnToActiveCall(call.callId) },
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 10.dp),
-            )
-        }
         }
     }
     }
@@ -4061,55 +4050,6 @@ private fun CallLogBubble(msg: Message, onCall: () -> Unit) {
                     contentDescription = "Call back",
                     tint = MaterialTheme.colorScheme.secondary,
                     modifier = Modifier.size(22.dp),
-                )
-            }
-        }
-    }
-}
-
-/**
- * The floating pill naming this thread's live call: its authenticated display name and, once the
- * answer anchor exists, a duration ticking each second from that anchor — never a wall clock,
- * which device time changes would corrupt. Tapping it returns to the call already in progress.
- */
-@Composable
-private fun LiveCallBanner(
-    call: ActiveCallPresence,
-    onReturn: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val seconds = rememberLiveCallSeconds(call)
-    Surface(
-        shape = CircleShape,
-        color = KitTheme.colors.successContainer,
-        shadowElevation = 4.dp,
-        modifier = modifier.clip(CircleShape).clickable(onClick = onReturn),
-    ) {
-        Row(
-            Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                if (call.video) Icons.Rounded.Videocam else Icons.Rounded.Call,
-                contentDescription = "Return to call",
-                tint = KitTheme.colors.success,
-                modifier = Modifier.size(16.dp),
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(
-                call.name,
-                style = MaterialTheme.typography.labelMedium,
-                color = KitTheme.colors.onSuccessContainer,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.widthIn(max = 180.dp),
-            )
-            if (call.anchor != null) {
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    formatCallDuration(seconds),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = KitTheme.colors.onSuccessContainer,
                 )
             }
         }

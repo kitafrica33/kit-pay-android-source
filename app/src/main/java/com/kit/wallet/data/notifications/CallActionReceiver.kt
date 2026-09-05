@@ -30,6 +30,8 @@ class CallActionReceiver : BroadcastReceiver() {
 
     @Inject lateinit var incomingCallRelay: IncomingCallRelay
 
+    @Inject lateinit var callEvents: CallLifecycleEventBus
+
     @Inject @ApplicationScope lateinit var applicationScope: CoroutineScope
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -37,6 +39,18 @@ class CallActionReceiver : BroadcastReceiver() {
         val callId = IncomingCallPayload.callId(
             mapOf("call_id" to intent.getStringExtra(EXTRA_CALL_ID).orEmpty()),
         ) ?: return
+        // Android's hang-up action must stop this device's media immediately, even offline.
+        // The active ViewModel accepts only its exact call id; a retained old action cannot
+        // disconnect a replacement call. Backend retirement continues independently below.
+        if (intent.action == ACTION_END) callEvents.publish(
+            CallLifecycleEvent(
+                callId = callId,
+                kind = CallLifecycleKind.ENDED,
+                state = "ended",
+                reason = intent.getStringExtra(EXTRA_REASON) ?: "cancelled",
+                localEndRequested = true,
+            ),
+        )
         replayLedger.retire(
             callId,
             if (intent.action == ACTION_DECLINE) {

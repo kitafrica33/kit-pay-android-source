@@ -25,20 +25,24 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -82,6 +86,10 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -102,6 +110,10 @@ import com.kit.wallet.ui.theme.KitGreen700
 import com.kit.wallet.ui.theme.KitNavy600
 import com.kit.wallet.ui.theme.KitNavy700
 import com.kit.wallet.ui.theme.KitNavy900
+import com.twilio.audioswitch.AudioDevice
+import io.livekit.android.room.track.CameraPosition
+import io.livekit.android.room.track.LocalVideoTrack
+import io.livekit.android.util.flow
 import kotlin.math.roundToInt
 
 @Composable
@@ -172,6 +184,18 @@ fun ActiveCallScreen(
     }
     val contactsToAdd by viewModel.callableContacts.collectAsStateWithLifecycle()
     var showAddPeople by remember { mutableStateOf(false) }
+    var showAudioOutput by remember { mutableStateOf(false) }
+    if (showAudioOutput) {
+        AudioOutputDialog(
+            devices = state.audioDevices,
+            selected = state.selectedAudioDevice,
+            onDismiss = { showAudioOutput = false },
+            onSelect = {
+                viewModel.selectAudioDevice(it)
+                showAudioOutput = false
+            },
+        )
+    }
     if (showAddPeople) {
         AddPeopleDialog(
             contacts = contactsToAdd,
@@ -300,8 +324,17 @@ fun ActiveCallScreen(
         room = viewModel.room,
         compact = inPictureInPicture,
         onMute = viewModel::toggleMute,
-        onSpeaker = viewModel::toggleSpeaker,
-        onCamera = viewModel::toggleCamera,
+        onSpeaker = { showAudioOutput = true },
+        onCamera = {
+            if (state.cameraEnabled ||
+                ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                viewModel.toggleCamera()
+            } else {
+                cameraSwitchRequest.launch(Manifest.permission.CAMERA)
+            }
+        },
         onFlip = viewModel::flipCamera,
         onSwitchToVideo = {
             if (
@@ -313,7 +346,6 @@ fun ActiveCallScreen(
                 cameraSwitchRequest.launch(Manifest.permission.CAMERA)
             }
         },
-        onSwitchToAudio = viewModel::switchToAudio,
         onDeclineWaiting = viewModel::declineWaitingCall,
         onMergeWaiting = viewModel::mergeWaitingCall,
         onAddParticipant = { showAddPeople = true },
@@ -350,7 +382,7 @@ internal fun shouldEnterCallPictureInPicture(video: Boolean, phase: CallPhase): 
     video && phase in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)
 
 @Composable
-private fun ActiveCallContent(
+internal fun ActiveCallContent(
     state: ActiveCallUiState,
     room: io.livekit.android.room.Room,
     compact: Boolean,
@@ -359,7 +391,6 @@ private fun ActiveCallContent(
     onCamera: () -> Unit,
     onFlip: () -> Unit,
     onSwitchToVideo: () -> Unit,
-    onSwitchToAudio: () -> Unit,
     onDeclineWaiting: () -> Unit,
     onMergeWaiting: () -> Unit,
     onAddParticipant: () -> Unit,
@@ -372,7 +403,7 @@ private fun ActiveCallContent(
     onRetry: () -> Unit,
     onEnd: () -> Unit,
 ) {
-    Box(
+    BoxWithConstraints(
         Modifier
             .fillMaxSize()
             .background(
@@ -382,9 +413,19 @@ private fun ActiveCallContent(
                 ),
             ),
     ) {
+        val shortLayout = maxHeight < 560.dp
         // A group video call renders every remote participant as a tile; a one-to-one video call
         // fills the screen with the single remote video behind the local self-view.
-        if (state.video && state.isGroup) {
+        if (state.remoteScreenShare != null) {
+            // The fitted share is rendered inside the safe content area below, without controls
+            // or the self-view covering the document. PiP still shows the complete shared frame.
+            if (compact) LiveKitVideoRenderer(
+                room = room,
+                track = state.remoteScreenShare?.videoTrack,
+                fit = true,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else if (state.video && state.isGroup) {
             GroupVideoGrid(state = state, room = room, modifier = Modifier.fillMaxSize())
             Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.18f)))
         } else if (state.video && state.remoteVideoTrack != null) {
@@ -399,12 +440,11 @@ private fun ActiveCallContent(
         Column(
             Modifier
                 .fillMaxSize()
-                .statusBarsPadding()
-                .navigationBarsPadding(),
+                .windowInsetsPadding(WindowInsets.safeDrawing),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (!compact) Spacer(Modifier.height(14.dp))
-            if (!compact) Row(verticalAlignment = Alignment.CenterVertically) {
+            if (!compact && !shortLayout) Spacer(Modifier.height(14.dp))
+            if (!compact && !shortLayout) Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     Icons.Rounded.Lock,
                     contentDescription = null,
@@ -419,7 +459,11 @@ private fun ActiveCallContent(
                 )
             }
 
-            if (state.video) {
+            if (compact && state.video) {
+                Spacer(Modifier.weight(1f))
+            } else if (state.remoteScreenShare != null) {
+                SharedScreenCallBody(state.remoteScreenShare!!, room, shortLayout)
+            } else if (state.video) {
                 VideoCallBody(state, room, onFlip)
             } else {
                 VoiceCallBody(state)
@@ -485,9 +529,16 @@ private fun ActiveCallContent(
                     // Add people to the call and share the screen — available once connected.
                     if (connected) {
                         Row(
-                            Modifier.padding(bottom = 14.dp),
+                            Modifier.padding(bottom = if (shortLayout) 8.dp else 14.dp),
                             horizontalArrangement = Arrangement.spacedBy(18.dp),
                         ) {
+                            CallControl(
+                                Icons.AutoMirrored.Rounded.VolumeUp,
+                                callAudioDeviceLabel(state.selectedAudioDevice),
+                                active = state.speakerEnabled,
+                                size = 48.dp,
+                                onClick = onSpeaker,
+                            )
                             CallControl(
                                 Icons.Rounded.PersonAdd,
                                 "Add",
@@ -508,9 +559,10 @@ private fun ActiveCallContent(
                                 } else {
                                     Icons.AutoMirrored.Rounded.ScreenShare
                                 },
-                                "Share",
+                                if (state.screenSharing) "Stop share" else "Share",
                                 active = state.screenSharing,
                                 size = 44.dp,
+                                enabled = !state.mediaChanging,
                                 onClick = onToggleScreenShare,
                             )
                         }
@@ -520,10 +572,10 @@ private fun ActiveCallContent(
                         color = Color(0xFF081524).copy(alpha = if (state.video) 0.55f else 0.35f),
                         shape = RoundedCornerShape(38.dp),
                         border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.12f)),
-                        modifier = Modifier.padding(bottom = 26.dp),
+                        modifier = Modifier.padding(bottom = if (shortLayout) 12.dp else 26.dp),
                     ) {
                         Row(
-                            Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                            Modifier.padding(horizontal = 14.dp, vertical = if (shortLayout) 8.dp else 12.dp),
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
                             if (state.video) {
@@ -531,6 +583,7 @@ private fun ActiveCallContent(
                                     if (state.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
                                     if (state.muted) "Unmute" else "Mute",
                                     active = state.muted,
+                                    enabled = connected && !state.mediaChanging,
                                     onClick = onMute,
                                 )
                                 CallControl(
@@ -539,22 +592,17 @@ private fun ActiveCallContent(
                                     } else {
                                         Icons.Rounded.VideocamOff
                                     },
-                                    "Camera",
+                                    if (state.cameraEnabled) "Camera off" else "Camera on",
                                     active = !state.cameraEnabled,
+                                    enabled = connected && !state.mediaChanging,
                                     onClick = onCamera,
                                 )
-                                CallControl(Icons.Rounded.Call, "Audio", onClick = onSwitchToAudio)
                             } else {
-                                CallControl(
-                                    Icons.AutoMirrored.Rounded.VolumeUp,
-                                    "Speaker",
-                                    active = state.speakerEnabled,
-                                    onClick = onSpeaker,
-                                )
                                 if (connected) {
                                     CallControl(
                                         Icons.Rounded.Videocam,
                                         "Video",
+                                        enabled = !state.mediaChanging,
                                         onClick = onSwitchToVideo,
                                     )
                                 }
@@ -562,6 +610,7 @@ private fun ActiveCallContent(
                                     if (state.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
                                     if (state.muted) "Unmute" else "Mute",
                                     active = state.muted,
+                                    enabled = connected && !state.mediaChanging,
                                     onClick = onMute,
                                 )
                             }
@@ -651,6 +700,12 @@ private fun ColumnScope.VideoCallBody(
     // The self-view floats over the call and can be dragged anywhere inside the safe area.
     // The offset is relative to its top-end anchor and clamped so it can never leave the screen.
     var previewOffset by remember { mutableStateOf(Offset.Zero) }
+    LaunchedEffect(containerSize, previewSize) {
+        previewOffset = Offset(
+            previewOffset.x.coerceIn(-(containerSize.width - previewSize.width).coerceAtLeast(0).toFloat(), 0f),
+            previewOffset.y.coerceIn(0f, (containerSize.height - previewSize.height).coerceAtLeast(0).toFloat()),
+        )
+    }
     Box(
         Modifier
             .fillMaxSize()
@@ -658,8 +713,14 @@ private fun ColumnScope.VideoCallBody(
             .padding(20.dp)
             .onSizeChanged { containerSize = it },
     ) {
-        Column(Modifier.align(Alignment.TopStart)) {
-            Text(state.name, style = MaterialTheme.typography.titleLarge, color = Color.White)
+        Column(Modifier.align(Alignment.TopStart).padding(end = 120.dp)) {
+            Text(
+                state.name,
+                style = MaterialTheme.typography.titleLarge,
+                color = Color.White,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
             Text(
                 state.statusText(),
                 style = MaterialTheme.typography.labelSmall,
@@ -687,24 +748,59 @@ private fun ColumnScope.VideoCallBody(
                 .background(Color(0xFF2B4A66)),
         ) {
             if (state.localVideoTrack != null && state.cameraEnabled) {
+                val localTrack = state.localVideoTrack as? LocalVideoTrack
+                val mirror = if (localTrack != null) {
+                    val options by localTrack::options.flow.collectAsStateWithLifecycle()
+                    options.position == CameraPosition.FRONT
+                } else false
                 LiveKitVideoRenderer(
                     room = room,
                     track = state.localVideoTrack,
-                    mirror = true,
+                    mirror = mirror,
                     modifier = Modifier.fillMaxSize(),
                 )
             }
-            Icon(
+            if (state.cameraEnabled) Icon(
                 Icons.Rounded.Cameraswitch,
                 contentDescription = "Switch camera",
                 tint = Color.White,
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .clickable(onClick = onFlip)
-                    .padding(8.dp)
-                    .size(20.dp),
+                    .size(48.dp)
+                    .padding(12.dp),
             )
         }
+    }
+}
+
+@Composable
+private fun ColumnScope.SharedScreenCallBody(
+    participant: RemoteCallParticipant,
+    room: io.livekit.android.room.Room,
+    shortLayout: Boolean,
+) {
+    Column(Modifier.weight(1f).fillMaxWidth().padding(if (shortLayout) 8.dp else 16.dp)) {
+        Text(
+            participant.name,
+            style = MaterialTheme.typography.titleMedium,
+            color = Color.White,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            "Sharing screen",
+            style = MaterialTheme.typography.labelSmall,
+            color = Color.White.copy(alpha = 0.75f),
+        )
+        Spacer(Modifier.height(if (shortLayout) 6.dp else 12.dp))
+        LiveKitVideoRenderer(
+            room = room,
+            track = participant.videoTrack,
+            fit = true,
+            modifier = Modifier.weight(1f).fillMaxWidth().background(Color.Black)
+                .semantics { contentDescription = "${participant.name}'s shared screen" },
+        )
     }
 }
 
@@ -828,6 +924,7 @@ private fun CallControl(
     danger: Boolean = false,
     success: Boolean = false,
     size: Dp = 52.dp,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     // The end-call red matches the iOS call panel exactly; the rest stays on the Kit palette.
@@ -838,10 +935,16 @@ private fun CallControl(
         else -> Color.White.copy(alpha = 0.16f)
     }
     val foreground = if (active && !danger) KitNavy700 else Color.White
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+    Column(
+        modifier = Modifier.widthIn(min = 48.dp).clip(RoundedCornerShape(12.dp))
+            .graphicsLayer { alpha = if (enabled) 1f else 0.45f }
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+            .padding(4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
         Box(
             Modifier
-                .size(size)
+                .size(size.coerceAtLeast(48.dp))
                 .background(background, CircleShape)
                 .then(
                     if (danger || success || active) {
@@ -850,13 +953,12 @@ private fun CallControl(
                         Modifier.border(0.8.dp, Color.White.copy(alpha = 0.22f), CircleShape)
                     },
                 )
-                .clip(CircleShape)
-                .clickable(onClick = onClick),
+                .clip(CircleShape),
             contentAlignment = Alignment.Center,
         ) {
             Icon(
                 icon,
-                contentDescription = label,
+                contentDescription = null,
                 tint = foreground,
                 modifier = Modifier.size(size * 22 / 52),
             )
@@ -894,6 +996,7 @@ private fun GroupVideoGrid(
                             LiveKitVideoRenderer(
                                 room = room,
                                 track = participant.videoTrack,
+                                fit = participant.screenSharing,
                                 modifier = Modifier.fillMaxSize(),
                             )
                         } else {
@@ -923,6 +1026,34 @@ private fun GroupVideoGrid(
             }
         }
     }
+}
+
+@Composable
+private fun AudioOutputDialog(
+    devices: List<AudioDevice>,
+    selected: AudioDevice?,
+    onDismiss: () -> Unit,
+    onSelect: (AudioDevice?) -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Audio output") },
+        text = {
+            Column {
+                TextButton(onClick = { onSelect(null) }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Automatic · prefer headphones")
+                }
+                devices.forEach { device ->
+                    TextButton(onClick = { onSelect(device) }, modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            callAudioDeviceLabel(device) + if (device == selected) " · In use" else "",
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
+    )
 }
 
 /** In-call people picker: tap a Kit Pay contact to invite them into the call. */
