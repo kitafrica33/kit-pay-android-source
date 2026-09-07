@@ -6,6 +6,7 @@ import com.kit.wallet.data.notifications.CallLifecycleKind
 import com.kit.wallet.data.notifications.IncomingCallPublicationAuthorization
 import com.kit.wallet.data.notifications.IncomingCallRetirementDisposition
 import com.kit.wallet.data.notifications.callRingLease
+import com.kit.wallet.data.notifications.endsRingingSurface
 import com.kit.wallet.data.notifications.reconcilePublishedIncomingCall
 import com.kit.wallet.data.notifications.ringingRetirementDisposition
 import com.kit.wallet.data.notifications.selectIncomingCallPublicationAuthorization
@@ -150,9 +151,11 @@ class IncomingCallReplayPolicyTest {
 
     @Test
     fun `terminal lifecycle retirement preserves its Telecom disposition`() {
-        val dispositions = CallLifecycleKind.entries.associateWith { kind ->
-            CallLifecycleEvent(callId = "call-1", kind = kind)
-                .ringingRetirementDisposition()
+        val dispositions = CallLifecycleKind.entries.map { kind ->
+            CallLifecycleEvent(callId = "call-1", kind = kind,
+                state = if (kind == CallLifecycleKind.DECLINED) "declined" else null)
+        }.filter(CallLifecycleEvent::endsRingingSurface).associate { event ->
+            event.kind to event.ringingRetirementDisposition()
         }
 
         assertEquals(
@@ -165,6 +168,15 @@ class IncomingCallReplayPolicyTest {
             ),
             dispositions,
         )
+    }
+
+    @Test
+    fun `participant changes never retire a ringing surface even with terminal state hints`() {
+        for (state in listOf(null, "active", "declined", "ended")) {
+            val event = CallLifecycleEvent("call-1", CallLifecycleKind.PARTICIPANT_CHANGED, state)
+            assertFalse(event.terminal)
+            assertFalse(event.endsRingingSurface())
+        }
     }
 
     @Test

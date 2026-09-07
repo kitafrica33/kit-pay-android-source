@@ -202,7 +202,10 @@ class IncomingCallSecurityContractTest {
         assertTrue(systemAnswered.contains("markAnswering(callId)"))
         assertTrue(markAnswering.contains("TelecomCallState.ANSWERING"))
         assertTrue(telecom.contains("TelecomCallState.ANSWERING -> setInitializing()"))
-        assertTrue(connected.contains("telecom::markActive"))
+        val markActive = Regex("""telecom\s*(?:::markActive\b|\.\s*markActive\s*\()""")
+            .find(connected)
+        assertTrue("Connected media must activate its Telecom call", markActive != null)
+        assertTrue(connected.indexOf("CallPhase.CONNECTED") in 0 until checkNotNull(markActive).range.first)
     }
 
     @Test

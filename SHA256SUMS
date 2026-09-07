@@ -5,11 +5,11 @@
 0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0  ./LICENSE
 f295946ff6ca41eb018f8df87506cab9a421ce760083ca96ff1964f1a1ea51c5  ./NOTICE
 be1bc834fb0a6828c6d04e38970f14f983fec06df21849e9b51ea90d89f34631  ./README.md
-0461bc3a7ad3ef1808ea1e045758325fa34b08fdbcead2534e4dc8dc7ef9f4e7  ./SOURCE_PROVENANCE.json
-63561498cf6c8c6812cb1cf77f3f3edfac9f052be3fa16090a9dade6af674e4d  ./THIRD_PARTY_LICENSES.json
-f131b2db96747ef172c0da8717c98322e1341982178cd47ca4b0f54fc17344d5  ./THIRD_PARTY_LICENSES.md
+1a50a332ac030363fb70f89ac4095e029caacaf16caa0d39d137afd1c3971bd8  ./SOURCE_PROVENANCE.json
+98a2982dddb4b8fcac86c4b3e2b49c7317cf1534190c271f268cf3f7469f4dc4  ./THIRD_PARTY_LICENSES.json
+57a98f7f77717e558f8c1e6ce4b56aeadb64f69b7611fe360c7b1bd27e56b124  ./THIRD_PARTY_LICENSES.md
 a02b20bf3674b986e8c225a4b0c090b089059c21576a501ce340e13e5966f353  ./TRADEMARKS.md
-5b5eeac7ce4d238596405aef362f503e77effa5eec0ee44c7441280903cec9cf  ./app/build.gradle.kts
+43b599bfd24559367846e2d424ab93b6a4ffb40070e2b74dd675192ee83afc5b  ./app/build.gradle.kts
 9f2d9362505add82bae6ecfed64cb9caf5621cfb7445622fd89ee512c32726c7  ./app/proguard-rules.pro
 ee7e1ffb1720a585935d3e55e8c9c93c643a6cc3083e872e02b06cbd2a07894e  ./app/schemas/com.kit.wallet.data.local.KitWalletDatabase/1.json
 7e606af3a39fe4c2c18ed713df21b9a15ddc08084358d9da3711d2732a79dcfc  ./app/schemas/com.kit.wallet.data.local.KitWalletDatabase/10.json
@@ -66,7 +66,7 @@ a44eb7b5caf5534c6ef536b21edb40b4d6babf91bf97d9d45596868618b2c6fb  ./app/src/main
 dae3375b7a34fa5e154f989e88942fda5919eabba5d6f6e70ae88854cd3ae984  ./app/src/main/assets/legal/LIVEKIT_NOTICE.txt
 fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85  ./app/src/main/assets/legal/MPL-2.0.txt
 6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d  ./app/src/main/assets/legal/PROTOBUF_BSD-3-Clause.txt
-63561498cf6c8c6812cb1cf77f3f3edfac9f052be3fa16090a9dade6af674e4d  ./app/src/main/assets/legal/RUNTIME_LICENSE_CLEARANCE.json
+98a2982dddb4b8fcac86c4b3e2b49c7317cf1534190c271f268cf3f7469f4dc4  ./app/src/main/assets/legal/RUNTIME_LICENSE_CLEARANCE.json
 f2648977a7ce48a6a48962a11ff33b3c754fc23780ac1c4c388d40a96b0815b9  ./app/src/main/assets/legal/SEMVER4J_LICENSE.txt
 f295946ff6ca41eb018f8df87506cab9a421ce760083ca96ff1964f1a1ea51c5  ./app/src/main/assets/legal/THIRD_PARTY_NOTICES.txt
 e6b282fe6c0fb353928923470457f31b44cbab203effd60c0cde4a5bb96c8aec  ./app/src/main/assets/legal/WEBRTC_ANDROID_WRAPPER_MIT_LICENSE.txt
@@ -585,8 +585,8 @@ fe3f75b9836b6530c3ab5b7a3ee0e10ff10cdfea74ebcc5df5443946ac8b83c7  ./app/src/test
 4cab78568d7756d287be98b367b78dbfa28366803a51663ff4a0f407a294be35  ./app/src/test/java/com/kit/wallet/IncomingCallLaunchAuthorizationTest.kt
 d95b15129f429414edec0c7e2660f53575786002b808a5c7e59a12ea7ab1dfe9  ./app/src/test/java/com/kit/wallet/IncomingCallNotificationPolicyTest.kt
 e5f7556ab65addc2da9f2b42a7a1b711c05140db54d856eee8ae6090f7ed77d4  ./app/src/test/java/com/kit/wallet/IncomingCallPayloadTest.kt
-f31388cfabd344880c0f60422b603a5cc230b8c6854cdf9e419e85e3dd4a0b74  ./app/src/test/java/com/kit/wallet/IncomingCallReplayPolicyTest.kt
-d60d3cc173178aa2f51e55d5fd4c083a4f362475f99e21eac9bc20b29c861af7  ./app/src/test/java/com/kit/wallet/IncomingCallSecurityContractTest.kt
+d425c01cad6a0a985e36a483b6d03dca49fd9fe7405cacf839810b2970a64b34  ./app/src/test/java/com/kit/wallet/IncomingCallReplayPolicyTest.kt
+e5ef5b74c793016cd2ace8347208dada65d2a78781587e672eb0a603a3607f82  ./app/src/test/java/com/kit/wallet/IncomingCallSecurityContractTest.kt
 9e773b5c9159163b343bd7787fb9b0645bafd0ef68418f5d39795110cd741895  ./app/src/test/java/com/kit/wallet/IncomingCallValidationTest.kt
 90b49e6fcec2d078726dc47e3af0c3af99b03d2f8d6df3679fd0c05fd7ed23e5  ./app/src/test/java/com/kit/wallet/IncomingShareRequestPersistenceTest.kt
 10b493c274b19d6dc55bad229e99e3bb12b2b7c32c5dd96c1265ac745d26782e  ./app/src/test/java/com/kit/wallet/InsufficientFundsCauseTest.kt
