@@ -1050,6 +1050,9 @@ data class CallParticipantDto(
     @Json(name = "avatar_url") val avatarUrl: String? = null,
     /** Server-owned designation; unknown or malformed values never produce a badge. */
     val verification: AccountVerificationDto? = null,
+    val state: String? = null,
+    @Json(name = "is_held") val isHeld: Boolean? = null,
+    @Json(name = "held_at") val heldAt: String? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -1075,6 +1078,13 @@ data class CallDto(
     @Json(name = "ring_expires_at") val ringExpiresAt: String? = null,
     /** Server clock paired with this call's ring expiry. Required by current call responses. */
     @Json(name = "server_time") val serverTime: String? = null,
+    @Json(name = "participant_state") val participantState: String? = null,
+    @Json(name = "is_held") val isHeld: Boolean? = null,
+    @Json(name = "held_at") val heldAt: String? = null,
+    @Json(name = "hold_revision") val holdRevision: Long? = null,
+    @Json(name = "hold_reason") val holdReason: String? = null,
+    @Json(name = "can_hold") val canHold: Boolean? = null,
+    @Json(name = "scheduled_call_id") val scheduledCallId: String? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -1083,6 +1093,27 @@ data class StartCallRequest(
     val type: String,
     @Json(name = "conversation_id") val conversationId: String? = null,
     @Json(name = "client_call_id") val clientCallId: String? = null,
+    @Json(name = "supports_hold") val supportsHold: Boolean = true,
+)
+
+@JsonClass(generateAdapter = false)
+data class AcceptCallRequest(
+    @Json(name = "hold_call_id") val holdCallId: String? = null,
+    @Json(name = "hold_call_revision") val holdCallRevision: Long? = null,
+    @Json(name = "supports_hold") val supportsHold: Boolean = true,
+)
+
+@JsonClass(generateAdapter = false)
+data class HoldCallRequest(
+    @Json(name = "hold_revision") val holdRevision: Long? = null,
+    @Json(name = "hold_reason") val holdReason: String = "manual",
+)
+
+@JsonClass(generateAdapter = false)
+data class ResumeCallRequest(
+    @Json(name = "hold_call_id") val holdCallId: String? = null,
+    @Json(name = "hold_revision") val holdRevision: Long? = null,
+    @Json(name = "hold_call_revision") val holdCallRevision: Long? = null,
 )
 
 @JsonClass(generateAdapter = false)
@@ -1127,6 +1158,7 @@ data class CallSessionDto(
      * inherits the phone's drift. Null on servers that predate the field.
      */
     @Json(name = "server_time") val serverTime: String? = null,
+    @Json(name = "held_call") val heldCall: CallDto? = null,
 )
 
 @JsonClass(generateAdapter = false)

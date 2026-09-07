@@ -103,6 +103,7 @@ class DefaultPushEnvelopeReceiver @Inject internal constructor(
                 manager.cancel(callTag(lifecycleEvent.callId), CALL_NOTIFICATION_ID)
             }
             when (lifecycleEvent.kind) {
+                CallLifecycleKind.PARTICIPANT_CHANGED -> Unit
                 CallLifecycleKind.ANSWERED ->
                     telecom.finishRingingAsAnsweredElsewhere(lifecycleEvent.callId)
                 CallLifecycleKind.DECLINED -> if (lifecycleEvent.terminal) {
@@ -735,6 +736,7 @@ internal fun reconcilePublishedIncomingCall(
 
 internal fun CallLifecycleEvent.ringingRetirementDisposition(): IncomingCallRetirementDisposition =
     when (kind) {
+        CallLifecycleKind.PARTICIPANT_CHANGED -> error("Participant updates do not retire ringing calls")
         CallLifecycleKind.ANSWERED -> IncomingCallRetirementDisposition.ANSWERED_ELSEWHERE
         CallLifecycleKind.DECLINED -> IncomingCallRetirementDisposition.REJECTED
         CallLifecycleKind.ENDED -> IncomingCallRetirementDisposition.REMOTE

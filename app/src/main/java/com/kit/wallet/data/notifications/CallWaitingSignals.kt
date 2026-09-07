@@ -31,6 +31,9 @@ internal data class ActiveCallPresence(
     val video: Boolean,
     /** Authoritative answer anchor the per-second timer counts from; null until known. */
     val anchor: CallDurationAnchor?,
+    /** Process-owned incoming route that still owns this VM after answering/swapping calls. */
+    val ownerRouteCallId: String? = null,
+    val held: Boolean = false,
 ) {
     /**
      * Whether this live call belongs to the chat identified by [chatId]/[isGroup]/[peerUserId].

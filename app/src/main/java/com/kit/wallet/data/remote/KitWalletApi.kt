@@ -204,32 +204,59 @@ interface KitWalletApi {
     ): ApiEnvelope<CallPageDto>
 
     @POST("api/kit-wallet/v1/calls")
-    suspend fun startCall(@Body request: StartCallRequest): ApiEnvelope<CallSessionDto>
+    suspend fun startCall(
+        @Body request: StartCallRequest,
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<CallSessionDto>
 
     @POST("api/kit-wallet/v1/calls/client-attempts/{clientCallId}/cancel")
     suspend fun cancelCallAttempt(
         @Path("clientCallId") clientCallId: String,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<CancelCallAttemptDto>
 
     @GET("api/kit-wallet/v1/calls/{callId}")
-    suspend fun call(@Path("callId") callId: String): ApiEnvelope<CallDto>
+    suspend fun call(
+        @Path("callId") callId: String,
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<CallDto>
 
     @POST("api/kit-wallet/v1/calls/{callId}/invite")
     suspend fun inviteToCall(
         @Path("callId") callId: String,
         @Body request: InviteCallRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<CallDto>
 
     @POST("api/kit-wallet/v1/calls/{callId}/accept")
-    suspend fun acceptCall(@Path("callId") callId: String): ApiEnvelope<CallSessionDto>
+    suspend fun acceptCall(
+        @Path("callId") callId: String,
+        @Body request: AcceptCallRequest = AcceptCallRequest(),
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<CallSessionDto>
+
+    @POST("api/kit-wallet/v1/calls/{callId}/hold")
+    suspend fun holdCall(
+        @Path("callId") callId: String,
+        @Body request: HoldCallRequest,
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<CallDto>
+
+    @POST("api/kit-wallet/v1/calls/{callId}/resume")
+    suspend fun resumeCall(
+        @Path("callId") callId: String,
+        @Body request: ResumeCallRequest,
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<CallSessionDto>
 
     @POST("api/kit-wallet/v1/calls/{callId}/decline")
-    suspend fun declineCall(@Path("callId") callId: String): ApiEnvelope<CallDto>
+    suspend fun declineCall(@Path("callId") callId: String, @Tag expectedOwner: SessionFence? = null): ApiEnvelope<CallDto>
 
     @POST("api/kit-wallet/v1/calls/{callId}/end")
     suspend fun endCall(
         @Path("callId") callId: String,
         @Body request: EndCallRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<CallDto>
 
     @POST("api/kit-wallet/v1/calls/{callId}/token")

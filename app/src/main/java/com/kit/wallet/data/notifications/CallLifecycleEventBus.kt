@@ -11,6 +11,7 @@ enum class CallLifecycleKind(val wireType: String) {
     DECLINED("call.declined"),
     ENDED("call.ended"),
     MISSED("call.missed"),
+    PARTICIPANT_CHANGED("call.participant_changed"),
 }
 
 data class CallLifecycleEvent(
@@ -32,7 +33,7 @@ data class CallLifecycleEvent(
 ) {
     val terminal: Boolean
         get() = when (kind) {
-            CallLifecycleKind.ANSWERED -> false
+            CallLifecycleKind.ANSWERED, CallLifecycleKind.PARTICIPANT_CHANGED -> false
             CallLifecycleKind.DECLINED -> state.equals("declined", ignoreCase = true)
             CallLifecycleKind.ENDED, CallLifecycleKind.MISSED -> true
         }

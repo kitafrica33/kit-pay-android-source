@@ -95,6 +95,9 @@ import com.kit.wallet.feature.bills.BillsScreen
 import com.kit.wallet.feature.calls.ActiveCallScreen
 import com.kit.wallet.feature.calls.ActiveCallMiniBar
 import com.kit.wallet.feature.calls.CallsScreen
+import com.kit.wallet.feature.calls.CallInviteLink
+import com.kit.wallet.feature.calls.CallInvitePreviewScreen
+import com.kit.wallet.feature.calls.ScheduledCallsScreen
 import com.kit.wallet.feature.chat.ChatsScreen
 import com.kit.wallet.feature.chat.ChatsViewModel
 import com.kit.wallet.feature.chat.ConversationFocusRequests
@@ -222,6 +225,7 @@ internal fun KitApp(
             capabilitiesViewModel.refreshWhileForeground()
         }
     }
+    val callCommandViewModel: com.kit.wallet.feature.calls.CallCommandViewModel = hiltViewModel()
     val chatsBadgeViewModel: ChatsViewModel = hiltViewModel()
     val totalUnread by chatsBadgeViewModel.totalUnread.collectAsStateWithLifecycle()
     val localMessagingOutboxAvailable by
@@ -293,6 +297,7 @@ internal fun KitApp(
             secureMessageConversationId == null
         ) return@LaunchedEffect
         val callReturn = rawDeepLink?.let { ActiveCallReturnLink.fromDeepLink(it) }
+        val callInvite = rawDeepLink?.let { CallInviteLink.fromDeepLink(it) }
         val claimLink = rawDeepLink?.let { PaymentClaimLink.fromDeepLink(it) }
         val mobileMoneySettlementLink = rawDeepLink?.let {
             MobileMoneySettlementLink.fromDeepLink(it)
@@ -327,6 +332,19 @@ internal fun KitApp(
                     return@LaunchedEffect
                 }
                 if (capabilities.enabled(KitFeature.CALLS)) {
+                    val existingCall = activeCallPresence
+                    if (existingCall != null) {
+                        // This authorization may answer a waiting call, but must not allocate a
+                        // second call ViewModel/microphone owner. Reuse the process-owned route.
+                        returnToActiveCall(existingCall.callId)
+                        if (authorizedIncomingCall.acceptRequested) {
+                            callCommandViewModel.answerWaiting(authorizedIncomingCall.callId)
+                        }
+                        withFrameNanos { }
+                        withFrameNanos { }
+                        onAuthorizedIncomingCallSurfaceChanged(authorizedIncomingCall.callId, true)
+                        return@LaunchedEffect
+                    }
                     val routed = runCatching {
                         navController.navigate(
                             Dest.incomingCall(
@@ -340,6 +358,15 @@ internal fun KitApp(
                     }
                 } else {
                     onAuthorizedIncomingCallRejected(authorizedIncomingCall.callId)
+                }
+            }
+            callInvite != null -> {
+                if (!signedIn || !capabilities.loaded || capabilities.loadFailed) return@LaunchedEffect
+                onDeepLinkConsumed()
+                if (capabilities.allEnabled(KitFeature.CALLS, "calls_invite_links")) {
+                    // A public VIEW link opens only an authenticated preview. Joining is explicit
+                    // and uses the normal permission/current-call gates in ActiveCallViewModel.
+                    navController.navigate(Dest.callInvitePreview(callInvite.token)) { launchSingleTop = true }
                 }
             }
             claimLink != null -> {
@@ -631,6 +658,7 @@ internal fun KitApp(
                     financialBlockReason = financialAccess.blockReason,
                     onFinancialIdentityRequired = requestFinancialAccess,
                     activeAuthorizedIncomingCall = activeAuthorizedIncomingCall,
+                    activeCallPresence = activeCallPresence,
                     onAuthorizedIncomingCallRejected = onAuthorizedIncomingCallRejected,
                     onAuthorizedIncomingCallSurfaceChanged =
                         onAuthorizedIncomingCallSurfaceChanged,
@@ -718,7 +746,7 @@ private val SIGN_IN_ROUTES = setOf(
 private val ACCOUNT_SETUP_ROUTES = setOf(Dest.PIN_SETUP, Dest.PROFILE_SETUP)
 
 /** Entries a live call can sit on; reopening one is always a pop back to one of these. */
-private val CALL_ROUTES = listOf(Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL)
+private val CALL_ROUTES = listOf(Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL, Dest.CALL_INVITE)
 
 @Composable
 private fun KitNavHost(
@@ -735,6 +763,7 @@ private fun KitNavHost(
     financialBlockReason: FinancialBlockReason?,
     onFinancialIdentityRequired: () -> Unit,
     activeAuthorizedIncomingCall: AuthorizedIncomingCallLaunch? = null,
+    activeCallPresence: com.kit.wallet.data.notifications.ActiveCallPresence? = null,
     onAuthorizedIncomingCallRejected: (String) -> Unit = {},
     onAuthorizedIncomingCallSurfaceChanged: (String, Boolean) -> Unit = { _, _ -> },
     onReturnToActiveCall: (String) -> Unit = {},
@@ -991,6 +1020,36 @@ private fun KitNavHost(
                     onVoiceCall = { navController.navigate(Dest.voiceCall(it)) },
                     onVideoCall = { navController.navigate(Dest.videoCall(it)) },
                     onNewCall = { navController.navigate(Dest.CALL_CONTACTS) },
+                    onScheduledCalls = { navController.navigate(Dest.SCHEDULED_CALLS) },
+                    callsAvailable = capabilities.enabled(KitFeature.CALLS),
+                    schedulingAvailable = capabilities.allEnabled(KitFeature.CALLS, "calls_scheduling"),
+                )
+            }
+        }
+        composable(Dest.SCHEDULED_CALLS) {
+            FeatureRouteContent(signedIn, capabilities, Dest.SCHEDULED_CALLS) {
+                ScheduledCallsScreen(onBack = { navController.popBackStack() })
+            }
+        }
+        composable(Dest.CALL_INVITE_PREVIEW, arguments = listOf(navArgument("inviteToken") { type = NavType.StringType })) {
+            FeatureRouteContent(signedIn, capabilities, Dest.CALL_INVITE_PREVIEW) {
+                CallInvitePreviewScreen(onBack = { navController.popBackStack() }, onJoin = { token, video ->
+                    navController.navigate(Dest.callInvite(token, video)) { launchSingleTop = true }
+                })
+            }
+        }
+        composable(
+            Dest.CALL_INVITE,
+            arguments = listOf(
+                navArgument("inviteToken") { type = NavType.StringType },
+                navArgument("video") { type = NavType.BoolType; defaultValue = false },
+            ),
+        ) { entry ->
+            FeatureRouteContent(signedIn, capabilities, Dest.CALL_INVITE) {
+                ActiveCallScreen(
+                    name = "Kit Pay call", video = entry.arguments?.getBoolean("video") == true,
+                    onEnd = { navController.popBackStack() },
+                    onOpenChat = { navController.navigate(Dest.conversation(it)) },
                 )
             }
         }
@@ -1272,7 +1331,16 @@ private fun KitNavHost(
         ) { entry ->
             val callId = entry.arguments?.getString("callId").orEmpty()
             val authorization = activeAuthorizedIncomingCall?.takeIf { it.callId == callId }
-            if (authorization == null) {
+            val ownedLiveRoute = activeCallPresence?.ownerRouteCallId == callId
+            if (ownedLiveRoute && signedIn && capabilities.loaded && !capabilities.loadFailed &&
+                capabilities.enabled(KitFeature.CALLS)
+            ) {
+                FeatureRouteContent(signedIn, capabilities, Dest.INCOMING_CALL) {
+                    ActiveCallScreen(name = "Kit Pay call", video = false,
+                        onEnd = { navController.popBackStack() },
+                        onOpenChat = { navController.navigate(Dest.conversation(it)) })
+                }
+            } else if (authorization == null) {
                 LaunchedEffect(callId, authorization, signedIn, capabilities.features) {
                     onAuthorizedIncomingCallRejected(callId)
                     navController.popBackStack()

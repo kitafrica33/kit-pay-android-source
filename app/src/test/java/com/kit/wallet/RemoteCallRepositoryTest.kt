@@ -55,9 +55,9 @@ class RemoteCallRepositoryTest {
 
         assertEquals(2, api.startedCalls)
         assertEquals(2, api.endedCalls)
-        // Two awaited walks from ending the calls, and one background walk: the redial
-        // cancels and replaces the walk its predecessor started rather than stacking them.
-        assertEquals(3, api.callListRequests)
+        // Start/end share one replaceable background refresh; ending a call no longer delays
+        // resuming a held call on a paginated history walk.
+        assertEquals(1, api.callListRequests)
         assertEquals(0, contacts.refreshRequests)
         assertEquals("Saved locally", first.name)
         assertEquals("Saved locally", second.name)
@@ -222,6 +222,50 @@ class RemoteCallRepositoryTest {
         override suspend fun syncDeviceContacts() = error("Outgoing calls must not sync contacts")
     }
 
+    @Test
+    fun `hold and resume retain participant truth and bind exact session and revisions`() = runTest {
+        val api = RecordingCallApi()
+        val repository = repository(api)
+        val held = repository.hold(INCOMING_CALL_ID, 4, interruption = true)
+        assertTrue(held.isHeld)
+        assertEquals(5L, held.holdRevision)
+        assertTrue(!held.terminal)
+        val hold = api.holdRequests.single()
+        assertEquals(4L, hold.holdRevision)
+        assertEquals("interruption", hold.holdReason)
+        val resumed = repository.resume(INCOMING_CALL_ID, held.holdRevision, RECIPIENT_ID, 9)
+        assertEquals("fresh-resume-token", resumed.token)
+        assertEquals(6L, resumed.holdRevision)
+        assertEquals(RECIPIENT_ID, api.resumeRequests.single().holdCallId)
+        assertEquals(9L, api.resumeRequests.single().holdCallRevision)
+        assertTrue(api.owners.all { it == sessionStore().current()!!.fence() })
+    }
+
+    @Test
+    fun `waiting answer advertises support and atomically binds previous call revision`() = runTest {
+        val api = RecordingCallApi()
+        repository(api).accept(INCOMING_CALL_ID, RECIPIENT_ID, 11)
+        val request = api.acceptRequests.single()
+        assertTrue(request.supportsHold)
+        assertEquals(RECIPIENT_ID, request.holdCallId)
+        assertEquals(11L, request.holdCallRevision)
+    }
+
+    @Test
+    fun `resume refuses held participant credentials`() = runTest {
+        val api = RecordingCallApi().apply { resumeRemainsHeld = true }
+        assertTrue(runCatching { repository(api).resume(INCOMING_CALL_ID, 5) }.isFailure)
+    }
+
+    @Test
+    fun `group start deduplicates recipients and advertises hold support`() = runTest {
+        val api = RecordingCallApi()
+        repository(api).startGroup(listOf(RECIPIENT_ID, INCOMING_CALL_ID, RECIPIENT_ID.uppercase()),
+            video = true, clientCallId = INCOMING_CALL_ID)
+        assertEquals(listOf(RECIPIENT_ID, INCOMING_CALL_ID), api.startRequests.single().recipientUserIds)
+        assertTrue(api.startRequests.single().supportsHold)
+    }
+
     private class RecordingCallApi {
         var startedCalls = 0
             private set
@@ -233,6 +277,12 @@ class RemoteCallRepositoryTest {
             private set
         var acceptedCallIdOverride: String? = null
         var structuredParticipants: List<CallParticipantDto?>? = null
+        val holdRequests = mutableListOf<com.kit.wallet.data.remote.HoldCallRequest>()
+        val resumeRequests = mutableListOf<com.kit.wallet.data.remote.ResumeCallRequest>()
+        val acceptRequests = mutableListOf<com.kit.wallet.data.remote.AcceptCallRequest>()
+        val startRequests = mutableListOf<StartCallRequest>()
+        val owners = mutableListOf<SessionFence>()
+        var resumeRemainsHeld = false
         val clientCallIds = mutableListOf<String>()
         val cancelledClientCallIds = mutableListOf<String>()
 
@@ -242,6 +292,7 @@ class RemoteCallRepositoryTest {
         ) { instance, method, arguments ->
             when (method.name) {
                 "startCall" -> {
+                    startRequests += arguments!![0] as StartCallRequest
                     clientCallIds += (arguments?.first() as StartCallRequest).clientCallId.orEmpty()
                     ApiEnvelope(ok = true, data = withStructuredParticipants(callSession(++startedCalls)))
                 }
@@ -254,6 +305,7 @@ class RemoteCallRepositoryTest {
                     )
                 }
                 "acceptCall" -> {
+                    acceptRequests += arguments!![1] as com.kit.wallet.data.remote.AcceptCallRequest
                     acceptedCalls += 1
                     ApiEnvelope(
                         ok = true,
@@ -261,6 +313,20 @@ class RemoteCallRepositoryTest {
                             answeredSession(acceptedCallIdOverride ?: INCOMING_CALL_ID),
                         ),
                     )
+                }
+                "holdCall" -> {
+                    holdRequests += arguments!![1] as com.kit.wallet.data.remote.HoldCallRequest
+                    owners += arguments[2] as SessionFence
+                    ApiEnvelope(ok = true, data = answeredSession().call.copy(participantState = "joined",
+                        isHeld = true, holdRevision = 5, canHold = true))
+                }
+                "resumeCall" -> {
+                    resumeRequests += arguments!![1] as com.kit.wallet.data.remote.ResumeCallRequest
+                    owners += arguments[2] as SessionFence
+                    val session = answeredSession()
+                    ApiEnvelope(ok = true, data = session.copy(call = session.call.copy(participantState = "joined",
+                        isHeld = resumeRemainsHeld, holdRevision = 6, canHold = true),
+                        rtc = session.rtc.copy(token = "fresh-resume-token")))
                 }
                 "endCall" -> ApiEnvelope(
                     ok = true,

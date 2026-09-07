@@ -892,14 +892,35 @@ interface CallRepository {
     /** Prevents a still-in-flight process-owned call attempt from ringing after local dismissal. */
     suspend fun cancelAttempt(clientCallId: String) = Unit
 
+    suspend fun startGroup(
+        recipientUserIds: List<String>, video: Boolean, clientCallId: String,
+        conversationId: String? = null,
+    ): CallConnection = if (recipientUserIds.size == 1) {
+        start(recipientUserIds.single(), video, conversationId, clientCallId)
+    } else error("Group calling is unavailable")
+
     /** Adds more Kit Pay users to an active or ringing call, turning it into a group call. */
     suspend fun invite(callId: String, recipientUserIds: List<String>) = Unit
 
     suspend fun accept(callId: String): CallConnection = error("Calling is unavailable")
 
+    suspend fun accept(callId: String, holdCallId: String, holdCallRevision: Long?, expectedOwner: SessionFence? = null): CallConnection =
+        error("Call waiting is unavailable")
+
+    suspend fun status(callId: String, expectedOwner: SessionFence? = null): CallStatus = error("Calling is unavailable")
+
+    suspend fun hold(callId: String, revision: Long?, interruption: Boolean = false, expectedOwner: SessionFence? = null): CallStatus =
+        error("Call hold is unavailable")
+
+    suspend fun resume(callId: String, revision: Long?, holdCallId: String? = null,
+        holdCallRevision: Long? = null, expectedOwner: SessionFence? = null): CallConnection =
+        error("Call resume is unavailable")
+
     suspend fun decline(callId: String) = Unit
 
     suspend fun end(callId: String, reason: String = "completed") = Unit
+
+    suspend fun end(callId: String, reason: String, expectedOwner: SessionFence) = end(callId, reason)
 }
 
 data class IncomingCallDetails(
@@ -953,7 +974,25 @@ data class CallConnection(
     val serverTime: String? = null,
     /** Server-reported conversation the call belongs to; null when it reported none. */
     val conversationId: String? = null,
+    val canHold: Boolean = false,
+    val holdRevision: Long? = null,
+    val heldCall: CallStatus? = null,
 )
+
+/** Authenticated participant truth; an empty media room is never a terminal call state. */
+data class CallStatus(
+    val callId: String,
+    val state: String,
+    val participantState: String?,
+    val isHeld: Boolean,
+    val holdRevision: Long?,
+    val canHold: Boolean,
+    val participants: List<CallParticipantIdentity>,
+    val holdReason: String? = null,
+) {
+    val terminal: Boolean get() = state in setOf("ended", "declined", "missed", "cancelled") ||
+        participantState in setOf("left", "declined", "missed", "ended")
+}
 
 /** Server-authenticated first-sighting presentation bound to one exact public account ID. */
 data class CallParticipantIdentity(
@@ -961,6 +1000,8 @@ data class CallParticipantIdentity(
     val name: String? = null,
     val avatarUrl: String? = null,
     val accountVerification: AccountVerification? = null,
+    val state: String? = null,
+    val isHeld: Boolean = false,
 )
 
 interface BillsRepository {

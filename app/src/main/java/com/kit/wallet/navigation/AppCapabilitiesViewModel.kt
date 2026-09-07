@@ -210,8 +210,10 @@ data class AppCapabilities(
             ->
                 messagingUsable
             // Including an in-progress call: a failed capability poll must never hang one up.
-            Dest.CALLS, Dest.CALL_CONTACTS, Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL ->
+            Dest.CALLS, Dest.CALL_CONTACTS, Dest.VOICE_CALL, Dest.VIDEO_CALL, Dest.INCOMING_CALL, Dest.CALL_INVITE ->
                 lastKnownEnabled(KitFeature.CALLS)
+            Dest.SCHEDULED_CALLS -> allEnabled(KitFeature.CALLS, "calls_scheduling")
+            Dest.CALL_INVITE_PREVIEW -> allEnabled(KitFeature.CALLS, "calls_invite_links")
             Dest.BILLS, Dest.BILL_PAY -> billPaymentsUsable
             Dest.AIRTIME -> airtimeUsable
             Dest.BANK -> bankUsable

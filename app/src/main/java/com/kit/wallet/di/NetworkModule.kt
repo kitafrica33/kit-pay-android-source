@@ -2,6 +2,7 @@ package com.kit.wallet.di
 
 import com.kit.wallet.BuildConfig
 import com.kit.wallet.data.remote.KitWalletApi
+import com.kit.wallet.data.remote.ScheduledCallsApi
 import com.kit.wallet.data.remote.SecureMessagingWireApi
 import com.kit.wallet.data.remote.SessionAuthenticator
 import com.kit.wallet.data.remote.SessionHeaderInterceptor
@@ -84,6 +85,21 @@ object NetworkModule {
         moshi: Moshi,
         client: OkHttpClient,
     ): KitWalletApi = retrofit(baseUrl, moshi, client).create(KitWalletApi::class.java)
+
+    @Provides
+    @Singleton
+    fun provideScheduledCallsApi(
+        baseUrl: HttpUrl,
+        moshi: Moshi,
+        client: OkHttpClient,
+    ): ScheduledCallsApi {
+        // Invite tokens are credentials in the URL path. Even BASIC debug logging exposes them.
+        val privateClient = client.newBuilder().apply {
+            interceptors().removeAll { it is HttpLoggingInterceptor }
+            networkInterceptors().removeAll { it is HttpLoggingInterceptor }
+        }.build()
+        return retrofit(baseUrl, moshi, privateClient).create(ScheduledCallsApi::class.java)
+    }
 
     @Provides
     @Singleton

@@ -33,6 +33,7 @@ import javax.inject.Singleton
 @Singleton
 class KitTelecomBridge @Inject constructor(
     @ApplicationContext private val context: Context,
+    private val systemCommands: CallSystemCommands = CallSystemCommands(),
 ) {
     private val telecom = context.getSystemService(TelecomManager::class.java)
     private val accountHandle = PhoneAccountHandle(
@@ -197,6 +198,22 @@ class KitTelecomBridge @Inject constructor(
         updateState(callId, TelecomCallState.ACTIVE)
     }
 
+    fun markHeld(callId: String) = updateState(callId, TelecomCallState.HELD)
+
+    fun setHoldSupported(callId: String, supported: Boolean) {
+        calls.updateMetadata(callId, { it.copy(holdSupported = supported) }) { connection, metadata ->
+            connection.applyPresentation(metadata)
+        }
+    }
+
+    internal fun systemHeld(callId: String) {
+        systemCommands.publish(CallSystemCommand.Hold(callId))
+    }
+
+    internal fun systemResumed(callId: String) {
+        systemCommands.publish(CallSystemCommand.Resume(callId))
+    }
+
     fun finish(callId: String, disconnect: KitTelecomDisconnect) {
         val tracked = calls.finish(callId, disconnect)
         tracked?.connection?.complete(disconnect.cause)
@@ -297,7 +314,7 @@ enum class KitTelecomDisconnect(internal val cause: DisconnectCause) {
     ANSWERED_ELSEWHERE(DisconnectCause(DisconnectCause.ANSWERED_ELSEWHERE)),
 }
 
-private enum class TelecomCallState { RINGING, ANSWERING, DIALING, ACTIVE }
+private enum class TelecomCallState { RINGING, ANSWERING, DIALING, ACTIVE, HELD }
 
 internal data class TelecomCallMetadata(
     val callId: String,
@@ -306,6 +323,7 @@ internal data class TelecomCallMetadata(
     val video: Boolean,
     val incoming: Boolean,
     val ringExpiresAt: String?,
+    val holdSupported: Boolean = false,
 ) {
     val address: Uri get() = telecomAddress(phone)
     val videoState: Int get() = if (video) VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY
@@ -361,12 +379,16 @@ private class KitTelecomConnection(
 
     init {
         setConnectionProperties(PROPERTY_SELF_MANAGED)
-        setConnectionCapabilities(CAPABILITY_MUTE or CAPABILITY_SUPPORT_HOLD)
+        setConnectionCapabilities(CAPABILITY_MUTE)
         setAudioModeIsVoip(true)
         applyPresentation(metadata)
     }
 
     fun applyPresentation(metadata: TelecomCallMetadata) {
+        // System interruption hold is always safe locally; ordinary server-side switching is
+        // advertised only after all joined peers declare support in an authenticated response.
+        setConnectionCapabilities(CAPABILITY_MUTE or CAPABILITY_SUPPORT_HOLD or
+            if (metadata.holdSupported) CAPABILITY_HOLD else 0)
         setAddress(metadata.address, TelecomManager.PRESENTATION_ALLOWED)
         setCallerDisplayName(metadata.name, TelecomManager.PRESENTATION_ALLOWED)
         setVideoState(metadata.videoState)
@@ -377,6 +399,7 @@ private class KitTelecomConnection(
         TelecomCallState.ANSWERING -> setInitializing()
         TelecomCallState.DIALING -> setDialing()
         TelecomCallState.ACTIVE -> setActive()
+        TelecomCallState.HELD -> setOnHold()
     }
 
     fun complete(cause: DisconnectCause) {
@@ -402,6 +425,10 @@ private class KitTelecomConnection(
     }
 
     override fun onAbort() = onDisconnect()
+
+    override fun onHold() = bridge.systemHeld(callId)
+
+    override fun onUnhold() = bridge.systemResumed(callId)
 }
 
 internal fun telecomAddress(phone: String?): Uri {

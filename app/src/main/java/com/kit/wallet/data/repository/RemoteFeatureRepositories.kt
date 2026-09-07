@@ -751,7 +751,7 @@ class RemoteCallRepository @Inject constructor(
 
     override suspend fun incoming(callId: String): IncomingCallDetails {
         val fence = sessions.current()?.fence() ?: throw SessionInvalidatedException()
-        val call = apiCalls.execute { api.call(callId) }
+        val call = apiCalls.execute { api.call(callId, fence) }
         check(call.id == callId) { "The call lookup returned an unexpected call" }
         val participants = call.toCallParticipantIdentities()
         val participantIds = participants.map(CallParticipantIdentity::userId)
@@ -796,20 +796,30 @@ class RemoteCallRepository @Inject constructor(
         video: Boolean,
         conversationId: String?,
         clientCallId: String,
+    ): CallConnection = startGroup(listOf(recipientUserId), video, clientCallId, conversationId)
+
+    override suspend fun startGroup(
+        recipientUserIds: List<String>,
+        video: Boolean,
+        clientCallId: String,
+        conversationId: String?,
     ): CallConnection {
         val fence = sessions.current()?.fence() ?: throw SessionInvalidatedException()
-        require(recipientUserId.isNotBlank()) { "Choose a Kit Pay contact to call" }
+        val recipients = recipientUserIds.map { requireNotNull(canonicalCallUserId(it)) }
+            .distinctBy(String::lowercase)
+        require(recipients.size in 1..20) { "Choose between 1 and 20 Kit Pay contacts" }
         require(runCatching { UUID.fromString(clientCallId) }.isSuccess) {
             "The call attempt identifier is invalid"
         }
         val session = apiCalls.execute {
             api.startCall(
                 StartCallRequest(
-                    recipientUserIds = listOf(recipientUserId),
+                    recipientUserIds = recipients,
                     type = if (video) "video" else "voice",
                     conversationId = conversationId,
                     clientCallId = clientCallId.lowercase(),
                 ),
+                expectedOwner = fence,
             )
         }
         // The recipient came from the already-loaded contact graph. Refreshing contacts here
@@ -819,33 +829,48 @@ class RemoteCallRepository @Inject constructor(
         // for discovering address-book changes.
         refreshHistoryInBackground()
         return sessions.withCurrentSession(fence) {
-            session.toConnection(listOf(recipientUserId), fence)
+            session.toConnection(recipients, fence)
         }
     }
 
     override suspend fun invite(callId: String, recipientUserIds: List<String>) {
+        val fence = sessions.current()?.fence() ?: throw SessionInvalidatedException()
         require(recipientUserIds.isNotEmpty()) { "Choose at least one Kit Pay contact to add" }
-        apiCalls.execute {
+        val call = apiCalls.execute {
             api.inviteToCall(
                 callId,
-                com.kit.wallet.data.remote.InviteCallRequest(recipientUserIds),
+                com.kit.wallet.data.remote.InviteCallRequest(recipientUserIds.distinctBy(String::lowercase)),
+                expectedOwner = fence,
             )
         }
-        refreshCallList()
+        sessions.withCurrentSession(fence) {
+            check(call.id.equals(callId, ignoreCase = true)) { "Unexpected call invitation response" }
+        }
+        refreshHistoryInBackground()
     }
 
     override suspend fun cancelAttempt(clientCallId: String) {
+        val fence = sessions.current()?.fence() ?: throw SessionInvalidatedException()
         val canonical = runCatching { UUID.fromString(clientCallId).toString() }.getOrNull()
             ?: error("The call attempt identifier is invalid")
-        val result = apiCalls.execute { api.cancelCallAttempt(canonical) }
+        val result = apiCalls.execute { api.cancelCallAttempt(canonical, fence) }
         check(result.cancelled && result.clientCallId.equals(canonical, ignoreCase = true)) {
             "The call attempt was not cancelled"
         }
     }
 
     override suspend fun accept(callId: String): CallConnection {
-        val fence = sessions.current()?.fence() ?: throw SessionInvalidatedException()
-        val session = apiCalls.execute { api.acceptCall(callId) }
+        return acceptSession(callId, null, null, null)
+    }
+
+    override suspend fun accept(callId: String, holdCallId: String, holdCallRevision: Long?, expectedOwner: SessionFence?): CallConnection =
+        acceptSession(callId, holdCallId, holdCallRevision, expectedOwner)
+
+    private suspend fun acceptSession(callId: String, holdCallId: String?, holdCallRevision: Long?, expectedOwner: SessionFence?): CallConnection {
+        val fence = callOwner(expectedOwner)
+        val session = apiCalls.execute {
+            api.acceptCall(callId, com.kit.wallet.data.remote.AcceptCallRequest(holdCallId, holdCallRevision), fence)
+        }
         check(session.call.id == callId) {
             "The call answer returned credentials for an unexpected call"
         }
@@ -853,14 +878,63 @@ class RemoteCallRepository @Inject constructor(
         return sessions.withCurrentSession(fence) { session.toConnection(owner = fence) }
     }
 
-    override suspend fun decline(callId: String) {
-        apiCalls.execute { api.declineCall(callId) }
-        runCatching { refreshCallList() }
+    override suspend fun status(callId: String, expectedOwner: SessionFence?): CallStatus {
+        val fence = callOwner(expectedOwner)
+        val call = apiCalls.execute { api.call(callId, fence) }
+        return sessions.withCurrentSession(fence) { call.toStatus(callId) }
     }
 
-    override suspend fun end(callId: String, reason: String) {
-        apiCalls.execute { api.endCall(callId, EndCallRequest(reason)) }
-        runCatching { refreshCallList() }
+    override suspend fun hold(callId: String, revision: Long?, interruption: Boolean, expectedOwner: SessionFence?): CallStatus {
+        val fence = callOwner(expectedOwner)
+        val call = apiCalls.execute {
+            api.holdCall(callId, com.kit.wallet.data.remote.HoldCallRequest(
+                revision, if (interruption) "interruption" else "manual",
+            ), fence)
+        }
+        return sessions.withCurrentSession(fence) { call.toStatus(callId) }
+    }
+
+    override suspend fun resume(callId: String, revision: Long?, holdCallId: String?, holdCallRevision: Long?, expectedOwner: SessionFence?): CallConnection {
+        val fence = callOwner(expectedOwner)
+        val session = apiCalls.execute {
+            api.resumeCall(callId, com.kit.wallet.data.remote.ResumeCallRequest(holdCallId, revision, holdCallRevision), fence)
+        }
+        return sessions.withCurrentSession(fence) {
+            check(session.call.id.equals(callId, ignoreCase = true)) { "Unexpected call resume response" }
+            check(session.call.isHeld == false && session.call.participantState == "joined") {
+                "The call has not resumed"
+            }
+            session.toConnection(owner = fence)
+        }
+    }
+
+    private fun com.kit.wallet.data.remote.CallDto.toStatus(expectedId: String): CallStatus {
+        check(id.equals(expectedId, ignoreCase = true)) { "Unexpected call status response" }
+        return CallStatus(id, state, participantState, isHeld == true, holdRevision,
+            canHold == true, toCallParticipantIdentities(), holdReason)
+    }
+
+    private fun callOwner(expected: SessionFence?): SessionFence {
+        val current = sessions.current()?.fence() ?: throw SessionInvalidatedException()
+        if (expected != null && current != expected) throw SessionInvalidatedException()
+        return expected ?: current
+    }
+
+    override suspend fun decline(callId: String) {
+        val fence = callOwner(null)
+        apiCalls.execute { api.declineCall(callId, fence) }
+        refreshHistoryInBackground()
+    }
+
+    override suspend fun end(callId: String, reason: String) = end(callId, reason, callOwner(null))
+
+    override suspend fun end(callId: String, reason: String, expectedOwner: SessionFence) {
+        val fence = callOwner(expectedOwner)
+        val result = apiCalls.execute { api.endCall(callId, EndCallRequest(reason), fence) }
+        sessions.withCurrentSession(fence) {
+            check(result.id.equals(callId, ignoreCase = true)) { "Unexpected call end response" }
+        }
+        refreshHistoryInBackground()
     }
 
     private fun CallSessionDto.toConnection(
@@ -899,6 +973,9 @@ class RemoteCallRepository @Inject constructor(
             answeredAt = call.answeredAt,
             serverTime = serverTime,
             conversationId = call.conversationId?.trim()?.takeIf(String::isNotEmpty),
+            canHold = call.canHold == true,
+            holdRevision = call.holdRevision,
+            heldCall = heldCall?.toStatus(heldCall.id),
         )
     }
 

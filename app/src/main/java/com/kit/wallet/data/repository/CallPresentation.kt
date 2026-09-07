@@ -78,6 +78,8 @@ internal fun CallDto.toCallParticipantIdentities(
                     row.verification?.designation,
                     row.verification?.since,
                 ),
+                state = row.state,
+                isHeld = row.isHeld == true,
             ),
         )
     }

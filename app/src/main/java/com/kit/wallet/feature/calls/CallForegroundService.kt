@@ -18,8 +18,13 @@ import com.kit.wallet.MainActivity
 import com.kit.wallet.R
 import com.kit.wallet.data.notifications.ActiveCallReturnLink
 import com.kit.wallet.data.notifications.CallActionReceiver
+import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
 
+@AndroidEntryPoint
 class CallForegroundService : Service() {
+    @Inject lateinit var systemCommands: CallSystemCommands
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
@@ -28,6 +33,7 @@ class CallForegroundService : Service() {
         val name = intent?.getStringExtra(EXTRA_NAME).orEmpty().ifBlank { "Kit Pay contact" }
         val video = intent?.getBooleanExtra(EXTRA_VIDEO, false) == true
         val camera = intent?.getBooleanExtra(EXTRA_CAMERA, video) == true
+        val held = intent?.getBooleanExtra(EXTRA_HELD, false) == true
         // The tap must land back on this exact call, so the content intent names it by id.
         // The link is only ever matched against the call the app knows it is in — a stale
         // notification does nothing. Without a valid id the tap just brings the app forward.
@@ -48,7 +54,7 @@ class CallForegroundService : Service() {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_kit_mark)
             .setContentTitle(if (video) "Kit Pay video call" else "Kit Pay voice call")
-            .setContentText("Call with $name")
+            .setContentText(if (held) "On hold · $name" else "Call with $name")
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -76,7 +82,16 @@ class CallForegroundService : Service() {
         } else {
             0
         }
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, serviceType)
+        try {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, serviceType)
+        } catch (_: RuntimeException) {
+            // Capture eligibility can change between the Activity's request and this callback.
+            // Android reports denied promotion here, outside the caller's try/catch. Retire the
+            // exact call through its owner instead of crashing or leaving unprotected capture.
+            returnLink?.let { systemCommands.publish(CallSystemCommand.ForegroundUnavailable(it.callId)) }
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf(startId)
+        }
         return START_NOT_STICKY
     }
 
@@ -89,14 +104,17 @@ class CallForegroundService : Service() {
         private const val EXTRA_VIDEO = "video"
         private const val EXTRA_CAMERA = "camera"
         private const val EXTRA_CALL_ID = "call_id"
+        private const val EXTRA_HELD = "held"
 
-        fun start(context: Context, name: String, video: Boolean, callId: String? = null, camera: Boolean = video) {
+        fun start(context: Context, name: String, video: Boolean, callId: String? = null, camera: Boolean = video,
+            held: Boolean = false) {
             ContextCompat.startForegroundService(
                 context,
                 Intent(context, CallForegroundService::class.java)
                     .putExtra(EXTRA_NAME, name)
                     .putExtra(EXTRA_VIDEO, video)
                     .putExtra(EXTRA_CAMERA, camera)
+                    .putExtra(EXTRA_HELD, held)
                     .putExtra(EXTRA_CALL_ID, callId),
             )
         }

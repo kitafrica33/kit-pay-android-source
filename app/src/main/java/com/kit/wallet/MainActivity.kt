@@ -881,6 +881,7 @@ internal fun Intent.takeKitDeepLink(): String? {
                 it.fragment == null
         } == true
         val returnLink = ActiveCallReturnLink.fromDeepLink(raw)
+        val callInvite = com.kit.wallet.feature.calls.CallInviteLink.fromDeepLink(raw)
         val claimLink = PaymentClaimLink.fromDeepLink(raw)
         val mobileMoneySettlementLink = MobileMoneySettlementLink.fromDeepLink(raw)
         val canonicalRoute = when {
@@ -888,6 +889,7 @@ internal fun Intent.takeKitDeepLink(): String? {
             isKycReturn -> KYC_STATUS_DEEP_LINK
             // The ongoing-call notification: return to the call the app is already in.
             returnLink != null -> returnLink.deepLinkUri()
+            callInvite != null -> callInvite.deepLinkUri()
             // A claim alert: the link is the locally reconstructed one and the group hints ride
             // as extras this app itself validated; a hint that no longer parses drops the route.
             claimLink != null -> claimLink.withExtraHints(

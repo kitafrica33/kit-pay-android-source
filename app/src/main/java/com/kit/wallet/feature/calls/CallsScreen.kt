@@ -30,6 +30,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -57,10 +58,26 @@ fun CallsScreen(
     onVoiceCall: (String) -> Unit,
     onVideoCall: (String) -> Unit,
     onNewCall: () -> Unit,
+    onScheduledCalls: () -> Unit = {},
+    callsAvailable: Boolean = false,
+    schedulingAvailable: Boolean = false,
     viewModel: CallsViewModel = hiltViewModel(),
 ) {
     val calls by viewModel.calls.collectAsStateWithLifecycle()
-    CallsContent(calls, onVoiceCall, onVideoCall, onNewCall)
+    val actions by viewModel.actions.collectAsStateWithLifecycle()
+    CallsContent(calls, onVoiceCall, onVideoCall, onNewCall,
+        onGroupCall = viewModel::openGroupPicker,
+        onScheduledCalls = onScheduledCalls,
+        groupCallsEnabled = callsAvailable,
+        schedulingEnabled = schedulingAvailable,
+    )
+    LaunchedEffect(callsAvailable) { if (!callsAvailable) viewModel.closeGroupPicker() }
+    if (actions.groupPickerOpen && callsAvailable) {
+        CallRecipientPicker(actions, viewModel::toggleRecipient, viewModel::closeGroupPicker,
+            onVoice = { viewModel.groupTarget()?.let(onVoiceCall) },
+            onVideo = { viewModel.groupTarget()?.let(onVideoCall) },
+        )
+    }
 }
 
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
@@ -70,6 +87,10 @@ internal fun CallsContent(
     onVoiceCall: (String) -> Unit,
     onVideoCall: (String) -> Unit,
     onNewCall: () -> Unit,
+    onGroupCall: () -> Unit = {},
+    onScheduledCalls: () -> Unit = {},
+    groupCallsEnabled: Boolean = false,
+    schedulingEnabled: Boolean = false,
 ) {
     var filter by rememberSaveable { mutableStateOf("All") }
     val calls = allCalls.filter {
@@ -111,6 +132,12 @@ internal fun CallsContent(
             // A phone that cannot ring must say so where calls live, not in a notification
             // that Android is refusing to show.
             item { CallAlertBlockedWarning() }
+            if (groupCallsEnabled || schedulingEnabled) item {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+                    if (groupCallsEnabled) TextButton(onClick = onGroupCall) { Text("Group call") }
+                    if (schedulingEnabled) TextButton(onClick = onScheduledCalls) { Text("Scheduled calls") }
+                }
+            }
             item {
                 Row(Modifier.padding(horizontal = 20.dp, vertical = 4.dp)) {
                     listOf("All", "Missed").forEach { f ->

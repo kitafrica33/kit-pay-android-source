@@ -1,6 +1,7 @@
 package com.kit.wallet.feature.calls
 
 import android.Manifest
+import android.content.Intent
 import android.app.Activity
 import android.app.PictureInPictureParams
 import android.content.Context
@@ -99,6 +100,12 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.Call
+import androidx.compose.material3.Checkbox
 import com.kit.wallet.ui.components.KitAvatar
 import com.kit.wallet.ui.components.KitAvatarPhoto
 import com.kit.wallet.ui.components.VerifiedAccountName
@@ -128,6 +135,18 @@ fun ActiveCallScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val canOpenChat by viewModel.canOpenChat.collectAsStateWithLifecycle()
     val openingChat by viewModel.openingChat.collectAsStateWithLifecycle()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, _ ->
+            viewModel.setScreenForeground(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        viewModel.setScreenForeground(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+        onDispose {
+            viewModel.setScreenForeground(false)
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
     val context = LocalContext.current
     // Reading the configuration causes Compose to re-evaluate this after the activity enters or
     // leaves PiP, including when MainActivity handles the change without being recreated.
@@ -200,8 +219,16 @@ fun ActiveCallScreen(
         AddPeopleDialog(
             contacts = contactsToAdd,
             onDismiss = { showAddPeople = false },
-            onPick = { contact ->
-                viewModel.addParticipant(contact.id)
+            maximum = (20 - state.participantUserIds.size).coerceAtLeast(0),
+            onShareInvitation = if (state.canShareInvitation && !state.sharingInvitation) ({
+                viewModel.shareInvitation { link ->
+                    context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND)
+                        .setType("text/plain").putExtra(Intent.EXTRA_TEXT, "Join my Kit Pay call: $link"),
+                        "Share call invitation"))
+                }
+            }) else null,
+            onPick = { contacts ->
+                viewModel.addParticipants(contacts.map { it.id })
                 showAddPeople = false
             },
         )
@@ -343,6 +370,9 @@ fun ActiveCallScreen(
         },
         onDeclineWaiting = viewModel::declineWaitingCall,
         onMergeWaiting = viewModel::mergeWaitingCall,
+        onAnswerWaiting = { viewModel.answerWaitingCall() },
+        onHold = { viewModel.holdCurrent() },
+        onResume = viewModel::resumeHeldCall,
         onAddParticipant = { showAddPeople = true },
         onOpenChat = { viewModel.openChat(onOpenChat) },
         canOpenChat = canOpenChat,
@@ -397,6 +427,9 @@ internal fun ActiveCallContent(
     onDecline: () -> Unit,
     onRetry: () -> Unit,
     onEnd: () -> Unit,
+    onAnswerWaiting: () -> Unit = {},
+    onHold: () -> Unit = {},
+    onResume: () -> Unit = {},
 ) {
     BoxWithConstraints(
         Modifier
@@ -493,6 +526,7 @@ internal fun ActiveCallContent(
                     CallPhase.RINGING,
                     CallPhase.CONNECTED,
                     CallPhase.RECONNECTING,
+                    CallPhase.HELD,
                 )
             ) {
                 val connected = state.phase in setOf(CallPhase.CONNECTED, CallPhase.RECONNECTING)
@@ -524,8 +558,8 @@ internal fun ActiveCallContent(
                     // Add people to the call and share the screen — available once connected.
                     if (connected) {
                         Row(
-                            Modifier.padding(bottom = if (shortLayout) 8.dp else 14.dp),
-                            horizontalArrangement = Arrangement.spacedBy(18.dp),
+                            Modifier.fillMaxWidth().padding(bottom = if (shortLayout) 8.dp else 14.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
                         ) {
                             CallControl(
                                 Icons.AutoMirrored.Rounded.VolumeUp,
@@ -536,10 +570,15 @@ internal fun ActiveCallContent(
                             )
                             CallControl(
                                 Icons.Rounded.PersonAdd,
-                                "Add",
+                                if (state.addingParticipants) "Inviting…" else "Add",
+                                enabled = !state.addingParticipants && !state.switchingCall,
                                 size = 44.dp,
                                 onClick = onAddParticipant,
                             )
+                            if (state.canHold) {
+                                CallControl(Icons.Rounded.Pause, "Hold", size = 44.dp,
+                                    enabled = !state.switchingCall, onClick = onHold)
+                            }
                             if (canOpenChat) {
                                 CallControl(
                                     Icons.AutoMirrored.Rounded.Chat,
@@ -611,8 +650,9 @@ internal fun ActiveCallContent(
                             }
                             CallControl(
                                 Icons.Rounded.CallEnd,
-                                "End",
+                                if (state.heldCallName != null) "End & resume" else "End",
                                 danger = true,
+                                enabled = !state.switchingCall,
                                 onClick = onEnd,
                             )
                         }
@@ -621,26 +661,42 @@ internal fun ActiveCallContent(
             }
         }
 
-        if (!compact) state.waitingCall?.let { waiting ->
-            CallWaitingBanner(
-                waiting = waiting,
-                merging = state.mergingWaitingCall,
-                onDecline = onDeclineWaiting,
-                onMerge = onMergeWaiting,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-            )
+        if (!compact) Column(
+            Modifier.align(Alignment.TopCenter).statusBarsPadding()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            state.waitingCall?.let { waiting ->
+                CallWaitingBanner(waiting = waiting, merging = state.switchingCall,
+                    canAnswer = state.canHold && state.heldCallName == null,
+                    onDecline = onDeclineWaiting, onMerge = onAnswerWaiting)
+            }
+            if (state.phase == CallPhase.HELD || state.heldCallName != null) {
+                Surface(color = Color(0xFF0B1D2E), shape = MaterialTheme.shapes.large) {
+                    Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(if (state.phase == CallPhase.HELD) "Call on hold" else "${state.heldCallName} is on hold",
+                                color = Color.White, style = MaterialTheme.typography.titleSmall)
+                            if (state.holdReason == CallHoldReason.INTERRUPTION) Text(
+                                "Resumes when the other call ends", color = Color.White.copy(alpha = .7f),
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                        TextButton(onClick = onResume, enabled = !state.switchingCall) {
+                            Text(if (state.switchingCall) "Connecting…" else if (state.phase == CallPhase.HELD) "Resume" else "Swap")
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
-/** The call-waiting overlay: shows the second caller with Decline and Merge-to-group actions. */
+/** The waiting caller is answered only after the current call can be held safely. */
 @Composable
 private fun CallWaitingBanner(
     waiting: WaitingCall,
     merging: Boolean,
+    canAnswer: Boolean,
     onDecline: () -> Unit,
     onMerge: () -> Unit,
     modifier: Modifier = Modifier,
@@ -672,11 +728,12 @@ private fun CallWaitingBanner(
                     color = Color.White.copy(alpha = 0.7f),
                 )
             }
-            CallControl(Icons.Rounded.CallEnd, "Decline", danger = true, onClick = onDecline)
+            CallControl(Icons.Rounded.CallEnd, "Decline", danger = true, enabled = !merging, onClick = onDecline)
             Spacer(Modifier.width(14.dp))
             CallControl(
-                Icons.Rounded.PersonAdd,
-                if (merging) "Merging…" else "Merge",
+                Icons.Rounded.Call,
+                if (merging) "Answering…" else "Hold & answer",
+                enabled = canAnswer && !merging,
                 success = true,
                 onClick = { if (!merging) onMerge() },
             )
@@ -906,6 +963,7 @@ private fun ActiveCallUiState.statusText(): String = when (phase) {
         if (video) "video" else "voice",
     )
     CallPhase.RECONNECTING -> "Reconnecting…"
+    CallPhase.HELD -> "On hold • %02d:%02d".format(durationSeconds / 60, durationSeconds % 60)
     CallPhase.ENDING -> "Ending call…"
     CallPhase.ENDED -> "Call ended"
     CallPhase.ERROR -> "Could not connect"
@@ -1056,12 +1114,16 @@ private fun AudioOutputDialog(
 private fun AddPeopleDialog(
     contacts: List<Contact>,
     onDismiss: () -> Unit,
-    onPick: (Contact) -> Unit,
+    maximum: Int,
+    onShareInvitation: (() -> Unit)? = null,
+    onPick: (List<Contact>) -> Unit,
 ) {
+    var selected by remember { mutableStateOf(setOf<String>()) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Add to call") },
         text = {
+            Column {
             if (contacts.isEmpty()) {
                 Text(
                     "No Kit Pay contacts to add yet. Sync your contacts to find people on Kit Pay.",
@@ -1074,10 +1136,13 @@ private fun AddPeopleDialog(
                         Row(
                             Modifier
                                 .fillMaxWidth()
-                                .clickable { onPick(contact) }
+                                .clickable(enabled = contact.id in selected || selected.size < maximum) {
+                                    selected = if (contact.id in selected) selected - contact.id else selected + contact.id
+                                }
                                 .padding(vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
+                            Checkbox(checked = contact.id in selected, onCheckedChange = null)
                             KitAvatar(
                                 contact.name,
                                 size = 40.dp,
@@ -1093,9 +1158,16 @@ private fun AddPeopleDialog(
                     }
                 }
             }
+                if (onShareInvitation != null) {
+                    Text("Only invited people can use a call link.", style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = onShareInvitation) { Text("Share invitation") }
+                }
+            }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Done") }
+            TextButton(onClick = { onPick(contacts.filter { it.id in selected }) },
+                enabled = selected.isNotEmpty() && selected.size <= maximum) { Text("Invite (${selected.size})") }
         },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
