@@ -283,19 +283,25 @@ interface KitWalletApi {
     ): ApiEnvelope<StepUpVerificationDto>
 
     @GET("api/kit-wallet/v1/auth/session-assurance")
-    suspend fun sessionAssurance(): ApiEnvelope<SessionAssuranceResultDto>
+    suspend fun sessionAssurance(
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<SessionAssuranceResultDto>
 
     @POST("api/kit-wallet/v1/auth/session-unlock/pin")
     suspend fun unlockSessionWithPin(
         @Body request: LoginUnlockPinRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<SessionAssuranceResultDto>
 
     @POST("api/kit-wallet/v1/auth/session-unlock/biometric/challenge")
-    suspend fun createLoginBiometricChallenge(): ApiEnvelope<LoginBiometricChallengeDto>
+    suspend fun createLoginBiometricChallenge(
+        @Tag expectedOwner: SessionFence? = null,
+    ): ApiEnvelope<LoginBiometricChallengeDto>
 
     @POST("api/kit-wallet/v1/auth/session-unlock/biometric/assert")
     suspend fun assertLoginBiometricChallenge(
         @Body request: LoginBiometricAssertionRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<SessionAssuranceResultDto>
 
     @retrofit2.http.PUT("api/kit-wallet/v1/devices/current/biometric-key")
@@ -607,6 +613,7 @@ interface KitWalletApi {
     @PUT("api/kit-wallet/v1/auth/payment-pin")
     suspend fun setPaymentPin(
         @Body request: SetPaymentPinRequest,
+        @Tag expectedOwner: SessionFence? = null,
     ): ApiEnvelope<PaymentPinStatusDto>
 
     @POST("api/kit-wallet/v1/media/upload-intents")

@@ -1,6 +1,7 @@
 package com.kit.wallet.data.remote
 
 import com.kit.wallet.data.auth.requiresProfileSetup
+import com.kit.wallet.data.auth.toCachedSessionAssurance
 import com.kit.wallet.data.local.WalletCache
 import com.kit.wallet.data.messaging.AccountMessageHistoryRetention
 import com.kit.wallet.data.messaging.NoOpAccountMessageHistoryRetention
@@ -8,7 +9,7 @@ import com.kit.wallet.data.session.ProfileSetupState
 import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.SessionStore
 import com.kit.wallet.data.session.SessionTokens
-import com.kit.wallet.data.session.CachedSessionAssurance
+import com.squareup.moshi.Moshi
 import java.io.IOException
 import java.time.Instant
 import javax.inject.Inject
@@ -130,16 +131,8 @@ class AuthTokenRefresher @Inject constructor(
                 accountId = current.accountId ?: user?.id,
                 cacheScopeId = current.cacheScopeId,
                 profileSetupState = setupState,
-                cachedAssurance = result.sessionAssurance?.let {
-                    CachedSessionAssurance(
-                        access = it.access,
-                        deviceIdentityStatus = it.deviceIdentity.status,
-                        deviceIdentityRequired = it.deviceIdentity.required,
-                        loginUnlockStatus = it.loginUnlock.status,
-                        loginUnlockRequired = it.loginUnlock.required,
-                        loginUnlockMethods = it.loginUnlock.methods,
-                    )
-                } ?: current.cachedAssurance,
+                cachedAssurance = result.sessionAssurance?.toCachedSessionAssurance()
+                    ?: current.cachedAssurance,
                 messagingResetProof = current.messagingResetProof,
                 refreshReplayNonce = java.util.UUID.randomUUID().toString(),
             ),
@@ -188,6 +181,9 @@ class SessionAuthenticator @Inject constructor(
 ) : Authenticator {
     override fun authenticate(route: Route?, response: Response): Request? {
         if (responseCount(response) >= MAX_AUTH_ATTEMPTS) return null
+        // These 401s reject the submitted proof, not the bearer token. Replaying one consumes
+        // another PIN/challenge attempt and cannot repair the user's rejected proof.
+        if (response.isRejectedUnlockProof()) return null
         val failedAccessToken = response.request.bearerToken() ?: return null
         val failedSessionId = response.request.header(SessionHeaderInterceptor.SESSION_ID_HEADER)
             ?.takeIf(String::isNotBlank)
@@ -196,6 +192,8 @@ class SessionAuthenticator @Inject constructor(
         return runBlocking {
             refreshCoordinator.serialized {
                 val latest = sessions.current() ?: return@serialized null
+                val expectedOwner = response.request.tag(SessionFence::class.java)
+                if (expectedOwner != null && latest.fence() != expectedOwner) return@serialized null
 
                 // Never replay a request from a previous login under the current account.
                 if (latest.sessionId != failedSessionId) return@serialized null
@@ -287,8 +285,27 @@ class SessionAuthenticator @Inject constructor(
         return count
     }
 
+    private fun Response.isRejectedUnlockProof(): Boolean {
+        if (code != 401 || request.method != "POST") return false
+        val rejectedCodes = when (request.url.encodedPath) {
+            "/api/kit-wallet/v1/auth/session-unlock/pin" -> setOf("INVALID_LOGIN_PIN")
+            "/api/kit-wallet/v1/auth/session-unlock/biometric/assert" -> setOf(
+                "BIOMETRIC_CHALLENGE_INVALID", "BIOMETRIC_CHALLENGE_EXPIRED", "BIOMETRIC_ASSERTION_INVALID",
+            )
+            else -> return false
+        }
+        // Peeking preserves the original error body for the PIN/biometric UI.
+        return runCatching {
+            val envelope = AUTH_ERROR_ADAPTER.fromJson(peekBody(MAX_AUTH_ERROR_BYTES).string())
+            val error = envelope?.get("error") as? Map<*, *>
+            error?.get("code") in rejectedCodes
+        }.getOrDefault(false)
+    }
+
     private companion object {
         const val BEARER_PREFIX = "Bearer "
         const val MAX_AUTH_ATTEMPTS = 2
+        const val MAX_AUTH_ERROR_BYTES = 64L * 1024L
+        val AUTH_ERROR_ADAPTER = Moshi.Builder().build().adapter(Map::class.java)
     }
 }

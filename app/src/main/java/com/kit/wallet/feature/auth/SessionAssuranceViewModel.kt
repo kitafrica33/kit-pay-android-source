@@ -13,6 +13,7 @@ import com.kit.wallet.data.remote.SessionAssuranceSignal
 import com.kit.wallet.data.remote.SetPaymentPinRequest
 import com.kit.wallet.data.repository.KycVerificationState
 import com.kit.wallet.data.session.SessionStore
+import com.kit.wallet.data.session.SessionFence
 import com.kit.wallet.data.session.CachedSessionAssurance
 import com.kit.wallet.data.auth.toCachedSessionAssurance
 import com.kit.wallet.feature.wallet.ScopedAccessPosture
@@ -33,6 +34,7 @@ data class BiometricUnlockRequest(
     val nonce: String,
     val signingPayload: String,
     val signature: Signature,
+    val owner: SessionFence,
 )
 
 data class SessionAssuranceUiState(
@@ -71,7 +73,7 @@ class SessionAssuranceViewModel @Inject constructor(
     val state = mutableState.asStateFlow()
     private var refreshJob: Job? = null
     private var generation = 0L
-    private var lastSessionId: String? = null
+    private var lastSession: SessionFence? = null
 
     init {
         // Any API call answered with HTTP 428 proves the server considers this login locked, even
@@ -87,38 +89,43 @@ class SessionAssuranceViewModel @Inject constructor(
     }
 
     fun reconcile(signedIn: Boolean, supported: Boolean) {
-        val sessionId = sessions.current()?.sessionId
-        if (!signedIn || !supported || sessionId == null) {
+        val session = sessions.current()?.fence()
+        if (!signedIn || !supported || session == null) {
             refreshJob?.cancel()
             generation++
             // This session is deliberately NOT recorded as reconciled: capability discovery may
             // still be in flight, and the first supported call must verify this exact login with
             // the server. Recording it here previously suppressed that verification forever,
             // leaving locked sessions without an unlock prompt.
-            lastSessionId = null
+            lastSession = null
             mutableState.value = SessionAssuranceUiState()
             return
         }
-        if (sessionId == lastSessionId && (refreshJob?.isActive == true ||
+        if (session == lastSession && (refreshJob?.isActive == true ||
                 mutableState.value.required || (!mutableState.value.checking && mutableState.value.error == null))
         ) return
-        lastSessionId = sessionId
+        if (session != lastSession) {
+            refreshJob?.cancel()
+            refreshJob = null
+            generation++
+        }
+        lastSession = session
         refresh()
     }
 
     fun refresh() {
-        val expected = sessions.snapshot()
-        if (expected.fence == null || refreshJob?.isActive == true) return
+        val expected = sessions.current()?.fence() ?: return
+        if (refreshJob?.isActive == true) return
         val requestGeneration = ++generation
         mutableState.value = initialState().copy(checking = true)
         refreshJob = viewModelScope.launch {
             try {
-                val assurance = apiCalls.execute { api.sessionAssurance() }.sessionAssurance
-                if (requestGeneration == generation && sessions.snapshot() == expected) publish(assurance)
+                val assurance = apiCalls.execute { api.sessionAssurance(expected) }.sessionAssurance
+                publish(assurance, expected, requestGeneration)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                if (requestGeneration == generation && sessions.snapshot() == expected) {
+                if (isCurrent(expected, requestGeneration)) {
                     val cached = sessions.current()?.cachedAssurance
                     val serverWithoutAssurance =
                         (error as? KitWalletApiException)?.statusCode == 404
@@ -149,8 +156,7 @@ class SessionAssuranceViewModel @Inject constructor(
             )
             return
         }
-        val expected = sessions.snapshot()
-        if (expected.fence == null) return
+        val expected = sessions.current()?.fence() ?: return
         val requestGeneration = ++generation
         mutableState.value = mutableState.value.copy(unlocking = true, error = null)
         refreshJob = viewModelScope.launch {
@@ -158,20 +164,19 @@ class SessionAssuranceViewModel @Inject constructor(
                 val result = apiCalls.execute {
                     api.setPaymentPin(
                         SetPaymentPinRequest(pin = pin, pinConfirmation = confirmation),
+                        expected,
                     )
                 }
                 check(result.paymentPinSet == true) { "The wallet PIN was not saved" }
                 // Newer services return the fresh assurance with the PIN receipt; older ones are
                 // asked directly so the gate reflects the pin_setup unlock without a relaunch.
                 val assurance = result.sessionAssurance
-                    ?: apiCalls.execute { api.sessionAssurance() }.sessionAssurance
-                if (requestGeneration == generation && sessions.snapshot() == expected) {
-                    publish(assurance)
-                }
+                    ?: apiCalls.execute { api.sessionAssurance(expected) }.sessionAssurance
+                publish(assurance, expected, requestGeneration)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                if (requestGeneration == generation && sessions.snapshot() == expected) {
+                if (isCurrent(expected, requestGeneration)) {
                     mutableState.value = mutableState.value.copy(
                         unlocking = false,
                         error = error.message ?: "The wallet PIN could not be created",
@@ -183,20 +188,19 @@ class SessionAssuranceViewModel @Inject constructor(
 
     fun unlockWithPin(pin: String) {
         if (!pin.matches(Regex("^[0-9]{4}$")) || mutableState.value.unlocking) return
-        val expected = sessions.snapshot()
-        if (expected.fence == null) return
+        val expected = sessions.current()?.fence() ?: return
         val requestGeneration = ++generation
         mutableState.value = mutableState.value.copy(unlocking = true, error = null)
         refreshJob = viewModelScope.launch {
             try {
                 val assurance = apiCalls.execute {
-                    api.unlockSessionWithPin(LoginUnlockPinRequest(pin))
+                    api.unlockSessionWithPin(LoginUnlockPinRequest(pin), expected)
                 }.sessionAssurance
-                if (requestGeneration == generation && sessions.snapshot() == expected) publish(assurance)
+                publish(assurance, expected, requestGeneration)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                if (requestGeneration == generation && sessions.snapshot() == expected) {
+                if (isCurrent(expected, requestGeneration)) {
                     mutableState.value = mutableState.value.copy(
                         unlocking = false,
                         error = error.message ?: "The PIN could not unlock this session",
@@ -207,32 +211,33 @@ class SessionAssuranceViewModel @Inject constructor(
     }
 
     fun requestBiometricUnlock() {
-        val expected = sessions.snapshot()
-        val accountId = expected.fence?.accountId ?: return
+        val expected = sessions.current()?.fence() ?: return
+        val accountId = expected.accountId ?: return
         val signingKey = biometricKey ?: return
         if (!mutableState.value.biometricReady || mutableState.value.unlocking) return
         val requestGeneration = ++generation
         mutableState.value = mutableState.value.copy(unlocking = true, error = null)
         refreshJob = viewModelScope.launch {
             try {
-                val challenge = apiCalls.execute { api.createLoginBiometricChallenge() }
+                val challenge = apiCalls.execute { api.createLoginBiometricChallenge(expected) }
                 check(Instant.parse(challenge.expiresAt).isAfter(Instant.now())) {
                     "The biometric challenge has expired"
                 }
-                if (requestGeneration == generation && sessions.snapshot() == expected) {
+                if (isCurrent(expected, requestGeneration)) {
                     mutableState.value = mutableState.value.copy(
                         biometricRequest = BiometricUnlockRequest(
                             challenge.challengeId,
                             challenge.nonce,
                             challenge.signingPayload,
                             signingKey.signature(accountId),
+                            expected,
                         ),
                     )
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                if (requestGeneration == generation && sessions.snapshot() == expected) {
+                if (isCurrent(expected, requestGeneration)) {
                     mutableState.value = mutableState.value.copy(
                         unlocking = false,
                         biometricRequest = null,
@@ -245,8 +250,8 @@ class SessionAssuranceViewModel @Inject constructor(
 
     fun completeBiometricUnlock(request: BiometricUnlockRequest, authenticated: Signature) {
         if (mutableState.value.biometricRequest !== request) return
-        val expected = sessions.snapshot()
-        if (expected.fence == null) return
+        val expected = request.owner
+        if (sessions.current()?.fence() != expected) return
         val requestGeneration = ++generation
         mutableState.value = mutableState.value.copy(biometricRequest = null)
         refreshJob = viewModelScope.launch {
@@ -256,18 +261,17 @@ class SessionAssuranceViewModel @Inject constructor(
                 val result = apiCalls.execute {
                     api.assertLoginBiometricChallenge(
                         LoginBiometricAssertionRequest(request.challengeId, request.nonce, signature),
+                        expected,
                     )
                 }
                 check(result.method.equals("biometric_signature", ignoreCase = true)) {
                     "The server did not confirm biometric unlock"
                 }
-                if (requestGeneration == generation && sessions.snapshot() == expected) {
-                    publish(result.sessionAssurance)
-                }
+                publish(result.sessionAssurance, expected, requestGeneration)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                if (requestGeneration == generation && sessions.snapshot() == expected) {
+                if (isCurrent(expected, requestGeneration)) {
                     mutableState.value = mutableState.value.copy(
                         unlocking = false,
                         error = error.message ?: "Biometric unlock failed",
@@ -286,9 +290,19 @@ class SessionAssuranceViewModel @Inject constructor(
         )
     }
 
-    private suspend fun publish(assurance: SessionAssuranceDto) {
-        val expected = sessions.current()?.fence() ?: return
+    // Credential rotation and cached metadata change the store revision without changing the
+    // authenticated owner. Only this owner and the latest UI request may adopt an unlock result.
+    private fun isCurrent(expected: SessionFence, requestGeneration: Long): Boolean =
+        requestGeneration == generation && sessions.current()?.fence() == expected
+
+    private suspend fun publish(
+        assurance: SessionAssuranceDto,
+        expected: SessionFence,
+        requestGeneration: Long,
+    ) {
+        if (!isCurrent(expected, requestGeneration)) return
         if (!sessions.updateCachedAssurance(expected, assurance.toCachedSessionAssurance())) return
+        if (!isCurrent(expected, requestGeneration)) return
         val identityReady = assurance.deviceIdentityReady()
         val full = assurance.grantsFullAccess()
         mutableState.value = SessionAssuranceUiState(

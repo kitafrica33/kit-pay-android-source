@@ -1,8 +1,8 @@
 {
   "schema_version": 3,
   "application_id": "com.kit.wallet",
-  "version_name": "0.2.52",
-  "version_code": 63,
+  "version_name": "0.2.53",
+  "version_code": 64,
   "audit_date": "2026-07-22",
   "distribution_clearance": true,
   "unresolved_issue_ids": [],
